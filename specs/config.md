@@ -23,7 +23,13 @@ earlier sources:
 1. built-in defaults
 2. config file
 3. environment variables
-4. command-line flags
+
+The MVP does not define command-line flags for router URL, router
+authentication, daemon bind address, queue limits, or agent-id prefix. Those
+values are intentionally supplied through config files or environment variables
+so the daemon has a single startup-time runtime view. Command flags such as
+`init --capability` and `init --dialect` are request data, not persistent
+configuration overrides.
 
 Recommended config file locations:
 

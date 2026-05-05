@@ -139,6 +139,7 @@ With `--json`, stdout:
   "agent_handle": "01JX8F4V2QK8GZP9H6W5",
   "router_agent_id": "local-agent-01JX8F4V2QK8GZP9H6W5",
   "capabilities": ["code:edit", "code:test"],
+  "dialects": [],
   "state": "connected"
 }
 ```
@@ -291,6 +292,28 @@ Closes the WebSocket connection and removes daemon state for
 
 After `close`, commands using the same handle should fail with an unknown handle
 error.
+
+Stdout:
+
+* default: nothing
+
+Stderr:
+
+* daemon discovery errors
+* missing handle errors
+* unknown handle errors
+* malformed handle errors
+
+Exit codes:
+
+* `0` - handle was closed and removed
+* `6` - `CBCL_AGENT_HANDLE` is missing
+* `7` - handle is unknown
+* `2` - handle value is malformed
+
+Closing an unhealthy handle should succeed if the daemon can remove local state.
+The command is primarily cleanup; it should not require the router WebSocket to
+still be healthy.
 
 ## Exit Codes
 

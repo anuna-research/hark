@@ -131,7 +131,7 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
    * if discovery state exists but `ping` fails, probe `daemon.lock` before
      deciding whether stale discovery state can be replaced
 3. Spawn the same binary in foreground daemon mode, for example
-   `cbcl-router-client daemon run --internal`.
+   `cbcl-router-client daemon run`.
 4. Detach the child process from the terminal as far as the platform reasonably
    supports.
 5. Poll `daemon.json` and authenticated `ping` until the daemon is reachable or

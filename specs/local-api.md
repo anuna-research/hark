@@ -41,9 +41,9 @@ Errors should use a stable shape:
 ```json
 {
   "error": {
-    "code": "missing_agent_handle",
-    "message": "CBCL_AGENT_HANDLE is not set",
-    "hint": "run `eval \"$(cbcl-router-client init ...)\"`"
+    "code": "unknown_agent_handle",
+    "message": "agent handle is not active",
+    "hint": "run `cbcl-router-client daemon status` to list active handles"
   }
 }
 ```
@@ -59,6 +59,37 @@ HTTP status guidance:
 * `422` - CBCL validation failed
 * `503` - daemon is shutting down or otherwise temporarily unavailable
 * `500` - daemon internal error
+
+Stable error codes used by the MVP local API:
+
+* `missing_daemon_token` - local authorization header is absent.
+* `invalid_daemon_token` - local authorization failed.
+* `daemon_api_incompatible` - daemon local API version does not match the CLI.
+* `missing_router_ws_url` - router WebSocket URL is not configured.
+* `invalid_router_ws_url` - router WebSocket URL is malformed or not `ws://` or
+  `wss://`.
+* `missing_router_auth_token` - router bearer token is not configured.
+* `router_auth_rejected` - router rejected the WebSocket authentication.
+* `router_connection_failed` - router WebSocket connection failed for another
+  network or protocol reason.
+* `missing_capability` - agent creation request has no capabilities.
+* `duplicate_capability` - agent creation request repeats a capability.
+* `duplicate_dialect` - agent creation request repeats a dialect.
+* `invalid_capability` - capability value does not match the configured grammar.
+* `invalid_dialect` - dialect value does not match the configured grammar.
+* `malformed_agent_handle` - handle path component does not match the handle
+  grammar.
+* `unknown_agent_handle` - handle is well-formed but not active in the daemon.
+* `agent_handle_unhealthy` - handle exists but cannot send or receive.
+* `recv_already_waiting` - a blocking receive is already parked for the handle.
+* `recv_timeout` - blocking receive reached its timeout.
+* `daemon_stopping` - daemon is shutting down.
+* `cbcl_validation_failed` - CBCL parsing or validation failed.
+* `message_kind_mismatch` - message performative does not match `kind`.
+* `missing_thread` - sent message has no `:thread`.
+* `duplicate_thread` - sent message has more than one `:thread`.
+* `invalid_thread` - sent message has an empty or non-string `:thread`.
+* `internal_error` - unexpected daemon failure.
 
 ## Endpoints
 
@@ -125,6 +156,7 @@ Response:
   "agent_handle": "01JX8F4V2QK8GZP9H6W5",
   "router_agent_id": "local-agent-01JX8F4V2QK8GZP9H6W5",
   "capabilities": ["code:edit", "code:test"],
+  "dialects": [],
   "state": "connected"
 }
 ```
@@ -163,6 +195,7 @@ Response:
       "agent_handle": "01JX8F4V2QK8GZP9H6W5",
       "router_agent_id": "local-agent-01JX8F4V2QK8GZP9H6W5",
       "capabilities": ["code:edit", "code:test"],
+      "dialects": [],
       "state": "connected",
       "queued_messages": 0,
       "queued_bytes": 0,
@@ -311,6 +344,18 @@ Closes the selected WebSocket connection and removes daemon state for the agent
 handle.
 
 `handle` uses the same validation rules as `/recv`.
+
+If the handle is connected, the daemon should close the router WebSocket and
+remove local handle state. If the handle is already unhealthy, the daemon should
+still remove local handle state and return success. Explicit close is a local
+cleanup command; callers should not have to recover an unhealthy handle before
+removing it.
+
+Failure behavior:
+
+* malformed handle: `400` with `error.code = "malformed_agent_handle"`
+* unknown handle: `404` with `error.code = "unknown_agent_handle"`
+* daemon shutdown: `503` with `error.code = "daemon_stopping"`
 
 Response:
 

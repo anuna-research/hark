@@ -158,7 +158,7 @@ them on `init`, and an agent must advertise at least one capability.
 
 ## Validation
 
-Before forwarding messages, both the CLI command and the daemon should use
+Before forwarding messages, both the CLI command and the daemon must use
 `cbcl-rs` to parse and validate CBCL locally. This gives agents fast, precise
 feedback when a message is malformed or violates known CBCL constraints, instead
 of relying only on router-side rejection.
@@ -166,9 +166,9 @@ of relying only on router-side rejection.
 The router remains authoritative. Local validation is an ergonomics and safety
 layer, not a substitute for router validation.
 
-## Agent Skill Definition
+## Future Agent Skill Definition
 
-The repository should include a Markdown skill definition describing the CLI
-workflow for agents. The skill should defer to the CLI's built-in help for
-exact flags and examples where possible, so the skill remains stable as the CLI
-evolves.
+The repository may later include a Markdown skill definition describing the CLI
+workflow for agents. That is not required for the first implementation. If
+added, the skill should defer to the CLI's built-in help for exact flags and
+examples where possible, so the skill remains stable as the CLI evolves.
