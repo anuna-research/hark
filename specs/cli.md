@@ -40,6 +40,11 @@ inheritance.
 Starts the per-user daemon in the background and exits once the daemon responds
 to authenticated `ping`.
 
+This command is local-only. It must not open a router WebSocket, send a router
+`hello`, or fail merely because router URL or router authentication
+configuration is missing. Router configuration errors surface when `init`
+attempts to create an agent instance.
+
 Stdout:
 
 * concise success message or nothing
@@ -79,8 +84,9 @@ Status should distinguish these cases:
   singleton lock is still held; exit `5`.
 * daemon responds but local authentication fails: print a fail-closed diagnostic;
   exit `11`.
-* daemon version is incompatible with the CLI: print both versions and a restart
-  hint; exit `12`.
+* daemon local API version is incompatible with the CLI: print the CLI API
+  version, daemon API version if available, daemon binary version if available,
+  and a restart hint; exit `12`.
 
 ### `daemon stop`
 
@@ -98,6 +104,10 @@ Exit codes:
 ### `init`
 
 Creates a new ephemeral agent instance and prints shell exports.
+
+This is the command that asks the daemon to open a router WebSocket for the new
+agent. If router URL or router authentication configuration is missing or
+rejected, `init` fails and no handle is printed.
 
 Example:
 
@@ -135,13 +145,13 @@ With `--json`, stdout:
 
 Useful options:
 
-* `--capability <name>` - may be repeated.
+* `--capability <name>` - required at least once; may be repeated.
 * `--dialect <id>` - may be repeated.
 * `--json` - print JSON instead of shell exports.
 
-An agent must advertise at least one capability after applying config defaults
-and command-line overrides. If no capability is available, `init` fails with a
-usage/configuration error and does not call the daemon.
+An agent must advertise at least one capability. Capabilities are per-agent,
+not daemon-level defaults. If no `--capability` value is supplied, `init` fails
+with a usage error and does not call the daemon.
 
 ### `recv`
 
@@ -166,12 +176,17 @@ No prompt, prefix, or extra explanatory text should be printed to stdout.
 Useful options:
 
 * `--timeout <duration>` - fail if no message arrives before the timeout.
+* `--no-timeout` - explicitly wait without a client-side timeout.
 
 Without `--timeout`, `recv` blocks until a message arrives, the selected handle
 is removed or becomes unhealthy, the daemon stops, or the local HTTP request
 fails.
 Durations use a simple unit suffix: `ms`, `s`, `m`, or `h`. The CLI converts the
 duration to `timeout_ms` for the local API and rejects zero or negative values.
+The maximum finite timeout is `2160h` (90 days). This supports agents that wait
+for work for days or weeks while still rejecting values likely to overflow
+local timers. Omitting `--timeout` and using `--no-timeout` both mean no
+finite timeout; `--no-timeout` is just an explicit form for scripts.
 
 ### `reply`, `error`, and `progress`
 
@@ -231,13 +246,21 @@ sent to the daemon.
 `progress` always generates a dialect-wrapped message:
 
 ```text
-(lang <dialect> (tell @router "progress" :thread "<receipt-id>" ...))
+(lang <dialect> (tell @router "progress" :thread "<receipt-id>"))
+```
+
+If `--text <text>` is supplied, `progress` includes exactly one additional
+`:text` parameter:
+
+```text
+(lang <dialect> (tell @router "progress" :thread "<receipt-id>" :text "<text>"))
 ```
 
 Progress messages are non-terminal. A successful `progress` command means the
-frame was accepted by the local daemon for forwarding; the current router does
-not send an application-level ACK for progress frames. Agents should still send
-a later `reply` or `error` for the same `:thread`.
+daemon validated the generated CBCL and successfully wrote the frame to the
+selected WebSocket. The current router does not send an application-level ACK
+for progress frames, so success does not prove receipt persistence. Agents
+should still send a later `reply` or `error` for the same `:thread`.
 
 Stdout:
 
@@ -278,6 +301,10 @@ on common failure modes:
 * `10` - timeout
 * `11` - local daemon authentication failure
 * `12` - internal error
+
+When exit code `12` is caused by daemon API incompatibility, stderr should
+include a stable error code such as `daemon_api_incompatible` so callers can
+distinguish it from an unexpected internal error.
 
 Commands may include more specific machine-readable error codes in local API
 responses, but process exit codes should map to the categories above.

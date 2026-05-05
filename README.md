@@ -4,7 +4,7 @@ This project defines a focused Rust CLI for agents that communicate through
 `cbcl-lfe-router`.
 
 The client is responsible for local agent ergonomics: starting a per-user
-daemon, opening router WebSocket connections for local agent instances,
+local daemon, opening router WebSocket connections for local agent instances,
 advertising capabilities, validating CBCL with `cbcl-rs`, and providing
 shell-friendly commands for receiving work and sending replies.
 
@@ -26,6 +26,12 @@ shell-friendly commands for receiving work and sending replies.
 
 The client runs one daemon per OS user. The daemon listens on loopback TCP for
 local CLI invocations and manages any number of agent instances.
+
+Daemon startup is local-only. `daemon start` creates the local control plane,
+writes the discovery record, and waits until authenticated local `ping` works.
+It does not open a router WebSocket, send a router `hello`, or require router
+credentials. Router communication begins only when `init` creates an agent
+instance.
 
 Each agent instance has:
 
@@ -70,8 +76,9 @@ fails with a hint to run `cbcl-router-client daemon start`.
 ### `daemon start`
 
 Starts the per-user daemon if it is not already running. The daemon owns router
-connections and local queues. It should bind only to loopback TCP and require
-local clients to present a daemon token or equivalent local credential.
+connections and local queues for agent instances, but startup itself is
+local-only. It should bind only to loopback TCP and require local clients to
+present a daemon token or equivalent local credential.
 
 Users must start the daemon before creating agent instances.
 
@@ -89,13 +96,14 @@ discovery record, and exit.
 
 Creates a new ephemeral agent instance.
 
-`init` opens a WebSocket connection to the router, sends a CBCL `hello` frame
-with the requested capabilities, stores the connection under a daemon-minted
-handle, and prints environment exports for later commands.
+`init` asks the daemon to create one agent instance. The daemon opens one
+WebSocket connection to the router, sends a CBCL `hello` frame with the
+requested capabilities, stores the connection under a daemon-minted handle, and
+prints environment exports for later commands.
 
 Useful options:
 
-* `--capability <name>` - may be repeated.
+* `--capability <name>` - required at least once; may be repeated.
 * `--dialect <id>` - may be repeated when the agent wants to advertise known
   dialects.
 * `--json` - print machine-readable JSON instead of shell exports.
@@ -134,20 +142,19 @@ Close the WebSocket connection and remove daemon state for the current
 ## Configuration
 
 Configuration uses the Rust `config` and `dirs` crates for cross-platform
-defaults. The daemon loads configuration at startup. Users should restart the
-daemon after changing config files or relevant environment variables.
+defaults. The daemon loads configuration at startup, but router URL and router
+authentication are used lazily when an agent instance is created. Users should
+restart the daemon after changing config files or relevant environment
+variables.
 
 Expected config values include:
 
 * router WebSocket address
 * router authentication material
 * local daemon bind preferences
-* default capabilities and dialects
 
-Capabilities can be supplied from config or directly to `init`. Direct command
-line values should override configured defaults for that `init` request. An
-agent must advertise at least one capability after applying those defaults and
-overrides.
+Capabilities are per-agent, not daemon-level configuration. The agent supplies
+them on `init`, and an agent must advertise at least one capability.
 
 ## Validation
 

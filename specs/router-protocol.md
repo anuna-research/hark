@@ -9,6 +9,11 @@ The MVP is an agent interface. It focuses on persistent WebSocket agent
 connections, receiving dispatched asks, and sending progress or terminal
 messages. HTTP producer commands are optional later extensions.
 
+The daemon itself is not a router-visible participant. It has no daemon-level
+router identity, no daemon-level router WebSocket, and no router startup
+handshake. Every router WebSocket connection in the MVP belongs to exactly one
+daemon-managed agent instance created by `init`.
+
 ## Router Endpoints
 
 The MVP client uses:
@@ -44,6 +49,10 @@ implementation.
 
 `cbcl-router-client init` creates one daemon-managed agent instance.
 
+This is the first router-facing step in the normal client lifecycle. Running
+`cbcl-router-client daemon start` before `init` only starts the local daemon; it
+does not contact `/agent/v1`.
+
 For each agent instance, the daemon:
 
 1. mints a local `agent_handle`
@@ -53,8 +62,9 @@ For each agent instance, the daemon:
 5. stores the connection under the local handle after the binary hello frame is
    successfully written
 
-The capability list must be non-empty after applying config defaults and local
-`init` overrides. The daemon must not open a router WebSocket for a
+The capability list must be non-empty and supplied by the agent's `init`
+request. Capabilities are per-agent; there are no daemon-level capability
+defaults in the MVP. The daemon must not open a router WebSocket for a
 zero-capability agent.
 
 Recommended router-visible id:
@@ -66,6 +76,9 @@ local-agent-<agent_handle>
 The router-visible id must be unique among currently connected local agent
 instances. It does not need to be semantically meaningful or durable across
 daemon restarts.
+
+A daemon with zero agent instances therefore has zero router-visible ids and
+zero router WebSocket connections.
 
 ## Hello Frame
 
@@ -171,6 +184,17 @@ Example progress frame:
     :thread "rcp-ABCDEF"
     :text "running tests"))
 ```
+
+If no progress text is supplied, the generated frame omits `:text`:
+
+```lisp
+(lang elf
+  (tell @router "progress"
+    :thread "rcp-ABCDEF"))
+```
+
+Both forms are valid CBCL under the local `cbcl-rs` parser; `:thread` is
+mandatory for router receipt correlation, and `:text` is optional.
 
 ## Thread and Receipt Correlation
 

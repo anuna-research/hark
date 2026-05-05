@@ -9,6 +9,11 @@ long-lived daemon process.
 The API is local-only. It is not a public network API and must not bind to a
 non-loopback interface.
 
+The local API is also the boundary between daemon startup and router-facing
+agent creation. Starting the daemon only makes this API available. The daemon
+does not communicate with the router until `POST /v1/agents` asks it to create
+an agent instance.
+
 ## Transport
 
 The first implementation should use HTTP with JSON request and response bodies
@@ -71,14 +76,27 @@ Response:
 ```json
 {
   "ok": true,
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "api_version": 1
 }
 ```
+
+The CLI is compatible with a daemon only when the daemon reports the same
+`api_version`. Patch and minor binary version differences are allowed under the
+same API version. If `api_version` differs or is missing, the CLI should treat
+the daemon as incompatible, report both versions when available, and suggest
+restarting the daemon with the current binary.
 
 ### `POST /v1/agents`
 
 Creates an ephemeral agent instance and opens a WebSocket connection to the
 router.
+
+This endpoint is the first point in the normal lifecycle that requires router
+WebSocket URL and router authentication configuration. A daemon may be running
+and healthy before those values are configured, but this endpoint must fail
+before opening a WebSocket if the effective router configuration is missing or
+invalid.
 
 Request:
 
@@ -91,10 +109,12 @@ Request:
 
 Fields:
 
-* `capabilities` - non-empty capability strings advertised in the router `hello`.
+* `capabilities` - non-empty per-agent capability strings advertised in the
+  router `hello`.
 * `dialects` - optional dialect ids advertised in the router `hello`.
 
-The daemon must reject requests whose effective `capabilities` list is empty.
+The daemon must reject requests whose `capabilities` list is empty. The daemon
+does not apply capability defaults.
 
 Response:
 
@@ -133,7 +153,8 @@ Response:
   "daemon": {
     "pid": 12345,
     "addr": "127.0.0.1:49152",
-    "version": "0.1.0"
+    "version": "0.1.0",
+    "api_version": 1
   },
   "agents": [
     {
@@ -152,6 +173,10 @@ Response:
 ### `GET /v1/agents/{handle}/recv`
 
 Blocks until an inbound CBCL message is available for `handle`, then returns it.
+
+`handle` must match the agent-handle grammar defined in [`daemon.md`](daemon.md).
+Malformed handle path components should return `400` with
+`error.code = "malformed_agent_handle"` rather than `404`.
 
 The CLI `recv` command should print only the message bytes to stdout by
 default. This endpoint may return JSON so the CLI can handle metadata.
@@ -173,7 +198,8 @@ If `timeout_ms` is absent, the request may block until a message arrives, the
 selected handle is removed or becomes unhealthy, the daemon stops, or the HTTP
 connection fails. If `timeout_ms` expires before a message arrives, return a
 timeout error rather than an empty success. The daemon should reject zero,
-negative, and unreasonably large timeout values as malformed requests.
+negative, and values greater than `7776000000` milliseconds (90 days) as
+malformed requests.
 
 If the handle has queued messages, the daemon should return the oldest queued
 message immediately. Otherwise it should park the request until a message
@@ -195,6 +221,8 @@ shutdown to exit code `12` unless a more specific daemon-lifecycle code applies.
 ### `POST /v1/agents/{handle}/send`
 
 Sends a CBCL frame over the selected agent's WebSocket connection.
+
+`handle` uses the same validation rules as `/recv`.
 
 Request:
 
@@ -232,6 +260,17 @@ unwrapped shape rather than relying on that CLI behavior.
 If validation or kind checking fails, the daemon must return an error and must
 not send the frame to the router.
 
+A successful `/send` response means:
+
+1. the daemon validated the CBCL and command kind,
+2. the selected handle was connected and healthy, and
+3. the frame was successfully written to the selected router WebSocket.
+
+The daemon must not return success merely because the frame was accepted into
+an internal queue. If the local WebSocket write fails, the daemon should mark
+the handle unhealthy with `local_send_failed` and return `409` with
+`error.code = "agent_handle_unhealthy"` or `503` if the daemon is shutting down.
+
 Handle failure behavior for `/send` should match `/recv`: unknown handles
 return `404`, unhealthy handles return `409`, and daemon shutdown returns
 `503`.
@@ -240,10 +279,10 @@ The daemon does not track dispatched `:thread` values in the MVP. It only
 requires that the field is present and well-formed enough for CBCL validation.
 The router remains responsible for authoritative receipt correlation.
 
-For `progress`, successful local send only means the daemon accepted the frame
-for forwarding on the selected WebSocket. The current router does not send an
-application-level ACK for progress frames, so the local API cannot confirm
-receipt persistence synchronously.
+For `progress`, successful local send means the daemon wrote the frame to the
+selected WebSocket. The current router does not send an application-level ACK
+for progress frames, so the local API cannot confirm receipt persistence
+synchronously.
 
 The CLI `progress` command builds its CBCL message from command-line flags and
 then calls this endpoint with `kind = "progress"`. The local API remains
@@ -263,6 +302,8 @@ Response:
 
 Closes the selected WebSocket connection and removes daemon state for the agent
 handle.
+
+`handle` uses the same validation rules as `/recv`.
 
 Response:
 
@@ -288,6 +329,9 @@ Response:
 After accepting the stop request, the daemon should close all active agent
 WebSocket connections, remove `daemon.json`, and exit. Releasing
 `daemon.lock` happens by process exit.
+
+If no agent instances exist, shutdown has no router WebSocket connections to
+close. It should still remove local discovery state and exit normally.
 
 ## Agent States
 

@@ -3,7 +3,8 @@
 ## Purpose
 
 `cbcl-router-client` runs one daemon per OS user. The daemon owns local agent
-instances, WebSocket connections to the router, and per-agent inbound queues.
+instances, the router WebSocket connections created for those instances, and
+per-agent inbound queues.
 
 CLI commands such as `init`, `recv`, `reply`, `daemon status`, and `close` need
 a reliable way to discover the daemon and fail clearly when no daemon is
@@ -44,6 +45,11 @@ should fail closed with a diagnostic rather than trusting the local daemon
 token. Equivalent owner-only protections should be used on platforms that
 support ACLs rather than Unix modes.
 
+On Unix-like systems, commands must also reject runtime directories,
+`daemon.json`, or `daemon.lock` that are symlinks, not owned by the current user,
+or otherwise fail owner-only checks. The local daemon token is a bearer
+credential, so discovery files should be treated as sensitive local secrets.
+
 ## Files
 
 ### `daemon.lock`
@@ -75,7 +81,8 @@ Example:
   "addr": "127.0.0.1:49152",
   "token": "base64url-random-32-bytes",
   "started_at": "2026-05-05T12:34:56Z",
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "api_version": 1
 }
 ```
 
@@ -86,15 +93,27 @@ Fields:
 * `token` - random local authentication secret for CLI-to-daemon requests.
 * `started_at` - timestamp for diagnostics.
 * `version` - daemon binary version for diagnostics and compatibility checks.
+* `api_version` - local API major version supported by the daemon.
 
 The token should contain at least 32 bytes of randomness, encoded with base64url
 or another shell-safe representation.
 
+The CLI is compatible with the daemon only when `api_version` matches the CLI's
+compiled local API version. Binary `version` is diagnostic under a matching API
+version. If `api_version` is absent or different, the CLI should fail with the
+daemon-version-incompatible status defined in [`cli.md`](cli.md) and suggest
+restarting the daemon.
+
 ## Daemon Startup
 
 `daemon start` is an adb-style command: it starts a background daemon and then
-returns after the daemon is reachable. Users should not need to append `&` or
-manage process detachment themselves.
+returns after the daemon is reachable on the local loopback API. Users should
+not need to append `&` or manage process detachment themselves.
+
+Daemon startup is local-only. A newly started daemon with no agent instances
+must not open a router WebSocket, send a router `hello`, or require router URL
+or router authentication configuration. Router communication begins only when a
+local `init` request creates an agent instance.
 
 The CLI should expose two daemon execution modes:
 
@@ -118,6 +137,11 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
 5. Poll `daemon.json` and authenticated `ping` until the daemon is reachable or
    startup times out.
 6. Exit successfully only after the daemon is ready.
+
+The default startup timeout should be 10 seconds. Implementations may expose a
+debug/service-manager override later, but the MVP `daemon start` command should
+not wait indefinitely for a child that failed before writing usable discovery
+state.
 
 If stale `daemon.json` exists, `daemon start` should use the file lock only as
 a short-lived probe:
@@ -155,6 +179,11 @@ the now-responsive daemon as success after authenticated `ping`.
 
 The daemon should bind only to loopback addresses. It must not listen on a
 public interface.
+
+`daemon run` has the same local-only startup contract as `daemon start`. It may
+load router configuration for later use, but it must not validate router
+reachability or open router connections until handling an agent-creation
+request.
 
 `daemon run` is not idempotent. If it cannot acquire `daemon.lock` and an
 authenticated `ping` to the recorded daemon succeeds, it should fail with a
@@ -240,7 +269,8 @@ diagnostic rather than removing files blindly.
 The daemon's local protocol should include at least:
 
 * `ping` - proves liveness and token validity.
-* `init` - creates an ephemeral agent instance and returns an agent handle.
+* `init` - creates an ephemeral agent instance, opens that instance's router
+  WebSocket, and returns an agent handle.
 * `recv` - blocks until the selected agent handle has an inbound message.
 * `send` - sends a validated CBCL frame over the selected agent handle's WebSocket
   connection.
@@ -294,7 +324,8 @@ acceptable default for task dispatch.
 
 ## Agent Handles
 
-`init` creates one daemon-managed agent instance:
+`init` creates one daemon-managed agent instance. This is the operation that
+turns a local daemon process into a router-visible agent:
 
 ```bash
 eval "$(cbcl-router-client init \
@@ -329,6 +360,15 @@ The handle is a local daemon routing key. The daemon maps it to:
 handle -> router agent-id -> WebSocket connection -> inbound queue
 ```
 
+No such mapping exists immediately after `daemon start`. A daemon with no
+agent handles has no router-visible identity and no router WebSocket
+connections.
+
+Agent handles should be generated as ULIDs or as an equivalent 128-bit random
+identifier encoded in Crockford base32. The MVP handle grammar is exactly 26
+characters matching `[0-9A-HJKMNP-TV-Z]{26}`. Handles are local-only, shell-safe,
+and URL-path-safe.
+
 The router-visible `agent-id` may be derived from the handle, for example:
 
 ```text
@@ -338,10 +378,11 @@ local-agent-01JX8F4V2QK8GZP9H6W5
 Commands such as `recv`, `reply`, `error`, `progress`, and `close` should
 select the agent instance from `CBCL_AGENT_HANDLE`.
 
-An agent instance must advertise at least one capability. The CLI should reject
-`init` requests with no effective capabilities before calling the daemon, and
-the daemon should reject local API requests that still contain an empty
-capability list.
+An agent instance must advertise at least one capability. Capabilities are
+per-agent and are supplied by that agent's `init` request. The daemon has no
+daemon-level capability defaults. The CLI should reject `init` requests with no
+`--capability` value before calling the daemon, and the daemon should reject
+local API requests whose `capabilities` list is empty.
 
 ## Error Handling Principles
 

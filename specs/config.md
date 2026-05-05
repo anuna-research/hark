@@ -7,7 +7,6 @@ The client needs configuration for:
 * router WebSocket address
 * router authentication material
 * local daemon runtime behavior
-* default agent capabilities and dialects
 * queue limits
 
 This spec captures the MVP configuration model and the current router
@@ -37,12 +36,18 @@ Windows: %APPDATA%\cbcl-router-client\config.toml
 Runtime daemon state is separate from configuration and is defined in
 [`daemon.md`](daemon.md).
 
-The daemon owns router connections, so it loads configuration at daemon
-startup. Changes to config files or relevant environment variables do not
-affect an already-running daemon; users must restart the daemon for those
-changes to take effect. Command-line flags to `init` can still override
-configured agent defaults for that one agent instance, because those values are
-sent in the local init request.
+The daemon owns router connections for agent instances, so it loads
+configuration at daemon startup and keeps that configuration as its runtime
+view. Changes to config files or relevant environment variables do not affect
+an already-running daemon; users must restart the daemon for those changes to
+take effect. Agent capabilities and dialect advertisements are not part of the
+daemon's loaded configuration; they are supplied in each local `init` request.
+
+Daemon startup does not require router configuration. A daemon may start,
+answer local `ping`, report status, and stop without a router WebSocket URL or
+router authentication token. Router URL and authentication are required only
+when creating an agent instance with `init`, because that operation opens a
+router WebSocket.
 
 ## MVP Config Shape
 
@@ -54,8 +59,6 @@ ws_url = "wss://cbcl-lfe.anuna.io/agent/v1"
 auth_token = "shr_prod-agent.REPLACE_ME"
 
 [agent]
-default_capabilities = []
-default_dialects = []
 agent_id_prefix = "local-agent"
 
 [daemon]
@@ -88,7 +91,8 @@ Environment override:
 export CBCL_ROUTER_AUTH_TOKEN='shr_prod-agent.REPLACE_ME'
 ```
 
-The daemon uses this value when opening WebSocket connections to the router:
+The daemon uses this value when `init` opens an agent WebSocket connection to
+the router:
 
 ```text
 Authorization: Bearer ${CBCL_ROUTER_AUTH_TOKEN}
@@ -114,27 +118,33 @@ export CBCL_ROUTER_WS='wss://cbcl-lfe.anuna.io/agent/v1'
 
 HTTP router configuration is out of MVP.
 
-## Agent Defaults
+## Agent Configuration
 
-Capabilities and dialects can come from config or from `init` flags.
+Capabilities and dialect advertisements are owned by each agent instance. They
+are not daemon-level configuration and there are no configured default
+capabilities or default dialects in the MVP.
 
-Config:
+An agent supplies capabilities and optional dialects through `init` flags:
+
+```bash
+cbcl-router-client init --capability code:edit --capability code:test --dialect elf
+```
+
+`init` must include at least one `--capability`. If no capability is supplied,
+the CLI fails with a clear missing-capability error before calling the daemon.
+The daemon must also reject local API agent-creation requests whose
+`capabilities` list is empty.
+
+Dialect advertisements are optional. If no `--dialect` is supplied, the agent
+advertises an empty dialect list.
+
+The only agent-related daemon configuration in the MVP is the router-visible
+agent-id prefix:
 
 ```toml
 [agent]
-default_capabilities = ["code:edit", "code:test"]
-default_dialects = []
 agent_id_prefix = "local-agent"
 ```
-
-Command-line flags replace configured defaults:
-
-* if `--capability` is supplied, use supplied capabilities
-* otherwise use `agent.default_capabilities`
-* if neither produces at least one capability, fail with a clear
-  missing-capability error before opening a router WebSocket
-* if `--dialect` is supplied, use supplied dialects
-* otherwise use `agent.default_dialects`
 
 The router-visible agent id is derived from:
 
@@ -145,14 +155,24 @@ The router-visible agent id is derived from:
 Environment overrides:
 
 ```bash
-export CBCL_AGENT_DEFAULT_CAPABILITIES='code:edit,code:test'
-export CBCL_AGENT_DEFAULT_DIALECTS='elf'
 export CBCL_AGENT_ID_PREFIX='local-agent'
 ```
 
-List-valued environment variables are comma-separated. Empty items after
-trimming whitespace are ignored. If an environment variable is present but
-contains no usable entries, it overrides the config file with an empty list.
+`CBCL_AGENT_ID_PREFIX` must follow the same grammar as `agent_id_prefix`.
+
+MVP string grammar:
+
+* `agent_id_prefix` - ASCII, 1-63 characters, matching
+  `[A-Za-z0-9][A-Za-z0-9._-]*`.
+* capability name - ASCII, 1-128 characters, matching
+  `[A-Za-z0-9][A-Za-z0-9._:/-]*`.
+* dialect id - ASCII, 1-64 characters, matching
+  `[A-Za-z][A-Za-z0-9._-]*`.
+
+These restrictions are narrower than general CBCL symbols on purpose. They keep
+agent ids shell-safe, URL-path-safe, and readable in status output while still
+covering the current examples such as `code:edit`, `code:test`, `elf`, and
+`cbcl-router`.
 
 ## Daemon Config
 
@@ -185,8 +205,9 @@ export CBCL_DAEMON_OVERFLOW_POLICY='reject_new_and_close'
 ```
 
 Numeric environment values must parse as positive base-10 integers. Invalid
-values should fail configuration loading before the daemon starts. The only MVP
-overflow policy is `reject_new_and_close`; any other value should be rejected.
+daemon-runtime values should fail configuration loading before the daemon
+starts. The only MVP overflow policy is `reject_new_and_close`; any other value
+should be rejected.
 
 ## Secret Handling
 
@@ -221,16 +242,18 @@ shared-secret bearer token required by `/agent/v1`.
 
 ## Error Handling
 
-Missing router auth config should fail before opening a WebSocket:
+Missing router auth config should not prevent `daemon start`, `daemon run`,
+`daemon status`, or `daemon stop`. It should fail an agent `init` request before
+opening a WebSocket:
 
 ```text
 error: router auth token is not configured
 hint: set `CBCL_ROUTER_AUTH_TOKEN` or configure `router.auth_token`
 ```
 
-Missing router URL should fail before agent init. The daemon may start without
-router configuration, but it cannot create router WebSocket connections until a
-URL is available:
+Missing router URL should likewise fail before agent init opens a WebSocket.
+The daemon may start without router configuration, but it cannot create router
+WebSocket connections until a URL is available:
 
 ```text
 error: router WebSocket URL is not configured
