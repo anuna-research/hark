@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{IsTerminal, Read},
     process::{Command as ProcessCommand, Stdio},
     time::{Duration, Instant},
 };
@@ -7,14 +8,19 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::net::TcpListener;
 
+use crate::cbcl_validation::{MessageKind, validate_for_send};
+use crate::config::validate_dialect_id;
 use crate::constants::{COMMAND_NAME, DEFAULT_PROGRESS_DIALECT};
 use crate::daemon::{
-    AgentStore, AgentStoreConfig, DiscoveryRecord, RuntimePaths, acquire_daemon_lock,
+    AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord, RuntimePaths, acquire_daemon_lock,
     create_runtime_dir, generate_daemon_token, load_discovery_record, probe_lock_available,
     resolve_runtime_paths, write_discovery_record,
 };
 use crate::errors::{AppError, AppResult};
-use crate::local_api::{ClientPingError, LocalApiClient, serve_local_api_with_agents};
+use crate::local_api::{
+    ClientPingError, LocalApiClient, LocalApiRequestError, SendMessageKind, SendRequest,
+    serve_local_api_with_agents,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = COMMAND_NAME, version, about)]
@@ -91,9 +97,9 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         },
         Command::Init(_) => not_implemented("init"),
         Command::Recv(_) => not_implemented("recv"),
-        Command::Reply(_) => not_implemented("reply"),
-        Command::Error(_) => not_implemented("error"),
-        Command::Progress(_) => not_implemented("progress"),
+        Command::Reply(args) => send_message_command(SendMessageKind::Reply, args).await,
+        Command::Error(args) => send_message_command(SendMessageKind::Error, args).await,
+        Command::Progress(args) => progress_command(args).await,
         Command::Close => not_implemented("close"),
     }
 }
@@ -102,6 +108,132 @@ fn not_implemented(command: &str) -> AppResult<()> {
     Err(AppError::Internal(format!(
         "{command} is not implemented yet"
     )))
+}
+
+async fn send_message_command(kind: SendMessageKind, args: MessageInputArgs) -> AppResult<()> {
+    let message = read_message_input(args.message)?;
+    let expected_kind = MessageKind::from(kind);
+    validate_for_send(&message, expected_kind).map_err(|error| {
+        eprintln!("{}: {error}", error.code());
+        AppError::CbclValidation
+    })?;
+    send_validated_message(kind, message).await
+}
+
+async fn progress_command(args: ProgressArgs) -> AppResult<()> {
+    validate_dialect_id(&args.dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+    let message = build_progress_message(&args.thread, args.text.as_deref(), &args.dialect);
+    validate_for_send(&message, MessageKind::Progress).map_err(|error| {
+        eprintln!("{}: {error}", error.code());
+        AppError::CbclValidation
+    })?;
+    send_validated_message(SendMessageKind::Progress, message).await
+}
+
+async fn send_validated_message(kind: SendMessageKind, message: String) -> AppResult<()> {
+    let handle = resolve_agent_handle()?;
+    let client = discover_live_client().await?;
+    client
+        .send(&handle, &SendRequest { kind, message })
+        .await
+        .map_err(map_local_api_request_error)?;
+    Ok(())
+}
+
+fn read_message_input(message: Option<String>) -> AppResult<String> {
+    if let Some(message) = message {
+        return Ok(message);
+    }
+
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err(AppError::Usage(
+            "message argument is required when stdin is a terminal".to_owned(),
+        ));
+    }
+
+    let mut message = String::new();
+    stdin
+        .read_to_string(&mut message)
+        .map_err(|error| AppError::Internal(format!("failed to read stdin: {error}")))?;
+    Ok(message)
+}
+
+fn resolve_agent_handle() -> AppResult<AgentHandle> {
+    let value = std::env::var("CBCL_AGENT_HANDLE").map_err(|_| AppError::MissingAgentHandle)?;
+    AgentHandle::new(value).map_err(|error| AppError::Usage(error.to_string()))
+}
+
+async fn discover_live_client() -> AppResult<LocalApiClient> {
+    let paths = resolve_runtime_paths()
+        .map_err(|error| AppError::Internal(format!("failed to resolve runtime dir: {error}")))?;
+    let Some(record) = load_discovery_record(&paths)
+        .map_err(|error| AppError::Internal(format!("failed to read daemon discovery: {error}")))?
+    else {
+        return Err(AppError::DaemonNotRunning);
+    };
+
+    ping_record(&record)
+        .await
+        .map_err(|error| map_client_error(error, "local daemon request failed"))
+}
+
+fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
+    match error {
+        LocalApiRequestError::AuthFailure => AppError::LocalAuth,
+        LocalApiRequestError::Api(error, status) => {
+            eprintln!("{}: {}", error.error.code, error.error.message);
+            match error.error.code.as_str() {
+                "malformed_agent_handle" => AppError::Usage(error.error.message),
+                "unknown_agent_handle" | "agent_handle_unhealthy" => {
+                    AppError::AgentHandleUnavailable
+                }
+                "cbcl_validation_failed"
+                | "message_kind_mismatch"
+                | "missing_thread"
+                | "duplicate_thread"
+                | "invalid_thread" => AppError::CbclValidation,
+                "daemon_stopping" => AppError::Internal(error.error.message),
+                _ if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+                    AppError::RouterConnection
+                }
+                _ => AppError::Internal(error.error.message),
+            }
+        }
+        LocalApiRequestError::RequestFailed(error) => {
+            AppError::Internal(format!("local daemon request failed: {error}"))
+        }
+        LocalApiRequestError::DecodeFailed(error) => {
+            AppError::Internal(format!("failed to decode local API response: {error}"))
+        }
+    }
+}
+
+fn build_progress_message(thread: &str, text: Option<&str>, dialect: &str) -> String {
+    let mut message = format!(
+        "(lang {} (tell @router \"progress\" :thread \"{}\"",
+        dialect,
+        escape_cbcl_string(thread)
+    );
+    if let Some(text) = text {
+        message.push_str(&format!(" :text \"{}\"", escape_cbcl_string(text)));
+    }
+    message.push_str("))");
+    message
+}
+
+fn escape_cbcl_string(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            _ => vec![character],
+        })
+        .collect()
 }
 
 async fn daemon_run() -> AppResult<()> {
@@ -383,7 +515,7 @@ fn is_lock_busy(error: &crate::daemon::DiscoveryError) -> bool {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, DaemonCommand};
+    use super::{Cli, Command, DaemonCommand, build_progress_message, escape_cbcl_string};
 
     #[test]
     fn command_tree_matches_mvp_surface() {
@@ -459,5 +591,22 @@ mod tests {
 
         let cli = Cli::parse_from(["cbcl-router-client", "close"]);
         assert!(matches!(cli.command, Command::Close));
+    }
+
+    #[test]
+    fn builds_progress_message_with_escaped_values() {
+        assert_eq!(
+            build_progress_message("rcp-1", None, "elf"),
+            r#"(lang elf (tell @router "progress" :thread "rcp-1"))"#
+        );
+        assert_eq!(
+            build_progress_message("rcp\"2", Some("line\nnext"), "elf"),
+            r#"(lang elf (tell @router "progress" :thread "rcp\"2" :text "line\nnext"))"#
+        );
+    }
+
+    #[test]
+    fn escapes_cbcl_strings() {
+        assert_eq!(escape_cbcl_string("a\\b\"c\n"), "a\\\\b\\\"c\\n");
     }
 }

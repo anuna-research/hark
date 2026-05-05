@@ -16,7 +16,7 @@ use rand::rngs::OsRng;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 use crate::{
     config::{validate_capability_name, validate_dialect_id},
@@ -68,6 +68,17 @@ pub struct AgentStore {
     inner: Arc<Mutex<AgentRegistry>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentSendChannel {
+    tx: mpsc::Sender<OutboundFrame>,
+}
+
+#[derive(Debug)]
+pub struct OutboundFrame {
+    pub message: String,
+    pub result_tx: oneshot::Sender<Result<(), String>>,
+}
+
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
 pub enum AgentError {
     #[error("malformed agent handle")]
@@ -116,6 +127,7 @@ struct AgentEntry {
     recv_waiting: bool,
     notify: Arc<Notify>,
     close_tx: Option<oneshot::Sender<()>>,
+    send_channel: Option<AgentSendChannel>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -295,6 +307,18 @@ impl AgentStore {
         dialects: Vec<String>,
         close_tx: Option<oneshot::Sender<()>>,
     ) -> Result<AgentStatusSnapshot, AgentError> {
+        self.insert_connected_with_router_channels(handle, capabilities, dialects, close_tx, None)
+            .await
+    }
+
+    pub async fn insert_connected_with_router_channels(
+        &self,
+        handle: AgentHandle,
+        capabilities: Vec<String>,
+        dialects: Vec<String>,
+        close_tx: Option<oneshot::Sender<()>>,
+        send_channel: Option<AgentSendChannel>,
+    ) -> Result<AgentStatusSnapshot, AgentError> {
         validate_agent_advertisement(&capabilities, &dialects)?;
         let mut inner = self.inner.lock().await;
         let router_agent_id = format!("{}-{}", inner.config.agent_id_prefix, handle.as_str());
@@ -310,6 +334,7 @@ impl AgentStore {
             recv_waiting: false,
             notify: Arc::new(Notify::new()),
             close_tx,
+            send_channel,
         };
         inner.agents.insert(handle.clone(), entry);
         Ok(inner
@@ -317,6 +342,68 @@ impl AgentStore {
             .get(&handle)
             .expect("agent was just inserted")
             .snapshot(&handle))
+    }
+
+    pub async fn send_outbound(
+        &self,
+        handle: &AgentHandle,
+        message: String,
+    ) -> Result<(), AgentError> {
+        let send_channel = {
+            let inner = self.inner.lock().await;
+            let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
+            entry.ensure_healthy()?;
+            entry
+                .send_channel
+                .clone()
+                .ok_or_else(|| AgentError::Unhealthy {
+                    reason: "local_send_failed".to_owned(),
+                    detail: Some("agent has no router send channel".to_owned()),
+                })?
+        };
+
+        let (result_tx, result_rx) = oneshot::channel();
+        if send_channel
+            .tx
+            .send(OutboundFrame { message, result_tx })
+            .await
+            .is_err()
+        {
+            let _ = self
+                .mark_unhealthy(
+                    handle,
+                    "local_send_failed",
+                    Some("router send loop is closed".to_owned()),
+                )
+                .await;
+            return Err(AgentError::Unhealthy {
+                reason: "local_send_failed".to_owned(),
+                detail: Some("router send loop is closed".to_owned()),
+            });
+        }
+
+        match result_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(detail)) => {
+                let _ = self
+                    .mark_unhealthy(handle, "local_send_failed", Some(detail.clone()))
+                    .await;
+                Err(AgentError::Unhealthy {
+                    reason: "local_send_failed".to_owned(),
+                    detail: Some(detail),
+                })
+            }
+            Err(_) => {
+                let detail = "router send loop dropped send result".to_owned();
+                let _ = self
+                    .mark_unhealthy(handle, "local_send_failed", Some(detail.clone()))
+                    .await;
+                Err(AgentError::Unhealthy {
+                    reason: "local_send_failed".to_owned(),
+                    detail: Some(detail),
+                })
+            }
+        }
     }
 
     pub async fn enqueue_inbound(
@@ -451,6 +538,12 @@ impl AgentStore {
         if let Some(entry) = inner.agents.get_mut(handle) {
             entry.recv_waiting = false;
         }
+    }
+}
+
+impl AgentSendChannel {
+    pub fn new(tx: mpsc::Sender<OutboundFrame>) -> Self {
+        Self { tx }
     }
 }
 

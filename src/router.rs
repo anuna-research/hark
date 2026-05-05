@@ -1,6 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, client::IntoClientRequest, http::header::InvalidHeaderValue},
@@ -8,7 +8,7 @@ use tokio_tungstenite::{
 
 use crate::{
     config::ValidatedRouterConfig,
-    daemon::{AgentHandle, AgentStore},
+    daemon::{AgentHandle, AgentSendChannel, AgentStore},
 };
 
 pub const AGENT_WS_PATH: &str = "/agent/v1";
@@ -52,16 +52,18 @@ pub async fn create_router_agent(
         .map_err(|error| RouterError::HelloSendFailed(error.to_string()))?;
 
     let (close_tx, close_rx) = oneshot::channel();
+    let (send_tx, send_rx) = mpsc::channel(8);
     let snapshot = store
-        .insert_connected_with_close_signal(
+        .insert_connected_with_router_channels(
             handle.clone(),
             capabilities.clone(),
             dialects.clone(),
             Some(close_tx),
+            Some(AgentSendChannel::new(send_tx)),
         )
         .await
         .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
-    spawn_receive_loop(store, handle.clone(), websocket, close_rx);
+    spawn_receive_loop(store, handle.clone(), websocket, close_rx, send_rx);
 
     Ok(CreatedRouterAgent {
         agent_handle: handle,
@@ -118,6 +120,7 @@ fn spawn_receive_loop(
     handle: AgentHandle,
     mut websocket: RouterWebSocket,
     mut close_rx: oneshot::Receiver<()>,
+    mut send_rx: mpsc::Receiver<crate::daemon::OutboundFrame>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -125,6 +128,23 @@ fn spawn_receive_loop(
                 _ = &mut close_rx => {
                     let _ = websocket.close(None).await;
                     break;
+                }
+                outbound = send_rx.recv() => {
+                    let Some(outbound) = outbound else {
+                        let _ = store.mark_unhealthy(&handle, "local_send_failed", Some("router send channel closed".to_owned())).await;
+                        break;
+                    };
+                    match websocket.send(Message::Binary(outbound.message.into_bytes().into())).await {
+                        Ok(()) => {
+                            let _ = outbound.result_tx.send(Ok(()));
+                        }
+                        Err(error) => {
+                            let detail = sanitize_diagnostic(&error.to_string());
+                            let _ = outbound.result_tx.send(Err(detail.clone()));
+                            let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(detail)).await;
+                            break;
+                        }
+                    }
                 }
                 message = websocket.next() => {
                     match message {

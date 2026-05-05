@@ -206,9 +206,83 @@ async fn router_integration_rejects_duplicate_capability_before_router_connect()
     local.stop().await;
 }
 
+#[tokio::test]
+async fn router_integration_send_writes_binary_frame_to_router() {
+    let router = MockRouter::start(RouterBehavior::CaptureSend).await;
+    let local = LocalApi::start(router.ws_url()).await;
+    let created = local
+        .create_agent(&["code:edit"], &["elf"])
+        .await
+        .expect("agent should be created");
+
+    let response = local
+        .post_send(
+            &created.agent_handle,
+            "reply",
+            r#"(lang elf (reply "done" :thread "rcp-1"))"#,
+        )
+        .await
+        .expect("send request should complete");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    router.wait().await;
+    assert_eq!(
+        router.sent_frame(),
+        Some(r#"(lang elf (reply "done" :thread "rcp-1"))"#.to_owned())
+    );
+    local.stop().await;
+}
+
+#[tokio::test]
+async fn router_integration_send_rejects_validation_errors_without_forwarding() {
+    let router = MockRouter::start(RouterBehavior::CaptureSend).await;
+    let local = LocalApi::start(router.ws_url()).await;
+    let created = local
+        .create_agent(&["code:edit"], &[])
+        .await
+        .expect("agent should be created");
+    router.wait_for_hello(Duration::from_secs(1)).await;
+
+    let response = local
+        .post_send(
+            &created.agent_handle,
+            "reply",
+            r#"(error "failed" :thread "rcp-1")"#,
+        )
+        .await
+        .expect("send request should complete");
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(response).await, "message_kind_mismatch");
+    assert!(router.sent_frame().is_none());
+    router.abort();
+    local.stop().await;
+}
+
+#[tokio::test]
+async fn router_integration_send_rejects_unknown_handle() {
+    let router = MockRouter::start(RouterBehavior::CaptureSend).await;
+    let local = LocalApi::start(router.ws_url()).await;
+
+    let response = local
+        .post_send(
+            "0123456789ABCDEFGHJKMNPQRS",
+            "reply",
+            r#"(reply "done" :thread "rcp-1")"#,
+        )
+        .await
+        .expect("send request should complete");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(error_code(response).await, "unknown_agent_handle");
+    router.abort();
+    local.stop().await;
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RouterBehavior {
     SendDispatch,
+    CaptureSend,
     RejectAuth,
     CloseAfterHello,
     SendError,
@@ -225,6 +299,7 @@ struct MockRouter {
 struct MockRouterState {
     auth_header: Option<String>,
     hello_frame: Option<String>,
+    sent_frame: Option<String>,
 }
 
 impl MockRouter {
@@ -278,6 +353,14 @@ impl MockRouter {
                         .await;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+                RouterBehavior::CaptureSend => {
+                    if let Some(Ok(message)) = websocket.next().await {
+                        task_shared
+                            .lock()
+                            .expect("mock state should lock")
+                            .sent_frame = Some(message_to_string(message));
+                    }
+                }
                 RouterBehavior::CloseAfterHello => {
                     let _ = websocket.close(None).await;
                 }
@@ -322,6 +405,14 @@ impl MockRouter {
             .clone()
     }
 
+    fn sent_frame(&self) -> Option<String> {
+        self.shared
+            .lock()
+            .expect("mock state should lock")
+            .sent_frame
+            .clone()
+    }
+
     async fn wait_for_hello(&self, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
@@ -337,6 +428,12 @@ impl MockRouter {
         let task = self.task.lock().expect("task should lock").take();
         if let Some(task) = task {
             task.await.expect("router task should not panic");
+        }
+    }
+
+    fn abort(&self) {
+        if let Some(task) = self.task.lock().expect("task should lock").take() {
+            task.abort();
         }
     }
 
@@ -430,6 +527,23 @@ impl LocalApi {
             .json()
             .await
             .expect("recv response should decode")
+    }
+
+    async fn post_send(
+        &self,
+        handle: &str,
+        kind: &str,
+        message: &str,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        reqwest::Client::new()
+            .post(self.url(&format!("/v1/agents/{handle}/send")))
+            .header("authorization", format!("Bearer {}", self.record.token))
+            .json(&serde_json::json!({
+                "kind": kind,
+                "message": message,
+            }))
+            .send()
+            .await
     }
 
     async fn agents(&self) -> cbcl_router_client::local_api::AgentsResponse {

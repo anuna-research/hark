@@ -194,25 +194,25 @@ Potential spec follow-ups to settle during implementation:
 
 ### 9. Implement Agent Send API and CLI Send Commands
 
-- [ ] Implement `POST /v1/agents/{handle}/send` with daemon-side CBCL
+- [x] Implement `POST /v1/agents/{handle}/send` with daemon-side CBCL
   validation, kind checking, health checks, and direct WebSocket write.
-- [ ] Ensure send success means the frame was written to the selected router
+- [x] Ensure send success means the frame was written to the selected router
   WebSocket, not merely queued locally.
-- [ ] Mark handles unhealthy with `local_send_failed` when local WebSocket write
+- [x] Mark handles unhealthy with `local_send_failed` when local WebSocket write
   fails.
-- [ ] Implement CLI input rules for `reply [MESSAGE]` and `error [MESSAGE]`,
+- [x] Implement CLI input rules for `reply [MESSAGE]` and `error [MESSAGE]`,
   including stdin reading and interactive-TTY usage failure.
-- [ ] Implement CLI-side CBCL validation and kind checking before calling the
+- [x] Implement CLI-side CBCL validation and kind checking before calling the
   daemon.
-- [ ] Implement `progress --thread <receipt-id> [--text <text>] [--dialect <id>]`
+- [x] Implement `progress --thread <receipt-id> [--text <text>] [--dialect <id>]`
   generation with correct CBCL string escaping and default dialect `elf`.
-- [ ] Keep stdout empty on successful `reply`, `error`, and `progress`.
-- [ ] Add integration tests with a mock router verifying binary send frames,
+- [x] Keep stdout empty on successful `reply`, `error`, and `progress`.
+- [x] Add integration tests with a mock router verifying binary send frames,
   send error mapping, CLI stdout/stderr discipline, stdin behavior, and progress
   generation.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and the send
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and the send
   command test subset.
-- [ ] Commit with a focused message such as `implement agent send commands`.
+- [x] Commit with a focused message such as `implement agent send commands`.
 
 ### 10. Implement `init`, `recv`, and `close` CLI Behavior
 

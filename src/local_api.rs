@@ -19,6 +19,7 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::oneshot};
 
+use crate::cbcl_validation::{CbclValidationError, MessageKind, validate_for_send};
 use crate::{
     config::{AppConfig, ConfigError},
     constants::{LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
@@ -59,6 +60,26 @@ pub struct RecvResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CloseResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SendRequest {
+    pub kind: SendMessageKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SendMessageKind {
+    Reply,
+    Error,
+    Progress,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SendResponse {
     pub ok: bool,
     pub agent_handle: String,
 }
@@ -137,6 +158,14 @@ pub enum ClientPingError {
     },
     RequestFailed(String),
     UnexpectedStatus(StatusCode),
+    DecodeFailed(String),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum LocalApiRequestError {
+    AuthFailure,
+    Api(ErrorResponse, StatusCode),
+    RequestFailed(String),
     DecodeFailed(String),
 }
 
@@ -246,6 +275,23 @@ impl LocalApiClient {
             .map_err(|error| ClientPingError::DecodeFailed(error.to_string()))
     }
 
+    pub async fn send(
+        &self,
+        handle: &AgentHandle,
+        request: &SendRequest,
+    ) -> Result<SendResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/v1/agents/{}/send", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+
+        decode_api_response(response).await
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -260,6 +306,41 @@ impl LocalApiClient {
         }
 
         Ok(ping)
+    }
+}
+
+async fn decode_api_response<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+) -> Result<T, LocalApiRequestError> {
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return Err(LocalApiRequestError::AuthFailure);
+    }
+
+    let status = response.status();
+    if !status.is_success() {
+        let error = response
+            .json::<ErrorResponse>()
+            .await
+            .map_err(|error| LocalApiRequestError::DecodeFailed(error.to_string()))?;
+        return Err(LocalApiRequestError::Api(error, status));
+    }
+
+    response
+        .json::<T>()
+        .await
+        .map_err(|error| LocalApiRequestError::DecodeFailed(error.to_string()))
+}
+
+impl fmt::Display for LocalApiRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AuthFailure => write!(formatter, "local daemon authentication failed"),
+            Self::Api(error, status) => {
+                write!(formatter, "{}: {}", status, error.error.message)
+            }
+            Self::RequestFailed(error) => write!(formatter, "request failed: {error}"),
+            Self::DecodeFailed(error) => write!(formatter, "failed to decode response: {error}"),
+        }
     }
 }
 
@@ -343,6 +424,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/ping", get(ping))
         .route("/v1/agents", get(agents).post(create_agent))
         .route("/v1/agents/{handle}/recv", get(recv))
+        .route("/v1/agents/{handle}/send", post(send))
         .route("/v1/agents/{handle}", delete(close_agent))
         .route("/v1/stop", post(stop))
         .with_state(state)
@@ -465,6 +547,28 @@ async fn recv(
     Ok(Json(RecvResponse {
         agent_handle: handle.as_str().to_owned(),
         message,
+    }))
+}
+
+async fn send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Json(request): Json<SendRequest>,
+) -> Result<Json<SendResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let kind = MessageKind::from(request.kind);
+    validate_for_send(&request.message, kind).map_err(cbcl_validation_error_to_api)?;
+    state
+        .agents
+        .send_outbound(&handle, request.message)
+        .await
+        .map_err(agent_error_to_api)?;
+    Ok(Json(SendResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
     }))
 }
 
@@ -670,6 +774,51 @@ fn router_error_to_api(error: RouterError) -> ApiError {
             message,
             None,
         ),
+    }
+}
+
+fn cbcl_validation_error_to_api(error: CbclValidationError) -> ApiError {
+    match error {
+        CbclValidationError::KindMismatch { .. } => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "message_kind_mismatch",
+            error.to_string(),
+            None,
+        ),
+        CbclValidationError::MissingThread => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "missing_thread",
+            error.to_string(),
+            None,
+        ),
+        CbclValidationError::DuplicateThread => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "duplicate_thread",
+            error.to_string(),
+            None,
+        ),
+        CbclValidationError::EmptyThread | CbclValidationError::NonStringThread => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_thread",
+            error.to_string(),
+            None,
+        ),
+        _ => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cbcl_validation_failed",
+            error.to_string(),
+            None,
+        ),
+    }
+}
+
+impl From<SendMessageKind> for MessageKind {
+    fn from(kind: SendMessageKind) -> Self {
+        match kind {
+            SendMessageKind::Reply => Self::Reply,
+            SendMessageKind::Error => Self::Error,
+            SendMessageKind::Progress => Self::Progress,
+        }
     }
 }
 
