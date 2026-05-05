@@ -92,22 +92,22 @@ Potential spec follow-ups to settle during implementation:
 
 ### 4. Build the Local HTTP API Skeleton
 
-- [ ] Implement the loopback-only HTTP server for foreground `daemon run`.
-- [ ] Enforce `Authorization: Bearer <daemon-token>` on every local API
+- [x] Implement the loopback-only HTTP server for foreground `daemon run`.
+- [x] Enforce `Authorization: Bearer <daemon-token>` on every local API
   endpoint.
-- [ ] Define stable JSON success and error response types.
-- [ ] Implement `GET /v1/ping`, `GET /v1/agents`, and `POST /v1/stop` without
+- [x] Define stable JSON success and error response types.
+- [x] Implement `GET /v1/ping`, `GET /v1/agents`, and `POST /v1/stop` without
   router integration.
-- [ ] Implement graceful shutdown state, discovery-file removal, and lock
+- [x] Implement graceful shutdown state, discovery-file removal, and lock
   release by process exit.
-- [ ] Implement the local HTTP client used by CLI commands, including API
+- [x] Implement the local HTTP client used by CLI commands, including API
   compatibility checks.
-- [ ] Add integration tests that start the HTTP server on loopback, verify auth
+- [x] Add integration tests that start the HTTP server on loopback, verify auth
   failures, ping success, status shape, stop behavior, and incompatible API
   handling.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
   `cargo test local_api`.
-- [ ] Commit with a focused message such as `add local daemon api skeleton`.
+- [x] Commit with a focused message such as `add local daemon api skeleton`.
 
 ### 5. Implement Daemon Lifecycle Commands
 
