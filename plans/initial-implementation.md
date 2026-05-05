@@ -130,25 +130,25 @@ Potential spec follow-ups to settle during implementation:
 
 ### 6. Implement Agent State, Queues, and Handle Operations
 
-- [ ] Add daemon state for active agent handles, router agent ids,
+- [x] Add daemon state for active agent handles, router agent ids,
   capabilities, dialects, connection state, unhealthy reason/detail, inbound
   queues, queued byte counts, and a single optional blocking recv waiter.
-- [ ] Implement handle generation and validation.
-- [ ] Implement bounded FIFO queues with configured message and byte limits.
-- [ ] Implement overflow behavior: reject the new inbound frame, mark the handle
+- [x] Implement handle generation and validation.
+- [x] Implement bounded FIFO queues with configured message and byte limits.
+- [x] Implement overflow behavior: reject the new inbound frame, mark the handle
   unhealthy with `queue_overflow`, and close the router WebSocket.
-- [ ] Implement `DELETE /v1/agents/{handle}` to close connected handles and
+- [x] Implement `DELETE /v1/agents/{handle}` to close connected handles and
   remove unhealthy handles.
-- [ ] Implement `GET /v1/agents/{handle}/recv` against in-memory queues and
+- [x] Implement `GET /v1/agents/{handle}/recv` against in-memory queues and
   waiters before router receive-loop integration.
-- [ ] Enforce malformed, unknown, unhealthy, busy, timeout, and shutdown error
+- [x] Enforce malformed, unknown, unhealthy, busy, timeout, and shutdown error
   behavior from the local API spec.
-- [ ] Add unit tests for handle grammar, queue FIFO behavior, queue byte
+- [x] Add unit tests for handle grammar, queue FIFO behavior, queue byte
   accounting, overflow, close semantics, one-waiter concurrency, timeout bounds,
   and status snapshots.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
   `cargo test agent_state`.
-- [ ] Commit with a focused message such as `implement agent state and queues`.
+- [x] Commit with a focused message such as `implement agent state and queues`.
 
 ### 7. Integrate Router WebSocket Agent Creation
 

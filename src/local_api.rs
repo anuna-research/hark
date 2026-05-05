@@ -10,18 +10,21 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
-    constants::LOCAL_API_VERSION,
-    daemon::{DiscoveryRecord, authenticated_headers},
+    constants::{LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
+    daemon::{
+        AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord,
+        authenticated_headers,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -44,6 +47,18 @@ impl PingResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct StopResponse {
     pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RecvResponse {
+    pub agent_handle: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloseResponse {
+    pub ok: bool,
+    pub agent_handle: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -117,6 +132,7 @@ pub enum LocalApiError {
 struct AppState {
     record: Arc<DiscoveryRecord>,
     stop: Arc<StopState>,
+    agents: AgentStore,
 }
 
 struct StopState {
@@ -253,6 +269,25 @@ pub async fn serve_local_api(
     record: DiscoveryRecord,
     discovery_file: Option<PathBuf>,
 ) -> Result<(), LocalApiError> {
+    serve_local_api_with_agents(
+        listener,
+        record,
+        discovery_file,
+        AgentStore::new(AgentStoreConfig {
+            agent_id_prefix: crate::constants::DEFAULT_AGENT_ID_PREFIX.to_owned(),
+            max_messages_per_handle: crate::constants::DEFAULT_MAX_MESSAGES_PER_HANDLE,
+            max_bytes_per_handle: crate::constants::DEFAULT_MAX_BYTES_PER_HANDLE,
+        }),
+    )
+    .await
+}
+
+pub async fn serve_local_api_with_agents(
+    listener: TcpListener,
+    record: DiscoveryRecord,
+    discovery_file: Option<PathBuf>,
+    agents: AgentStore,
+) -> Result<(), LocalApiError> {
     if !listener.local_addr()?.ip().is_loopback() {
         return Err(LocalApiError::Server(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -263,6 +298,7 @@ pub async fn serve_local_api(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let state = AppState {
         record: Arc::new(record),
+        agents,
         stop: Arc::new(StopState {
             discovery_file,
             stopping: AtomicBool::new(false),
@@ -284,6 +320,8 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/ping", get(ping))
         .route("/v1/agents", get(agents))
+        .route("/v1/agents/{handle}/recv", get(recv))
+        .route("/v1/agents/{handle}", delete(close_agent))
         .route("/v1/stop", post(stop))
         .with_state(state)
 }
@@ -303,6 +341,23 @@ async fn agents(
 ) -> Result<Json<AgentsResponse>, ApiError> {
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
+    let agents = state
+        .agents
+        .status_snapshots()
+        .await
+        .into_iter()
+        .map(|snapshot| AgentStatus {
+            agent_handle: snapshot.agent_handle,
+            router_agent_id: snapshot.router_agent_id,
+            capabilities: snapshot.capabilities,
+            dialects: snapshot.dialects,
+            state: snapshot.state.as_str().to_owned(),
+            queued_messages: snapshot.queued_messages,
+            queued_bytes: snapshot.queued_bytes,
+            unhealthy_reason: snapshot.unhealthy_reason,
+            unhealthy_detail: snapshot.unhealthy_detail,
+        })
+        .collect();
     Ok(Json(AgentsResponse {
         daemon: DaemonStatus {
             pid: state.record.pid,
@@ -310,7 +365,71 @@ async fn agents(
             version: state.record.version.clone(),
             api_version: state.record.api_version,
         },
-        agents: Vec::new(),
+        agents,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct RecvQuery {
+    timeout_ms: Option<u64>,
+}
+
+async fn recv(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Query(query): Query<RecvQuery>,
+) -> Result<Json<RecvResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let timeout = match query.timeout_ms {
+        Some(0) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "malformed_request",
+                "timeout_ms must be positive",
+                None,
+            ));
+        }
+        Some(value) if value > MAX_RECV_TIMEOUT_MS => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "malformed_request",
+                "timeout_ms exceeds maximum",
+                None,
+            ));
+        }
+        Some(value) => Some(std::time::Duration::from_millis(value)),
+        None => None,
+    };
+    let message = state
+        .agents
+        .recv(&handle, timeout)
+        .await
+        .map_err(agent_error_to_api)?;
+    Ok(Json(RecvResponse {
+        agent_handle: handle.as_str().to_owned(),
+        message,
+    }))
+}
+
+async fn close_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Result<Json<CloseResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    state
+        .agents
+        .close(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    Ok(Json(CloseResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
     }))
 }
 
@@ -379,6 +498,75 @@ fn reject_if_stopping(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn parse_handle(handle: String) -> Result<AgentHandle, ApiError> {
+    AgentHandle::new(handle).map_err(agent_error_to_api)
+}
+
+fn agent_error_to_api(error: AgentError) -> ApiError {
+    match error {
+        AgentError::MalformedHandle => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_agent_handle",
+            "agent handle is malformed",
+            None,
+        ),
+        AgentError::UnknownHandle => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_agent_handle",
+            "agent handle is not active",
+            Some("run `cbcl-router-client daemon status` to list active handles".to_owned()),
+        ),
+        AgentError::Unhealthy { reason, detail } => ApiError::new(
+            StatusCode::CONFLICT,
+            "agent_handle_unhealthy",
+            format!("agent handle is unhealthy: {reason}"),
+            detail,
+        ),
+        AgentError::RecvAlreadyWaiting => ApiError::new(
+            StatusCode::CONFLICT,
+            "recv_already_waiting",
+            "a blocking receive is already waiting for this handle",
+            None,
+        ),
+        AgentError::RecvTimeout => ApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "recv_timeout",
+            "blocking receive timed out",
+            None,
+        ),
+        AgentError::QueueOverflow => ApiError::new(
+            StatusCode::CONFLICT,
+            "agent_handle_unhealthy",
+            "agent queue overflowed",
+            None,
+        ),
+        AgentError::MissingCapability => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "missing_capability",
+            "agent creation requires at least one capability",
+            None,
+        ),
+        AgentError::DuplicateCapability => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "duplicate_capability",
+            "agent creation request repeats a capability",
+            None,
+        ),
+        AgentError::DuplicateDialect => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "duplicate_dialect",
+            "agent creation request repeats a dialect",
+            None,
+        ),
+        AgentError::InvalidCapability(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_capability", message, None)
+        }
+        AgentError::InvalidDialect(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_dialect", message, None)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ApiError {
     status: StatusCode,
@@ -439,9 +627,12 @@ mod tests {
 
     use super::{
         AgentsResponse, ClientPingError, ErrorResponse, LocalApiClient, PingResponse,
-        serve_local_api,
+        serve_local_api_with_agents,
     };
-    use crate::{constants::LOCAL_API_VERSION, daemon::DiscoveryRecord};
+    use crate::{
+        constants::LOCAL_API_VERSION,
+        daemon::{AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord},
+    };
 
     #[tokio::test]
     async fn ping_requires_authorization() {
@@ -567,6 +758,137 @@ mod tests {
         server.stop().await;
     }
 
+    #[tokio::test]
+    async fn recv_returns_queued_message() {
+        let store = agent_store();
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .await
+            .expect("agent should insert");
+        store
+            .enqueue_inbound(&handle, "(ask @router \"work\")".to_owned())
+            .await
+            .expect("message should enqueue");
+        let server = TestServer::start_with_store(None, store).await;
+
+        let response = reqwest::Client::new()
+            .get(server.url(&format!("/v1/agents/{}/recv", handle.as_str())))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", server.record.token),
+            )
+            .send()
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .json::<super::RecvResponse>()
+            .await
+            .expect("response should decode");
+        assert_eq!(body.agent_handle, handle.as_str());
+        assert_eq!(body.message, "(ask @router \"work\")");
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_malformed_unknown_and_timeout() {
+        let store = agent_store();
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .await
+            .expect("agent should insert");
+        let server = TestServer::start_with_store(None, store).await;
+
+        let malformed = authed_get(&server, "/v1/agents/not-a-handle/recv").await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(malformed).await, "malformed_agent_handle");
+
+        let unknown = authed_get(&server, "/v1/agents/0123456789ABCDEFGHJKMNPQRT/recv").await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(unknown).await, "unknown_agent_handle");
+
+        let timeout = authed_get(
+            &server,
+            &format!("/v1/agents/{}/recv?timeout_ms=1", handle.as_str()),
+        )
+        .await;
+        assert_eq!(timeout.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(error_code(timeout).await, "recv_timeout");
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn close_removes_handle_and_unknown_afterward() {
+        let store = agent_store();
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .await
+            .expect("agent should insert");
+        let server = TestServer::start_with_store(None, store).await;
+
+        let response = reqwest::Client::new()
+            .delete(server.url(&format!("/v1/agents/{}", handle.as_str())))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", server.record.token),
+            )
+            .send()
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .json::<super::CloseResponse>()
+            .await
+            .expect("response should decode");
+        assert!(body.ok);
+        assert_eq!(body.agent_handle, handle.as_str());
+
+        let unknown = authed_get(
+            &server,
+            &format!("/v1/agents/{}/recv?timeout_ms=1", handle.as_str()),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn agents_status_includes_agent_snapshots() {
+        let store = agent_store();
+        let handle = handle();
+        store
+            .insert_connected(
+                handle.clone(),
+                vec!["code:edit".to_owned()],
+                vec!["elf".to_owned()],
+            )
+            .await
+            .expect("agent should insert");
+        let server = TestServer::start_with_store(None, store).await;
+
+        let status = server
+            .client()
+            .agents()
+            .await
+            .expect("agents should succeed");
+
+        assert_eq!(status.agents.len(), 1);
+        assert_eq!(status.agents[0].agent_handle, handle.as_str());
+        assert_eq!(status.agents[0].state, "connected");
+        assert_eq!(status.agents[0].capabilities, ["code:edit"]);
+        assert_eq!(status.agents[0].dialects, ["elf"]);
+
+        server.stop().await;
+    }
+
     struct TestServer {
         record: DiscoveryRecord,
         task: JoinHandle<Result<(), super::LocalApiError>>,
@@ -574,6 +896,10 @@ mod tests {
 
     impl TestServer {
         async fn start(discovery_file: Option<PathBuf>) -> Self {
+            Self::start_with_store(discovery_file, agent_store()).await
+        }
+
+        async fn start_with_store(discovery_file: Option<PathBuf>, store: AgentStore) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("listener should bind");
@@ -581,7 +907,7 @@ mod tests {
             let record = sample_record(addr);
             let task_record = record.clone();
             let task = tokio::spawn(async move {
-                serve_local_api(listener, task_record, discovery_file).await
+                serve_local_api_with_agents(listener, task_record, discovery_file, store).await
             });
 
             let server = Self { record, task };
@@ -631,5 +957,38 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             api_version: LOCAL_API_VERSION,
         }
+    }
+
+    fn agent_store() -> AgentStore {
+        AgentStore::new(AgentStoreConfig {
+            agent_id_prefix: "local-agent".to_owned(),
+            max_messages_per_handle: 10,
+            max_bytes_per_handle: 1024,
+        })
+    }
+
+    fn handle() -> AgentHandle {
+        AgentHandle::new("0123456789ABCDEFGHJKMNPQRS").expect("handle should be valid")
+    }
+
+    async fn authed_get(server: &TestServer, path: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(server.url(path))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", server.record.token),
+            )
+            .send()
+            .await
+            .expect("request should complete")
+    }
+
+    async fn error_code(response: reqwest::Response) -> String {
+        response
+            .json::<ErrorResponse>()
+            .await
+            .expect("error response should decode")
+            .error
+            .code
     }
 }

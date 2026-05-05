@@ -9,11 +9,12 @@ use tokio::net::TcpListener;
 
 use crate::constants::{COMMAND_NAME, DEFAULT_PROGRESS_DIALECT};
 use crate::daemon::{
-    DiscoveryRecord, RuntimePaths, acquire_daemon_lock, create_runtime_dir, generate_daemon_token,
-    load_discovery_record, probe_lock_available, resolve_runtime_paths, write_discovery_record,
+    AgentStore, AgentStoreConfig, DiscoveryRecord, RuntimePaths, acquire_daemon_lock,
+    create_runtime_dir, generate_daemon_token, load_discovery_record, probe_lock_available,
+    resolve_runtime_paths, write_discovery_record,
 };
 use crate::errors::{AppError, AppResult};
-use crate::local_api::{ClientPingError, LocalApiClient, serve_local_api};
+use crate::local_api::{ClientPingError, LocalApiClient, serve_local_api_with_agents};
 
 #[derive(Debug, Parser)]
 #[command(name = COMMAND_NAME, version, about)]
@@ -144,7 +145,10 @@ async fn daemon_run() -> AppResult<()> {
         AppError::Internal(format!("failed to write daemon discovery: {error}"))
     })?;
 
-    let result = serve_local_api(listener, record, Some(paths.discovery_file.clone())).await;
+    let agents = AgentStore::new(AgentStoreConfig::from_config(&config));
+    let result =
+        serve_local_api_with_agents(listener, record, Some(paths.discovery_file.clone()), agents)
+            .await;
     drop(lock);
 
     result.map_err(|error| AppError::Internal(format!("local API server failed: {error}")))
