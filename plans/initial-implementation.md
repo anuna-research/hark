@@ -49,22 +49,22 @@ Potential spec follow-ups to settle during implementation:
 
 ### 2. Implement Configuration Loading and Validation
 
-- [ ] Implement config loading in precedence order: built-in defaults, platform
+- [x] Implement config loading in precedence order: built-in defaults, platform
   config file, then environment variables.
-- [ ] Resolve platform config paths with `directories` or `dirs`.
-- [ ] Model `[router]`, `[agent]`, and `[daemon]` config sections.
-- [ ] Validate daemon-runtime config at daemon startup:
+- [x] Resolve platform config paths with `directories` or `dirs`.
+- [x] Model `[router]`, `[agent]`, and `[daemon]` config sections.
+- [x] Validate daemon-runtime config at daemon startup:
   loopback-only bind address, positive queue limits, supported overflow policy,
   and valid `agent_id_prefix`.
-- [ ] Defer missing or malformed router URL and missing router auth token until
+- [x] Defer missing or malformed router URL and missing router auth token until
   agent creation.
-- [ ] Implement grammar validators for `agent_id_prefix`, capability names, and
+- [x] Implement grammar validators for `agent_id_prefix`, capability names, and
   dialect ids.
-- [ ] Redact router auth tokens in debug output, status output, and errors.
-- [ ] Add unit tests for precedence, defaults, environment overrides, grammar
+- [x] Redact router auth tokens in debug output, status output, and errors.
+- [x] Add unit tests for precedence, defaults, environment overrides, grammar
   validation, loopback rejection, queue limit validation, and router-config
   deferral.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
   `cargo test config`.
 - [ ] Commit with a focused message such as `implement mvp configuration`.
 
