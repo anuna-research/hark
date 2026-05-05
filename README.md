@@ -1,53 +1,161 @@
 # cbcl-lfe-router-client
 
-This project defines a Rust CLI tool for communicating with the cbcl-lfe-router project.
+This project defines a focused Rust CLI for agents that communicate through
+`cbcl-lfe-router`.
 
-The tool provides a convenient way to register with the router, advertise capabilities, send and receive WebSocket messages, and get feedback on CBCL message validity.
+The client is responsible for local agent ergonomics: starting a per-user
+daemon, opening router WebSocket connections for local agent instances,
+advertising capabilities, validating CBCL with `cbcl-rs`, and providing
+shell-friendly commands for receiving work and sending replies.
 
-## Related projects
+## Related Projects
 
-* cbcl-lfe-router - the capability-based router which this tool connects to
-* cbcl-rs - a rust library for the CBCL language
+* `cbcl-lfe-router` - the capability-based router this client connects to.
+* `cbcl-rs` - the Rust implementation of the CBCL language, used for local
+  parsing and validation before messages are sent to the router.
 
-## Features
+## Design Specs
 
-### Connecting
+* [Daemon singleton and discovery](specs/daemon.md)
+* [Local daemon API](specs/local-api.md)
+* [Router protocol mapping](specs/router-protocol.md)
+* [CLI UX contract](specs/cli.md)
+* [Configuration and authentication](specs/config.md)
 
-Connect to the router, including any required authorisation/handshake procedures. This creates a persistent WebSocket connection.
+## Model
 
-Open question - does the router have/expect any kind of heartbeat mechanism?
+The client runs one daemon per OS user. The daemon listens on loopback TCP for
+local CLI invocations and manages any number of agent instances.
 
-### Capability advertisement
+Each agent instance has:
 
-To know where to route messages, the router must know what capabilities a given agent has. The CLI determines capabilities from a config file (see below) and publishes them to the router.
+* one daemon-minted local handle
+* one persistent WebSocket connection to `/agent/v1`
+* one router-visible `agent-id`, derived from the handle
+* one capability advertisement sent in the WebSocket `hello`
+* one inbound queue for dispatched CBCL messages
 
-### Allow agent to send messages
+The local handle is exported into the agent's shell environment:
 
-Agents can invoke the CLI with a CBCL message to be sent to the router. The CLI uses cbcl-rs to parse and check the message, either feeding issues back to the agent, or forwarding the message to the router if it's valid.
+```bash
+eval "$(cbcl-router-client init \
+  --capability code:edit \
+  --capability code:test)"
+```
 
-### Allow agent to receive messages
+The command prints shell exports similar to:
 
-The CLI provides a command which blocks until a message is received, at which point it prints to STDOUT and exits. This allows easy interfacing with different agent harnesses.
+```bash
+export CBCL_AGENT_HANDLE='01JX8F4V2QK8GZP9H6W5'
+export CBCL_ROUTER_CLIENT='http://127.0.0.1:49152'
+```
 
-### Agent skill definition
+Subsequent commands use `CBCL_AGENT_HANDLE` to select the correct daemon-managed
+WebSocket connection:
 
-The repository comes along with a markdown skill definition file covering the usage of the CLI tool. It defers to the CLI's in-built help where possible to make the system more robust to CLI interface changes over time. (Look into best practices for authoring skills).
+```bash
+cbcl-router-client recv
+cbcl-router-client reply < reply.cbcl
+cbcl-router-client close
+```
+
+For non-shell harnesses, `init --json` returns the same information as JSON.
+
+## Command Shape
+
+### `daemon start`
+
+Starts the per-user daemon if it is not already running. The daemon owns router
+connections and local queues. It should bind only to loopback TCP and require
+local clients to present a daemon token or equivalent local credential.
+
+### `init`
+
+Creates a new ephemeral agent instance.
+
+`init` opens a WebSocket connection to the router, sends a CBCL `hello` frame
+with the requested capabilities, stores the connection under a daemon-minted
+handle, and prints environment exports for later commands.
+
+Useful options:
+
+* `--capability <name>` - may be repeated.
+* `--dialect <id>` - may be repeated when the agent wants to advertise known
+  dialects.
+* `--json` - print machine-readable JSON instead of shell exports.
+
+### `recv`
+
+Blocks until a message is available for the current `CBCL_AGENT_HANDLE`, prints
+the CBCL message to stdout, and exits.
+
+This is intended to compose with existing agent harnesses:
+
+```bash
+task="$(cbcl-router-client recv)"
+```
+
+### `reply`, `error`, and `progress`
+
+Validate a CBCL message with `cbcl-rs`, then send it over the WebSocket
+connection associated with the current `CBCL_AGENT_HANDLE`.
+
+Terminal messages such as `reply` and `error` should preserve the `:thread`
+value from the dispatched ask so the router can append them to the same receipt.
+
+### `submit`
+
+Submit a new CBCL ask to the router's HTTP ingress endpoint. This is the
+producer path, distinct from agent replies over WebSocket.
+
+`submit` validates the CBCL message with `cbcl-rs`, posts it to
+`/ingress/v1/messages`, and prints the router response containing the receipt
+id and dispatch status.
+
+### `receipt`
+
+Fetch a receipt from the router and print the newline-delimited CBCL message
+sequence.
+
+### `status`
+
+Show daemon state, including active handles, router agent ids, capabilities,
+connection state, and queued message counts.
+
+### `close`
+
+Close the WebSocket connection and remove daemon state for the current
+`CBCL_AGENT_HANDLE`.
 
 ## Configuration
 
-Configuration uses the rust `config` library and `dirs` to get standard locations across platforms.
+Configuration uses the Rust `config` and `dirs` crates for cross-platform
+defaults.
 
-Config values include:
+Expected config values include:
 
-* Router address
-* Agent capabilities
+* router HTTP address
+* router WebSocket address
+* router authentication material
+* local daemon bind preferences
+* default capabilities and dialects
 
-## Open questions
+Capabilities can be supplied from config or directly to `init`. Direct command
+line values should override configured defaults.
 
-Does the router have a concept of persistent agent 'identity'/'state'? As in - does it make sense to have agents consuming/producing single one-off messages, or is a more long term 'conversation' of messages the expected model? I suppose part of the question here is - is there a concept of a 'chain' of messages in reply to each other, and if so, are there guarantees that replies are routed back to the agent that produced the message being replied to?
+## Validation
 
-Related to that - let's say we have messages representing 'please complete task X' and 'task X complete'. Is there any sense in which the 'same' agent that receives the first message should also be the one to send the 'complete' message? Or would it be acceptable to do say: WSS connection established, agent receives 'please complete task X', WSS connection closed. Agent completes task. Agent opens new WSS connection to send 'task X complete' message. Does that create any confusion/issues, having those messages happen in different sessions?
+Before forwarding messages, the client should use `cbcl-rs` to parse and
+validate CBCL locally. This gives agents fast, precise feedback when a message
+is malformed or violates known CBCL constraints, instead of relying only on
+router-side rejection.
 
-Would the ideal here be to have a single persistent WSS connection (e.g. a local server) then have commands for waiting on a message from that server, sendng a message to that server, all of which are relayed via the persistent WSS connection? Or is it fine to create/drop WSS connections as needed?
+The router remains authoritative. Local validation is an ergonomics and safety
+layer, not a substitute for router validation.
 
-If a persistent connection/local server is preferred, how should CLI invocations (for say blocking until a message is received, sending a message) communicate with the local server? UNIX sockets? What's a reliable cross-platform option here?
+## Agent Skill Definition
+
+The repository should include a Markdown skill definition describing the CLI
+workflow for agents. The skill should defer to the CLI's built-in help for
+exact flags and examples where possible, so the skill remains stable as the CLI
+evolves.
