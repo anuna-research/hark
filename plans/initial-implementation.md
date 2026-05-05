@@ -30,22 +30,22 @@ Potential spec follow-ups to settle during implementation:
 
 ### 1. Scaffold the Rust CLI Project
 
-- [ ] Create the Rust package structure with `Cargo.toml`, `src/main.rs`, and
+- [x] Create the Rust package structure with `Cargo.toml`, `src/main.rs`, and
   initial module layout for `cli`, `config`, `daemon`, `local_api`,
   `router`, `cbcl_validation`, and `errors`.
-- [ ] Add core dependencies for CLI parsing, async runtime, HTTP server/client,
+- [x] Add core dependencies for CLI parsing, async runtime, HTTP server/client,
   WebSockets, serde JSON, config loading, runtime directories, file locking,
   random token generation, time handling, and test utilities.
-- [ ] Define constants for binary version, local API version, command name, and
+- [x] Define constants for binary version, local API version, command name, and
   default config values.
-- [ ] Wire a minimal `clap` command tree for all MVP commands:
+- [x] Wire a minimal `clap` command tree for all MVP commands:
   `daemon start`, `daemon run`, `daemon status`, `daemon stop`, `init`, `recv`,
   `reply`, `error`, `progress`, and `close`.
-- [ ] Return stable exit codes from a central error-to-exit-code mapper.
-- [ ] Add smoke tests for CLI parsing and exit-code mapping.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
+- [x] Return stable exit codes from a central error-to-exit-code mapper.
+- [x] Add smoke tests for CLI parsing and exit-code mapping.
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
   `cargo test`.
-- [ ] Commit with a focused message such as `scaffold router client cli`.
+- [x] Commit with a focused message such as `scaffold router client cli`.
 
 ### 2. Implement Configuration Loading and Validation
 
