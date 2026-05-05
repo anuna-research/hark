@@ -49,6 +49,20 @@ router authentication token. Router URL and authentication are required only
 when creating an agent instance with `init`, because that operation opens a
 router WebSocket.
 
+Configuration validation has two phases:
+
+* daemon-runtime config is validated at daemon startup. Invalid local bind
+  addresses, non-loopback bind addresses, invalid queue limits, invalid
+  overflow policies, and invalid `agent_id_prefix` values fail `daemon start`
+  and `daemon run`.
+* router config is validated when `init` creates an agent instance. Missing
+  router URL, malformed router URL, missing router auth token, and router
+  authentication rejection fail `init` without creating a local handle.
+
+The daemon may parse router config at startup for diagnostics, but it must not
+make missing router URL or missing router auth fatal until an agent-creation
+request needs those values.
+
 ## MVP Config Shape
 
 Example TOML:
@@ -134,6 +148,10 @@ cbcl-router-client init --capability code:edit --capability code:test --dialect 
 the CLI fails with a clear missing-capability error before calling the daemon.
 The daemon must also reject local API agent-creation requests whose
 `capabilities` list is empty.
+
+Duplicate capability values are rejected rather than deduplicated silently.
+Duplicate dialect values are also rejected. Successful requests preserve the
+user-supplied order of capabilities and dialects.
 
 Dialect advertisements are optional. If no `--dialect` is supplied, the agent
 advertises an empty dialect list.
@@ -258,6 +276,14 @@ WebSocket connections until a URL is available:
 ```text
 error: router WebSocket URL is not configured
 hint: set `CBCL_ROUTER_WS` or configure `router.ws_url`
+```
+
+Malformed router URLs should fail the same `init` path before the daemon opens a
+WebSocket:
+
+```text
+error: router WebSocket URL is invalid
+hint: set `CBCL_ROUTER_WS` or configure `router.ws_url` to a ws:// or wss:// URL
 ```
 
 Authentication failure from the router should be surfaced distinctly from

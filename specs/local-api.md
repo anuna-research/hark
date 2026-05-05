@@ -113,8 +113,10 @@ Fields:
   router `hello`.
 * `dialects` - optional dialect ids advertised in the router `hello`.
 
-The daemon must reject requests whose `capabilities` list is empty. The daemon
-does not apply capability defaults.
+The daemon must reject requests whose `capabilities` list is empty. Capability
+and dialect values must follow the grammars defined in [`config.md`](config.md),
+duplicates are rejected, and successful responses preserve request order. The
+daemon does not apply capability defaults.
 
 Response:
 
@@ -252,6 +254,11 @@ The daemon must enforce that `kind` matches the message:
   ...)` dialect wrapper, recipient `@router`, and content `"progress"`.
 * all three kinds require a `:thread` parameter.
 
+The required `:thread` parameter must appear exactly once after unwrapping any
+`(lang ...)` dialect wrapper. Its value must be a non-empty CBCL string.
+Missing, empty, non-string, or duplicate `:thread` values must return `422`
+with a stable validation error code and must not be forwarded to the router.
+
 Bare CBCL messages and dialect-wrapped CBCL messages are valid inputs for
 `reply` and `error` if they pass validation and kind checking. The CLI-generated
 `progress` message is always dialect-wrapped, but the daemon should validate the
@@ -276,8 +283,8 @@ return `404`, unhealthy handles return `409`, and daemon shutdown returns
 `503`.
 
 The daemon does not track dispatched `:thread` values in the MVP. It only
-requires that the field is present and well-formed enough for CBCL validation.
-The router remains responsible for authoritative receipt correlation.
+requires the local `:thread` shape defined above. The router remains responsible
+for authoritative receipt correlation.
 
 For `progress`, successful local send means the daemon wrote the frame to the
 selected WebSocket. The current router does not send an application-level ACK
@@ -333,6 +340,17 @@ WebSocket connections, remove `daemon.json`, and exit. Releasing
 If no agent instances exist, shutdown has no router WebSocket connections to
 close. It should still remove local discovery state and exit normally.
 
+The `daemon stop` CLI should treat shutdown as successful after a successful
+`POST /v1/stop` once one of these conditions is observed before its stop
+timeout expires:
+
+* `daemon.json` has been removed
+* the recorded local address refuses connections or no longer accepts HTTP
+* authenticated `GET /v1/ping` no longer succeeds
+
+This allows the CLI to handle the normal race between the stop response,
+discovery-file deletion, listener shutdown, and process exit.
+
 ## Agent States
 
 Agent status responses should use these MVP state values:
@@ -348,6 +366,10 @@ state.
 When `state` is `unhealthy`, `unhealthy_reason` should be a short stable code
 such as `router_closed`, `router_error`, `queue_overflow`, or
 `local_send_failed`.
+
+When available, status may also include `unhealthy_detail` with a sanitized
+human-readable diagnostic, such as the router error frame text. This field must
+not contain router authentication material or the local daemon token.
 
 ## Blocking and Concurrency
 

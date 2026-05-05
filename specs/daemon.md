@@ -100,8 +100,8 @@ or another shell-safe representation.
 
 The CLI is compatible with the daemon only when `api_version` matches the CLI's
 compiled local API version. Binary `version` is diagnostic under a matching API
-version. If `api_version` is absent or different, the CLI should fail with the
-daemon-version-incompatible status defined in [`cli.md`](cli.md) and suggest
+version. If `api_version` is absent or different, the CLI should fail with exit
+code `12`, include the stable error code `daemon_api_incompatible`, and suggest
 restarting the daemon.
 
 ## Daemon Startup
@@ -263,6 +263,12 @@ terminates. If no daemon responds but `daemon stop` can acquire `daemon.lock`,
 it may remove stale `daemon.json` and then exit successfully. If the lock is
 held and no daemon responds, `daemon stop` should fail with a stale-state
 diagnostic rather than removing files blindly.
+
+After a responsive daemon accepts a stop request, the `daemon stop` CLI should
+treat shutdown as successful once `daemon.json` has been removed, the recorded
+local address refuses connections or no longer accepts HTTP, or authenticated
+`ping` no longer succeeds. This avoids depending on one exact ordering between
+the stop response, discovery-file deletion, listener shutdown, and process exit.
 
 ## Local Protocol
 

@@ -125,6 +125,9 @@ The daemon should therefore treat router-originated CBCL `error` frames as
 router diagnostics for frames the client sent, mark the handle unhealthy with
 `router_error`, and expose the error through status and subsequent handle
 operations. They should not be delivered as ordinary dispatched work by `recv`.
+If the router error frame includes useful text, the daemon should retain a
+sanitized diagnostic detail for `daemon status` while continuing to redact all
+router and local daemon credentials.
 
 ## Receiving Work
 
@@ -217,6 +220,11 @@ the agent intentionally starts a separate conversation.
 The daemon does not track in-flight thread ids in the MVP. It rejects missing
 `:thread` values but does not reject an otherwise valid message simply because
 the thread is unknown locally.
+
+For local validation, `:thread` must appear exactly once on the unwrapped inner
+message and must be a non-empty CBCL string. Duplicate, empty, or non-string
+thread values are rejected locally even if the router would otherwise accept or
+store the frame under a fallback receipt id.
 
 Progress messages also use `:thread` for receipt correlation. The current router
 persists `(tell ... "progress" :thread "...")` frames as receipt entries with

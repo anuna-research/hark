@@ -153,6 +153,11 @@ An agent must advertise at least one capability. Capabilities are per-agent,
 not daemon-level defaults. If no `--capability` value is supplied, `init` fails
 with a usage error and does not call the daemon.
 
+The CLI should reject duplicate capability values and duplicate dialect values
+before calling the daemon. Preserving the user-supplied order in successful
+requests is useful for predictable status output, but duplicate advertisements
+do not add information and make tests and diagnostics noisier.
+
 ### `recv`
 
 Blocks until a CBCL message is available for `CBCL_AGENT_HANDLE`, prints the
@@ -176,7 +181,6 @@ No prompt, prefix, or extra explanatory text should be printed to stdout.
 Useful options:
 
 * `--timeout <duration>` - fail if no message arrives before the timeout.
-* `--no-timeout` - explicitly wait without a client-side timeout.
 
 Without `--timeout`, `recv` blocks until a message arrives, the selected handle
 is removed or becomes unhealthy, the daemon stops, or the local HTTP request
@@ -185,8 +189,7 @@ Durations use a simple unit suffix: `ms`, `s`, `m`, or `h`. The CLI converts the
 duration to `timeout_ms` for the local API and rejects zero or negative values.
 The maximum finite timeout is `2160h` (90 days). This supports agents that wait
 for work for days or weeks while still rejecting values likely to overflow
-local timers. Omitting `--timeout` and using `--no-timeout` both mean no
-finite timeout; `--no-timeout` is just an explicit form for scripts.
+local timers. Omitting `--timeout` means no finite client-side timeout.
 
 ### `reply`, `error`, and `progress`
 
@@ -229,6 +232,12 @@ Command-specific message rules:
   content is the string `"progress"`.
 * all sent messages require a `:thread` parameter so router receipt storage can
   correlate the message with a dispatched ask.
+
+Thread validation is deliberately stricter than the current router fallback
+behavior. After unwrapping any `(lang ...)` dialect wrapper, the inner message
+must contain exactly one `:thread` parameter, and that value must be a non-empty
+CBCL string. Missing, empty, non-string, or duplicate `:thread` values are
+validation failures and must not be sent to the router.
 
 Bare CBCL messages and dialect-wrapped CBCL messages are both accepted for
 `reply` and `error` as long as they pass `cbcl-rs` validation and the unwrapped
@@ -300,11 +309,11 @@ on common failure modes:
 * `9` - router connection or router authentication failure
 * `10` - timeout
 * `11` - local daemon authentication failure
-* `12` - internal error
+* `12` - daemon local API incompatibility or internal error
 
-When exit code `12` is caused by daemon API incompatibility, stderr should
-include a stable error code such as `daemon_api_incompatible` so callers can
-distinguish it from an unexpected internal error.
+When exit code `12` is caused by daemon API incompatibility, stderr must include
+the stable error code `daemon_api_incompatible` so callers can distinguish it
+from an unexpected internal error.
 
 Commands may include more specific machine-readable error codes in local API
 responses, but process exit codes should map to the categories above.
