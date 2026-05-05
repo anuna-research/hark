@@ -66,29 +66,29 @@ Potential spec follow-ups to settle during implementation:
   deferral.
 - [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
   `cargo test config`.
-- [ ] Commit with a focused message such as `implement mvp configuration`.
+- [x] Commit with a focused message such as `implement mvp configuration`.
 
 ### 3. Implement Runtime Directory, Discovery, and Local Auth
 
-- [ ] Resolve and create the per-user runtime directory with owner-only
+- [x] Resolve and create the per-user runtime directory with owner-only
   permissions where supported.
-- [ ] Implement strict Unix checks for runtime directory, `daemon.json`, and
+- [x] Implement strict Unix checks for runtime directory, `daemon.json`, and
   `daemon.lock`: no symlinks, current-user ownership, and owner-only access.
-- [ ] Implement `daemon.lock` singleton locking with a held file handle for
+- [x] Implement `daemon.lock` singleton locking with a held file handle for
   daemon lifetime.
-- [ ] Implement atomic `daemon.json` writes containing `pid`, `addr`, `token`,
+- [x] Implement atomic `daemon.json` writes containing `pid`, `addr`, `token`,
   `started_at`, `version`, and `api_version`.
-- [ ] Generate local daemon tokens with at least 32 bytes of randomness encoded
+- [x] Generate local daemon tokens with at least 32 bytes of randomness encoded
   in a shell-safe format.
-- [ ] Implement discovery loading and authenticated local client request
+- [x] Implement discovery loading and authenticated local client request
   headers.
-- [ ] Add discovery-state classification helpers for missing, live, stale with
+- [x] Add discovery-state classification helpers for missing, live, stale with
   free lock, stale with held lock, auth failure, and API incompatibility.
-- [ ] Add unit and integration tests for secure file checks, stale-state
+- [x] Add unit and integration tests for secure file checks, stale-state
   classification, token generation shape, and API version compatibility.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
   `cargo test discovery`.
-- [ ] Commit with a focused message such as `implement daemon discovery`.
+- [x] Commit with a focused message such as `implement daemon discovery`.
 
 ### 4. Build the Local HTTP API Skeleton
 
