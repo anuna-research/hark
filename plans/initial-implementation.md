@@ -176,21 +176,21 @@ Potential spec follow-ups to settle during implementation:
 
 ### 8. Implement CBCL Validation and Message Kind Checking
 
-- [ ] Integrate `cbcl-rs` parsing and validation behind a small local
+- [x] Integrate `cbcl-rs` parsing and validation behind a small local
   abstraction so CLI and daemon code share the same checks.
-- [ ] Support bare CBCL messages and one `(lang ...)` wrapper for validation and
+- [x] Support bare CBCL messages and one `(lang ...)` wrapper for validation and
   kind checking.
-- [ ] Implement command-kind checks for `reply`, `error`, and `progress`.
-- [ ] Enforce exactly one `:thread` parameter on the unwrapped inner message.
-- [ ] Reject missing, duplicate, empty, and non-string `:thread` values with
+- [x] Implement command-kind checks for `reply`, `error`, and `progress`.
+- [x] Enforce exactly one `:thread` parameter on the unwrapped inner message.
+- [x] Reject missing, duplicate, empty, and non-string `:thread` values with
   stable error codes.
-- [ ] Validate progress shape as `tell @router "progress"` after unwrapping.
-- [ ] Add parser-focused tests for valid wrapped and bare messages, malformed
+- [x] Validate progress shape as `tell @router "progress"` after unwrapping.
+- [x] Add parser-focused tests for valid wrapped and bare messages, malformed
   CBCL, kind mismatch, missing and duplicate thread values, empty and non-string
   thread values, valid progress, and invalid progress recipient/content.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and
   `cargo test cbcl_validation`.
-- [ ] Commit with a focused message such as `add cbcl send validation`.
+- [x] Commit with a focused message such as `add cbcl send validation`.
 
 ### 9. Implement Agent Send API and CLI Send Commands
 

@@ -211,6 +211,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "cbcl-core"
+version = "0.1.0"
+dependencies = [
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "cbcl-parser"
+version = "0.1.0"
+dependencies = [
+ "cbcl-core",
+]
+
+[[package]]
 name = "cbcl-router-client"
 version = "0.1.0"
 dependencies = [
@@ -218,6 +232,8 @@ dependencies = [
  "assert_cmd",
  "axum",
  "base64",
+ "cbcl-core",
+ "cbcl-parser",
  "clap",
  "config",
  "directories",

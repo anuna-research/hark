@@ -10,6 +10,8 @@ license = "MIT OR Apache-2.0"
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
+cbcl-core = { path = "../cbcl-rs/crates/cbcl-core" }
+cbcl-parser = { path = "../cbcl-rs/crates/cbcl-parser" }
 clap = { version = "4.5", features = ["derive", "env"] }
 config = "0.15"
 directories = "6.0"
