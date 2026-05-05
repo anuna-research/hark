@@ -16,7 +16,7 @@ use rand::rngs::OsRng;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, oneshot};
 
 use crate::{
     config::{validate_capability_name, validate_dialect_id},
@@ -115,6 +115,7 @@ struct AgentEntry {
     queued_bytes: usize,
     recv_waiting: bool,
     notify: Arc<Notify>,
+    close_tx: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -270,11 +271,29 @@ impl AgentStore {
         }
     }
 
+    pub fn validate_advertisement(
+        capabilities: &[String],
+        dialects: &[String],
+    ) -> Result<(), AgentError> {
+        validate_agent_advertisement(capabilities, dialects)
+    }
+
     pub async fn insert_connected(
         &self,
         handle: AgentHandle,
         capabilities: Vec<String>,
         dialects: Vec<String>,
+    ) -> Result<AgentStatusSnapshot, AgentError> {
+        self.insert_connected_with_close_signal(handle, capabilities, dialects, None)
+            .await
+    }
+
+    pub async fn insert_connected_with_close_signal(
+        &self,
+        handle: AgentHandle,
+        capabilities: Vec<String>,
+        dialects: Vec<String>,
+        close_tx: Option<oneshot::Sender<()>>,
     ) -> Result<AgentStatusSnapshot, AgentError> {
         validate_agent_advertisement(&capabilities, &dialects)?;
         let mut inner = self.inner.lock().await;
@@ -290,6 +309,7 @@ impl AgentStore {
             queued_bytes: 0,
             recv_waiting: false,
             notify: Arc::new(Notify::new()),
+            close_tx,
         };
         inner.agents.insert(handle.clone(), entry);
         Ok(inner
@@ -317,6 +337,7 @@ impl AgentStore {
         if entry.queue.len() >= max_messages || entry.queued_bytes.saturating_add(bytes) > max_bytes
         {
             entry.mark_unhealthy("queue_overflow", None);
+            entry.close_connection();
             entry.notify.notify_waiters();
             return Err(AgentError::QueueOverflow);
         }
@@ -389,6 +410,8 @@ impl AgentStore {
                 .agents
                 .remove(handle)
                 .ok_or(AgentError::UnknownHandle)?;
+            let mut entry = entry;
+            entry.close_connection();
             entry.notify
         };
         notify.notify_waiters();
@@ -407,6 +430,7 @@ impl AgentStore {
             .get_mut(handle)
             .ok_or(AgentError::UnknownHandle)?;
         entry.mark_unhealthy(reason, detail);
+        entry.close_connection();
         entry.notify.notify_waiters();
         Ok(())
     }
@@ -455,6 +479,12 @@ impl AgentEntry {
         self.state = AgentState::Unhealthy;
         self.unhealthy_reason = Some(reason.into());
         self.unhealthy_detail = detail;
+    }
+
+    fn close_connection(&mut self) {
+        if let Some(close_tx) = self.close_tx.take() {
+            let _ = close_tx.send(());
+        }
     }
 
     fn snapshot(&self, handle: &AgentHandle) -> AgentStatusSnapshot {

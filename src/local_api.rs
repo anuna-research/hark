@@ -20,11 +20,13 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
+    config::{AppConfig, ConfigError},
     constants::{LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
     daemon::{
         AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord,
         authenticated_headers,
     },
+    router::{RouterError, create_router_agent},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -59,6 +61,22 @@ pub struct RecvResponse {
 pub struct CloseResponse {
     pub ok: bool,
     pub agent_handle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CreateAgentRequest {
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub dialects: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CreateAgentResponse {
+    pub agent_handle: String,
+    pub router_agent_id: String,
+    pub capabilities: Vec<String>,
+    pub dialects: Vec<String>,
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -133,6 +151,7 @@ struct AppState {
     record: Arc<DiscoveryRecord>,
     stop: Arc<StopState>,
     agents: AgentStore,
+    config: Arc<AppConfig>,
 }
 
 struct StopState {
@@ -278,6 +297,7 @@ pub async fn serve_local_api(
             max_messages_per_handle: crate::constants::DEFAULT_MAX_MESSAGES_PER_HANDLE,
             max_bytes_per_handle: crate::constants::DEFAULT_MAX_BYTES_PER_HANDLE,
         }),
+        AppConfig::default(),
     )
     .await
 }
@@ -287,6 +307,7 @@ pub async fn serve_local_api_with_agents(
     record: DiscoveryRecord,
     discovery_file: Option<PathBuf>,
     agents: AgentStore,
+    config: AppConfig,
 ) -> Result<(), LocalApiError> {
     if !listener.local_addr()?.ip().is_loopback() {
         return Err(LocalApiError::Server(std::io::Error::new(
@@ -299,6 +320,7 @@ pub async fn serve_local_api_with_agents(
     let state = AppState {
         record: Arc::new(record),
         agents,
+        config: Arc::new(config),
         stop: Arc::new(StopState {
             discovery_file,
             stopping: AtomicBool::new(false),
@@ -319,11 +341,43 @@ pub async fn serve_local_api_with_agents(
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/ping", get(ping))
-        .route("/v1/agents", get(agents))
+        .route("/v1/agents", get(agents).post(create_agent))
         .route("/v1/agents/{handle}/recv", get(recv))
         .route("/v1/agents/{handle}", delete(close_agent))
         .route("/v1/stop", post(stop))
         .with_state(state)
+}
+
+async fn create_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateAgentRequest>,
+) -> Result<Json<CreateAgentResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    AgentStore::validate_advertisement(&request.capabilities, &request.dialects)
+        .map_err(agent_error_to_api)?;
+    let router = state
+        .config
+        .validate_router()
+        .map_err(config_error_to_api)?;
+    let created = create_router_agent(
+        state.agents.clone(),
+        &router,
+        &state.config.agent.agent_id_prefix,
+        request.capabilities,
+        request.dialects,
+    )
+    .await
+    .map_err(router_error_to_api)?;
+
+    Ok(Json(CreateAgentResponse {
+        agent_handle: created.agent_handle.as_str().to_owned(),
+        router_agent_id: created.router_agent_id,
+        capabilities: created.capabilities,
+        dialects: created.dialects,
+        state: "connected".to_owned(),
+    }))
 }
 
 async fn ping(
@@ -564,6 +618,58 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
         AgentError::InvalidDialect(message) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_dialect", message, None)
         }
+    }
+}
+
+fn config_error_to_api(error: ConfigError) -> ApiError {
+    match error {
+        ConfigError::MissingRouterWsUrl => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "missing_router_ws_url",
+            "router WebSocket URL is not configured",
+            None,
+        ),
+        ConfigError::InvalidRouterWsUrl(message) => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_router_ws_url",
+            message,
+            None,
+        ),
+        ConfigError::MissingRouterAuthToken => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "missing_router_auth_token",
+            "router authentication token is not configured",
+            None,
+        ),
+        error => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_router_ws_url",
+            error.to_string(),
+            None,
+        ),
+    }
+}
+
+fn router_error_to_api(error: RouterError) -> ApiError {
+    match error {
+        RouterError::AuthRejected => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "router_auth_rejected",
+            "router rejected WebSocket authentication",
+            None,
+        ),
+        RouterError::ConnectionFailed(message) => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "router_connection_failed",
+            message,
+            None,
+        ),
+        RouterError::HelloSendFailed(message) => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "router_connection_failed",
+            message,
+            None,
+        ),
     }
 }
 
@@ -907,7 +1013,14 @@ mod tests {
             let record = sample_record(addr);
             let task_record = record.clone();
             let task = tokio::spawn(async move {
-                serve_local_api_with_agents(listener, task_record, discovery_file, store).await
+                serve_local_api_with_agents(
+                    listener,
+                    task_record,
+                    discovery_file,
+                    store,
+                    crate::config::AppConfig::default(),
+                )
+                .await
             });
 
             let server = Self { record, task };

@@ -152,27 +152,27 @@ Potential spec follow-ups to settle during implementation:
 
 ### 7. Integrate Router WebSocket Agent Creation
 
-- [ ] Implement lazy router config validation during `POST /v1/agents`.
-- [ ] Connect to configured `ws://` or `wss://` `/agent/v1` URLs with the shared
+- [x] Implement lazy router config validation during `POST /v1/agents`.
+- [x] Connect to configured `ws://` or `wss://` `/agent/v1` URLs with the shared
   secret bearer authorization header.
-- [ ] Reject missing URL, malformed URL, missing token, authentication rejection,
+- [x] Reject missing URL, malformed URL, missing token, authentication rejection,
   and connection failures with stable local API error codes.
-- [ ] Build the CBCL `hello` frame from router agent id, capabilities, and
+- [x] Build the CBCL `hello` frame from router agent id, capabilities, and
   dialects.
-- [ ] Store the agent handle only after WebSocket upgrade succeeds and the
+- [x] Store the agent handle only after WebSocket upgrade succeeds and the
   binary hello frame is successfully written.
-- [ ] Preserve capability and dialect order while rejecting duplicates.
-- [ ] Spawn a receive loop per agent connection that treats router binary frames
+- [x] Preserve capability and dialect order while rejecting duplicates.
+- [x] Spawn a receive loop per agent connection that treats router binary frames
   as CBCL text and enqueues dispatched work.
-- [ ] Treat router-originated CBCL `error` frames as diagnostics, mark the
+- [x] Treat router-originated CBCL `error` frames as diagnostics, mark the
   handle unhealthy with `router_error`, and keep sanitized detail for status.
-- [ ] Mark handles unhealthy on router close or receive-loop failure.
-- [ ] Add integration tests with a local mock WebSocket router covering auth
+- [x] Mark handles unhealthy on router close or receive-loop failure.
+- [x] Add integration tests with a local mock WebSocket router covering auth
   header, hello frame, successful init response, router auth rejection, router
   close, router error diagnostics, and dispatched ask enqueueing.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and the
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and the
   router integration test subset.
-- [ ] Commit with a focused message such as `connect agent handles to router`.
+- [x] Commit with a focused message such as `connect agent handles to router`.
 
 ### 8. Implement CBCL Validation and Message Kind Checking
 

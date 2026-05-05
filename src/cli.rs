@@ -146,9 +146,14 @@ async fn daemon_run() -> AppResult<()> {
     })?;
 
     let agents = AgentStore::new(AgentStoreConfig::from_config(&config));
-    let result =
-        serve_local_api_with_agents(listener, record, Some(paths.discovery_file.clone()), agents)
-            .await;
+    let result = serve_local_api_with_agents(
+        listener,
+        record,
+        Some(paths.discovery_file.clone()),
+        agents,
+        config,
+    )
+    .await;
     drop(lock);
 
     result.map_err(|error| AppError::Internal(format!("local API server failed: {error}")))
