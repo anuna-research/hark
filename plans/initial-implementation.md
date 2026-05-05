@@ -257,14 +257,14 @@ Potential spec follow-ups to settle during implementation:
 
 ### 12. Documentation and Release Readiness
 
-- [ ] Update `README.md` with build instructions, config file examples,
+- [x] Update `README.md` with build instructions, config file examples,
   environment overrides, and the core daemon/init/recv/reply/progress/close
   workflow.
-- [ ] Document stable exit codes and local API error codes at a user-facing
+- [x] Document stable exit codes and local API error codes at a user-facing
   level, linking back to specs for deeper detail.
-- [ ] Add short troubleshooting notes for daemon-not-running, stale discovery
+- [x] Add short troubleshooting notes for daemon-not-running, stale discovery
   state, router auth rejection, missing capabilities, and unhealthy handles.
-- [ ] Confirm generated `--help` output is consistent with the CLI UX spec.
-- [ ] Run final full verification: `cargo fmt --check`,
+- [x] Confirm generated `--help` output is consistent with the CLI UX spec.
+- [x] Run final full verification: `cargo fmt --check`,
   `cargo clippy --all-targets --all-features`, and `cargo test`.
-- [ ] Commit with a focused message such as `document initial router client mvp`.
+- [x] Commit with a focused message such as `document initial router client mvp`.
