@@ -5,9 +5,10 @@
 `cbcl-router-client` runs one daemon per OS user. The daemon owns local agent
 instances, WebSocket connections to the router, and per-agent inbound queues.
 
-CLI commands such as `init`, `recv`, `reply`, `status`, and `close` need a
-reliable way to discover the daemon and fail clearly when no daemon is running.
-`daemon start` also needs to reject a second live daemon for the same user.
+CLI commands such as `init`, `recv`, `reply`, `daemon status`, and `close` need
+a reliable way to discover the daemon and fail clearly when no daemon is
+running. The daemon lifecycle also needs to prevent a second live daemon for the
+same user.
 
 This spec defines the singleton and discovery mechanism.
 
@@ -99,6 +100,9 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
 
 1. Resolve and create the runtime directory.
 2. Check whether a daemon is already discoverable.
+   * if authenticated `ping` succeeds, exit successfully
+   * if discovery state exists but `ping` fails, report stale state and do not
+     remove files automatically
 3. Spawn the same binary in foreground daemon mode, for example
    `cbcl-router-client daemon run --internal`.
 4. Detach the child process from the terminal as far as the platform reasonably
@@ -121,7 +125,7 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
    * read `daemon.json` if present
    * send an authenticated `ping` request to the recorded `addr`
    * if `ping` succeeds, exit with a descriptive "daemon already running" error
-   * if `ping` fails, report stale daemon state and suggest `daemon start --replace`
+   * if `ping` fails, report stale daemon state and suggest manual cleanup
 
 The daemon should bind only to loopback addresses. It must not listen on a
 public interface.
@@ -159,7 +163,7 @@ fail with:
 
 ```text
 error: daemon state exists but no daemon responded at 127.0.0.1:49152
-hint: run `cbcl-router-client daemon status` or `cbcl-router-client daemon start --replace`
+hint: run `cbcl-router-client daemon status`; if stale, stop the old process and remove daemon.json
 ```
 
 If the daemon responds but authentication fails, the command should fail closed
@@ -175,17 +179,16 @@ The client should provide:
 ```bash
 cbcl-router-client daemon status
 cbcl-router-client daemon stop
-cbcl-router-client daemon start --replace
 ```
 
-`daemon start --replace` may remove stale `daemon.json` and create a new daemon
-only when either:
+The MVP does not provide automatic stale-state replacement. If stale state
+blocks startup, users may stop the old process and remove `daemon.json`
+manually. A future replacement flow may be added only after its safety semantics
+are specified.
 
-* `daemon.lock` is acquirable, or
-* the recorded daemon fails authenticated ping
-
-It must not kill or replace a healthy daemon unless a separate explicit force
-option is added.
+`daemon stop` uses the same authenticated discovery flow as other local
+commands. It can stop a responsive daemon, but it does not clean up stale state
+when no daemon responds.
 
 ## Local Protocol
 
@@ -199,6 +202,7 @@ The daemon's local protocol should include at least:
 * `status` - returns daemon state, active handles, connection states, and queue
   lengths.
 * `close` - closes the WSS connection and removes state for an agent handle.
+* `stop` - closes all WSS connections, removes `daemon.json`, and exits.
 
 The wire format can be JSON over HTTP on loopback TCP for the first
 implementation. The daemon token should be sent in an authorization header or
@@ -230,7 +234,7 @@ old messages. The default overflow behavior should be:
 1. reject the newly arrived message locally
 2. mark the handle unhealthy with an overflow reason
 3. close that handle's WebSocket connection to the router
-4. expose the unhealthy state through `status`
+4. expose the unhealthy state through `daemon status`
 
 Closing the WebSocket is the current backpressure signal. The router already
 treats disconnected agent WebSocket processes as unavailable for further
@@ -254,7 +258,6 @@ Shell output:
 
 ```bash
 export CBCL_AGENT_HANDLE='01JX8F4V2QK8GZP9H6W5'
-export CBCL_ROUTER_CLIENT='http://127.0.0.1:49152'
 ```
 
 JSON output:
@@ -266,7 +269,9 @@ cbcl-router-client init --json --capability code:edit
 ```json
 {
   "agent_handle": "01JX8F4V2QK8GZP9H6W5",
-  "router_client": "http://127.0.0.1:49152"
+  "router_agent_id": "local-agent-01JX8F4V2QK8GZP9H6W5",
+  "capabilities": ["code:edit"],
+  "state": "connected"
 }
 ```
 
@@ -291,9 +296,9 @@ Errors should be descriptive and action-oriented:
 
 * missing daemon: tell the user to run `daemon start`
 * live daemon already running: include the daemon address
-* stale state: suggest `daemon status` or `daemon start --replace`
+* stale state: suggest `daemon status` and manual cleanup
 * missing `CBCL_AGENT_HANDLE`: suggest running `eval "$(cbcl-router-client init ...)"`
-* unknown handle: suggest `status` to list active handles
+* unknown handle: suggest `daemon status` to list active handles
 * local auth failure: fail closed and avoid automatic cleanup
 
 ## Non-Goals
@@ -303,6 +308,7 @@ This spec does not require:
 * OS service manager integration
 * Unix domain sockets or Windows named pipes
 * automatic daemon startup from `init`
+* automatic stale-state replacement
 * daemon clustering
 * durable persistence of agent instances across daemon restarts
 

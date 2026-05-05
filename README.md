@@ -38,6 +38,8 @@ Each agent instance has:
 The local handle is exported into the agent's shell environment:
 
 ```bash
+cbcl-router-client daemon start
+
 eval "$(cbcl-router-client init \
   --capability code:edit \
   --capability code:test)"
@@ -47,7 +49,6 @@ The command prints shell exports similar to:
 
 ```bash
 export CBCL_AGENT_HANDLE='01JX8F4V2QK8GZP9H6W5'
-export CBCL_ROUTER_CLIENT='http://127.0.0.1:49152'
 ```
 
 Subsequent commands use `CBCL_AGENT_HANDLE` to select the correct daemon-managed
@@ -61,6 +62,9 @@ cbcl-router-client close
 
 For non-shell harnesses, `init --json` returns the same information as JSON.
 
+`init` does not auto-start the daemon. If the daemon is not running, `init`
+fails with a hint to run `cbcl-router-client daemon start`.
+
 ## Command Shape
 
 ### `daemon start`
@@ -68,6 +72,18 @@ For non-shell harnesses, `init --json` returns the same information as JSON.
 Starts the per-user daemon if it is not already running. The daemon owns router
 connections and local queues. It should bind only to loopback TCP and require
 local clients to present a daemon token or equivalent local credential.
+
+Users must start the daemon before creating agent instances.
+
+### `daemon status`
+
+Show daemon state, including active handles, router agent ids, capabilities,
+connection state, and queued message counts.
+
+### `daemon stop`
+
+Ask the running daemon to close active WebSocket connections, remove its
+discovery record, and exit.
 
 ### `init`
 
@@ -100,27 +116,28 @@ task="$(cbcl-router-client recv)"
 Validate a CBCL message with `cbcl-rs`, then send it over the WebSocket
 connection associated with the current `CBCL_AGENT_HANDLE`.
 
-Terminal messages such as `reply` and `error` should preserve the `:thread`
-value from the dispatched ask so the router can append them to the same receipt.
+`reply` must send a CBCL `reply` message, `error` must send a CBCL `error`
+message, and `progress` must send a CBCL `tell` message with content
+`"progress"`. Messages must include the `:thread` value from the dispatched ask
+so the router can append them to the same receipt.
 
-### `submit`
+Progress is non-terminal: it records an intermediate receipt entry but does not
+complete the dispatched ask. Agents should still send a later `reply` or
+`error` for the same `:thread`.
+
+### Future: `submit`
 
 Submit a new CBCL ask to the router's HTTP ingress endpoint. This is the
 producer path, distinct from agent replies over WebSocket.
 
-`submit` validates the CBCL message with `cbcl-rs`, posts it to
-`/ingress/v1/messages`, and prints the router response containing the receipt
-id and dispatch status.
+If implemented later, `submit` should validate the CBCL message with `cbcl-rs`,
+post it to `/ingress/v1/messages`, and print the router response containing the
+receipt id and dispatch status.
 
-### `receipt`
+### Future: `receipt`
 
 Fetch a receipt from the router and print the newline-delimited CBCL message
 sequence.
-
-### `status`
-
-Show daemon state, including active handles, router agent ids, capabilities,
-connection state, and queued message counts.
 
 ### `close`
 
@@ -134,7 +151,6 @@ defaults.
 
 Expected config values include:
 
-* router HTTP address
 * router WebSocket address
 * router authentication material
 * local daemon bind preferences
@@ -145,10 +161,10 @@ line values should override configured defaults.
 
 ## Validation
 
-Before forwarding messages, the client should use `cbcl-rs` to parse and
-validate CBCL locally. This gives agents fast, precise feedback when a message
-is malformed or violates known CBCL constraints, instead of relying only on
-router-side rejection.
+Before forwarding messages, both the CLI command and the daemon should use
+`cbcl-rs` to parse and validate CBCL locally. This gives agents fast, precise
+feedback when a message is malformed or violates known CBCL constraints, instead
+of relying only on router-side rejection.
 
 The router remains authoritative. Local validation is an ergonomics and safety
 layer, not a substitute for router validation.

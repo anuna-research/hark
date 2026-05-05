@@ -80,8 +80,7 @@ Request:
 ```json
 {
   "capabilities": ["code:edit", "code:test"],
-  "dialects": [],
-  "router_ws": null
+  "dialects": []
 }
 ```
 
@@ -89,7 +88,6 @@ Fields:
 
 * `capabilities` - capability strings advertised in the router `hello`.
 * `dialects` - optional dialect ids advertised in the router `hello`.
-* `router_ws` - optional override for the configured router WebSocket URL.
 
 Response:
 
@@ -97,14 +95,22 @@ Response:
 {
   "agent_handle": "01JX8F4V2QK8GZP9H6W5",
   "router_agent_id": "local-agent-01JX8F4V2QK8GZP9H6W5",
-  "router_client": "http://127.0.0.1:49152",
   "capabilities": ["code:edit", "code:test"],
   "state": "connected"
 }
 ```
 
-The daemon should not return from this call until the WebSocket is connected
-and the `hello` frame has been sent.
+The daemon should not return success from this call until:
+
+* the WebSocket upgrade has succeeded
+* the `hello` frame has been sent
+* the connection remains open through a short implementation-defined readiness
+  grace period
+* no router error frame is received during that grace period
+
+The current router does not send an explicit hello ACK. It registers the agent
+after parsing the `hello` frame and sends an error frame only for malformed CBCL,
+so this grace-period check is the MVP readiness signal.
 
 ### `GET /v1/agents`
 
@@ -179,7 +185,24 @@ Fields:
 * `message` - CBCL text to send over the router WebSocket.
 
 The CLI should validate the CBCL with `cbcl-rs` before making this request. The
-daemon may also validate defensively.
+daemon must also validate before forwarding because local HTTP clients are not
+trusted.
+
+The daemon must enforce that `kind` matches the message:
+
+* `reply` requires an inner CBCL performative of `reply`.
+* `error` requires an inner CBCL performative of `error`.
+* `progress` requires an inner CBCL performative of `tell`, recipient `@router`,
+  and content `"progress"`.
+* all three kinds require a `:thread` parameter.
+
+If validation or kind checking fails, the daemon must return an error and must
+not send the frame to the router.
+
+For `progress`, successful local send only means the daemon accepted the frame
+for forwarding on the selected WebSocket. The current router does not send an
+application-level ACK for progress frames, so the local API cannot confirm
+receipt persistence synchronously.
 
 Response:
 
@@ -205,6 +228,22 @@ Response:
 }
 ```
 
+### `POST /v1/stop`
+
+Requests daemon shutdown.
+
+Response:
+
+```json
+{
+  "ok": true
+}
+```
+
+After accepting the stop request, the daemon should close all active agent
+WebSocket connections, remove `daemon.json`, and exit. Releasing
+`daemon.lock` happens by process exit.
+
 ## Blocking and Concurrency
 
 Multiple `recv` calls for the same handle should not all receive the same
@@ -223,7 +262,7 @@ local delivery semantics.
 ## Validation Boundary
 
 Local CLI commands should perform CBCL parse/validation before calling
-`/send`. The daemon should still treat inbound local requests as untrusted and
-may revalidate messages before forwarding them to the router.
+`/send`. The daemon must still treat inbound local requests as untrusted and
+must revalidate messages before forwarding them to the router.
 
 Router validation remains authoritative.

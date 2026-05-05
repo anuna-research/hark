@@ -105,14 +105,8 @@ Environment override:
 export CBCL_ROUTER_WS='wss://cbcl-lfe.anuna.io/agent/v1'
 ```
 
-Optional future producer/debug commands may also need:
-
-```toml
-[router]
-http_url = "https://cbcl-lfe.anuna.io"
-```
-
-`http_url` is out of MVP unless `submit` or `receipt` is implemented.
+HTTP router configuration is out of MVP. Future producer/debug commands such as
+`submit` or `receipt` may add an HTTP base URL when they are specified.
 
 ## Agent Defaults
 
@@ -127,12 +121,13 @@ default_dialects = []
 agent_id_prefix = "local-agent"
 ```
 
-Command-line flags should override or extend defaults according to the command
-help. Recommended first behavior:
+Command-line flags replace configured defaults:
 
 * if `--capability` is supplied, use supplied capabilities
 * otherwise use `agent.default_capabilities`
 * if neither is present, fail with a clear missing-capability error
+* if `--dialect` is supplied, use supplied dialects
+* otherwise use `agent.default_dialects`
 
 The router-visible agent id is derived from:
 
@@ -173,6 +168,7 @@ Recommended behavior:
 * logs redact secrets
 * `init --json` does not include secrets
 * `daemon.json` contains only the local daemon token, not the router token
+* the local daemon token is not exported through environment variables
 
 Future versions may add OS keychain integration. That is not required for MVP.
 
