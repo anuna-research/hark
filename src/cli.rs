@@ -9,8 +9,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::net::TcpListener;
 
 use crate::cbcl_validation::{MessageKind, validate_for_send};
-use crate::config::validate_dialect_id;
-use crate::constants::{COMMAND_NAME, DEFAULT_PROGRESS_DIALECT};
+use crate::config::{validate_capability_name, validate_dialect_id};
+use crate::constants::{COMMAND_NAME, DEFAULT_PROGRESS_DIALECT, MAX_RECV_TIMEOUT_MS};
 use crate::daemon::{
     AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord, RuntimePaths, acquire_daemon_lock,
     create_runtime_dir, generate_daemon_token, load_discovery_record, probe_lock_available,
@@ -18,8 +18,8 @@ use crate::daemon::{
 };
 use crate::errors::{AppError, AppResult};
 use crate::local_api::{
-    ClientPingError, LocalApiClient, LocalApiRequestError, SendMessageKind, SendRequest,
-    serve_local_api_with_agents,
+    ClientPingError, CreateAgentRequest, LocalApiClient, LocalApiRequestError, SendMessageKind,
+    SendRequest, serve_local_api_with_agents,
 };
 
 #[derive(Debug, Parser)]
@@ -95,19 +95,93 @@ pub async fn run(cli: Cli) -> AppResult<()> {
             DaemonCommand::Status => daemon_status().await,
             DaemonCommand::Stop => daemon_stop().await,
         },
-        Command::Init(_) => not_implemented("init"),
-        Command::Recv(_) => not_implemented("recv"),
+        Command::Init(args) => init_command(args).await,
+        Command::Recv(args) => recv_command(args).await,
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args).await,
         Command::Error(args) => send_message_command(SendMessageKind::Error, args).await,
         Command::Progress(args) => progress_command(args).await,
-        Command::Close => not_implemented("close"),
+        Command::Close => close_command().await,
     }
 }
 
-fn not_implemented(command: &str) -> AppResult<()> {
-    Err(AppError::Internal(format!(
-        "{command} is not implemented yet"
-    )))
+async fn init_command(args: InitArgs) -> AppResult<()> {
+    validate_init_advertisement(&args.capabilities, &args.dialects)?;
+    let client = discover_live_client().await.map_err(|error| {
+        if matches!(error, AppError::DaemonNotRunning) {
+            eprintln!("daemon_not_running: run `cbcl-router-client daemon start` first");
+        }
+        error
+    })?;
+    let response = client
+        .create_agent(&CreateAgentRequest {
+            capabilities: args.capabilities,
+            dialects: args.dialects,
+        })
+        .await
+        .map_err(map_local_api_request_error)?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&response).map_err(|error| AppError::Internal(format!(
+                "failed to encode init JSON: {error}"
+            )))?
+        );
+    } else {
+        println!(
+            "export CBCL_AGENT_HANDLE='{}'",
+            shell_single_quote(&response.agent_handle)
+        );
+    }
+
+    Ok(())
+}
+
+async fn recv_command(args: RecvArgs) -> AppResult<()> {
+    let handle = resolve_agent_handle()?;
+    let timeout_ms = match args.timeout {
+        Some(timeout) => Some(parse_recv_timeout_ms(&timeout)?),
+        None => None,
+    };
+    let client = discover_live_client().await?;
+    let response = client
+        .recv(&handle, timeout_ms)
+        .await
+        .map_err(map_local_api_request_error)?;
+    println!("{}", response.message);
+    Ok(())
+}
+
+async fn close_command() -> AppResult<()> {
+    let handle = resolve_agent_handle()?;
+    let client = discover_live_client().await?;
+    client
+        .close(&handle)
+        .await
+        .map_err(map_local_api_request_error)?;
+    Ok(())
+}
+
+fn validate_init_advertisement(capabilities: &[String], dialects: &[String]) -> AppResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    for capability in capabilities {
+        validate_capability_name(capability).map_err(|error| AppError::Usage(error.to_string()))?;
+        if !seen.insert(capability) {
+            return Err(AppError::Usage(format!(
+                "duplicate capability: {capability}"
+            )));
+        }
+    }
+
+    seen.clear();
+    for dialect in dialects {
+        validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        if !seen.insert(dialect) {
+            return Err(AppError::Usage(format!("duplicate dialect: {dialect}")));
+        }
+    }
+
+    Ok(())
 }
 
 async fn send_message_command(kind: SendMessageKind, args: MessageInputArgs) -> AppResult<()> {
@@ -185,9 +259,20 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
             eprintln!("{}: {}", error.error.code, error.error.message);
             match error.error.code.as_str() {
                 "malformed_agent_handle" => AppError::Usage(error.error.message),
-                "unknown_agent_handle" | "agent_handle_unhealthy" => {
+                "unknown_agent_handle" | "agent_handle_unhealthy" | "recv_already_waiting" => {
                     AppError::AgentHandleUnavailable
                 }
+                "recv_timeout" => AppError::Timeout,
+                "missing_router_ws_url"
+                | "invalid_router_ws_url"
+                | "missing_router_auth_token"
+                | "router_auth_rejected"
+                | "router_connection_failed" => AppError::RouterConnection,
+                "missing_capability"
+                | "duplicate_capability"
+                | "duplicate_dialect"
+                | "invalid_capability"
+                | "invalid_dialect" => AppError::Usage(error.error.message),
                 "cbcl_validation_failed"
                 | "message_kind_mismatch"
                 | "missing_thread"
@@ -234,6 +319,40 @@ fn escape_cbcl_string(value: &str) -> String {
             _ => vec![character],
         })
         .collect()
+}
+
+fn parse_recv_timeout_ms(input: &str) -> AppResult<u64> {
+    let (number, multiplier) = if let Some(number) = input.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = input.strip_suffix('s') {
+        (number, 1_000_u64)
+    } else if let Some(number) = input.strip_suffix('m') {
+        (number, 60_000_u64)
+    } else if let Some(number) = input.strip_suffix('h') {
+        (number, 3_600_000_u64)
+    } else {
+        return Err(AppError::Usage(
+            "timeout must use ms, s, m, or h suffix".to_owned(),
+        ));
+    };
+
+    let value = number
+        .parse::<u64>()
+        .map_err(|_| AppError::Usage("timeout value must be a positive integer".to_owned()))?;
+    if value == 0 {
+        return Err(AppError::Usage("timeout must be positive".to_owned()));
+    }
+    let millis = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| AppError::Usage("timeout is too large".to_owned()))?;
+    if millis > MAX_RECV_TIMEOUT_MS {
+        return Err(AppError::Usage("timeout exceeds maximum 2160h".to_owned()));
+    }
+    Ok(millis)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    value.replace('\'', "'\\''")
 }
 
 async fn daemon_run() -> AppResult<()> {
@@ -515,7 +634,10 @@ fn is_lock_busy(error: &crate::daemon::DiscoveryError) -> bool {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, DaemonCommand, build_progress_message, escape_cbcl_string};
+    use super::{
+        Cli, Command, DaemonCommand, build_progress_message, escape_cbcl_string,
+        parse_recv_timeout_ms, validate_init_advertisement,
+    };
 
     #[test]
     fn command_tree_matches_mvp_surface() {
@@ -608,5 +730,33 @@ mod tests {
     #[test]
     fn escapes_cbcl_strings() {
         assert_eq!(escape_cbcl_string("a\\b\"c\n"), "a\\\\b\\\"c\\n");
+    }
+
+    #[test]
+    fn parses_recv_timeout_units() {
+        assert_eq!(parse_recv_timeout_ms("1ms").unwrap(), 1);
+        assert_eq!(parse_recv_timeout_ms("2s").unwrap(), 2_000);
+        assert_eq!(parse_recv_timeout_ms("3m").unwrap(), 180_000);
+        assert_eq!(parse_recv_timeout_ms("4h").unwrap(), 14_400_000);
+        assert_eq!(parse_recv_timeout_ms("2160h").unwrap(), 7_776_000_000);
+
+        assert!(parse_recv_timeout_ms("0s").is_err());
+        assert!(parse_recv_timeout_ms("2161h").is_err());
+        assert!(parse_recv_timeout_ms("10").is_err());
+    }
+
+    #[test]
+    fn validates_duplicate_init_values_before_api_call() {
+        assert!(
+            validate_init_advertisement(&["code:edit".to_owned(), "code:edit".to_owned()], &[])
+                .is_err()
+        );
+        assert!(
+            validate_init_advertisement(
+                &["code:edit".to_owned()],
+                &["elf".to_owned(), "elf".to_owned()]
+            )
+            .is_err()
+        );
     }
 }

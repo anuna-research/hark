@@ -275,6 +275,43 @@ impl LocalApiClient {
             .map_err(|error| ClientPingError::DecodeFailed(error.to_string()))
     }
 
+    pub async fn create_agent(
+        &self,
+        request: &CreateAgentRequest,
+    ) -> Result<CreateAgentResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url("/v1/agents"))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+
+        decode_api_response(response).await
+    }
+
+    pub async fn recv(
+        &self,
+        handle: &AgentHandle,
+        timeout_ms: Option<u64>,
+    ) -> Result<RecvResponse, LocalApiRequestError> {
+        let mut request = self
+            .http
+            .get(self.url(&format!("/v1/agents/{}/recv", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone());
+        if let Some(timeout_ms) = timeout_ms {
+            request = request.query(&[("timeout_ms", timeout_ms)]);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+
+        decode_api_response(response).await
+    }
+
     pub async fn send(
         &self,
         handle: &AgentHandle,
@@ -285,6 +322,18 @@ impl LocalApiClient {
             .post(self.url(&format!("/v1/agents/{}/send", handle.as_str())))
             .header(AUTHORIZATION, self.auth_header.clone())
             .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+
+        decode_api_response(response).await
+    }
+
+    pub async fn close(&self, handle: &AgentHandle) -> Result<CloseResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .delete(self.url(&format!("/v1/agents/{}", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
             .send()
             .await
             .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;

@@ -216,25 +216,25 @@ Potential spec follow-ups to settle during implementation:
 
 ### 10. Implement `init`, `recv`, and `close` CLI Behavior
 
-- [ ] Implement `init` discovery flow without auto-starting the daemon.
-- [ ] Validate required and duplicate `--capability` values and duplicate
+- [x] Implement `init` discovery flow without auto-starting the daemon.
+- [x] Validate required and duplicate `--capability` values and duplicate
   `--dialect` values before calling the daemon.
-- [ ] Implement default `init` shell-export output with no extra stdout text.
-- [ ] Implement `init --json` output matching the local API response.
-- [ ] Implement `recv` handle resolution from `CBCL_AGENT_HANDLE`.
-- [ ] Implement `recv --timeout <duration>` parsing for `ms`, `s`, `m`, and `h`,
+- [x] Implement default `init` shell-export output with no extra stdout text.
+- [x] Implement `init --json` output matching the local API response.
+- [x] Implement `recv` handle resolution from `CBCL_AGENT_HANDLE`.
+- [x] Implement `recv --timeout <duration>` parsing for `ms`, `s`, `m`, and `h`,
   including max `2160h`.
-- [ ] Ensure `recv` prints only CBCL message text to stdout.
-- [ ] Implement `close` handle resolution and success/error behavior.
-- [ ] Map missing handle, unknown/unhealthy/busy handle, timeout, auth failure,
+- [x] Ensure `recv` prints only CBCL message text to stdout.
+- [x] Implement `close` handle resolution and success/error behavior.
+- [x] Map missing handle, unknown/unhealthy/busy handle, timeout, auth failure,
   daemon-not-running, router failure, validation failure, and API incompatibility
   to the stable CLI exit codes.
-- [ ] Add CLI integration tests for output discipline, env var handling,
+- [x] Add CLI integration tests for output discipline, env var handling,
   timeout parsing, missing daemon hints, duplicate capability/dialect rejection,
   and local API error-to-exit-code mapping.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and the CLI
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and the CLI
   command test subset.
-- [ ] Commit with a focused message such as `implement agent workflow cli`.
+- [x] Commit with a focused message such as `implement agent workflow cli`.
 
 ### 11. End-to-End MVP Verification
 
