@@ -47,12 +47,11 @@ Stdout:
 Stderr:
 
 * startup diagnostics
-* already-running errors
 * stale-state hints
 
 Exit codes:
 
-* `0` - daemon is running and reachable
+* `0` - daemon is running and reachable, including when it was already running
 * nonzero - daemon could not be started or stale daemon state blocks startup
 
 ### `daemon run`
@@ -60,11 +59,28 @@ Exit codes:
 Runs the daemon in the foreground. Intended for debugging and future
 service-manager integration.
 
+Unlike `daemon start`, `daemon run` treats an already-running daemon as an
+error because it is the long-lived daemon process, not the idempotent launcher.
+
 ### `daemon status`
 
 Shows daemon status and active agent handles.
 
 Default output should be human-readable.
+
+Status should distinguish these cases:
+
+* live daemon: print daemon address, version, active handles, connection states,
+  capabilities, and queue sizes; exit `0`.
+* no `daemon.json`: print that the daemon is not running; exit `3`.
+* stale `daemon.json` with free lock: print stale discovery details and say that
+  `daemon start` or `daemon stop` can clean it; exit `5`.
+* stale `daemon.json` with held lock: print that discovery is stale but the
+  singleton lock is still held; exit `5`.
+* daemon responds but local authentication fails: print a fail-closed diagnostic;
+  exit `11`.
+* daemon version is incompatible with the CLI: print both versions and a restart
+  hint; exit `12`.
 
 ### `daemon stop`
 
@@ -123,6 +139,10 @@ Useful options:
 * `--dialect <id>` - may be repeated.
 * `--json` - print JSON instead of shell exports.
 
+An agent must advertise at least one capability after applying config defaults
+and command-line overrides. If no capability is available, `init` fails with a
+usage/configuration error and does not call the daemon.
+
 ### `recv`
 
 Blocks until a CBCL message is available for `CBCL_AGENT_HANDLE`, prints the
@@ -138,7 +158,7 @@ Stderr:
 
 * daemon discovery errors
 * missing handle errors
-* closed/unhealthy handle errors
+* unknown/unhealthy handle errors
 * timeout diagnostics
 
 No prompt, prefix, or extra explanatory text should be printed to stdout.
@@ -146,6 +166,12 @@ No prompt, prefix, or extra explanatory text should be printed to stdout.
 Useful options:
 
 * `--timeout <duration>` - fail if no message arrives before the timeout.
+
+Without `--timeout`, `recv` blocks until a message arrives, the selected handle
+is removed or becomes unhealthy, the daemon stops, or the local HTTP request
+fails.
+Durations use a simple unit suffix: `ms`, `s`, `m`, or `h`. The CLI converts the
+duration to `timeout_ms` for the local API and rejects zero or negative values.
 
 ### `reply`, `error`, and `progress`
 
@@ -179,12 +205,19 @@ cbcl-router-client progress --thread rcp-... --text "running tests"
 
 Command-specific message rules:
 
-* `reply` accepts only CBCL whose inner performative is `reply`.
-* `error` accepts only CBCL whose inner performative is `error`.
-* `progress` builds a CBCL message whose inner performative is `tell`, recipient
-  is `@router`, and content is the string `"progress"`.
+* `reply` accepts only CBCL whose performative, after unwrapping any `(lang ...)`
+  dialect wrapper, is `reply`.
+* `error` accepts only CBCL whose performative, after unwrapping any `(lang ...)`
+  dialect wrapper, is `error`.
+* `progress` builds a CBCL message whose performative, after unwrapping the
+  generated `(lang ...)` dialect wrapper, is `tell`, recipient is `@router`, and
+  content is the string `"progress"`.
 * all sent messages require a `:thread` parameter so router receipt storage can
   correlate the message with a dispatched ask.
+
+Bare CBCL messages and dialect-wrapped CBCL messages are both accepted for
+`reply` and `error` as long as they pass `cbcl-rs` validation and the unwrapped
+performative matches the command.
 
 Useful `progress` options:
 
@@ -194,6 +227,12 @@ Useful `progress` options:
 
 The generated progress frame is still validated with `cbcl-rs` before it is
 sent to the daemon.
+
+`progress` always generates a dialect-wrapped message:
+
+```text
+(lang <dialect> (tell @router "progress" :thread "<receipt-id>" ...))
+```
 
 Progress messages are non-terminal. A successful `progress` command means the
 frame was accepted by the local daemon for forwarding; the current router does
@@ -218,8 +257,8 @@ Validation errors must not be sent to the router.
 Closes the WebSocket connection and removes daemon state for
 `CBCL_AGENT_HANDLE`.
 
-After `close`, commands using the same handle should fail with an unknown or
-closed handle error.
+After `close`, commands using the same handle should fail with an unknown handle
+error.
 
 ## Exit Codes
 
@@ -229,10 +268,11 @@ on common failure modes:
 * `0` - success
 * `2` - command-line usage error or malformed local request
 * `3` - daemon not running
-* `4` - daemon already running
+* `4` - daemon already running when invoking non-idempotent foreground
+  `daemon run`
 * `5` - stale daemon state
 * `6` - missing `CBCL_AGENT_HANDLE`
-* `7` - unknown, closed, unhealthy, or busy agent handle
+* `7` - unknown, unhealthy, or busy agent handle
 * `8` - CBCL validation or command-kind validation failure
 * `9` - router connection or router authentication failure
 * `10` - timeout

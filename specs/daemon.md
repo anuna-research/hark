@@ -107,7 +107,8 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
 
 1. Resolve and create the runtime directory.
 2. Check whether a daemon is already discoverable.
-   * if authenticated `ping` succeeds, exit successfully
+   * if authenticated `ping` succeeds, exit successfully; `daemon start` is
+     idempotent
    * if discovery state exists but `ping` fails, probe `daemon.lock` before
      deciding whether stale discovery state can be replaced
 3. Spawn the same binary in foreground daemon mode, for example
@@ -155,6 +156,11 @@ the now-responsive daemon as success after authenticated `ping`.
 The daemon should bind only to loopback addresses. It must not listen on a
 public interface.
 
+`daemon run` is not idempotent. If it cannot acquire `daemon.lock` and an
+authenticated `ping` to the recorded daemon succeeds, it should fail with a
+"daemon already running" diagnostic. The idempotent behavior belongs to
+`daemon start`, which is the user-facing launcher.
+
 Process detachment is necessarily platform-specific:
 
 * Unix and macOS: redirect stdio to null or log files and create a new session
@@ -193,6 +199,17 @@ hint: run `cbcl-router-client daemon status`; if stale, `cbcl-router-client daem
 
 If the daemon responds but authentication fails, the command should fail closed
 and should not attempt to remove state automatically.
+
+`daemon status` should use the same discovery checks, but it should be useful
+even when discovery is broken:
+
+* If `daemon.json` is missing, report that the daemon is not running.
+* If `daemon.json` exists and authenticated `ping` succeeds, report live daemon
+  and agent status.
+* If `daemon.json` exists but no daemon responds, probe `daemon.lock` without
+  removing files and report whether stale state appears cleanable.
+* If the daemon responds but authentication fails, report a fail-closed local
+  authentication error and do not remove files.
 
 ## Stale State
 
@@ -258,9 +275,11 @@ overflow_policy         = reject_new_and_close
 The daemon should drain each handle's queue in FIFO order.
 
 When a queue reaches its configured limit, the daemon should not silently drop
-old messages. The default overflow behavior should be:
+old messages. Because the router has already delivered the WebSocket frame by
+the time the local daemon observes the overflow, this is not a router-visible
+rejection. The default overflow behavior should be:
 
-1. reject the newly arrived message locally
+1. do not enqueue the newly arrived frame
 2. mark the handle unhealthy with an overflow reason
 3. close that handle's WebSocket connection to the router
 4. expose the unhealthy state through `daemon status`
@@ -318,6 +337,11 @@ local-agent-01JX8F4V2QK8GZP9H6W5
 
 Commands such as `recv`, `reply`, `error`, `progress`, and `close` should
 select the agent instance from `CBCL_AGENT_HANDLE`.
+
+An agent instance must advertise at least one capability. The CLI should reject
+`init` requests with no effective capabilities before calling the daemon, and
+the daemon should reject local API requests that still contain an empty
+capability list.
 
 ## Error Handling Principles
 

@@ -145,7 +145,9 @@ Expected config values include:
 * default capabilities and dialects
 
 Capabilities can be supplied from config or directly to `init`. Direct command
-line values should override configured defaults for that `init` request.
+line values should override configured defaults for that `init` request. An
+agent must advertise at least one capability after applying those defaults and
+overrides.
 
 ## Validation
 

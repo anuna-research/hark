@@ -53,6 +53,10 @@ For each agent instance, the daemon:
 5. stores the connection under the local handle after the binary hello frame is
    successfully written
 
+The capability list must be non-empty after applying config defaults and local
+`init` overrides. The daemon must not open a router WebSocket for a
+zero-capability agent.
+
 Recommended router-visible id:
 
 ```text
@@ -95,6 +99,19 @@ does not prove that the router registered the agent. The daemon must not pause
 after hello to wait for a possible router error. If the router later sends an
 error frame or closes the connection, the daemon should mark the handle
 unhealthy and expose that state through `recv`, `send`, and `daemon status`.
+
+Current router implementation detail: `/agent/v1` sends frames from the router
+to agents in two known situations:
+
+* dispatched work arrives as a binary CBCL ask through the router's
+  `dispatch-ask` path
+* a CBCL `error` frame is sent back to the agent when the agent sends malformed
+  CBCL to the router
+
+The daemon should therefore treat router-originated CBCL `error` frames as
+router diagnostics for frames the client sent, mark the handle unhealthy with
+`router_error`, and expose the error through status and subsequent handle
+operations. They should not be delivered as ordinary dispatched work by `recv`.
 
 ## Receiving Work
 
@@ -142,6 +159,9 @@ must be CBCL `tell` messages to `@router` whose content is the string
 
 The daemon must repeat validation and command-kind checking before forwarding
 the frame to the router.
+
+`reply` and `error` may be bare CBCL messages or dialect-wrapped CBCL messages.
+Kind checking is performed after unwrapping any `(lang ...)` wrapper.
 
 Example progress frame:
 
@@ -200,6 +220,9 @@ avoid orphaning receipt entries.
 
 When the WebSocket closes, the router removes that connected agent from its
 active registry. The same handle should not be reused after close.
+
+The local daemon removes the handle from its active state after explicit close.
+Subsequent commands using the same handle should fail as `unknown_agent_handle`.
 
 If an agent queue overflows, the daemon should close the corresponding
 WebSocket as a backpressure signal, as described in [`daemon.md`](daemon.md).

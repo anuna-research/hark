@@ -131,7 +131,8 @@ Command-line flags replace configured defaults:
 
 * if `--capability` is supplied, use supplied capabilities
 * otherwise use `agent.default_capabilities`
-* if neither is present, fail with a clear missing-capability error
+* if neither produces at least one capability, fail with a clear
+  missing-capability error before opening a router WebSocket
 * if `--dialect` is supplied, use supplied dialects
 * otherwise use `agent.default_dialects`
 

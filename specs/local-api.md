@@ -50,7 +50,7 @@ HTTP status guidance:
 * `401` - missing or invalid daemon token
 * `408` - blocking receive timed out
 * `404` - unknown agent handle
-* `409` - handle is closed, unhealthy, or otherwise not usable
+* `409` - handle is unhealthy, busy, or otherwise not currently usable
 * `422` - CBCL validation failed
 * `503` - daemon is shutting down or otherwise temporarily unavailable
 * `500` - daemon internal error
@@ -91,8 +91,10 @@ Request:
 
 Fields:
 
-* `capabilities` - capability strings advertised in the router `hello`.
+* `capabilities` - non-empty capability strings advertised in the router `hello`.
 * `dialects` - optional dialect ids advertised in the router `hello`.
+
+The daemon must reject requests whose effective `capabilities` list is empty.
 
 Response:
 
@@ -167,27 +169,28 @@ Query parameters:
 
 * `timeout_ms` - optional maximum wait time.
 
-If `timeout_ms` expires before a message arrives, return a timeout error rather
-than an empty success.
+If `timeout_ms` is absent, the request may block until a message arrives, the
+selected handle is removed or becomes unhealthy, the daemon stops, or the HTTP
+connection fails. If `timeout_ms` expires before a message arrives, return a
+timeout error rather than an empty success. The daemon should reject zero,
+negative, and unreasonably large timeout values as malformed requests.
 
 If the handle has queued messages, the daemon should return the oldest queued
 message immediately. Otherwise it should park the request until a message
-arrives, the handle closes, or the timeout expires.
+arrives, the handle becomes unhealthy, is removed, or the timeout expires.
 
 Failure behavior:
 
 * unknown handle: `404` with `error.code = "unknown_agent_handle"`
-* closed handle: `409` with `error.code = "agent_handle_closed"`
 * unhealthy handle: `409` with `error.code = "agent_handle_unhealthy"`
 * second concurrent waiter for the same handle: `409` with
   `error.code = "recv_already_waiting"`
 * timeout: `408` with `error.code = "recv_timeout"`
 * daemon shutdown while waiting: `503` with `error.code = "daemon_stopping"`
 
-The CLI should map unknown, closed, and unhealthy handles to exit code `7`,
-second concurrent waiters to exit code `7`, timeouts to exit code `10`, and
-daemon shutdown to exit code `12` unless a more specific daemon-lifecycle code
-applies.
+The CLI should map unknown and unhealthy handles to exit code `7`, second
+concurrent waiters to exit code `7`, timeouts to exit code `10`, and daemon
+shutdown to exit code `12` unless a more specific daemon-lifecycle code applies.
 
 ### `POST /v1/agents/{handle}/send`
 
@@ -213,18 +216,25 @@ trusted.
 
 The daemon must enforce that `kind` matches the message:
 
-* `reply` requires an inner CBCL performative of `reply`.
-* `error` requires an inner CBCL performative of `error`.
-* `progress` requires an inner CBCL performative of `tell`, recipient `@router`,
-  and content `"progress"`.
+* `reply` requires a CBCL performative of `reply` after unwrapping any `(lang
+  ...)` dialect wrapper.
+* `error` requires a CBCL performative of `error` after unwrapping any `(lang
+  ...)` dialect wrapper.
+* `progress` requires a CBCL performative of `tell` after unwrapping any `(lang
+  ...)` dialect wrapper, recipient `@router`, and content `"progress"`.
 * all three kinds require a `:thread` parameter.
+
+Bare CBCL messages and dialect-wrapped CBCL messages are valid inputs for
+`reply` and `error` if they pass validation and kind checking. The CLI-generated
+`progress` message is always dialect-wrapped, but the daemon should validate the
+unwrapped shape rather than relying on that CLI behavior.
 
 If validation or kind checking fails, the daemon must return an error and must
 not send the frame to the router.
 
 Handle failure behavior for `/send` should match `/recv`: unknown handles
-return `404`, closed or unhealthy handles return `409`, and daemon shutdown
-returns `503`.
+return `404`, unhealthy handles return `409`, and daemon shutdown returns
+`503`.
 
 The daemon does not track dispatched `:thread` values in the MVP. It only
 requires that the field is present and well-formed enough for CBCL validation.
@@ -259,8 +269,7 @@ Response:
 ```json
 {
   "ok": true,
-  "agent_handle": "01JX8F4V2QK8GZP9H6W5",
-  "state": "closed"
+  "agent_handle": "01JX8F4V2QK8GZP9H6W5"
 }
 ```
 
@@ -285,9 +294,12 @@ WebSocket connections, remove `daemon.json`, and exit. Releasing
 Agent status responses should use these MVP state values:
 
 * `connected` - WebSocket upgrade succeeded and the hello frame was written.
-* `closed` - the handle was explicitly closed or removed.
 * `unhealthy` - the handle still exists for diagnostics, but cannot receive or
   send messages.
+
+Explicitly closing a handle removes it from daemon state. Later requests for
+that handle should return `404 unknown_agent_handle`, not a persistent `closed`
+state.
 
 When `state` is `unhealthy`, `unhealthy_reason` should be a short stable code
 such as `router_closed`, `router_error`, `queue_overflow`, or
