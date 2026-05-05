@@ -1,15 +1,14 @@
 use std::{
-    ffi::OsStr,
     net::SocketAddr,
-    path::{Path, PathBuf},
-    process::{Command, Output},
     sync::{Arc, Mutex},
 };
 
 use futures_util::{SinkExt, StreamExt};
-use tempfile::TempDir;
 use tokio::{net::TcpListener, task::JoinHandle, time::Duration};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+mod support;
+use support::{TestEnv, assert_success, output_debug};
 
 const DISPATCH: &str = "(lang elf (ask @router \"work\" :thread \"rcp-1\"))";
 
@@ -17,7 +16,7 @@ const DISPATCH: &str = "(lang elf (ask @router \"work\" :thread \"rcp-1\"))";
 fn cli_workflow_init_recv_and_close_keeps_stdout_clean() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
     let router = runtime.block_on(MockRouter::start());
-    let env = TestEnv::new(router.ws_url());
+    let env = TestEnv::new().with_router(router.ws_url(), "shr_test.secret");
 
     assert_success(
         &env.command(["daemon", "start"])
@@ -67,7 +66,7 @@ fn cli_workflow_init_recv_and_close_keeps_stdout_clean() {
 fn cli_init_json_outputs_api_response_only() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
     let router = runtime.block_on(MockRouter::start());
-    let env = TestEnv::new(router.ws_url());
+    let env = TestEnv::new().with_router(router.ws_url(), "shr_test.secret");
 
     assert_success(
         &env.command(["daemon", "start"])
@@ -93,7 +92,7 @@ fn cli_init_json_outputs_api_response_only() {
 
 #[test]
 fn cli_rejects_missing_handle_and_duplicate_init_values() {
-    let env = TestEnv::new("ws://127.0.0.1:9/agent/v1".to_owned());
+    let env = TestEnv::new().with_router("ws://127.0.0.1:9/agent/v1", "shr_test.secret");
 
     let recv = env
         .command(["recv", "--timeout", "1ms"])
@@ -181,92 +180,4 @@ impl MockRouter {
             let _ = task.await;
         }
     }
-}
-
-struct TestEnv {
-    _temp_dir: TempDir,
-    home: PathBuf,
-    xdg_runtime_dir: PathBuf,
-    router_ws_url: String,
-}
-
-impl TestEnv {
-    fn new(router_ws_url: String) -> Self {
-        let temp_dir = TempDir::new().expect("temp dir should be created");
-        let home = temp_dir.path().join("home");
-        let xdg_runtime_dir = temp_dir.path().join("xdg-runtime");
-        std::fs::create_dir_all(&home).expect("home should be created");
-        std::fs::create_dir_all(&xdg_runtime_dir).expect("runtime should be created");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
-                .expect("home permissions should be set");
-            std::fs::set_permissions(&xdg_runtime_dir, std::fs::Permissions::from_mode(0o700))
-                .expect("runtime permissions should be set");
-        }
-
-        Self {
-            _temp_dir: temp_dir,
-            home,
-            xdg_runtime_dir,
-            router_ws_url,
-        }
-    }
-
-    fn command<I, S>(&self, args: I) -> Command
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let mut command = Command::new(binary_path());
-        command
-            .args(args)
-            .env("HOME", &self.home)
-            .env("XDG_RUNTIME_DIR", &self.xdg_runtime_dir)
-            .env("CBCL_ROUTER_WS", &self.router_ws_url)
-            .env("CBCL_ROUTER_AUTH_TOKEN", "shr_test.secret")
-            .env_remove("CBCL_DAEMON_BIND")
-            .env_remove("CBCL_AGENT_ID_PREFIX")
-            .env_remove("CBCL_DAEMON_MAX_MESSAGES_PER_HANDLE")
-            .env_remove("CBCL_DAEMON_MAX_BYTES_PER_HANDLE")
-            .env_remove("CBCL_DAEMON_OVERFLOW_POLICY")
-            .env_remove("CBCL_AGENT_HANDLE");
-        command
-    }
-
-    fn command_with_handle<I, S>(&self, args: I, handle: &str) -> Command
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let mut command = self.command(args);
-        command.env("CBCL_AGENT_HANDLE", handle);
-        command
-    }
-}
-
-impl Drop for TestEnv {
-    fn drop(&mut self) {
-        let _ = self.command(["daemon", "stop"]).output();
-    }
-}
-
-fn binary_path() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_cbcl-router-client"))
-}
-
-fn assert_success(output: &Output) {
-    assert!(output.status.success(), "{}", output_debug(output));
-}
-
-fn output_debug(output: &Output) -> String {
-    format!(
-        "status={:?}\nstdout={}\nstderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
 }

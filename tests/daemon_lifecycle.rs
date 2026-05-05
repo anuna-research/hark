@@ -1,13 +1,10 @@
-use std::{
-    ffi::OsStr,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    process::{Command, Output},
-};
+use std::net::SocketAddr;
 
 use cbcl_router_client::{constants::LOCAL_API_VERSION, daemon::DiscoveryRecord};
-use tempfile::TempDir;
 use time::OffsetDateTime;
+
+mod support;
+use support::{TestEnv, assert_success, output_debug, secure_dir, secure_file};
 
 #[test]
 fn daemon_start_status_stop_lifecycle() {
@@ -108,124 +105,4 @@ fn daemon_stop_cleans_stale_discovery_when_lock_is_free() {
 
     assert_success(&stop);
     assert!(!discovery.exists());
-}
-
-struct TestEnv {
-    _temp_dir: TempDir,
-    home: PathBuf,
-    xdg_runtime_dir: PathBuf,
-}
-
-impl TestEnv {
-    fn new() -> Self {
-        let temp_dir = TempDir::new().expect("temp dir should be created");
-        let home = temp_dir.path().join("home");
-        let xdg_runtime_dir = temp_dir.path().join("xdg-runtime");
-        std::fs::create_dir_all(&home).expect("home should be created");
-        std::fs::create_dir_all(&xdg_runtime_dir).expect("runtime should be created");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
-                .expect("home permissions should be set");
-            std::fs::set_permissions(&xdg_runtime_dir, std::fs::Permissions::from_mode(0o700))
-                .expect("runtime permissions should be set");
-        }
-
-        Self {
-            _temp_dir: temp_dir,
-            home,
-            xdg_runtime_dir,
-        }
-    }
-
-    fn command<I, S>(&self, args: I) -> Command
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let mut command = Command::new(binary_path());
-        command
-            .args(args)
-            .env("HOME", &self.home)
-            .env("XDG_RUNTIME_DIR", &self.xdg_runtime_dir)
-            .env_remove("CBCL_ROUTER_WS")
-            .env_remove("CBCL_ROUTER_AUTH_TOKEN")
-            .env_remove("CBCL_DAEMON_BIND")
-            .env_remove("CBCL_AGENT_ID_PREFIX")
-            .env_remove("CBCL_DAEMON_MAX_MESSAGES_PER_HANDLE")
-            .env_remove("CBCL_DAEMON_MAX_BYTES_PER_HANDLE")
-            .env_remove("CBCL_DAEMON_OVERFLOW_POLICY");
-        command
-    }
-
-    fn runtime_dir(&self) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        {
-            self.xdg_runtime_dir.join("cbcl-router-client")
-        }
-
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            self.home
-                .join("Library")
-                .join("Application Support")
-                .join("cbcl-router-client")
-                .join("runtime")
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        {
-            self.home
-                .join(".local")
-                .join("state")
-                .join("cbcl-router-client")
-                .join("runtime")
-        }
-    }
-}
-
-impl Drop for TestEnv {
-    fn drop(&mut self) {
-        let _ = self.command(["daemon", "stop"]).output();
-    }
-}
-
-fn binary_path() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_cbcl-router-client"))
-}
-
-fn assert_success(output: &Output) {
-    assert!(output.status.success(), "{}", output_debug(output));
-}
-
-fn output_debug(output: &Output) -> String {
-    format!(
-        "status={:?}\nstdout={}\nstderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-fn secure_dir(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .expect("dir permissions should be set");
-    }
-}
-
-fn secure_file(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .expect("file permissions should be set");
-    }
 }

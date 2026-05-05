@@ -3,13 +3,16 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest, http::header::InvalidHeaderValue},
+    tungstenite::{
+        Message as WsMessage, client::IntoClientRequest, http::header::InvalidHeaderValue,
+    },
 };
 
 use crate::{
     config::ValidatedRouterConfig,
     daemon::{AgentHandle, AgentSendChannel, AgentStore},
 };
+use cbcl_core::message::{CorePerformative, Message, Performative};
 
 pub const AGENT_WS_PATH: &str = "/agent/v1";
 
@@ -47,7 +50,7 @@ pub async fn create_router_agent(
     let mut websocket = connect(router).await?;
     let hello = build_hello_frame(&router_agent_id, &capabilities, &dialects);
     websocket
-        .send(Message::Binary(hello.into_bytes().into()))
+        .send(WsMessage::Binary(hello.into_bytes().into()))
         .await
         .map_err(|error| RouterError::HelloSendFailed(error.to_string()))?;
 
@@ -134,7 +137,7 @@ fn spawn_receive_loop(
                         let _ = store.mark_unhealthy(&handle, "local_send_failed", Some("router send channel closed".to_owned())).await;
                         break;
                     };
-                    match websocket.send(Message::Binary(outbound.message.into_bytes().into())).await {
+                    match websocket.send(WsMessage::Binary(outbound.message.into_bytes().into())).await {
                         Ok(()) => {
                             let _ = outbound.result_tx.send(Ok(()));
                         }
@@ -148,7 +151,7 @@ fn spawn_receive_loop(
                 }
                 message = websocket.next() => {
                     match message {
-                        Some(Ok(Message::Binary(bytes))) => {
+                        Some(Ok(WsMessage::Binary(bytes))) => {
                             let text = String::from_utf8_lossy(&bytes).into_owned();
                             if is_router_error_frame(&text) {
                                 let _ = store.mark_unhealthy(&handle, "router_error", Some(sanitize_diagnostic(&text))).await;
@@ -158,7 +161,7 @@ fn spawn_receive_loop(
                                 break;
                             }
                         }
-                        Some(Ok(Message::Text(text))) => {
+                        Some(Ok(WsMessage::Text(text))) => {
                             let text = text.to_string();
                             if is_router_error_frame(&text) {
                                 let _ = store.mark_unhealthy(&handle, "router_error", Some(sanitize_diagnostic(&text))).await;
@@ -168,7 +171,7 @@ fn spawn_receive_loop(
                                 break;
                             }
                         }
-                        Some(Ok(Message::Close(_))) | None => {
+                        Some(Ok(WsMessage::Close(_))) | None => {
                             let _ = store.mark_unhealthy(&handle, "router_closed", None).await;
                             break;
                         }
@@ -196,7 +199,19 @@ fn map_connect_error(error: tokio_tungstenite::tungstenite::Error) -> RouterErro
 }
 
 fn is_router_error_frame(text: &str) -> bool {
-    text.contains("(error") || text.contains(" error ")
+    let Ok(sexpr) = cbcl_parser::parse(text) else {
+        return false;
+    };
+    let Ok(message) = cbcl_parser::parse_message(&sexpr) else {
+        return false;
+    };
+    matches!(
+        message.innermost_simple(),
+        Some(Message::Simple {
+            performative: Performative::Core(CorePerformative::Error),
+            ..
+        })
+    )
 }
 
 fn sanitize_diagnostic(text: &str) -> String {
@@ -216,7 +231,7 @@ fn escape_cbcl_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build_hello_frame;
+    use super::{build_hello_frame, is_router_error_frame};
 
     #[test]
     fn builds_hello_frame_preserving_order() {
@@ -238,5 +253,21 @@ mod tests {
 
         assert!(frame.contains("\"agent\\\"id\""));
         assert!(frame.contains("\"code\\\\edit\""));
+    }
+
+    #[test]
+    fn detects_bare_and_wrapped_router_error_frames() {
+        assert!(is_router_error_frame(r#"(error "bad hello")"#));
+        assert!(is_router_error_frame(
+            r#"(lang cbcl-router (error @router "bad hello"))"#
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_error_text_as_router_error_frame() {
+        assert!(!is_router_error_frame(
+            r#"(lang elf (ask @router "contains (error text" :thread "rcp-1"))"#
+        ));
+        assert!(!is_router_error_frame("not cbcl (error"));
     }
 }

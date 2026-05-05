@@ -31,52 +31,75 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(about = "Manage the per-user local daemon")]
     #[command(subcommand)]
     Daemon(DaemonCommand),
+    #[command(about = "Create an agent WebSocket and print the local handle")]
     Init(InitArgs),
+    #[command(about = "Receive one CBCL message for the current agent handle")]
     Recv(RecvArgs),
+    #[command(about = "Validate and send a CBCL reply message")]
     Reply(MessageInputArgs),
+    #[command(about = "Validate and send a CBCL error message")]
     Error(MessageInputArgs),
+    #[command(about = "Build and send a non-terminal progress message")]
     Progress(ProgressArgs),
+    #[command(about = "Close the current agent handle")]
     Close,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
+    #[command(about = "Start the daemon in the background if needed")]
     Start,
+    #[command(about = "Run the daemon in the foreground")]
     Run,
+    #[command(about = "Show daemon and active agent status")]
     Status,
+    #[command(about = "Stop the daemon")]
     Stop,
 }
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    #[arg(long = "capability", required = true)]
+    #[arg(
+        long = "capability",
+        required = true,
+        help = "Capability to advertise; repeat for multiple capabilities"
+    )]
     pub capabilities: Vec<String>,
-    #[arg(long = "dialect")]
+    #[arg(
+        long = "dialect",
+        help = "Dialect id to advertise; repeat for multiple dialects"
+    )]
     pub dialects: Vec<String>,
-    #[arg(long = "json")]
+    #[arg(long = "json", help = "Print JSON instead of shell exports")]
     pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct RecvArgs {
-    #[arg(long = "timeout")]
+    #[arg(long = "timeout", help = "Maximum wait, using ms, s, m, or h")]
     pub timeout: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct MessageInputArgs {
+    #[arg(help = "Complete CBCL message; if absent, read stdin until EOF")]
     pub message: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct ProgressArgs {
-    #[arg(long = "thread")]
+    #[arg(long = "thread", help = "Receipt thread id from the dispatched ask")]
     pub thread: String,
-    #[arg(long = "text")]
+    #[arg(long = "text", help = "Optional human-readable progress detail")]
     pub text: Option<String>,
-    #[arg(long = "dialect", default_value = DEFAULT_PROGRESS_DIALECT)]
+    #[arg(
+        long = "dialect",
+        default_value = DEFAULT_PROGRESS_DIALECT,
+        help = "Dialect wrapper for the generated progress message"
+    )]
     pub dialect: String,
 }
 
@@ -468,10 +491,24 @@ async fn daemon_status() -> AppResult<()> {
             println!("api_version: {}", agents.daemon.api_version);
             println!("agents: {}", agents.agents.len());
             for agent in agents.agents {
+                let capabilities = agent.capabilities.join(",");
+                let dialects = agent.dialects.join(",");
                 println!(
-                    "{} {} queued_messages={} queued_bytes={}",
-                    agent.agent_handle, agent.state, agent.queued_messages, agent.queued_bytes
+                    "{} {} router_agent_id={} capabilities=[{}] dialects=[{}] queued_messages={} queued_bytes={}",
+                    agent.agent_handle,
+                    agent.state,
+                    agent.router_agent_id,
+                    capabilities,
+                    dialects,
+                    agent.queued_messages,
+                    agent.queued_bytes
                 );
+                if let Some(reason) = agent.unhealthy_reason {
+                    println!("  unhealthy_reason={reason}");
+                }
+                if let Some(detail) = agent.unhealthy_detail {
+                    println!("  unhealthy_detail={detail}");
+                }
             }
             Ok(())
         }
