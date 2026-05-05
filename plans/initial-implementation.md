@@ -111,22 +111,22 @@ Potential spec follow-ups to settle during implementation:
 
 ### 5. Implement Daemon Lifecycle Commands
 
-- [ ] Implement `daemon run` as the foreground long-lived process.
-- [ ] Implement `daemon start` as an idempotent detached launcher that polls
+- [x] Implement `daemon run` as the foreground long-lived process.
+- [x] Implement `daemon start` as an idempotent detached launcher that polls
   `daemon.json` and authenticated `ping` until ready or timeout.
-- [ ] Ensure `daemon start` can replace stale `daemon.json` only after a
+- [x] Ensure `daemon start` can replace stale `daemon.json` only after a
   short-lived successful lock probe.
-- [ ] Implement `daemon status` human-readable output for missing, live, stale,
+- [x] Implement `daemon status` human-readable output for missing, live, stale,
   auth failure, and API-incompatible daemon states.
-- [ ] Implement `daemon stop` for live daemons and cleanable stale discovery
+- [x] Implement `daemon stop` for live daemons and cleanable stale discovery
   state.
-- [ ] Verify `daemon start` does not validate router URL/authentication, open a
+- [x] Verify `daemon start` does not validate router URL/authentication, open a
   router WebSocket, or send a router `hello`.
-- [ ] Add process-level integration tests for start/status/stop where practical,
+- [x] Add process-level integration tests for start/status/stop where practical,
   using isolated temp runtime and config directories.
-- [ ] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and the
+- [x] Run `cargo fmt`, `cargo clippy --all-targets --all-features`, and the
   daemon lifecycle test subset.
-- [ ] Commit with a focused message such as `implement daemon lifecycle cli`.
+- [x] Commit with a focused message such as `implement daemon lifecycle cli`.
 
 ### 6. Implement Agent State, Queues, and Handle Operations
 
