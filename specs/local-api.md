@@ -48,14 +48,19 @@ HTTP status guidance:
 * `200` - success
 * `400` - malformed request
 * `401` - missing or invalid daemon token
+* `408` - blocking receive timed out
 * `404` - unknown agent handle
 * `409` - handle is closed, unhealthy, or otherwise not usable
 * `422` - CBCL validation failed
+* `503` - daemon is shutting down or otherwise temporarily unavailable
 * `500` - daemon internal error
 
 ## Endpoints
 
-Endpoint names are provisional; command behavior is the stable contract.
+Endpoint names and request/response shapes in this document are the MVP local
+API contract. Later versions may add endpoints or fields, but the first
+implementation should treat the endpoints below as stable enough for tests and
+agent harnesses.
 
 ### `GET /v1/ping`
 
@@ -109,9 +114,11 @@ The current router does not send an explicit hello ACK. It registers the agent
 after parsing the `hello` frame and sends an error frame only for malformed
 CBCL, so this endpoint cannot synchronously prove router-side registration.
 Successful `POST /v1/agents` means local connection establishment and local
-hello send succeeded. If the router later sends an error frame or closes the
-connection, the daemon should mark the handle unhealthy and expose that state
-through `recv`, `send`, and `GET /v1/agents`.
+hello send succeeded. The daemon must not add a grace-period wait for a possible
+immediate router error; that delay is not worth the CLI UX cost for the MVP.
+If the router later sends an error frame or closes the connection, the daemon
+should mark the handle unhealthy and expose that state through `recv`, `send`,
+and `GET /v1/agents`.
 
 ### `GET /v1/agents`
 
@@ -167,6 +174,21 @@ If the handle has queued messages, the daemon should return the oldest queued
 message immediately. Otherwise it should park the request until a message
 arrives, the handle closes, or the timeout expires.
 
+Failure behavior:
+
+* unknown handle: `404` with `error.code = "unknown_agent_handle"`
+* closed handle: `409` with `error.code = "agent_handle_closed"`
+* unhealthy handle: `409` with `error.code = "agent_handle_unhealthy"`
+* second concurrent waiter for the same handle: `409` with
+  `error.code = "recv_already_waiting"`
+* timeout: `408` with `error.code = "recv_timeout"`
+* daemon shutdown while waiting: `503` with `error.code = "daemon_stopping"`
+
+The CLI should map unknown, closed, and unhealthy handles to exit code `7`,
+second concurrent waiters to exit code `7`, timeouts to exit code `10`, and
+daemon shutdown to exit code `12` unless a more specific daemon-lifecycle code
+applies.
+
 ### `POST /v1/agents/{handle}/send`
 
 Sends a CBCL frame over the selected agent's WebSocket connection.
@@ -199,6 +221,10 @@ The daemon must enforce that `kind` matches the message:
 
 If validation or kind checking fails, the daemon must return an error and must
 not send the frame to the router.
+
+Handle failure behavior for `/send` should match `/recv`: unknown handles
+return `404`, closed or unhealthy handles return `409`, and daemon shutdown
+returns `503`.
 
 The daemon does not track dispatched `:thread` values in the MVP. It only
 requires that the field is present and well-formed enough for CBCL validation.
@@ -253,6 +279,19 @@ Response:
 After accepting the stop request, the daemon should close all active agent
 WebSocket connections, remove `daemon.json`, and exit. Releasing
 `daemon.lock` happens by process exit.
+
+## Agent States
+
+Agent status responses should use these MVP state values:
+
+* `connected` - WebSocket upgrade succeeded and the hello frame was written.
+* `closed` - the handle was explicitly closed or removed.
+* `unhealthy` - the handle still exists for diagnostics, but cannot receive or
+  send messages.
+
+When `state` is `unhealthy`, `unhealthy_reason` should be a short stable code
+such as `router_closed`, `router_error`, `queue_overflow`, or
+`local_send_failed`.
 
 ## Blocking and Concurrency
 

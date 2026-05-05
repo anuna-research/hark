@@ -141,6 +141,18 @@ The router-visible agent id is derived from:
 <agent_id_prefix>-<agent_handle>
 ```
 
+Environment overrides:
+
+```bash
+export CBCL_AGENT_DEFAULT_CAPABILITIES='code:edit,code:test'
+export CBCL_AGENT_DEFAULT_DIALECTS='elf'
+export CBCL_AGENT_ID_PREFIX='local-agent'
+```
+
+List-valued environment variables are comma-separated. Empty items after
+trimming whitespace are ignored. If an environment variable is present but
+contains no usable entries, it overrides the config file with an empty list.
+
 ## Daemon Config
 
 The daemon bind address should default to an ephemeral loopback port:
@@ -161,6 +173,19 @@ overflow_policy = "reject_new_and_close"
 
 The daemon must reject non-loopback bind addresses unless an explicit future
 unsafe override is added.
+
+Environment overrides:
+
+```bash
+export CBCL_DAEMON_BIND='127.0.0.1:0'
+export CBCL_DAEMON_MAX_MESSAGES_PER_HANDLE='1000'
+export CBCL_DAEMON_MAX_BYTES_PER_HANDLE='67108864'
+export CBCL_DAEMON_OVERFLOW_POLICY='reject_new_and_close'
+```
+
+Numeric environment values must parse as positive base-10 integers. Invalid
+values should fail configuration loading before the daemon starts. The only MVP
+overflow policy is `reject_new_and_close`; any other value should be rejected.
 
 ## Secret Handling
 

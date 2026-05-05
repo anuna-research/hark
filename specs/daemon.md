@@ -108,8 +108,8 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
 1. Resolve and create the runtime directory.
 2. Check whether a daemon is already discoverable.
    * if authenticated `ping` succeeds, exit successfully
-   * if discovery state exists but `ping` fails, try to acquire `daemon.lock`
-     before deciding whether stale discovery state can be replaced
+   * if discovery state exists but `ping` fails, probe `daemon.lock` before
+     deciding whether stale discovery state can be replaced
 3. Spawn the same binary in foreground daemon mode, for example
    `cbcl-router-client daemon run --internal`.
 4. Detach the child process from the terminal as far as the platform reasonably
@@ -118,10 +118,23 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
    startup times out.
 6. Exit successfully only after the daemon is ready.
 
-If stale `daemon.json` exists but `daemon start` can acquire `daemon.lock`, it
-may replace `daemon.json` as part of starting the new daemon. The file lock is
-the singleton authority; stale discovery JSON alone must not block startup when
-no live daemon owns the lock.
+If stale `daemon.json` exists, `daemon start` should use the file lock only as
+a short-lived probe:
+
+1. Try to acquire `daemon.lock`.
+2. If acquisition fails, report stale state with a held lock and do not remove
+   files.
+3. If acquisition succeeds, remove stale `daemon.json`, then release the lock
+   before spawning `daemon run`.
+4. Let the spawned `daemon run` process acquire and hold `daemon.lock` for the
+   actual daemon lifetime.
+
+The parent `daemon start` process must not keep `daemon.lock` across the child
+daemon's startup. This avoids a parent-child lock handoff and keeps
+`daemon.lock` as the sole live-daemon authority. If another process starts a
+daemon in the small window between the probe release and child acquisition,
+the child should fail with "daemon already running" and the parent should treat
+the now-responsive daemon as success after authenticated `ping`.
 
 `daemon run` should:
 
@@ -193,9 +206,9 @@ cbcl-router-client daemon status
 cbcl-router-client daemon stop
 ```
 
-`daemon start` may replace stale `daemon.json` only after it acquires
-`daemon.lock`. If the lock is still held, startup must fail because another
-daemon process or lock owner may still be alive.
+`daemon start` may remove stale `daemon.json` only during the short-lived lock
+probe described in "Daemon Startup". If the lock is still held, startup must
+fail because another daemon process or lock owner may still be alive.
 
 `daemon stop` uses the same authenticated discovery flow as other local
 commands. For a responsive daemon, `daemon stop` closes active agent WebSocket

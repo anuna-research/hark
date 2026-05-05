@@ -17,7 +17,7 @@ compose with ordinary Unix-style tools and agent harnesses:
 Local daemon routing key for an ephemeral agent instance.
 
 Commands that operate on an agent WebSocket connection require this variable
-unless a future explicit `--handle` override is added.
+for the MVP.
 
 Required by:
 
@@ -64,8 +64,7 @@ service-manager integration.
 
 Shows daemon status and active agent handles.
 
-Default output should be human-readable. A future `--json` flag may return the
-raw local API status response.
+Default output should be human-readable.
 
 ### `daemon stop`
 
@@ -154,6 +153,18 @@ Useful options:
 `cbcl-rs`, check that the message matches the selected command, and send it
 over the WebSocket connection selected by `CBCL_AGENT_HANDLE`.
 
+MVP input rules:
+
+* `reply [MESSAGE]` and `error [MESSAGE]` accept at most one positional CBCL
+  message argument.
+* If the positional argument is present, the command uses it as the complete
+  CBCL message and does not read stdin.
+* If the positional argument is absent, the command reads the complete CBCL
+  message from stdin until EOF.
+* If the positional argument is absent and stdin is an interactive TTY, the
+  command fails with a usage error instead of waiting silently.
+* `--file` is not part of the MVP; callers can use shell redirection instead.
+
 `progress` builds a CBCL progress message from flags, validates the generated
 message with `cbcl-rs`, and sends it over the same handle-selected WebSocket
 path.
@@ -192,7 +203,6 @@ a later `reply` or `error` for the same `:thread`.
 Stdout:
 
 * default: nothing
-* with future `--json`: structured send result
 
 Stderr:
 
@@ -211,21 +221,26 @@ Closes the WebSocket connection and removes daemon state for
 After `close`, commands using the same handle should fail with an unknown or
 closed handle error.
 
-## Exit Code Categories
+## Exit Codes
 
-Exact numeric codes can be finalized during implementation, but commands should
-distinguish these categories:
+The MVP CLI should use stable numeric exit codes so shell harnesses can branch
+on common failure modes:
 
-* success
-* daemon not running
-* daemon already running
-* stale daemon state
-* missing `CBCL_AGENT_HANDLE`
-* unknown or closed handle
-* CBCL validation failure
-* router connection/auth failure
-* timeout
-* internal error
+* `0` - success
+* `2` - command-line usage error or malformed local request
+* `3` - daemon not running
+* `4` - daemon already running
+* `5` - stale daemon state
+* `6` - missing `CBCL_AGENT_HANDLE`
+* `7` - unknown, closed, unhealthy, or busy agent handle
+* `8` - CBCL validation or command-kind validation failure
+* `9` - router connection or router authentication failure
+* `10` - timeout
+* `11` - local daemon authentication failure
+* `12` - internal error
+
+Commands may include more specific machine-readable error codes in local API
+responses, but process exit codes should map to the categories above.
 
 ## Output Discipline
 

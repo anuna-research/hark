@@ -91,8 +91,9 @@ hello produces no response.
 For MVP, the daemon should treat `init` as successful after the WebSocket
 upgrade succeeds and the binary hello frame is successfully written to the
 socket. This confirms local connection establishment and local send success; it
-does not prove that the router registered the agent. If the router later sends
-an error frame or closes the connection, the daemon should mark the handle
+does not prove that the router registered the agent. The daemon must not pause
+after hello to wait for a possible router error. If the router later sends an
+error frame or closes the connection, the daemon should mark the handle
 unhealthy and expose that state through `recv`, `send`, and `daemon status`.
 
 ## Receiving Work
@@ -187,8 +188,7 @@ Current router behavior:
 * progress does not call the dispatcher terminal ACK path and does not complete
   or clear the in-flight ask
 * the router does not send an application-level ACK for progress persistence
-* non-progress `tell` frames from agents are ignored, except for `hello` and
-  `heartbeat`
+* non-progress `tell` frames from agents are ignored, except for `hello`
 
 If `:thread` is missing, the current router stores the frame under receipt id
 `"unknown"`. The client must reject progress messages without `:thread` to
