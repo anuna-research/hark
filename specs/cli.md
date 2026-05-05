@@ -77,7 +77,7 @@ The daemon should close active agent WebSocket connections, remove
 
 Exit codes:
 
-* `0` - daemon stopped or was not running
+* `0` - daemon stopped, was not running, or stale discovery state was cleaned
 * nonzero - daemon was running but could not be stopped cleanly
 
 ### `init`
@@ -150,32 +150,39 @@ Useful options:
 
 ### `reply`, `error`, and `progress`
 
-Read CBCL from stdin or an argument, validate it with `cbcl-rs`, check that the
-message matches the selected command, and send it over the WebSocket connection
-selected by `CBCL_AGENT_HANDLE`.
+`reply` and `error` read CBCL from stdin or an argument, validate it with
+`cbcl-rs`, check that the message matches the selected command, and send it
+over the WebSocket connection selected by `CBCL_AGENT_HANDLE`.
+
+`progress` builds a CBCL progress message from flags, validates the generated
+message with `cbcl-rs`, and sends it over the same handle-selected WebSocket
+path.
 
 Examples:
 
 ```bash
 cbcl-router-client reply < reply.cbcl
 cbcl-router-client error '(lang elf (error @router "failed" :thread "rcp-..."))'
+cbcl-router-client progress --thread rcp-... --text "running tests"
 ```
 
 Command-specific message rules:
 
 * `reply` accepts only CBCL whose inner performative is `reply`.
 * `error` accepts only CBCL whose inner performative is `error`.
-* `progress` accepts only CBCL whose inner performative is `tell` and whose
-  recipient is `@router` and content is the string `"progress"`.
-* all three commands require a `:thread` parameter so router receipt storage can
+* `progress` builds a CBCL message whose inner performative is `tell`, recipient
+  is `@router`, and content is the string `"progress"`.
+* all sent messages require a `:thread` parameter so router receipt storage can
   correlate the message with a dispatched ask.
 
-Example progress message:
+Useful `progress` options:
 
-```bash
-cbcl-router-client progress \
-  '(lang elf (tell @router "progress" :thread "rcp-..." :text "running tests"))'
-```
+* `--thread <receipt-id>` - required.
+* `--text <text>` - optional human-readable progress detail.
+* `--dialect <id>` - optional dialect wrapper; defaults to `elf`.
+
+The generated progress frame is still validated with `cbcl-rs` before it is
+sent to the daemon.
 
 Progress messages are non-terminal. A successful `progress` command means the
 frame was accepted by the local daemon for forwarding; the current router does
@@ -203,18 +210,6 @@ Closes the WebSocket connection and removes daemon state for
 
 After `close`, commands using the same handle should fail with an unknown or
 closed handle error.
-
-## Optional Future Commands
-
-These are not MVP agent-interface requirements:
-
-```bash
-cbcl-router-client submit
-cbcl-router-client receipt
-```
-
-If added, they should be producer/debug commands and should not require
-`CBCL_AGENT_HANDLE`.
 
 ## Exit Code Categories
 

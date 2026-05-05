@@ -37,6 +37,13 @@ Windows: %APPDATA%\cbcl-router-client\config.toml
 Runtime daemon state is separate from configuration and is defined in
 [`daemon.md`](daemon.md).
 
+The daemon owns router connections, so it loads configuration at daemon
+startup. Changes to config files or relevant environment variables do not
+affect an already-running daemon; users must restart the daemon for those
+changes to take effect. Command-line flags to `init` can still override
+configured agent defaults for that one agent instance, because those values are
+sent in the local init request.
+
 ## MVP Config Shape
 
 Example TOML:
@@ -105,8 +112,7 @@ Environment override:
 export CBCL_ROUTER_WS='wss://cbcl-lfe.anuna.io/agent/v1'
 ```
 
-HTTP router configuration is out of MVP. Future producer/debug commands such as
-`submit` or `receipt` may add an HTTP base URL when they are specified.
+HTTP router configuration is out of MVP.
 
 ## Agent Defaults
 
@@ -163,7 +169,7 @@ environment.
 
 Recommended behavior:
 
-* environment variables override config file secrets
+* environment variables override config file secrets at daemon startup
 * status output redacts secrets
 * logs redact secrets
 * `init --json` does not include secrets

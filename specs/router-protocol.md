@@ -11,19 +11,13 @@ messages. HTTP producer commands are optional later extensions.
 
 ## Router Endpoints
 
-The current router exposes:
+The MVP client uses:
 
 ```text
 WSS  /agent/v1
-POST /ingress/v1/messages
-GET  /receipts/:receipt_id
 ```
 
-MVP client support:
-
-* required: `WSS /agent/v1`
-* optional later: `POST /ingress/v1/messages`
-* optional later: `GET /receipts/:receipt_id`
+Router HTTP paths are outside the client scope.
 
 ## Authentication
 
@@ -56,9 +50,8 @@ For each agent instance, the daemon:
 2. derives a router-visible `agent-id`
 3. opens one WebSocket connection to `/agent/v1`
 4. sends a CBCL `hello` frame advertising capabilities and dialects
-5. waits for the connection to remain open through a short readiness grace
-   period
-6. stores the connection under the local handle
+5. stores the connection under the local handle after the binary hello frame is
+   successfully written
 
 Recommended router-visible id:
 
@@ -93,10 +86,14 @@ life of that WebSocket connection.
 
 The current router does not send an explicit hello ACK. A malformed CBCL frame
 causes the router to send an error frame and keep the connection open; a valid
-hello produces no response. For MVP, the daemon should treat init as successful
-only after the WebSocket upgrade succeeds, the hello frame is sent, no immediate
-router error frame is received, and the connection remains open through a short
-implementation-defined grace period.
+hello produces no response.
+
+For MVP, the daemon should treat `init` as successful after the WebSocket
+upgrade succeeds and the binary hello frame is successfully written to the
+socket. This confirms local connection establishment and local send success; it
+does not prove that the router registered the agent. If the router later sends
+an error frame or closes the connection, the daemon should mark the handle
+unhealthy and expose that state through `recv`, `send`, and `daemon status`.
 
 ## Receiving Work
 
@@ -124,13 +121,19 @@ cbcl-router-client error
 cbcl-router-client progress
 ```
 
-Each command should:
+`reply` and `error` should:
 
 1. read CBCL from an argument or stdin
 2. validate the CBCL with `cbcl-rs`
 3. check that the CBCL message matches the selected command
 4. resolve `CBCL_AGENT_HANDLE`
-5. send the frame through the daemon over that handle's WebSocket
+5. send the frame through the daemon over that handle's WebSocket as a binary
+   CBCL frame
+
+`progress` should build a CBCL `tell @router "progress"` frame from flags,
+validate the generated CBCL with `cbcl-rs`, resolve `CBCL_AGENT_HANDLE`, and
+send the frame through the daemon over that handle's WebSocket as a binary CBCL
+frame.
 
 Terminal messages must be CBCL `reply` or `error` messages. Progress messages
 must be CBCL `tell` messages to `@router` whose content is the string
@@ -166,6 +169,10 @@ Example:
 The client should not invent a new thread for replies to dispatched work unless
 the agent intentionally starts a separate conversation.
 
+The daemon does not track in-flight thread ids in the MVP. It rejects missing
+`:thread` values but does not reject an otherwise valid message simply because
+the thread is unknown locally.
+
 Progress messages also use `:thread` for receipt correlation. The current router
 persists `(tell ... "progress" :thread "...")` frames as receipt entries with
 kind `tell`.
@@ -176,8 +183,7 @@ Current router behavior:
   when dialect-wrapped with `(lang ...)`
 * `(tell ... "progress" ...)` is appended to receipt storage using the `:thread`
   value as the receipt id
-* the original frame bytes are stored and later returned by
-  `GET /receipts/:receipt_id` as newline-delimited `application/cbcl`
+* the original frame bytes are stored in the router receipt log
 * progress does not call the dispatcher terminal ACK path and does not complete
   or clear the in-flight ask
 * the router does not send an application-level ACK for progress persistence
@@ -198,37 +204,10 @@ active registry. The same handle should not be reused after close.
 If an agent queue overflows, the daemon should close the corresponding
 WebSocket as a backpressure signal, as described in [`daemon.md`](daemon.md).
 
-## Optional Producer Extensions
-
-The CLI may later add producer-facing commands:
-
-```bash
-cbcl-router-client submit
-cbcl-router-client receipt
-```
-
-`submit` would validate CBCL locally and send it to:
-
-```text
-POST /ingress/v1/messages
-```
-
-`receipt` would fetch:
-
-```text
-GET /receipts/:receipt_id
-```
-
-These commands are out of MVP for the agent interface. They should not require
-`CBCL_AGENT_HANDLE` because they are producer/debug paths rather than
-handle-selected WebSocket paths.
-
 ## Non-Goals
 
 The MVP does not require:
 
-* HTTP submission of new asks
-* receipt polling
 * Ed25519/JWT enrollment
 * durable router identity across daemon restarts
 * router dialect gossip

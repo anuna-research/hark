@@ -103,14 +103,15 @@ Response:
 The daemon should not return success from this call until:
 
 * the WebSocket upgrade has succeeded
-* the `hello` frame has been sent
-* the connection remains open through a short implementation-defined readiness
-  grace period
-* no router error frame is received during that grace period
+* the binary `hello` frame has been successfully written to the WebSocket
 
 The current router does not send an explicit hello ACK. It registers the agent
-after parsing the `hello` frame and sends an error frame only for malformed CBCL,
-so this grace-period check is the MVP readiness signal.
+after parsing the `hello` frame and sends an error frame only for malformed
+CBCL, so this endpoint cannot synchronously prove router-side registration.
+Successful `POST /v1/agents` means local connection establishment and local
+hello send succeeded. If the router later sends an error frame or closes the
+connection, the daemon should mark the handle unhealthy and expose that state
+through `recv`, `send`, and `GET /v1/agents`.
 
 ### `GET /v1/agents`
 
@@ -199,10 +200,19 @@ The daemon must enforce that `kind` matches the message:
 If validation or kind checking fails, the daemon must return an error and must
 not send the frame to the router.
 
+The daemon does not track dispatched `:thread` values in the MVP. It only
+requires that the field is present and well-formed enough for CBCL validation.
+The router remains responsible for authoritative receipt correlation.
+
 For `progress`, successful local send only means the daemon accepted the frame
 for forwarding on the selected WebSocket. The current router does not send an
 application-level ACK for progress frames, so the local API cannot confirm
 receipt persistence synchronously.
+
+The CLI `progress` command builds its CBCL message from command-line flags and
+then calls this endpoint with `kind = "progress"`. The local API remains
+message-based so the daemon has one validation and forwarding path for all
+agent-originated frames.
 
 Response:
 

@@ -25,17 +25,24 @@ runtime-dir/
 Recommended locations:
 
 ```text
-Linux:   $XDG_RUNTIME_DIR/cbcl-lfe-router-client/
-         fallback: ~/.local/state/cbcl-lfe-router-client/runtime/
+Linux:   $XDG_RUNTIME_DIR/cbcl-router-client/
+         fallback: ~/.local/state/cbcl-router-client/runtime/
 
-macOS:   ~/Library/Application Support/cbcl-lfe-router-client/runtime/
+macOS:   ~/Library/Application Support/cbcl-router-client/runtime/
 
-Windows: %LOCALAPPDATA%\cbcl-lfe-router-client\runtime\
+Windows: %LOCALAPPDATA%\cbcl-router-client\runtime\
 ```
 
 The implementation should use `directories` or `dirs` to select platform
 locations and should create the directory with user-only permissions where the
 platform supports that.
+
+On Unix-like systems, the runtime directory must be created with mode `0700`
+or stricter, and `daemon.json` must be created with mode `0600` or stricter.
+If existing runtime state is readable or writable by other users, commands
+should fail closed with a diagnostic rather than trusting the local daemon
+token. Equivalent owner-only protections should be used on platforms that
+support ACLs rather than Unix modes.
 
 ## Files
 
@@ -101,8 +108,8 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
 1. Resolve and create the runtime directory.
 2. Check whether a daemon is already discoverable.
    * if authenticated `ping` succeeds, exit successfully
-   * if discovery state exists but `ping` fails, report stale state and do not
-     remove files automatically
+   * if discovery state exists but `ping` fails, try to acquire `daemon.lock`
+     before deciding whether stale discovery state can be replaced
 3. Spawn the same binary in foreground daemon mode, for example
    `cbcl-router-client daemon run --internal`.
 4. Detach the child process from the terminal as far as the platform reasonably
@@ -110,6 +117,11 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
 5. Poll `daemon.json` and authenticated `ping` until the daemon is reachable or
    startup times out.
 6. Exit successfully only after the daemon is ready.
+
+If stale `daemon.json` exists but `daemon start` can acquire `daemon.lock`, it
+may replace `daemon.json` as part of starting the new daemon. The file lock is
+the singleton authority; stale discovery JSON alone must not block startup when
+no live daemon owns the lock.
 
 `daemon run` should:
 
@@ -163,7 +175,7 @@ fail with:
 
 ```text
 error: daemon state exists but no daemon responded at 127.0.0.1:49152
-hint: run `cbcl-router-client daemon status`; if stale, stop the old process and remove daemon.json
+hint: run `cbcl-router-client daemon status`; if stale, `cbcl-router-client daemon start` can replace it when the lock is free
 ```
 
 If the daemon responds but authentication fails, the command should fail closed
@@ -181,14 +193,17 @@ cbcl-router-client daemon status
 cbcl-router-client daemon stop
 ```
 
-The MVP does not provide automatic stale-state replacement. If stale state
-blocks startup, users may stop the old process and remove `daemon.json`
-manually. A future replacement flow may be added only after its safety semantics
-are specified.
+`daemon start` may replace stale `daemon.json` only after it acquires
+`daemon.lock`. If the lock is still held, startup must fail because another
+daemon process or lock owner may still be alive.
 
 `daemon stop` uses the same authenticated discovery flow as other local
-commands. It can stop a responsive daemon, but it does not clean up stale state
-when no daemon responds.
+commands. For a responsive daemon, `daemon stop` closes active agent WebSocket
+connections, removes `daemon.json`, releases `daemon.lock` by exiting, and then
+terminates. If no daemon responds but `daemon stop` can acquire `daemon.lock`,
+it may remove stale `daemon.json` and then exit successfully. If the lock is
+held and no daemon responds, `daemon stop` should fail with a stale-state
+diagnostic rather than removing files blindly.
 
 ## Local Protocol
 
@@ -197,12 +212,13 @@ The daemon's local protocol should include at least:
 * `ping` - proves liveness and token validity.
 * `init` - creates an ephemeral agent instance and returns an agent handle.
 * `recv` - blocks until the selected agent handle has an inbound message.
-* `send` - sends a validated CBCL frame over the selected agent handle's WSS
+* `send` - sends a validated CBCL frame over the selected agent handle's WebSocket
   connection.
 * `status` - returns daemon state, active handles, connection states, and queue
   lengths.
-* `close` - closes the WSS connection and removes state for an agent handle.
-* `stop` - closes all WSS connections, removes `daemon.json`, and exits.
+* `close` - closes the WebSocket connection and removes state for an agent
+  handle.
+* `stop` - closes all WebSocket connections, removes `daemon.json`, and exits.
 
 The wire format can be JSON over HTTP on loopback TCP for the first
 implementation. The daemon token should be sent in an authorization header or
@@ -278,7 +294,7 @@ cbcl-router-client init --json --capability code:edit
 The handle is a local daemon routing key. The daemon maps it to:
 
 ```text
-handle -> router agent-id -> WSS connection -> inbound queue
+handle -> router agent-id -> WebSocket connection -> inbound queue
 ```
 
 The router-visible `agent-id` may be derived from the handle, for example:

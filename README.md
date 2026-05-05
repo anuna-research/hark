@@ -1,4 +1,4 @@
-# cbcl-lfe-router-client
+# cbcl-router-client
 
 This project defines a focused Rust CLI for agents that communicate through
 `cbcl-lfe-router`.
@@ -113,31 +113,18 @@ task="$(cbcl-router-client recv)"
 
 ### `reply`, `error`, and `progress`
 
-Validate a CBCL message with `cbcl-rs`, then send it over the WebSocket
-connection associated with the current `CBCL_AGENT_HANDLE`.
+Validate CBCL with `cbcl-rs`, then send it over the WebSocket connection
+associated with the current `CBCL_AGENT_HANDLE`.
 
-`reply` must send a CBCL `reply` message, `error` must send a CBCL `error`
-message, and `progress` must send a CBCL `tell` message with content
-`"progress"`. Messages must include the `:thread` value from the dispatched ask
-so the router can append them to the same receipt.
+`reply` must send a CBCL `reply` message and `error` must send a CBCL `error`
+message. `progress` is a convenience command that builds and sends a CBCL
+`tell @router "progress"` message from command-line flags. All sent messages
+must include the `:thread` value from the dispatched ask so the router can
+append them to the same receipt.
 
 Progress is non-terminal: it records an intermediate receipt entry but does not
 complete the dispatched ask. Agents should still send a later `reply` or
 `error` for the same `:thread`.
-
-### Future: `submit`
-
-Submit a new CBCL ask to the router's HTTP ingress endpoint. This is the
-producer path, distinct from agent replies over WebSocket.
-
-If implemented later, `submit` should validate the CBCL message with `cbcl-rs`,
-post it to `/ingress/v1/messages`, and print the router response containing the
-receipt id and dispatch status.
-
-### Future: `receipt`
-
-Fetch a receipt from the router and print the newline-delimited CBCL message
-sequence.
 
 ### `close`
 
@@ -147,7 +134,8 @@ Close the WebSocket connection and remove daemon state for the current
 ## Configuration
 
 Configuration uses the Rust `config` and `dirs` crates for cross-platform
-defaults.
+defaults. The daemon loads configuration at startup. Users should restart the
+daemon after changing config files or relevant environment variables.
 
 Expected config values include:
 
@@ -157,7 +145,7 @@ Expected config values include:
 * default capabilities and dialects
 
 Capabilities can be supplied from config or directly to `init`. Direct command
-line values should override configured defaults.
+line values should override configured defaults for that `init` request.
 
 ## Validation
 
