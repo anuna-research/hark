@@ -238,22 +238,22 @@ Potential spec follow-ups to settle during implementation:
 
 ### 11. End-to-End MVP Verification
 
-- [ ] Add an end-to-end test harness with an isolated runtime directory,
+- [x] Add an end-to-end test harness with an isolated runtime directory,
   isolated config, a real daemon process, and a mock WebSocket router.
-- [ ] Cover the main happy path:
+- [x] Cover the main happy path:
   `daemon start`, `init`, mock router dispatch, `recv`, `progress`, `reply`,
   `close`, and `daemon stop`.
-- [ ] Cover daemon startup without router config.
-- [ ] Cover `init` failure when router config is missing, malformed, or rejected.
-- [ ] Cover unhealthy-handle behavior after router close, router diagnostic
+- [x] Cover daemon startup without router config.
+- [x] Cover `init` failure when router config is missing, malformed, or rejected.
+- [x] Cover unhealthy-handle behavior after router close, router diagnostic
   error frame, queue overflow, and local send failure.
-- [ ] Verify no status or error output leaks router auth token or local daemon
+- [x] Verify no status or error output leaks router auth token or local daemon
   token.
-- [ ] Verify `daemon stop` removes `daemon.json` and makes authenticated `ping`
+- [x] Verify `daemon stop` removes `daemon.json` and makes authenticated `ping`
   stop succeeding.
-- [ ] Run full `cargo fmt`, `cargo clippy --all-targets --all-features`, and
+- [x] Run full `cargo fmt`, `cargo clippy --all-targets --all-features`, and
   `cargo test`.
-- [ ] Commit with a focused message such as `add end-to-end mvp coverage`.
+- [x] Commit with a focused message such as `add end-to-end mvp coverage`.
 
 ### 12. Documentation and Release Readiness
 
