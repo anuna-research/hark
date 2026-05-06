@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`cbcl-router-client` is a shell-friendly CLI for local agents. Commands should
+`hark` is a shell-friendly CLI for local agents. Commands should
 compose with ordinary Unix-style tools and agent harnesses:
 
 * machine-readable data goes to stdout
@@ -112,9 +112,9 @@ rejected, `init` fails and no handle is printed.
 Example:
 
 ```bash
-cbcl-router-client daemon start
+hark daemon start
 
-eval "$(cbcl-router-client init \
+eval "$(hark init \
   --capability code:edit \
   --capability code:test)"
 ```
@@ -130,7 +130,7 @@ callers may pass the output directly to `eval`.
 
 `init` requires the daemon to already be running. It must not auto-start the
 daemon. If discovery fails because `daemon.json` is missing, `init` should fail
-with a hint to run `cbcl-router-client daemon start`.
+with a hint to run `hark daemon start`.
 
 With `--json`, stdout:
 
@@ -217,9 +217,9 @@ path.
 Examples:
 
 ```bash
-cbcl-router-client reply < reply.cbcl
-cbcl-router-client error '(lang elf (error @router "failed" :thread "rcp-..."))'
-cbcl-router-client progress --thread rcp-... --text "running tests"
+hark reply < reply.cbcl
+hark error '(lang elf (error @router "failed" :thread "rcp-..."))'
+hark progress --thread rcp-... --text "running tests"
 ```
 
 Command-specific message rules:

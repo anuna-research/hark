@@ -1,4 +1,4 @@
-pub const COMMAND_NAME: &str = "cbcl-router-client";
+pub const COMMAND_NAME: &str = "hark";
 pub const LOCAL_API_VERSION: u16 = 1;
 
 pub const DEFAULT_AGENT_ID_PREFIX: &str = "local-agent";

@@ -131,7 +131,7 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
     validate_init_advertisement(&args.capabilities, &args.dialects)?;
     let client = discover_live_client().await.map_err(|error| {
         if matches!(error, AppError::DaemonNotRunning) {
-            eprintln!("daemon_not_running: run `cbcl-router-client daemon start` first");
+            eprintln!("daemon_not_running: run `hark daemon start` first");
         }
         error
     })?;
@@ -683,17 +683,17 @@ mod tests {
 
     #[test]
     fn parses_daemon_subcommands() {
-        let cli = Cli::parse_from(["cbcl-router-client", "daemon", "run"]);
+        let cli = Cli::parse_from(["hark", "daemon", "run"]);
         assert!(matches!(cli.command, Command::Daemon(DaemonCommand::Run)));
 
-        let cli = Cli::parse_from(["cbcl-router-client", "daemon", "start"]);
+        let cli = Cli::parse_from(["hark", "daemon", "start"]);
         assert!(matches!(cli.command, Command::Daemon(DaemonCommand::Start)));
     }
 
     #[test]
     fn parses_init_arguments() {
         let cli = Cli::parse_from([
-            "cbcl-router-client",
+            "hark",
             "init",
             "--capability",
             "code:edit",
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn rejects_init_without_capability() {
-        let error = Cli::try_parse_from(["cbcl-router-client", "init"]).unwrap_err();
+        let error = Cli::try_parse_from(["hark", "init"]).unwrap_err();
         assert_eq!(
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
@@ -724,17 +724,17 @@ mod tests {
 
     #[test]
     fn parses_agent_workflow_commands() {
-        let cli = Cli::parse_from(["cbcl-router-client", "recv", "--timeout", "30s"]);
+        let cli = Cli::parse_from(["hark", "recv", "--timeout", "30s"]);
         let Command::Recv(args) = cli.command else {
             panic!("expected recv command");
         };
         assert_eq!(args.timeout.as_deref(), Some("30s"));
 
-        let cli = Cli::parse_from(["cbcl-router-client", "reply", "(reply @router \"ok\")"]);
+        let cli = Cli::parse_from(["hark", "reply", "(reply @router \"ok\")"]);
         assert!(matches!(cli.command, Command::Reply(_)));
 
         let cli = Cli::parse_from([
-            "cbcl-router-client",
+            "hark",
             "progress",
             "--thread",
             "rcp-123",
@@ -748,7 +748,7 @@ mod tests {
         assert_eq!(args.text.as_deref(), Some("running tests"));
         assert_eq!(args.dialect, "elf");
 
-        let cli = Cli::parse_from(["cbcl-router-client", "close"]);
+        let cli = Cli::parse_from(["hark", "close"]);
         assert!(matches!(cli.command, Command::Close));
     }
 

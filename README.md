@@ -1,6 +1,6 @@
-# cbcl-router-client
+# hark
 
-`cbcl-router-client` is a Rust CLI and local per-user daemon for agents that
+`hark` is a Rust CLI and local per-user daemon for agents that
 communicate through `cbcl-lfe-router`.
 
 The daemon owns router WebSocket connections and local inbound queues. Short
@@ -32,7 +32,7 @@ cargo run -- daemon status
 After installing or copying the binary onto `PATH`, use:
 
 ```bash
-cbcl-router-client --help
+hark --help
 ```
 
 ## Configuration
@@ -46,9 +46,9 @@ Configuration is loaded in this order:
 Recommended config file locations:
 
 ```text
-Linux:   ~/.config/cbcl-router-client/config.toml
-macOS:   ~/Library/Application Support/cbcl-router-client/config.toml
-Windows: %APPDATA%\cbcl-router-client\config.toml
+Linux:   ~/.config/hark/config.toml
+macOS:   ~/Library/Application Support/hark/config.toml
+Windows: %APPDATA%\hark\config.toml
 ```
 
 Example config:
@@ -91,13 +91,13 @@ Restart the daemon after changing config files or environment variables.
 Start the local daemon:
 
 ```bash
-cbcl-router-client daemon start
+hark daemon start
 ```
 
 Create an agent connection and export its local handle:
 
 ```bash
-eval "$(cbcl-router-client init \
+eval "$(hark init \
   --capability code:edit \
   --capability code:test \
   --dialect elf)"
@@ -112,14 +112,14 @@ export CBCL_AGENT_HANDLE='0123456789ABCDEFGHJKMNPQRS'
 For non-shell harnesses:
 
 ```bash
-cbcl-router-client init --capability code:edit --json
+hark init --capability code:edit --json
 ```
 
 Receive dispatched work:
 
 ```bash
-task="$(cbcl-router-client recv)"
-task="$(cbcl-router-client recv --timeout 30s)"
+task="$(hark recv)"
+task="$(hark recv --timeout 30s)"
 ```
 
 Timeout units are `ms`, `s`, `m`, and `h`; the maximum finite timeout is
@@ -128,28 +128,28 @@ Timeout units are `ms`, `s`, `m`, and `h`; the maximum finite timeout is
 Send progress and a terminal reply:
 
 ```bash
-cbcl-router-client progress --thread rcp-123 --text "running tests"
-cbcl-router-client reply '(lang elf (reply "done" :thread "rcp-123"))'
+hark progress --thread rcp-123 --text "running tests"
+hark reply '(lang elf (reply "done" :thread "rcp-123"))'
 ```
 
 Send an error:
 
 ```bash
-cbcl-router-client error '(lang elf (error "failed" :thread "rcp-123"))'
+hark error '(lang elf (error "failed" :thread "rcp-123"))'
 ```
 
 `reply` and `error` accept one positional CBCL message or read the complete
 message from stdin:
 
 ```bash
-cbcl-router-client reply < reply.cbcl
+hark reply < reply.cbcl
 ```
 
 Close the current agent handle and stop the daemon:
 
 ```bash
-cbcl-router-client close
-cbcl-router-client daemon stop
+hark close
+hark daemon stop
 ```
 
 ## Commands
@@ -245,14 +245,14 @@ for the detailed contract.
 `daemon_not_running` or exit code `3`:
 
 ```bash
-cbcl-router-client daemon start
+hark daemon start
 ```
 
 Stale daemon state or exit code `5`:
 
 ```bash
-cbcl-router-client daemon stop
-cbcl-router-client daemon start
+hark daemon stop
+hark daemon start
 ```
 
 Router config errors during `init`:
@@ -260,8 +260,8 @@ Router config errors during `init`:
 ```bash
 export CBCL_ROUTER_WS='wss://cbcl-lfe.anuna.io/agent/v1'
 export CBCL_ROUTER_AUTH_TOKEN='shr_key-id.REPLACE_ME'
-cbcl-router-client daemon stop
-cbcl-router-client daemon start
+hark daemon stop
+hark daemon start
 ```
 
 `router_auth_rejected`:
@@ -272,17 +272,17 @@ belongs to the expected router environment.
 Missing capabilities:
 
 ```bash
-cbcl-router-client init --capability code:edit
+hark init --capability code:edit
 ```
 
 Unhealthy handles:
 
-Run `cbcl-router-client daemon status` to see active handles. Then create a
+Run `hark daemon status` to see active handles. Then create a
 fresh handle with `init`, or remove the unhealthy one:
 
 ```bash
-cbcl-router-client close
-eval "$(cbcl-router-client init --capability code:edit)"
+hark close
+eval "$(hark init --capability code:edit)"
 ```
 
 CBCL validation failures:

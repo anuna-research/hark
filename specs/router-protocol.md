@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This spec defines how `cbcl-router-client` maps local daemon and CLI actions to
+This spec defines how `hark` maps local daemon and CLI actions to
 `cbcl-lfe-router` HTTP and WebSocket behavior.
 
 The MVP is an agent interface. It focuses on persistent WebSocket agent
@@ -47,10 +47,10 @@ implementation.
 
 ## Agent Init
 
-`cbcl-router-client init` creates one daemon-managed agent instance.
+`hark init` creates one daemon-managed agent instance.
 
 This is the first router-facing step in the normal client lifecycle. Running
-`cbcl-router-client daemon start` before `init` only starts the local daemon; it
+`hark daemon start` before `init` only starts the local daemon; it
 does not contact `/agent/v1`.
 
 For each agent instance, the daemon:
@@ -150,9 +150,9 @@ The following CLI commands send over the selected handle's WebSocket
 connection:
 
 ```bash
-cbcl-router-client reply
-cbcl-router-client error
-cbcl-router-client progress
+hark reply
+hark error
+hark progress
 ```
 
 `reply` and `error` should:
@@ -248,7 +248,7 @@ avoid orphaning receipt entries.
 
 ## Disconnect and Close
 
-`cbcl-router-client close` closes the selected handle's WebSocket connection.
+`hark close` closes the selected handle's WebSocket connection.
 
 When the WebSocket closes, the router removes that connected agent from its
 active registry. The same handle should not be reused after close.

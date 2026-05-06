@@ -6,7 +6,7 @@ next chunk.
 
 Assumptions from the specs:
 
-* The project is a Rust CLI named `cbcl-router-client`.
+* The project is a Rust CLI named `hark`.
 * `daemon start` is local-only and must not require router configuration.
 * `init` is the first command that opens a router WebSocket.
 * CLI commands and the daemon both validate CBCL before sending agent-originated

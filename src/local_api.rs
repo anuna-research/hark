@@ -721,7 +721,7 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
             StatusCode::NOT_FOUND,
             "unknown_agent_handle",
             "agent handle is not active",
-            Some("run `cbcl-router-client daemon status` to list active handles".to_owned()),
+            Some("run `hark daemon status` to list active handles".to_owned()),
         ),
         AgentError::Unhealthy { reason, detail } => ApiError::new(
             StatusCode::CONFLICT,

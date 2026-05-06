@@ -25,7 +25,7 @@ impl ExitCode {
 pub enum AppError {
     #[error("{0}")]
     Usage(String),
-    #[error("cbcl-router-client daemon is not running")]
+    #[error("hark daemon is not running")]
     DaemonNotRunning,
     #[error("daemon is already running")]
     DaemonAlreadyRunning,

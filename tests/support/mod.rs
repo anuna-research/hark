@@ -105,7 +105,7 @@ impl TestEnv {
     pub fn runtime_dir(&self) -> PathBuf {
         #[cfg(target_os = "linux")]
         {
-            self.xdg_runtime_dir.join("cbcl-router-client")
+            self.xdg_runtime_dir.join("hark")
         }
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -113,7 +113,7 @@ impl TestEnv {
             self.home
                 .join("Library")
                 .join("Application Support")
-                .join("cbcl-router-client")
+                .join("hark")
                 .join("runtime")
         }
 
@@ -122,7 +122,7 @@ impl TestEnv {
             self.home
                 .join(".local")
                 .join("state")
-                .join("cbcl-router-client")
+                .join("hark")
                 .join("runtime")
         }
     }
@@ -145,7 +145,7 @@ impl Drop for TestEnv {
 }
 
 pub fn binary_path() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_cbcl-router-client"))
+    Path::new(env!("CARGO_BIN_EXE_hark"))
 }
 
 pub fn assert_success(output: &Output) {

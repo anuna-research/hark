@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`cbcl-router-client` runs one daemon per OS user. The daemon owns local agent
+`hark` runs one daemon per OS user. The daemon owns local agent
 instances, the router WebSocket connections created for those instances, and
 per-agent inbound queues.
 
@@ -26,12 +26,12 @@ runtime-dir/
 Recommended locations:
 
 ```text
-Linux:   $XDG_RUNTIME_DIR/cbcl-router-client/
-         fallback: ~/.local/state/cbcl-router-client/runtime/
+Linux:   $XDG_RUNTIME_DIR/hark/
+         fallback: ~/.local/state/hark/runtime/
 
-macOS:   ~/Library/Application Support/cbcl-router-client/runtime/
+macOS:   ~/Library/Application Support/hark/runtime/
 
-Windows: %LOCALAPPDATA%\cbcl-router-client\runtime\
+Windows: %LOCALAPPDATA%\hark\runtime\
 ```
 
 The implementation should use `directories` or `dirs` to select platform
@@ -118,8 +118,8 @@ local `init` request creates an agent instance.
 The CLI should expose two daemon execution modes:
 
 ```bash
-cbcl-router-client daemon start   # detached/background startup
-cbcl-router-client daemon run     # foreground daemon for debugging or service managers
+hark daemon start   # detached/background startup
+hark daemon run     # foreground daemon for debugging or service managers
 ```
 
 `daemon start` should:
@@ -131,7 +131,7 @@ cbcl-router-client daemon run     # foreground daemon for debugging or service m
    * if discovery state exists but `ping` fails, probe `daemon.lock` before
      deciding whether stale discovery state can be replaced
 3. Spawn the same binary in foreground daemon mode, for example
-   `cbcl-router-client daemon run`.
+   `hark daemon run`.
 4. Detach the child process from the terminal as far as the platform reasonably
    supports.
 5. Poll `daemon.json` and authenticated `ping` until the daemon is reachable or
@@ -214,8 +214,8 @@ All commands that need the daemon should:
 If `daemon.json` is missing, the command should fail with:
 
 ```text
-error: cbcl-router-client daemon is not running
-hint: run `cbcl-router-client daemon start`
+error: hark daemon is not running
+hint: run `hark daemon start`
 ```
 
 If `daemon.json` exists but no daemon responds at `addr`, the command should
@@ -223,7 +223,7 @@ fail with:
 
 ```text
 error: daemon state exists but no daemon responded at 127.0.0.1:49152
-hint: run `cbcl-router-client daemon status`; if stale, `cbcl-router-client daemon start` can replace it when the lock is free
+hint: run `hark daemon status`; if stale, `hark daemon start` can replace it when the lock is free
 ```
 
 If the daemon responds but authentication fails, the command should fail closed
@@ -248,8 +248,8 @@ to authenticated loopback requests.
 The client should provide:
 
 ```bash
-cbcl-router-client daemon status
-cbcl-router-client daemon stop
+hark daemon status
+hark daemon stop
 ```
 
 `daemon start` may remove stale `daemon.json` only during the short-lived lock
@@ -334,7 +334,7 @@ acceptable default for task dispatch.
 turns a local daemon process into a router-visible agent:
 
 ```bash
-eval "$(cbcl-router-client init \
+eval "$(hark init \
   --capability code:edit \
   --capability code:test)"
 ```
@@ -348,7 +348,7 @@ export CBCL_AGENT_HANDLE='01JX8F4V2QK8GZP9H6W5'
 JSON output:
 
 ```bash
-cbcl-router-client init --json --capability code:edit
+hark init --json --capability code:edit
 ```
 
 ```json
@@ -397,7 +397,7 @@ Errors should be descriptive and action-oriented:
 * missing daemon: tell the user to run `daemon start`
 * live daemon already running: include the daemon address
 * stale state: suggest `daemon status` and manual cleanup
-* missing `CBCL_AGENT_HANDLE`: suggest running `eval "$(cbcl-router-client init ...)"`
+* missing `CBCL_AGENT_HANDLE`: suggest running `eval "$(hark init ...)"`
 * unknown handle: suggest `daemon status` to list active handles
 * local auth failure: fail closed and avoid automatic cleanup
 

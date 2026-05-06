@@ -34,9 +34,9 @@ configuration overrides.
 Recommended config file locations:
 
 ```text
-Linux:   ~/.config/cbcl-router-client/config.toml
-macOS:   ~/Library/Application Support/cbcl-router-client/config.toml
-Windows: %APPDATA%\cbcl-router-client\config.toml
+Linux:   ~/.config/hark/config.toml
+macOS:   ~/Library/Application Support/hark/config.toml
+Windows: %APPDATA%\hark\config.toml
 ```
 
 Runtime daemon state is separate from configuration and is defined in
@@ -147,7 +147,7 @@ capabilities or default dialects in the MVP.
 An agent supplies capabilities and optional dialects through `init` flags:
 
 ```bash
-cbcl-router-client init --capability code:edit --capability code:test --dialect elf
+hark init --capability code:edit --capability code:test --dialect elf
 ```
 
 `init` must include at least one `--capability`. If no capability is supplied,

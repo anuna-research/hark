@@ -43,7 +43,7 @@ Errors should use a stable shape:
   "error": {
     "code": "unknown_agent_handle",
     "message": "agent handle is not active",
-    "hint": "run `cbcl-router-client daemon status` to list active handles"
+    "hint": "run `hark daemon status` to list active handles"
   }
 }
 ```

@@ -6,6 +6,10 @@ rust-version = "1.85"
 description = "Local CLI and daemon client for cbcl-lfe-router agent connections"
 license = "MIT OR Apache-2.0"
 
+[[bin]]
+name = "hark"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
