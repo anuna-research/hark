@@ -1,6 +1,7 @@
 use std::{
     fs,
-    io::{IsTerminal, Read},
+    io::{IsTerminal, Read, Write},
+    path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     time::{Duration, Instant},
 };
@@ -9,7 +10,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::net::TcpListener;
 
 use crate::cbcl_validation::{MessageKind, validate_for_send};
-use crate::config::{validate_capability_name, validate_dialect_id};
+use crate::config::{
+    SAMPLE_CONFIG, default_config_file, validate_capability_name, validate_dialect_id,
+};
 use crate::constants::{COMMAND_NAME, DEFAULT_PROGRESS_DIALECT, MAX_RECV_TIMEOUT_MS};
 use crate::daemon::{
     AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord, RuntimePaths, acquire_daemon_lock,
@@ -31,6 +34,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(about = "Show or create the user configuration file")]
+    #[command(subcommand)]
+    Config(ConfigCommand),
     #[command(about = "Manage the per-user local daemon")]
     #[command(subcommand)]
     Daemon(DaemonCommand),
@@ -46,6 +52,16 @@ pub enum Command {
     Progress(ProgressArgs),
     #[command(about = "Close the current agent handle")]
     Close,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    #[command(about = "Print the platform config file path")]
+    Path,
+    #[command(about = "Print an example config.toml")]
+    ShowExample,
+    #[command(about = "Create an example config.toml if none exists")]
+    Init,
 }
 
 #[derive(Debug, Subcommand)]
@@ -112,6 +128,11 @@ pub enum SendKind {
 
 pub async fn run(cli: Cli) -> AppResult<()> {
     match cli.command {
+        Command::Config(command) => match command {
+            ConfigCommand::Path => config_path(),
+            ConfigCommand::ShowExample => config_show_example(),
+            ConfigCommand::Init => config_init(),
+        },
         Command::Daemon(command) => match command {
             DaemonCommand::Start => daemon_start().await,
             DaemonCommand::Run => daemon_run().await,
@@ -125,6 +146,66 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Progress(args) => progress_command(args).await,
         Command::Close => close_command().await,
     }
+}
+
+fn config_path() -> AppResult<()> {
+    let path = resolve_config_file()?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn config_show_example() -> AppResult<()> {
+    print!("{SAMPLE_CONFIG}");
+    Ok(())
+}
+
+fn config_init() -> AppResult<()> {
+    let path = resolve_config_file()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to create config directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    write_new_config_file(&path, SAMPLE_CONFIG)?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn resolve_config_file() -> AppResult<PathBuf> {
+    default_config_file()
+        .ok_or_else(|| AppError::Internal("failed to resolve config file path".to_owned()))
+}
+
+fn write_new_config_file(path: &Path, contents: &str) -> AppResult<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            AppError::Usage(format!(
+                "config file already exists: {}; refusing to overwrite",
+                path.display()
+            ))
+        } else {
+            AppError::Internal(format!(
+                "failed to create config file {}: {error}",
+                path.display()
+            ))
+        }
+    })?;
+    file.write_all(contents.as_bytes()).map_err(|error| {
+        AppError::Internal(format!(
+            "failed to write config file {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 async fn init_command(args: InitArgs) -> AppResult<()> {
@@ -280,6 +361,9 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
         LocalApiRequestError::AuthFailure => AppError::LocalAuth,
         LocalApiRequestError::Api(error, status) => {
             eprintln!("{}: {}", error.error.code, error.error.message);
+            if let Some(hint) = &error.error.hint {
+                eprintln!("hint: {hint}");
+            }
             match error.error.code.as_str() {
                 "malformed_agent_handle" => AppError::Usage(error.error.message),
                 "unknown_agent_handle" | "agent_handle_unhealthy" | "recv_already_waiting" => {
@@ -672,7 +756,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        Cli, Command, DaemonCommand, build_progress_message, escape_cbcl_string,
+        Cli, Command, ConfigCommand, DaemonCommand, build_progress_message, escape_cbcl_string,
         parse_recv_timeout_ms, validate_init_advertisement,
     };
 
@@ -688,6 +772,21 @@ mod tests {
 
         let cli = Cli::parse_from(["hark", "daemon", "start"]);
         assert!(matches!(cli.command, Command::Daemon(DaemonCommand::Start)));
+    }
+
+    #[test]
+    fn parses_config_subcommands() {
+        let cli = Cli::parse_from(["hark", "config", "path"]);
+        assert!(matches!(cli.command, Command::Config(ConfigCommand::Path)));
+
+        let cli = Cli::parse_from(["hark", "config", "show-example"]);
+        assert!(matches!(
+            cli.command,
+            Command::Config(ConfigCommand::ShowExample)
+        ));
+
+        let cli = Cli::parse_from(["hark", "config", "init"]);
+        assert!(matches!(cli.command, Command::Config(ConfigCommand::Init)));
     }
 
     #[test]

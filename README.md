@@ -51,12 +51,31 @@ macOS:   ~/Library/Application Support/hark/config.toml
 Windows: %APPDATA%\hark\config.toml
 ```
 
+Discover the exact path for the current machine:
+
+```bash
+hark config path
+```
+
+Print a sample config:
+
+```bash
+hark config show-example
+```
+
+Create the config file if it does not already exist:
+
+```bash
+hark config init
+$EDITOR "$(hark config path)"
+```
+
 Example config:
 
 ```toml
 [router]
 ws_url = "wss://cbcl-lfe.anuna.io/agent/v1"
-auth_token = "shr_key-id.REPLACE_ME"
+auth_token = "shr_prod-agent.REPLACE_ME"
 
 [agent]
 agent_id_prefix = "local-agent"
@@ -153,6 +172,19 @@ hark daemon stop
 ```
 
 ## Commands
+
+### `config path`
+
+Prints the platform-specific config file path.
+
+### `config show-example`
+
+Prints an example `config.toml` to stdout.
+
+### `config init`
+
+Creates the config file with an example config if it does not already exist.
+It refuses to overwrite an existing config file.
 
 ### `daemon start`
 
@@ -258,8 +290,15 @@ hark daemon start
 Router config errors during `init`:
 
 ```bash
+hark config init
+$EDITOR "$(hark config path)"
+```
+
+Or set environment overrides:
+
+```bash
 export CBCL_ROUTER_WS='wss://cbcl-lfe.anuna.io/agent/v1'
-export CBCL_ROUTER_AUTH_TOKEN='shr_key-id.REPLACE_ME'
+export CBCL_ROUTER_AUTH_TOKEN='shr_prod-agent.REPLACE_ME'
 hark daemon stop
 hark daemon start
 ```

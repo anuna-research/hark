@@ -39,6 +39,19 @@ macOS:   ~/Library/Application Support/hark/config.toml
 Windows: %APPDATA%\hark\config.toml
 ```
 
+The CLI exposes configuration discovery commands:
+
+```bash
+hark config path          # print the platform config file path
+hark config show-example  # print the sample config to stdout
+hark config init          # create the sample config if missing
+```
+
+`config init` MUST create parent directories, MUST refuse to overwrite an
+existing config file, and SHOULD create the file with owner-only permissions
+where the platform exposes that control. The generated auth token is a
+placeholder and must be edited or overridden before router connections work.
+
 Runtime daemon state is separate from configuration and is defined in
 [`daemon.md`](daemon.md).
 
@@ -272,7 +285,7 @@ opening a WebSocket:
 
 ```text
 error: router auth token is not configured
-hint: set `CBCL_ROUTER_AUTH_TOKEN` or configure `router.auth_token`
+hint: run `hark config init` or set CBCL_ROUTER_AUTH_TOKEN
 ```
 
 Missing router URL should likewise fail before agent init opens a WebSocket.
@@ -281,7 +294,7 @@ WebSocket connections until a URL is available:
 
 ```text
 error: router WebSocket URL is not configured
-hint: set `CBCL_ROUTER_WS` or configure `router.ws_url`
+hint: run `hark config init` or set CBCL_ROUTER_WS
 ```
 
 Malformed router URLs should fail the same `init` path before the daemon opens a
@@ -289,7 +302,7 @@ WebSocket:
 
 ```text
 error: router WebSocket URL is invalid
-hint: set `CBCL_ROUTER_WS` or configure `router.ws_url` to a ws:// or wss:// URL
+hint: run `hark config path` to find config.toml
 ```
 
 Authentication failure from the router should be surfaced distinctly from

@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use cbcl_router_client::config::{AppConfig, SAMPLE_CONFIG};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{net::TcpListener, task::JoinHandle, time::Duration};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -134,6 +135,72 @@ fn cli_rejects_missing_handle_and_duplicate_init_values() {
         Some(2),
         "{}",
         output_debug(&duplicate_dialect)
+    );
+}
+
+#[test]
+fn cli_config_commands_show_path_example_and_initialize_file() {
+    let env = TestEnv::new();
+
+    let path = env.command(["config", "path"]).output().expect("path runs");
+    assert_success(&path);
+    assert_eq!(
+        String::from_utf8_lossy(&path.stdout),
+        format!("{}\n", env.config_file().display())
+    );
+    assert!(path.stderr.is_empty(), "{}", output_debug(&path));
+
+    let example = env
+        .command(["config", "show-example"])
+        .output()
+        .expect("show-example runs");
+    assert_success(&example);
+    assert_eq!(String::from_utf8_lossy(&example.stdout), SAMPLE_CONFIG);
+    assert!(example.stderr.is_empty(), "{}", output_debug(&example));
+
+    let init = env.command(["config", "init"]).output().expect("init runs");
+    assert_success(&init);
+    assert_eq!(
+        String::from_utf8_lossy(&init.stdout),
+        format!("{}\n", env.config_file().display())
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.config_file()).expect("config should be written"),
+        SAMPLE_CONFIG
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(env.config_file())
+            .expect("config metadata should load")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    let loaded = AppConfig::load_from(Some(env.config_file())).expect("sample config should parse");
+    assert_eq!(
+        loaded.router.ws_url.as_deref(),
+        Some("wss://cbcl-lfe.anuna.io/agent/v1")
+    );
+    assert_eq!(
+        loaded.router.auth_token.as_deref(),
+        Some("shr_prod-agent.REPLACE_ME")
+    );
+
+    let second_init = env
+        .command(["config", "init"])
+        .output()
+        .expect("second init runs");
+    assert_eq!(second_init.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&second_init.stderr).contains("refusing to overwrite"),
+        "{}",
+        output_debug(&second_init)
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.config_file()).expect("config should remain"),
+        SAMPLE_CONFIG
     );
 }
 

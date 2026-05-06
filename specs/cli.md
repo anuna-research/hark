@@ -35,6 +35,21 @@ inheritance.
 
 ## Commands
 
+### `config path`
+
+Prints the platform-specific config file path to stdout and exits `0`.
+
+### `config show-example`
+
+Prints an example `config.toml` to stdout and exits `0`. It must not read or
+print any real configured secrets.
+
+### `config init`
+
+Creates the platform config file with the example config and exits `0`. It must
+create parent directories as needed and fail with usage exit code `2` rather
+than overwrite an existing file.
+
 ### `daemon start`
 
 Starts the per-user daemon in the background and exits once the daemon responds

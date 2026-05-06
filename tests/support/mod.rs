@@ -127,6 +127,27 @@ impl TestEnv {
         }
     }
 
+    pub fn config_file(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            self.home.join(".config").join("hark").join("config.toml")
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.home
+                .join("Library")
+                .join("Application Support")
+                .join("hark")
+                .join("config.toml")
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            self.home.join(".config").join("hark").join("config.toml")
+        }
+    }
+
     pub fn discovery_file(&self) -> PathBuf {
         self.runtime_dir().join("daemon.json")
     }

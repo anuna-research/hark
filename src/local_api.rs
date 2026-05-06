@@ -22,7 +22,7 @@ use tokio::{net::TcpListener, sync::oneshot};
 use crate::cbcl_validation::{CbclValidationError, MessageKind, validate_for_send};
 use crate::{
     config::{AppConfig, ConfigError},
-    constants::{LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
+    constants::{COMMAND_NAME, LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
     daemon::{
         AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord,
         authenticated_headers,
@@ -780,19 +780,25 @@ fn config_error_to_api(error: ConfigError) -> ApiError {
             StatusCode::BAD_REQUEST,
             "missing_router_ws_url",
             "router WebSocket URL is not configured",
-            None,
+            Some(format!(
+                "run `{COMMAND_NAME} config init` or set CBCL_ROUTER_WS"
+            )),
         ),
         ConfigError::InvalidRouterWsUrl(message) => ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_router_ws_url",
             message,
-            None,
+            Some(format!(
+                "run `{COMMAND_NAME} config path` to find config.toml"
+            )),
         ),
         ConfigError::MissingRouterAuthToken => ApiError::new(
             StatusCode::BAD_REQUEST,
             "missing_router_auth_token",
             "router authentication token is not configured",
-            None,
+            Some(format!(
+                "run `{COMMAND_NAME} config init` or set CBCL_ROUTER_AUTH_TOKEN"
+            )),
         ),
         error => ApiError::new(
             StatusCode::BAD_REQUEST,

@@ -10,6 +10,20 @@ use crate::constants::{
     DEFAULT_MAX_MESSAGES_PER_HANDLE, DEFAULT_OVERFLOW_POLICY,
 };
 
+pub const SAMPLE_CONFIG: &str = r#"[router]
+ws_url = "wss://cbcl-lfe.anuna.io/agent/v1"
+auth_token = "shr_prod-agent.REPLACE_ME"
+
+[agent]
+agent_id_prefix = "local-agent"
+
+[daemon]
+bind = "127.0.0.1:0"
+max_messages_per_handle = 1000
+max_bytes_per_handle = 67108864
+overflow_policy = "reject_new_and_close"
+"#;
+
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
