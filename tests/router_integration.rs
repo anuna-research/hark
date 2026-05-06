@@ -18,6 +18,7 @@ use tokio_tungstenite::{
         Message,
         handshake::server::{ErrorResponse as WsErrorResponse, Request, Response},
         http::StatusCode as WsStatusCode,
+        protocol::{CloseFrame, frame::coding::CloseCode},
     },
 };
 
@@ -150,6 +151,13 @@ async fn router_integration_marks_handle_unhealthy_on_router_close() {
         .expect("agent should exist");
     assert_eq!(agent.state, "unhealthy");
     assert_eq!(agent.unhealthy_reason.as_deref(), Some("router_closed"));
+    assert!(
+        agent
+            .unhealthy_detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("code=Normal")
+    );
 
     local.stop().await;
 }
@@ -260,6 +268,55 @@ async fn router_integration_send_rejects_validation_errors_without_forwarding() 
 }
 
 #[tokio::test]
+async fn router_integration_sends_heartbeat_on_idle_connection() {
+    let router = MockRouter::start(RouterBehavior::CaptureHeartbeat).await;
+    let local = LocalApi::start(router.ws_url()).await;
+    let _created = local
+        .create_agent(&["code:edit"], &[])
+        .await
+        .expect("agent should be created");
+
+    router.wait_for_hello(Duration::from_secs(1)).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    router.wait().await;
+    assert_eq!(
+        router.sent_frame(),
+        Some(r#"(lang cbcl-router (tell @router "heartbeat"))"#.to_owned())
+    );
+    local.stop().await;
+}
+
+#[tokio::test]
+async fn router_integration_sends_heartbeat_for_each_active_connection() {
+    let router = MockRouter::start_accepting(RouterBehavior::CaptureHeartbeat, 2).await;
+    let local = LocalApi::start(router.ws_url()).await;
+    let _first = local
+        .create_agent(&["code:edit"], &[])
+        .await
+        .expect("first agent should be created");
+    let _second = local
+        .create_agent(&["code:test"], &[])
+        .await
+        .expect("second agent should be created");
+
+    router.wait_for_hellos(2, Duration::from_secs(1)).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    router.wait().await;
+    assert_eq!(
+        router.sent_frames(),
+        vec![
+            r#"(lang cbcl-router (tell @router "heartbeat"))"#.to_owned(),
+            r#"(lang cbcl-router (tell @router "heartbeat"))"#.to_owned(),
+        ]
+    );
+    local.stop().await;
+}
+
+#[tokio::test]
 async fn router_integration_send_rejects_unknown_handle() {
     let router = MockRouter::start(RouterBehavior::CaptureSend).await;
     let local = LocalApi::start(router.ws_url()).await;
@@ -283,6 +340,7 @@ async fn router_integration_send_rejects_unknown_handle() {
 enum RouterBehavior {
     SendDispatch,
     CaptureSend,
+    CaptureHeartbeat,
     RejectAuth,
     CloseAfterHello,
     SendError,
@@ -297,13 +355,17 @@ struct MockRouter {
 
 #[derive(Default)]
 struct MockRouterState {
-    auth_header: Option<String>,
-    hello_frame: Option<String>,
-    sent_frame: Option<String>,
+    auth_headers: Vec<String>,
+    hello_frames: Vec<String>,
+    sent_frames: Vec<String>,
 }
 
 impl MockRouter {
     async fn start(behavior: RouterBehavior) -> Self {
+        Self::start_accepting(behavior, 1).await
+    }
+
+    async fn start_accepting(behavior: RouterBehavior, connection_count: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("router should bind");
@@ -311,70 +373,18 @@ impl MockRouter {
         let shared = Arc::new(Mutex::new(MockRouterState::default()));
         let task_shared = Arc::clone(&shared);
         let task = tokio::spawn(async move {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                return;
-            };
-            let callback_shared = Arc::clone(&task_shared);
-            let callback = move |request: &Request, response: Response| {
-                callback_shared
-                    .lock()
-                    .expect("mock state should lock")
-                    .auth_header = request
-                    .headers()
-                    .get("authorization")
-                    .and_then(|value| value.to_str().ok())
-                    .map(ToOwned::to_owned);
-                if matches!(behavior, RouterBehavior::RejectAuth) {
-                    let mut response = WsErrorResponse::new(Some("unauthorized".to_owned()));
-                    *response.status_mut() = WsStatusCode::UNAUTHORIZED;
-                    return Err(response);
-                }
-                Ok(response)
-            };
-            let Ok(mut websocket) = accept_hdr_async(stream, callback).await else {
-                return;
-            };
-            if let Some(Ok(message)) = websocket.next().await {
-                let hello = message_to_string(message);
-                task_shared
-                    .lock()
-                    .expect("mock state should lock")
-                    .hello_frame = Some(hello);
+            let mut handlers = Vec::new();
+            for _ in 0..connection_count {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                let connection_shared = Arc::clone(&task_shared);
+                handlers.push(tokio::spawn(async move {
+                    handle_mock_connection(stream, connection_shared, behavior).await;
+                }));
             }
-
-            match behavior {
-                RouterBehavior::SendDispatch => {
-                    let _ = websocket
-                        .send(Message::Binary(
-                            b"(lang elf (ask @router \"work\" :thread \"rcp-1\"))"
-                                .to_vec()
-                                .into(),
-                        ))
-                        .await;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                RouterBehavior::CaptureSend => {
-                    if let Some(Ok(message)) = websocket.next().await {
-                        task_shared
-                            .lock()
-                            .expect("mock state should lock")
-                            .sent_frame = Some(message_to_string(message));
-                    }
-                }
-                RouterBehavior::CloseAfterHello => {
-                    let _ = websocket.close(None).await;
-                }
-                RouterBehavior::SendError => {
-                    let _ = websocket
-                        .send(Message::Binary(
-                            b"(lang cbcl-router (error @router \"bad hello\"))"
-                                .to_vec()
-                                .into(),
-                        ))
-                        .await;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                RouterBehavior::RejectAuth => {}
+            for handler in handlers {
+                let _ = handler.await;
             }
         });
 
@@ -393,24 +403,38 @@ impl MockRouter {
         self.shared
             .lock()
             .expect("mock state should lock")
-            .auth_header
-            .clone()
+            .auth_headers
+            .first()
+            .cloned()
     }
 
     fn hello_frame(&self) -> Option<String> {
         self.shared
             .lock()
             .expect("mock state should lock")
-            .hello_frame
-            .clone()
+            .hello_frames
+            .first()
+            .cloned()
     }
 
     fn sent_frame(&self) -> Option<String> {
         self.shared
             .lock()
             .expect("mock state should lock")
-            .sent_frame
-            .clone()
+            .sent_frames
+            .first()
+            .cloned()
+    }
+
+    fn sent_frames(&self) -> Vec<String> {
+        let mut frames = self
+            .shared
+            .lock()
+            .expect("mock state should lock")
+            .sent_frames
+            .clone();
+        frames.sort();
+        frames
     }
 
     async fn wait_for_hello(&self, timeout: Duration) {
@@ -422,6 +446,24 @@ impl MockRouter {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("mock router did not receive hello");
+    }
+
+    async fn wait_for_hellos(&self, count: usize, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if self
+                .shared
+                .lock()
+                .expect("mock state should lock")
+                .hello_frames
+                .len()
+                >= count
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("mock router did not receive {count} hellos");
     }
 
     async fn wait(&self) {
@@ -449,6 +491,86 @@ impl MockRouter {
                 None
             }
         }
+    }
+}
+
+async fn handle_mock_connection(
+    stream: tokio::net::TcpStream,
+    shared: Arc<Mutex<MockRouterState>>,
+    behavior: RouterBehavior,
+) {
+    let callback_shared = Arc::clone(&shared);
+    let callback = move |request: &Request, response: Response| {
+        if let Some(auth_header) = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+        {
+            callback_shared
+                .lock()
+                .expect("mock state should lock")
+                .auth_headers
+                .push(auth_header);
+        }
+        if matches!(behavior, RouterBehavior::RejectAuth) {
+            let mut response = WsErrorResponse::new(Some("unauthorized".to_owned()));
+            *response.status_mut() = WsStatusCode::UNAUTHORIZED;
+            return Err(response);
+        }
+        Ok(response)
+    };
+    let Ok(mut websocket) = accept_hdr_async(stream, callback).await else {
+        return;
+    };
+    if let Some(Ok(message)) = websocket.next().await {
+        let hello = message_to_string(message);
+        shared
+            .lock()
+            .expect("mock state should lock")
+            .hello_frames
+            .push(hello);
+    }
+
+    match behavior {
+        RouterBehavior::SendDispatch => {
+            let _ = websocket
+                .send(Message::Binary(
+                    b"(lang elf (ask @router \"work\" :thread \"rcp-1\"))"
+                        .to_vec()
+                        .into(),
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        RouterBehavior::CaptureSend | RouterBehavior::CaptureHeartbeat => {
+            if let Some(Ok(message)) = websocket.next().await {
+                shared
+                    .lock()
+                    .expect("mock state should lock")
+                    .sent_frames
+                    .push(message_to_string(message));
+            }
+        }
+        RouterBehavior::CloseAfterHello => {
+            let _ = websocket
+                .close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "idle timeout".into(),
+                }))
+                .await;
+        }
+        RouterBehavior::SendError => {
+            let _ = websocket
+                .send(Message::Binary(
+                    b"(lang cbcl-router (error @router \"bad hello\"))"
+                        .to_vec()
+                        .into(),
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        RouterBehavior::RejectAuth => {}
     }
 }
 

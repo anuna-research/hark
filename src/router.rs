@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{
@@ -15,6 +16,8 @@ use crate::{
 use cbcl_core::message::{CorePerformative, Message, Performative};
 
 pub const AGENT_WS_PATH: &str = "/agent/v1";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_FRAME: &str = r#"(lang cbcl-router (tell @router "heartbeat"))"#;
 
 type RouterWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -126,11 +129,21 @@ fn spawn_receive_loop(
     mut send_rx: mpsc::Receiver<crate::daemon::OutboundFrame>,
 ) {
     tokio::spawn(async move {
+        let mut heartbeat =
+            tokio::time::interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = &mut close_rx => {
                     let _ = websocket.close(None).await;
                     break;
+                }
+                _ = heartbeat.tick() => {
+                    if let Err(error) = websocket.send(WsMessage::Binary(HEARTBEAT_FRAME.as_bytes().to_vec().into())).await {
+                        let detail = sanitize_diagnostic(&format!("heartbeat send failed: {error}"));
+                        let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(detail)).await;
+                        break;
+                    }
                 }
                 outbound = send_rx.recv() => {
                     let Some(outbound) = outbound else {
@@ -171,8 +184,13 @@ fn spawn_receive_loop(
                                 break;
                             }
                         }
-                        Some(Ok(WsMessage::Close(_))) | None => {
-                            let _ = store.mark_unhealthy(&handle, "router_closed", None).await;
+                        Some(Ok(WsMessage::Close(close_frame))) => {
+                            let detail = close_frame_detail(close_frame);
+                            let _ = store.mark_unhealthy(&handle, "router_closed", Some(detail)).await;
+                            break;
+                        }
+                        None => {
+                            let _ = store.mark_unhealthy(&handle, "router_closed", Some("router WebSocket stream ended".to_owned())).await;
                             break;
                         }
                         Some(Ok(_)) => {}
@@ -185,6 +203,18 @@ fn spawn_receive_loop(
             }
         }
     });
+}
+
+fn close_frame_detail(
+    close_frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> String {
+    match close_frame {
+        Some(frame) => sanitize_diagnostic(&format!(
+            "router WebSocket closed: code={:?} reason=\"{}\"",
+            frame.code, frame.reason
+        )),
+        None => "router WebSocket closed without close frame".to_owned(),
+    }
 }
 
 fn map_connect_error(error: tokio_tungstenite::tungstenite::Error) -> RouterError {
