@@ -124,10 +124,31 @@ struct AgentEntry {
     unhealthy_detail: Option<String>,
     queue: VecDeque<QueuedMessage>,
     queued_bytes: usize,
-    recv_waiting: bool,
+    recv_waiter: Option<RecvWaiterId>,
+    next_recv_waiter_id: u64,
     notify: Arc<Notify>,
     close_tx: Option<oneshot::Sender<()>>,
     send_channel: Option<AgentSendChannel>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct RecvWaiterId(u64);
+
+#[derive(Debug)]
+struct RecvWaiterGuard {
+    store: AgentStore,
+    handle: AgentHandle,
+    waiter_id: RecvWaiterId,
+    armed: bool,
+}
+
+#[derive(Debug)]
+enum RecvClaim {
+    Ready(String),
+    Waiting {
+        notify: Arc<Notify>,
+        waiter: RecvWaiterGuard,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -331,7 +352,8 @@ impl AgentStore {
             unhealthy_detail: None,
             queue: VecDeque::new(),
             queued_bytes: 0,
-            recv_waiting: false,
+            recv_waiter: None,
+            next_recv_waiter_id: 0,
             notify: Arc::new(Notify::new()),
             close_tx,
             send_channel,
@@ -443,36 +465,28 @@ impl AgentStore {
         handle: &AgentHandle,
         timeout: Option<Duration>,
     ) -> Result<String, AgentError> {
-        let notify = {
-            let mut inner = self.inner.lock().await;
-            let entry = inner
-                .agents
-                .get_mut(handle)
-                .ok_or(AgentError::UnknownHandle)?;
-            entry.ensure_healthy()?;
-            if let Some(message) = entry.pop_message() {
-                return Ok(message);
-            }
-            if entry.recv_waiting {
-                return Err(AgentError::RecvAlreadyWaiting);
-            }
-            entry.recv_waiting = true;
-            Arc::clone(&entry.notify)
+        let (notify, mut waiter) = match self.claim_recv_waiter(handle).await? {
+            RecvClaim::Ready(message) => return Ok(message),
+            RecvClaim::Waiting { notify, waiter } => (notify, waiter),
         };
+        let waiter_id = waiter.waiter_id;
 
         let wait = async {
             loop {
                 notify.notified().await;
                 let mut inner = self.inner.lock().await;
                 let Some(entry) = inner.agents.get_mut(handle) else {
+                    waiter.disarm();
                     return Err(AgentError::UnknownHandle);
                 };
                 if let Err(error) = entry.ensure_healthy() {
-                    entry.recv_waiting = false;
+                    entry.clear_recv_waiter_if_match(waiter_id);
+                    waiter.disarm();
                     return Err(error);
                 }
                 if let Some(message) = entry.pop_message() {
-                    entry.recv_waiting = false;
+                    entry.clear_recv_waiter_if_match(waiter_id);
+                    waiter.disarm();
                     return Ok(message);
                 }
             }
@@ -482,7 +496,8 @@ impl AgentStore {
             Some(timeout) => match tokio::time::timeout(timeout, wait).await {
                 Ok(result) => result,
                 Err(_) => {
-                    self.clear_waiter(handle).await;
+                    self.clear_waiter_if_match(handle, waiter_id).await;
+                    waiter.disarm();
                     Err(AgentError::RecvTimeout)
                 }
             },
@@ -533,10 +548,36 @@ impl AgentStore {
         snapshots
     }
 
-    async fn clear_waiter(&self, handle: &AgentHandle) {
+    async fn claim_recv_waiter(&self, handle: &AgentHandle) -> Result<RecvClaim, AgentError> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        entry.ensure_healthy()?;
+        if let Some(message) = entry.pop_message() {
+            return Ok(RecvClaim::Ready(message));
+        }
+        if entry.recv_waiter.is_some() {
+            return Err(AgentError::RecvAlreadyWaiting);
+        }
+        let waiter_id = entry.allocate_recv_waiter_id();
+        entry.recv_waiter = Some(waiter_id);
+        Ok(RecvClaim::Waiting {
+            notify: Arc::clone(&entry.notify),
+            waiter: RecvWaiterGuard {
+                store: self.clone(),
+                handle: handle.clone(),
+                waiter_id,
+                armed: true,
+            },
+        })
+    }
+
+    async fn clear_waiter_if_match(&self, handle: &AgentHandle, waiter_id: RecvWaiterId) {
         let mut inner = self.inner.lock().await;
         if let Some(entry) = inner.agents.get_mut(handle) {
-            entry.recv_waiting = false;
+            entry.clear_recv_waiter_if_match(waiter_id);
         }
     }
 }
@@ -548,6 +589,18 @@ impl AgentSendChannel {
 }
 
 impl AgentEntry {
+    fn allocate_recv_waiter_id(&mut self) -> RecvWaiterId {
+        let waiter_id = RecvWaiterId(self.next_recv_waiter_id);
+        self.next_recv_waiter_id = self.next_recv_waiter_id.wrapping_add(1);
+        waiter_id
+    }
+
+    fn clear_recv_waiter_if_match(&mut self, waiter_id: RecvWaiterId) {
+        if self.recv_waiter == Some(waiter_id) {
+            self.recv_waiter = None;
+        }
+    }
+
     fn ensure_healthy(&self) -> Result<(), AgentError> {
         if self.state == AgentState::Unhealthy {
             Err(AgentError::Unhealthy {
@@ -591,6 +644,28 @@ impl AgentEntry {
             queued_bytes: self.queued_bytes,
             unhealthy_reason: self.unhealthy_reason.clone(),
             unhealthy_detail: self.unhealthy_detail.clone(),
+        }
+    }
+}
+
+impl RecvWaiterGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RecvWaiterGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let store = self.store.clone();
+        let handle = self.handle.clone();
+        let waiter_id = self.waiter_id;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                store.clear_waiter_if_match(&handle, waiter_id).await;
+            });
         }
     }
 }
@@ -1391,6 +1466,48 @@ mod tests {
                 .expect_err("recv should time out"),
             super::AgentError::RecvTimeout
         );
+
+        store
+            .enqueue_inbound(&handle, "later".to_owned())
+            .await
+            .expect("enqueue should succeed");
+        assert_eq!(
+            store
+                .recv(&handle, None)
+                .await
+                .expect("recv should succeed"),
+            "later"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_state_dropped_recv_clears_waiter() {
+        let store = agent_store(10, 100);
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .await
+            .expect("agent should insert");
+        let waiter_store = store.clone();
+        let waiter_handle = handle.clone();
+        let waiter = tokio::spawn(async move { waiter_store.recv(&waiter_handle, None).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        waiter.abort();
+        let _ = waiter.await.expect_err("waiter task should be aborted");
+
+        for _ in 0..20 {
+            match store
+                .recv(&handle, Some(std::time::Duration::from_millis(1)))
+                .await
+            {
+                Err(super::AgentError::RecvAlreadyWaiting) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(super::AgentError::RecvTimeout) => break,
+                other => panic!("expected cleared waiter to allow a timeout, got {other:?}"),
+            }
+        }
 
         store
             .enqueue_inbound(&handle, "later".to_owned())
