@@ -66,6 +66,39 @@ not a `BGOV-<number>` id, send a terminal error rather than guessing.
 11. Complete with a reply containing the merge request URL, or complete with an
     error explaining what blocked completion.
 
+## Merge Request Creation
+
+When creating the GitLab merge request, take care to pass the description as
+real multiline Markdown. Do not pass a description containing literal `\n`
+escape sequences, JSON-escaped text, or a single long shell-escaped string.
+
+Prefer writing the body to a temporary Markdown file with a quoted heredoc, then
+passing the file contents to `glab`:
+
+```bash
+mr_description="$(mktemp)"
+cat > "$mr_description" <<'EOF'
+## Summary
+
+- Describe the user-visible change.
+- Mention any important implementation detail.
+
+## Tests
+
+- `cargo test`
+EOF
+
+glab mr create \
+  --title "BGOV-123: short description" \
+  --description "$(cat "$mr_description")" \
+  --yes
+```
+
+Before running `glab mr create`, verify that the rendered description source
+contains actual blank lines, Markdown headings, and bullet lines. If the preview
+shows backslash-n text such as `\n## Tests`, rebuild the description before
+creating the merge request.
+
 ## Progress
 
 Send progress at major milestones using the original thread id:
