@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use cbcl_router_client::{
+use hark::{
     constants::LOCAL_API_VERSION,
     daemon::{
         DiscoveryRecord, DiscoveryState, ProbeResult, RuntimePaths, classify_discovery_with_probe,

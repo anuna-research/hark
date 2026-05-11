@@ -1,7 +1,7 @@
 # hark
 
 `hark` is a Rust CLI and local per-user daemon for agents that
-communicate through `cbcl-lfe-router`.
+communicate through `cbcl-router`.
 
 The daemon owns router WebSocket connections and local inbound queues. Short
 CLI invocations discover the daemon over loopback HTTP, authenticate with the
@@ -10,7 +10,7 @@ selected by `CBCL_AGENT_HANDLE`.
 
 ## Related Projects
 
-* `cbcl-lfe-router` - the capability-based router this client connects to.
+* `cbcl-router` - the capability-based router this client connects to.
 * `cbcl-rs` - the Rust CBCL parser and validation implementation used locally
   before outbound messages are sent to the router.
 

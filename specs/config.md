@@ -103,7 +103,7 @@ overflow_policy = "reject_new_and_close"
 
 ## Router Authentication
 
-The current `cbcl-lfe-router` `/agent/v1` WebSocket path requires:
+The current `cbcl-router` `/agent/v1` WebSocket path requires:
 
 ```text
 Authorization: Bearer shr_<key_id>.<secret>

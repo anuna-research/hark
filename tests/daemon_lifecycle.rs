@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use cbcl_router_client::{constants::LOCAL_API_VERSION, daemon::DiscoveryRecord};
+use hark::{constants::LOCAL_API_VERSION, daemon::DiscoveryRecord};
 use time::OffsetDateTime;
 
 mod support;

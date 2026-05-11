@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf};
 
-use cbcl_router_client::{
+use hark::{
     constants::LOCAL_API_VERSION,
     daemon::DiscoveryRecord,
     local_api::{AgentsResponse, LocalApiClient, PingResponse, serve_local_api},
@@ -23,7 +23,7 @@ async fn local_api_ping_and_status_work_over_loopback() {
     assert_eq!(
         status,
         AgentsResponse {
-            daemon: cbcl_router_client::local_api::DaemonStatus {
+            daemon: hark::local_api::DaemonStatus {
                 pid: server.record.pid,
                 addr: server.record.addr,
                 version: server.record.version.clone(),
@@ -58,7 +58,7 @@ async fn local_api_stop_removes_discovery_file() {
 
 struct TestServer {
     record: DiscoveryRecord,
-    task: JoinHandle<Result<(), cbcl_router_client::local_api::LocalApiError>>,
+    task: JoinHandle<Result<(), hark::local_api::LocalApiError>>,
 }
 
 impl TestServer {
