@@ -690,10 +690,6 @@ impl AgentStore {
             .ok_or(AgentError::UnknownHandle)?;
         entry.mark_unhealthy(reason, detail);
         entry.close_connection();
-        // Drop any pending meta waiter so `send_meta_and_await` returns
-        // immediately with `meta_reply_channel_closed` instead of blocking
-        // until META_REPLY_TIMEOUT — the connection is already gone.
-        entry.pending_meta_reply = None;
         entry.notify.notify_waiters();
         Ok(())
     }
@@ -819,6 +815,13 @@ impl AgentEntry {
         self.state = AgentState::Unhealthy;
         self.unhealthy_reason = Some(reason.into());
         self.unhealthy_detail = detail;
+        // Drop any pending meta waiter on every unhealthy path — including
+        // `enqueue_inbound`'s queue-overflow case, which calls us directly
+        // without going through `AgentStore::mark_unhealthy`. Without this,
+        // a full inbound queue (now reachable when unrelated subscription
+        // pushes fall through) can close the connection while a
+        // publish/list/query waiter stays armed until META_REPLY_TIMEOUT.
+        self.pending_meta_reply = None;
     }
 
     fn close_connection(&mut self) {
@@ -1817,6 +1820,43 @@ mod tests {
                 .is_some(),
             "mismatched push name must NOT be consumed by the query waiter"
         );
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_clears_pending_meta_waiter() {
+        // The inbound-queue overflow path calls `AgentEntry::mark_unhealthy`
+        // directly. With the meta-reply correlation in place, unrelated
+        // subscription pushes can fall through to the queue, so this path
+        // is now reachable while a publish/list/query waiter is armed —
+        // the waiter must observe the close immediately rather than
+        // waiting META_REPLY_TIMEOUT.
+        use super::{MetaReplyExpectation, PendingMetaReply};
+        let store = agent_store(1, 64);
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("insert");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut inner = store.inner.lock().await;
+            let entry = inner.agents.get_mut(&handle).expect("entry");
+            entry.pending_meta_reply = Some(PendingMetaReply {
+                expectation: MetaReplyExpectation::Reply,
+                sender: tx,
+            });
+        }
+
+        // First enqueue fits; second blows the per-handle cap and triggers
+        // `mark_unhealthy("queue_overflow", _)` on the entry directly.
+        store
+            .enqueue_inbound(&handle, "first".to_owned())
+            .await
+            .expect("first enqueue");
+        let _ = store.enqueue_inbound(&handle, "second".to_owned()).await;
+
+        rx.await
+            .expect_err("waiter sender should drop on queue-overflow unhealthy path");
     }
 
     #[tokio::test]
