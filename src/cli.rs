@@ -21,8 +21,8 @@ use crate::daemon::{
 };
 use crate::errors::{AppError, AppResult};
 use crate::local_api::{
-    ClientPingError, CreateAgentRequest, LocalApiClient, LocalApiRequestError, MetaSubscribeRequest,
-    SendMessageKind, SendRequest, serve_local_api_with_agents,
+    ClientPingError, CreateAgentRequest, LocalApiClient, LocalApiRequestError, MetaPublishRequest,
+    MetaSubscribeRequest, SendMessageKind, SendRequest, serve_local_api_with_agents,
 };
 
 #[derive(Debug, Parser)]
@@ -59,10 +59,23 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum DialectCommand {
+    #[command(about = "Publish a dialect to the router via (meta (teach @router <define>))")]
+    Publish(DialectPublishArgs),
     #[command(about = "Subscribe to router pushes for dialects matching a pattern")]
     Subscribe(DialectSubscribeArgs),
     #[command(about = "Drop the agent's dialect subscription on the router")]
     Unsubscribe,
+}
+
+#[derive(Debug, Args)]
+pub struct DialectPublishArgs {
+    #[arg(
+        long = "define",
+        help = "Complete `(define <name> ...)` CBCL form; if absent, read stdin until EOF"
+    )]
+    pub define: Option<String>,
+    #[arg(long = "json", help = "Print JSON instead of `digest name` text")]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -162,6 +175,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Error(args) => send_message_command(SendMessageKind::Error, args).await,
         Command::Progress(args) => progress_command(args).await,
         Command::Dialect(command) => match command {
+            DialectCommand::Publish(args) => dialect_publish_command(args).await,
             DialectCommand::Subscribe(args) => dialect_subscribe_command(args).await,
             DialectCommand::Unsubscribe => dialect_unsubscribe_command().await,
         },
@@ -333,6 +347,27 @@ async fn send_validated_message(kind: SendMessageKind, message: String) -> AppRe
     Ok(())
 }
 
+async fn dialect_publish_command(args: DialectPublishArgs) -> AppResult<()> {
+    let define = read_message_input(args.define)?;
+    let define = define.trim().to_owned();
+    let handle = resolve_agent_handle()?;
+    let client = discover_live_client().await?;
+    let response = client
+        .meta_publish(&handle, &MetaPublishRequest { define })
+        .await
+        .map_err(map_local_api_request_error)?;
+    if args.json {
+        let json = serde_json::json!({
+            "digest": response.digest,
+            "name": response.name,
+        });
+        println!("{json}");
+    } else {
+        println!("{} {}", response.digest, response.name);
+    }
+    Ok(())
+}
+
 async fn dialect_subscribe_command(args: DialectSubscribeArgs) -> AppResult<()> {
     let handle = resolve_agent_handle()?;
     let client = discover_live_client().await?;
@@ -404,7 +439,8 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 "unknown_agent_handle" | "agent_handle_unhealthy" | "recv_already_waiting" => {
                     AppError::AgentHandleUnavailable
                 }
-                "recv_timeout" => AppError::Timeout,
+                "recv_timeout" | "meta_reply_timeout" => AppError::Timeout,
+                "meta_send_busy" => AppError::AgentHandleUnavailable,
                 "missing_router_ws_url"
                 | "invalid_router_ws_url"
                 | "missing_router_auth_token"
@@ -419,6 +455,11 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "missing_thread"
                 | "duplicate_thread"
                 | "invalid_thread" => AppError::CbclValidation,
+                "meta_reply_malformed"
+                | "meta_reply_missing_digest"
+                | "meta_reply_missing_name" => {
+                    AppError::Internal(error.error.message)
+                }
                 "daemon_stopping" => AppError::Internal(error.error.message),
                 _ if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
                     AppError::RouterConnection

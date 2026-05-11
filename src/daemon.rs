@@ -101,6 +101,10 @@ pub enum AgentError {
     DuplicateDialect,
     #[error("invalid dialect: {0}")]
     InvalidDialect(String),
+    #[error("a meta send is already awaiting a router reply for this handle")]
+    MetaSendBusy,
+    #[error("meta send timed out waiting for router reply")]
+    MetaReplyTimeout,
 }
 
 #[derive(Debug)]
@@ -123,6 +127,13 @@ struct AgentEntry {
     notify: Arc<Notify>,
     close_tx: Option<oneshot::Sender<()>>,
     send_channel: Option<AgentSendChannel>,
+    /// Single-slot sender for routing the next router meta-reply (a
+    /// `(reply ...)` or `(meta (teach @<self> ...))` frame) back to a
+    /// caller blocked in `send_meta_and_await`. `None` when no caller is
+    /// waiting; the inbound classifier then falls through to the normal
+    /// recv queue. One slot per agent — meta sends are serialised; a
+    /// second concurrent call returns `MetaSendBusy`.
+    pending_meta_reply: Option<oneshot::Sender<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -344,6 +355,7 @@ impl AgentStore {
             notify: Arc::new(Notify::new()),
             close_tx,
             send_channel,
+            pending_meta_reply: None,
         };
         inner.agents.insert(handle.clone(), entry);
         Ok(inner
@@ -412,6 +424,87 @@ impl AgentStore {
                     detail: Some(detail),
                 })
             }
+        }
+    }
+
+    /// Send a meta frame to the router and await the next reply frame for
+    /// this agent. The receive loop calls [`try_route_meta_reply`] before
+    /// forwarding inbound frames to the recv queue — if a pending sender
+    /// is registered here, that frame is routed to it instead.
+    ///
+    /// Single-slot per agent: a concurrent call while another meta send is
+    /// in flight returns `MetaSendBusy` rather than queuing.
+    pub async fn send_meta_and_await(
+        &self,
+        handle: &AgentHandle,
+        message: String,
+        timeout: Duration,
+    ) -> Result<String, AgentError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut inner = self.inner.lock().await;
+            let entry = inner.agents.get_mut(handle).ok_or(AgentError::UnknownHandle)?;
+            entry.ensure_healthy()?;
+            if entry.pending_meta_reply.is_some() {
+                return Err(AgentError::MetaSendBusy);
+            }
+            entry.pending_meta_reply = Some(reply_tx);
+        }
+
+        if let Err(error) = self.send_outbound(handle, message).await {
+            // Clear the slot so subsequent attempts aren't stuck on the
+            // bookkeeping. Best-effort: if the handle vanished mid-flight
+            // the next get_mut will simply miss.
+            let mut inner = self.inner.lock().await;
+            if let Some(entry) = inner.agents.get_mut(handle) {
+                entry.pending_meta_reply = None;
+            }
+            return Err(error);
+        }
+
+        match tokio::time::timeout(timeout, reply_rx).await {
+            Ok(Ok(frame)) => Ok(frame),
+            Ok(Err(_recv)) => {
+                // Sender dropped without sending — happens if the receive
+                // loop exited while we were awaiting. Surface as unhealthy.
+                Err(AgentError::Unhealthy {
+                    reason: "meta_reply_channel_closed".to_owned(),
+                    detail: Some("router receive loop dropped pending meta reply".to_owned()),
+                })
+            }
+            Err(_elapsed) => {
+                // Timed out — clear the slot so the next attempt can proceed.
+                let mut inner = self.inner.lock().await;
+                if let Some(entry) = inner.agents.get_mut(handle) {
+                    entry.pending_meta_reply = None;
+                }
+                Err(AgentError::MetaReplyTimeout)
+            }
+        }
+    }
+
+    /// Hook for the router receive loop. If a meta-reply slot is filled
+    /// for this agent, route `message` to it and return `None` (the frame
+    /// is consumed; do not forward to the recv queue). Otherwise return
+    /// `Some(message)` so the caller can fall through to `enqueue_inbound`.
+    pub async fn try_route_meta_reply(
+        &self,
+        handle: &AgentHandle,
+        message: String,
+    ) -> Option<String> {
+        let mut inner = self.inner.lock().await;
+        let Some(entry) = inner.agents.get_mut(handle) else {
+            return Some(message);
+        };
+        let Some(sender) = entry.pending_meta_reply.take() else {
+            return Some(message);
+        };
+        match sender.send(message) {
+            Ok(()) => None,
+            // Receiver dropped (caller timed out / cancelled) — the frame
+            // becomes orphaned. Drop it rather than queueing, since the
+            // caller no longer wants it.
+            Err(_returned) => None,
         }
     }
 

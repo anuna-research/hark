@@ -96,6 +96,22 @@ pub struct MetaAckResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaPublishRequest {
+    /// Complete `(define <name> ...)` CBCL form. The daemon validates it
+    /// through cbcl-rs's R1–R5 pipeline before sending the
+    /// `(meta (teach @router <define>))` envelope to the router.
+    pub define: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaPublishResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+    pub digest: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CreateAgentRequest {
     /// SPEC-009: capability ≡ dialect. The agent declares the dialects
     /// it can perform; the daemon validates and forwards to the router.
@@ -374,6 +390,25 @@ impl LocalApiClient {
         decode_api_response(response).await
     }
 
+    pub async fn meta_publish(
+        &self,
+        handle: &AgentHandle,
+        request: &MetaPublishRequest,
+    ) -> Result<MetaPublishResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!(
+                "/v1/agents/{}/meta/publish",
+                handle.as_str()
+            )))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
     pub async fn close(&self, handle: &AgentHandle) -> Result<CloseResponse, LocalApiRequestError> {
         let response = self
             .http
@@ -527,6 +562,7 @@ fn router(state: AppState) -> Router {
             "/v1/agents/{handle}/meta/unsubscribe",
             post(meta_unsubscribe),
         )
+        .route("/v1/agents/{handle}/meta/publish", post(meta_publish))
         .route("/v1/agents/{handle}", delete(close_agent))
         .route("/v1/stop", post(stop))
         .with_state(state)
@@ -712,6 +748,167 @@ async fn meta_unsubscribe(
     }))
 }
 
+async fn meta_publish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Json(request): Json<MetaPublishRequest>,
+) -> Result<Json<MetaPublishResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let define = request.define.trim();
+    validate_define_for_publish(define)?;
+    let frame = crate::router::build_meta_teach_frame(define);
+    let reply = state
+        .agents
+        .send_meta_and_await(&handle, frame, META_REPLY_TIMEOUT)
+        .await
+        .map_err(agent_error_to_api)?;
+    let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
+        StatusCode::BAD_GATEWAY,
+        "meta_reply_malformed",
+        format!("router reply could not be parsed: {reason}"),
+        Some(reply.clone()),
+    ))?;
+    let digest = parsed
+        .get("digest")
+        .cloned()
+        .ok_or_else(|| ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "meta_reply_missing_digest",
+            "router reply did not include a digest",
+            Some(reply.clone()),
+        ))?;
+    let name = parsed
+        .get("name")
+        .cloned()
+        .ok_or_else(|| ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "meta_reply_missing_name",
+            "router reply did not include a name",
+            Some(reply.clone()),
+        ))?;
+    Ok(Json(MetaPublishResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
+        digest,
+        name,
+    }))
+}
+
+const META_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run cbcl-rs's R1–R5 pipeline on `(meta <define>)` so we don't ship a
+/// malformed define to the router. Mirrors the dialect-cache's
+/// `try_install` guard on the receive path.
+fn validate_define_for_publish(define: &str) -> Result<(), ApiError> {
+    if define.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cbcl_validation_failed",
+            "define body is empty",
+            None,
+        ));
+    }
+    let envelope = format!("(meta {define})");
+    match cbcl_parser::run_pipeline(&envelope) {
+        cbcl_parser::PipelineResult::Success(_) => Ok(()),
+        cbcl_parser::PipelineResult::ParseError(error) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cbcl_validation_failed",
+            format!("define failed to parse: {error}"),
+            None,
+        )),
+        cbcl_parser::PipelineResult::ValidationError(error) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cbcl_validation_failed",
+            format!("define failed R1–R5: {error}"),
+            None,
+        )),
+        cbcl_parser::PipelineResult::Pending { .. }
+        | cbcl_parser::PipelineResult::Buffered { .. } => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cbcl_validation_failed",
+            "define pipeline returned unexpected pending/buffered state",
+            None,
+        )),
+    }
+}
+
+/// Extract `:<key> "<value>"` and `:<key> <symbol>` pairs from a reply
+/// frame like
+/// `(reply @asker "ok" :thread "rcp-..." :digest "abc..." :name foo)`.
+/// Stops at the first close-paren outside a string and ignores positional
+/// args (the recipient, the status content). Strings are unescaped for
+/// `\\` and `\"`. Best-effort: returns `Err(_)` if the frame doesn't
+/// look like a single top-level list at all.
+fn parse_meta_reply_params(text: &str) -> Result<std::collections::HashMap<String, String>, String> {
+    let bytes = text.as_bytes();
+    let mut params = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return Err("reply does not start with `(`".to_owned());
+    }
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let key = std::str::from_utf8(&bytes[start..j])
+                .map_err(|_| "non-utf8 keyword".to_owned())?
+                .to_owned();
+            // skip whitespace to the value
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                return Err(format!(":{key} had no value"));
+            }
+            if bytes[j] == b'"' {
+                // quoted string with `\\` and `\"` escapes
+                j += 1;
+                let mut buf = String::new();
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'\\' if j + 1 < bytes.len() => {
+                            buf.push(bytes[j + 1] as char);
+                            j += 2;
+                        }
+                        b'"' => {
+                            j += 1;
+                            break;
+                        }
+                        c => {
+                            buf.push(c as char);
+                            j += 1;
+                        }
+                    }
+                }
+                params.insert(key, buf);
+            } else {
+                let start = j;
+                while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b')' {
+                    j += 1;
+                }
+                let value = std::str::from_utf8(&bytes[start..j])
+                    .map_err(|_| "non-utf8 value".to_owned())?
+                    .to_owned();
+                params.insert(key, value);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(params)
+}
+
 /// Reject patterns containing characters that would break the canonical
 /// `(subscribe (speak? <pattern>))` envelope. Slice 2 router supports the
 /// pattern grammar `*`, `<prefix>*`, and `<exact>` — all of which are
@@ -875,6 +1072,18 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
         AgentError::InvalidDialect(message) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_dialect", message, None)
         }
+        AgentError::MetaSendBusy => ApiError::new(
+            StatusCode::CONFLICT,
+            "meta_send_busy",
+            "another meta send is already awaiting a router reply",
+            None,
+        ),
+        AgentError::MetaReplyTimeout => ApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "meta_reply_timeout",
+            "router did not reply to the meta send in time",
+            None,
+        ),
     }
 }
 

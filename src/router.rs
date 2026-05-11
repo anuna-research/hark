@@ -325,12 +325,24 @@ async fn process_inbound(
             .await;
         return InboundOutcome::Exit;
     }
+    let class = classify_inbound(&text);
+    // Meta-reply correlation: if a `send_meta_and_await` call is in flight
+    // for this agent, route the next reply / teach-back to it instead of
+    // forwarding to the recv queue. Falls through when nobody is waiting.
+    let text = if matches!(class, InboundClass::DialectPush { .. } | InboundClass::MetaReply) {
+        match store.try_route_meta_reply(handle, text).await {
+            None => return InboundOutcome::Continue,
+            Some(text) => text,
+        }
+    } else {
+        text
+    };
     let mut installed: Option<String> = None;
     if let InboundClass::DialectPush {
         name, define_form, ..
-    } = classify_inbound(&text)
+    } = &class
     {
-        match dialect_cache.try_install(&name, &define_form) {
+        match dialect_cache.try_install(name, define_form) {
             Ok(digest) => {
                 tracing::info!(
                     target = "hark::dialect_cache",
@@ -338,7 +350,7 @@ async fn process_inbound(
                     digest = %digest,
                     "installed pushed dialect"
                 );
-                installed = Some(name);
+                installed = Some(name.clone());
             }
             Err(error) => {
                 tracing::warn!(
