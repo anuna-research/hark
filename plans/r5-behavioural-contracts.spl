@@ -347,3 +347,7 @@
   (normally r-cl-state-v1-polish claim-v1-polish state-claimed-v1-polish)
   (normally r-cl-chain-v1-polish state-claimed-v1-polish claimed-polish)
 )
+
+(claims agent:hugo
+  :at "2026-05-11T14:37:28Z"
+  (given completed-polish))
