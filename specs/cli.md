@@ -409,7 +409,11 @@ on common failure modes:
 * `5` - stale daemon state
 * `6` - missing `CBCL_AGENT_HANDLE`
 * `7` - unknown, unhealthy, or busy agent handle
-* `8` - CBCL validation or command-kind validation failure
+* `8` - CBCL validation or command-kind validation failure, including R1–R5
+  well-formedness failures on `dialect publish` and R5 runtime shape or
+  causal-protocol violations on outbound `reply`, `error`, and `progress`
+  (local API codes `cbcl_validation_failed`, `shape_violation`, and
+  `causal_violation`)
 * `9` - router connection or router authentication failure
 * `10` - timeout
 * `11` - local daemon authentication failure

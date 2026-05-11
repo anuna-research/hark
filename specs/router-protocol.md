@@ -246,6 +246,62 @@ If `:thread` is missing, the current router stores the frame under receipt id
 `"unknown"`. The client must reject progress messages without `:thread` to
 avoid orphaning receipt entries.
 
+## R5 Runtime Behavioural Verification
+
+In addition to the static R1–R4 well-formedness checks `cbcl-rs` applies on
+every parse, the daemon runs the cbcl-rs R5 pipeline (`run_pipeline_full`)
+against the installed dialect at two boundaries:
+
+* **Outbound** — between the local-api `/send` parse step and the router
+  WebSocket write. The handler resolves the agent handle, snapshots the
+  per-handle dialect registry from the agent's dialect cache, and runs the
+  parsed envelope through `run_pipeline_full` with that registry and the
+  per-handle `ThreadedMessageStore`. On success the innermost simple message is
+  content-hashed (sha256 over the canonical s-expression encoding), inserted
+  into the store keyed by `(hash, thread)`, and only then handed to the router
+  writer.
+* **Inbound** — between the agent WebSocket receive and the per-handle `recv`
+  queue, for ordinary (non-meta) frames. The router-dispatched message is
+  parsed, then passed through the same `run_pipeline_full` against the same
+  per-handle registry and store. On success the message is appended to the
+  store and enqueued for `recv` as today. Meta frames (`teach`, `query`,
+  `subscribe`, …) continue to use the existing R1–R5 well-formedness path and
+  do not enter the R5 behavioural pipeline.
+
+The pipeline enforces two classes of constraints from the installed dialect:
+
+* `(shape …)` constraints attached to a performative. These match against the
+  *expanded* form: a `(require :target string)` on performative `greet` only
+  fires if the dialect's performative template surfaces `:target` after
+  template expansion. This is upstream cbcl-rs behaviour, not a hark choice.
+* `(protocol …)` causal-predecessor declarations. The pipeline looks up the
+  message's `:caused-by` digest in the per-handle `ThreadedMessageStore` and
+  verifies that the predecessor's performative is permitted as a cause by the
+  declared protocol.
+
+Policy on unknown causal predecessors is `UnknownPredecessorPolicy::Reject`:
+if `:caused-by` references a hash the per-handle store has never seen, the
+daemon surfaces a `causal_violation` to the caller. We deliberately do not
+implement `Buffer` — there is no pending-queue retry, no later replay, and no
+out-of-order tolerance in the MVP.
+
+Outbound fallback for unknown dialects: if the outer `(lang <name> …)` wrapper
+names a dialect that is not present in the per-handle registry, the daemon
+falls back to the lightweight `run_pipeline` (R1–R4 well-formedness only).
+This preserves existing behaviour for tests and agents that have not yet
+installed the dialect locally. The limitation is real: shape and protocol
+constraints from an uninstalled dialect are *not* enforced on outbound traffic
+for that connection until the dialect is fetched via `hark dialect query` or
+arrives over a `subscribe` push.
+
+Inbound violation policy: any `ShapeViolation`, `CausalViolation`, or
+`PipelineResult::Pending` on an ordinary inbound frame causes the daemon to
+drop the message before it reaches `enqueue_inbound`. A
+`tracing::warn!(target: "hark::r5", …)` event is emitted with `performative`,
+`thread`, and `blame` fields so operators can correlate the drop. The message
+never reaches `recv`, and the daemon does not surface a separate inbound error
+channel for these drops in the MVP. The handle itself remains healthy.
+
 ## Disconnect and Close
 
 `hark close` closes the selected handle's WebSocket connection.

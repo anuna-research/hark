@@ -44,7 +44,18 @@ is the only process that holds a router WebSocket and the inbound
 message queue for each agent handle, and CLI invocations talk to it
 over loopback. Both the CLI and the daemon link `cbcl-rs` to parse and
 validate CBCL messages — locally on the way out and again before
-installing pushed dialects into the cache.
+installing pushed dialects into the cache. The daemon additionally
+runs cbcl-rs's R5 behavioural pipeline on simple messages at both the
+outbound `/send` boundary and the inbound `recv` boundary, using the
+per-handle dialect registry snapshot and the per-handle
+`ThreadedMessageStore` for shape and causal-predecessor checks. Outbound
+violations surface as `shape_violation` or `causal_violation` (HTTP 422,
+exit 8); inbound violations are dropped with a `tracing` warn on target
+`hark::r5` and never reach `recv`. If the outer `(lang <name>)` wrapper
+names a dialect not installed in the per-handle registry, the daemon
+falls back to the lightweight R1–R4 pipeline and does not enforce that
+dialect's shape or protocol constraints until the agent fetches it via
+`hark dialect query` or a `subscribe` push.
 
 ## Build
 
@@ -347,8 +358,9 @@ The daemon returns stable JSON errors on its loopback API. Common codes include:
 * `malformed_agent_handle`, `unknown_agent_handle`,
   `agent_handle_unhealthy`
 * `recv_already_waiting`, `recv_timeout`, `daemon_stopping`
-* `cbcl_validation_failed`, `message_kind_mismatch`, `missing_thread`,
-  `duplicate_thread`, `invalid_thread`
+* `cbcl_validation_failed`, `shape_violation`, `causal_violation`,
+  `message_kind_mismatch`, `missing_thread`, `duplicate_thread`,
+  `invalid_thread`
 * `invalid_subscribe_pattern`, `meta_send_busy`, `meta_reply_timeout`,
   `dialect_unknown_to_router`
 * `meta_reply_malformed`, `meta_reply_missing_digest`,
