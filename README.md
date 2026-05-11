@@ -54,8 +54,9 @@ exit 8); inbound violations are dropped with a `tracing` warn on target
 `hark::r5` and never reach `recv`. If the outer `(lang <name>)` wrapper
 names a dialect not installed in the per-handle registry, the daemon
 falls back to the lightweight R1–R4 pipeline and does not enforce that
-dialect's shape or protocol constraints until the agent fetches it via
-`hark dialect query` or a `subscribe` push.
+dialect's shape or protocol constraints until the agent installs it via
+`hark dialect publish` (publisher), `hark dialect query` (consumer), or
+a matching `subscribe` push.
 
 ## Build
 
@@ -297,6 +298,14 @@ from `--define` or stdin, runs it through cbcl-rs's R1–R5 pipeline in the
 daemon, sends `(meta (teach @router <define>))`, awaits the router's reply
 synchronously, and prints `<digest> <name>` on success. `--json` prints
 `{"digest", "name", "define"}` instead.
+
+On router ack the daemon also installs the published define into the
+publishing handle's local dialect cache so the publisher is subject to its
+own R5 shape and protocol constraints on subsequent outbound traffic
+without a separate `dialect query` round-trip. A local install failure
+after a successful router ack is non-fatal; the publish is still reported
+as successful and the install failure is logged under `tracing` target
+`hark::dialect_cache`.
 
 Content-addressed and idempotent: republishing identical bytes returns the
 same digest.
