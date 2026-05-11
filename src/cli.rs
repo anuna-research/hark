@@ -50,45 +50,8 @@ pub enum Command {
     Error(MessageInputArgs),
     #[command(about = "Build and send a non-terminal progress message")]
     Progress(ProgressArgs),
-    #[command(about = "Publish / discover / subscribe to dialects (SPEC-009)")]
-    #[command(subcommand)]
-    Dialect(DialectCommand),
     #[command(about = "Close the current agent handle")]
     Close,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum DialectCommand {
-    #[command(about = "Publish a dialect to the router via (meta (teach @router <define>))")]
-    Publish(DialectPublishArgs),
-    #[command(about = "Ask the router for a dialect by name via (meta (query (speak? <name>)))")]
-    Query(DialectQueryArgs),
-    #[command(about = "Subscribe to push announcements via (meta (subscribe (speak? <pattern>)))")]
-    Subscribe(DialectSubscribeArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct DialectPublishArgs {
-    #[arg(
-        long = "define",
-        help = "Complete `(define <name> ...)` CBCL form; if absent, read stdin until EOF"
-    )]
-    pub define: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct DialectQueryArgs {
-    #[arg(help = "Dialect name to ask about (CBCL symbol, no quotes)")]
-    pub name: String,
-}
-
-#[derive(Debug, Args)]
-pub struct DialectSubscribeArgs {
-    #[arg(
-        help = "Match pattern: exact name, `<prefix>*`, or `*` for all",
-        default_value = "*"
-    )]
-    pub pattern: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -178,44 +141,8 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args).await,
         Command::Error(args) => send_message_command(SendMessageKind::Error, args).await,
         Command::Progress(args) => progress_command(args).await,
-        Command::Dialect(command) => match command {
-            DialectCommand::Publish(args) => dialect_publish_command(args).await,
-            DialectCommand::Query(args) => dialect_query_command(args).await,
-            DialectCommand::Subscribe(args) => dialect_subscribe_command(args).await,
-        },
         Command::Close => close_command().await,
     }
-}
-
-// ---------------------------------------------------------------------------
-// SPEC-009 dialect subcommands (sketch).
-//
-// These build the canonical meta frames and print them to stdout for now.
-// The next step is wiring them through `local_api` → daemon → router so
-// `hark dialect query foo` actually round-trips and returns the teach-back
-// payload, mirroring how `hark reply` already talks to the daemon. For the
-// sketch the build-and-print form lets a user pipe into `hark reply` (or
-// inspect the bytes by hand) while the daemon plumbing is added in a
-// follow-up.
-// ---------------------------------------------------------------------------
-
-async fn dialect_publish_command(args: DialectPublishArgs) -> AppResult<()> {
-    let define = read_message_input(args.define)?;
-    let frame = crate::router::build_meta_teach_frame(define.trim());
-    println!("{frame}");
-    Ok(())
-}
-
-async fn dialect_query_command(args: DialectQueryArgs) -> AppResult<()> {
-    let frame = crate::router::build_meta_query_frame(&args.name);
-    println!("{frame}");
-    Ok(())
-}
-
-async fn dialect_subscribe_command(args: DialectSubscribeArgs) -> AppResult<()> {
-    let frame = crate::router::build_meta_subscribe_frame(&args.pattern);
-    println!("{frame}");
-    Ok(())
 }
 
 fn config_path() -> AppResult<()> {
