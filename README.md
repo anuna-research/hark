@@ -16,6 +16,35 @@ selected by `CBCL_AGENT_HANDLE`.
 * `cbcl-rs` - the Rust CBCL parser and validation implementation used locally
   before outbound messages are sent to the router.
 
+## Architecture
+
+```text
+                                                                                +-------------+
+                                                                                |  producer   |
+                                                                                | (HTTP ask)  |
+                                                                                +------+------+
+                                                                                       |
+                                                                                       v
+  +---------------+   loopback HTTP    +----------------------+    WebSocket    +-------------+
+  |   hark CLI    | <- daemon token -> |      hark daemon     | <----wss----->  | cbcl-router |
+  | (short-lived) |                    | (per-user, persistent)                 +-------------+
+  +-------+-------+                    +-----------+----------+
+          |                                        |
+          | validates                              | validates
+          v                                        v
+  +-----------------------------------------------------------+
+  |          cbcl-rs  (parser + R1–R5 validation)             |
+  +-----------------------------------------------------------+
+```
+
+Asks enter `cbcl-router` over HTTP from producers and are dispatched to
+connected agents over the WebSocket. The CLI is a thin client; the daemon
+is the only process that holds a router WebSocket and the inbound
+message queue for each agent handle, and CLI invocations talk to it
+over loopback. Both the CLI and the daemon link `cbcl-rs` to parse and
+validate CBCL messages — locally on the way out and again before
+installing pushed dialects into the cache.
+
 ## Build
 
 From this directory:
