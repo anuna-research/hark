@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod daemon;
+pub mod dialect_cache;
 pub mod errors;
 pub mod local_api;
 pub mod router;

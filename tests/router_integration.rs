@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use cbcl_router_client::{
+use hark::{
     config::AppConfig,
     constants::LOCAL_API_VERSION,
     daemon::{AgentStore, AgentStoreConfig, DiscoveryRecord},
@@ -28,12 +28,11 @@ async fn router_integration_success_sends_auth_and_hello_then_enqueues_dispatch(
     let local = LocalApi::start(router.ws_url()).await;
 
     let created = local
-        .create_agent(&["code:edit", "code:test"], &["elf"])
+        .create_agent(&["elf", "arena-v1"])
         .await
         .expect("agent should be created");
 
-    assert_eq!(created.capabilities, ["code:edit", "code:test"]);
-    assert_eq!(created.dialects, ["elf"]);
+    assert_eq!(created.dialects, ["elf", "arena-v1"]);
     assert_eq!(created.state, "connected");
 
     router.wait_for_hello(Duration::from_secs(1)).await;
@@ -44,8 +43,8 @@ async fn router_integration_success_sends_auth_and_hello_then_enqueues_dispatch(
     let hello = router.hello_frame().expect("hello should be captured");
     assert!(hello.contains(":agent-id"));
     assert!(hello.contains(&created.router_agent_id));
-    assert!(hello.contains(":capabilities (\"code:edit\" \"code:test\")"));
-    assert!(hello.contains(":dialects (\"elf\")"));
+    assert!(!hello.contains(":capabilities"));
+    assert!(hello.contains(":dialects (\"elf\" \"arena-v1\")"));
 
     let received = local.recv(&created.agent_handle).await;
     assert_eq!(
@@ -62,7 +61,7 @@ async fn router_integration_rejects_missing_router_config_before_connecting() {
     let local = LocalApi::start_with_config(AppConfig::default()).await;
 
     let response = local
-        .post_agent(&["code:edit"], &[])
+        .post_agent(&["elf"])
         .await
         .expect("request should complete");
 
@@ -78,7 +77,7 @@ async fn router_integration_maps_invalid_and_missing_router_config() {
     invalid_url.router.auth_token = Some("shr_test.secret".to_owned());
     let local = LocalApi::start_with_config(invalid_url).await;
     let response = local
-        .post_agent(&["code:edit"], &[])
+        .post_agent(&["elf"])
         .await
         .expect("request should complete");
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
@@ -89,7 +88,7 @@ async fn router_integration_maps_invalid_and_missing_router_config() {
     missing_token.router.ws_url = Some("ws://127.0.0.1:9/agent/v1".to_owned());
     let local = LocalApi::start_with_config(missing_token).await;
     let response = local
-        .post_agent(&["code:edit"], &[])
+        .post_agent(&["elf"])
         .await
         .expect("request should complete");
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
@@ -103,7 +102,7 @@ async fn router_integration_maps_router_auth_rejection() {
     let local = LocalApi::start(router.ws_url()).await;
 
     let response = local
-        .post_agent(&["code:edit"], &[])
+        .post_agent(&["elf"])
         .await
         .expect("request should complete");
 
@@ -123,7 +122,7 @@ async fn router_integration_maps_router_connection_failure() {
     let local = LocalApi::start(format!("ws://{addr}/agent/v1")).await;
 
     let response = local
-        .post_agent(&["code:edit"], &[])
+        .post_agent(&["elf"])
         .await
         .expect("request should complete");
 
@@ -137,7 +136,7 @@ async fn router_integration_marks_handle_unhealthy_on_router_close() {
     let router = MockRouter::start(RouterBehavior::CloseAfterHello).await;
     let local = LocalApi::start(router.ws_url()).await;
     let created = local
-        .create_agent(&["code:edit"], &[])
+        .create_agent(&["elf"])
         .await
         .expect("agent should be created");
 
@@ -167,7 +166,7 @@ async fn router_integration_marks_handle_unhealthy_on_router_error() {
     let router = MockRouter::start(RouterBehavior::SendError).await;
     let local = LocalApi::start(router.ws_url()).await;
     let created = local
-        .create_agent(&["code:edit"], &[])
+        .create_agent(&["elf"])
         .await
         .expect("agent should be created");
 
@@ -198,12 +197,12 @@ async fn router_integration_rejects_duplicate_capability_before_router_connect()
     let local = LocalApi::start(router.ws_url()).await;
 
     let response = local
-        .post_agent(&["code:edit", "code:edit"], &[])
+        .post_agent(&["elf", "elf"])
         .await
         .expect("request should complete");
 
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert_eq!(error_code(response).await, "duplicate_capability");
+    assert_eq!(error_code(response).await, "duplicate_dialect");
     assert!(
         router
             .wait_timeout(Duration::from_millis(100))
@@ -219,7 +218,7 @@ async fn router_integration_send_writes_binary_frame_to_router() {
     let router = MockRouter::start(RouterBehavior::CaptureSend).await;
     let local = LocalApi::start(router.ws_url()).await;
     let created = local
-        .create_agent(&["code:edit"], &["elf"])
+        .create_agent(&["elf"])
         .await
         .expect("agent should be created");
 
@@ -246,7 +245,7 @@ async fn router_integration_send_rejects_validation_errors_without_forwarding() 
     let router = MockRouter::start(RouterBehavior::CaptureSend).await;
     let local = LocalApi::start(router.ws_url()).await;
     let created = local
-        .create_agent(&["code:edit"], &[])
+        .create_agent(&["elf"])
         .await
         .expect("agent should be created");
     router.wait_for_hello(Duration::from_secs(1)).await;
@@ -272,7 +271,7 @@ async fn router_integration_sends_heartbeat_on_idle_connection() {
     let router = MockRouter::start(RouterBehavior::CaptureHeartbeat).await;
     let local = LocalApi::start(router.ws_url()).await;
     let _created = local
-        .create_agent(&["code:edit"], &[])
+        .create_agent(&["elf"])
         .await
         .expect("agent should be created");
 
@@ -293,11 +292,11 @@ async fn router_integration_sends_heartbeat_for_each_active_connection() {
     let router = MockRouter::start_accepting(RouterBehavior::CaptureHeartbeat, 2).await;
     let local = LocalApi::start(router.ws_url()).await;
     let _first = local
-        .create_agent(&["code:edit"], &[])
+        .create_agent(&["elf"])
         .await
         .expect("first agent should be created");
     let _second = local
-        .create_agent(&["code:test"], &[])
+        .create_agent(&["arena-v1"])
         .await
         .expect("second agent should be created");
 
@@ -576,7 +575,7 @@ async fn handle_mock_connection(
 
 struct LocalApi {
     record: DiscoveryRecord,
-    task: JoinHandle<Result<(), cbcl_router_client::local_api::LocalApiError>>,
+    task: JoinHandle<Result<(), hark::local_api::LocalApiError>>,
 }
 
 impl LocalApi {
@@ -605,14 +604,12 @@ impl LocalApi {
 
     async fn post_agent(
         &self,
-        capabilities: &[&str],
         dialects: &[&str],
     ) -> Result<reqwest::Response, reqwest::Error> {
         reqwest::Client::new()
             .post(self.url("/v1/agents"))
             .header("authorization", format!("Bearer {}", self.record.token))
             .json(&serde_json::json!({
-                "capabilities": capabilities,
                 "dialects": dialects,
             }))
             .send()
@@ -621,11 +618,10 @@ impl LocalApi {
 
     async fn create_agent(
         &self,
-        capabilities: &[&str],
         dialects: &[&str],
     ) -> Option<CreateAgentResponse> {
         let response = self
-            .post_agent(capabilities, dialects)
+            .post_agent(dialects)
             .await
             .expect("request should complete");
         if !response.status().is_success() {
@@ -668,7 +664,7 @@ impl LocalApi {
             .await
     }
 
-    async fn agents(&self) -> cbcl_router_client::local_api::AgentsResponse {
+    async fn agents(&self) -> hark::local_api::AgentsResponse {
         reqwest::Client::new()
             .get(self.url("/v1/agents"))
             .header("authorization", format!("Bearer {}", self.record.token))

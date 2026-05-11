@@ -225,36 +225,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cbcl-router-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "axum",
- "base64",
- "cbcl-core",
- "cbcl-parser",
- "clap",
- "config",
- "directories",
- "fs2",
- "futures-util",
- "predicates",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,6 +621,37 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
+]
+
+[[package]]
+name = "hark"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "axum",
+ "base64",
+ "cbcl-core",
+ "cbcl-parser",
+ "clap",
+ "config",
+ "directories",
+ "fs2",
+ "futures-util",
+ "predicates",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

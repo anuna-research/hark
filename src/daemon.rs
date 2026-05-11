@@ -19,7 +19,7 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 use crate::{
-    config::{validate_capability_name, validate_dialect_id},
+    config::validate_dialect_id,
     constants::LOCAL_API_VERSION,
     local_api::PingResponse,
 };
@@ -47,7 +47,6 @@ pub struct AgentHandle(String);
 pub struct AgentStatusSnapshot {
     pub agent_handle: String,
     pub router_agent_id: String,
-    pub capabilities: Vec<String>,
     pub dialects: Vec<String>,
     pub state: AgentState,
     pub queued_messages: usize,
@@ -96,14 +95,10 @@ pub enum AgentError {
     RecvTimeout,
     #[error("queue overflow")]
     QueueOverflow,
-    #[error("missing capability")]
-    MissingCapability,
-    #[error("duplicate capability")]
-    DuplicateCapability,
+    #[error("missing dialect")]
+    MissingDialect,
     #[error("duplicate dialect")]
     DuplicateDialect,
-    #[error("invalid capability: {0}")]
-    InvalidCapability(String),
     #[error("invalid dialect: {0}")]
     InvalidDialect(String),
 }
@@ -117,7 +112,6 @@ struct AgentRegistry {
 #[derive(Debug)]
 struct AgentEntry {
     router_agent_id: String,
-    capabilities: Vec<String>,
     dialects: Vec<String>,
     state: AgentState,
     unhealthy_reason: Option<String>,
@@ -304,48 +298,41 @@ impl AgentStore {
         }
     }
 
-    pub fn validate_advertisement(
-        capabilities: &[String],
-        dialects: &[String],
-    ) -> Result<(), AgentError> {
-        validate_agent_advertisement(capabilities, dialects)
+    pub fn validate_advertisement(dialects: &[String]) -> Result<(), AgentError> {
+        validate_agent_advertisement(dialects)
     }
 
     pub async fn insert_connected(
         &self,
         handle: AgentHandle,
-        capabilities: Vec<String>,
         dialects: Vec<String>,
     ) -> Result<AgentStatusSnapshot, AgentError> {
-        self.insert_connected_with_close_signal(handle, capabilities, dialects, None)
+        self.insert_connected_with_close_signal(handle, dialects, None)
             .await
     }
 
     pub async fn insert_connected_with_close_signal(
         &self,
         handle: AgentHandle,
-        capabilities: Vec<String>,
         dialects: Vec<String>,
         close_tx: Option<oneshot::Sender<()>>,
     ) -> Result<AgentStatusSnapshot, AgentError> {
-        self.insert_connected_with_router_channels(handle, capabilities, dialects, close_tx, None)
+        self.insert_connected_with_router_channels(handle, dialects, close_tx, None)
             .await
     }
 
     pub async fn insert_connected_with_router_channels(
         &self,
         handle: AgentHandle,
-        capabilities: Vec<String>,
         dialects: Vec<String>,
         close_tx: Option<oneshot::Sender<()>>,
         send_channel: Option<AgentSendChannel>,
     ) -> Result<AgentStatusSnapshot, AgentError> {
-        validate_agent_advertisement(&capabilities, &dialects)?;
+        validate_agent_advertisement(&dialects)?;
         let mut inner = self.inner.lock().await;
         let router_agent_id = format!("{}-{}", inner.config.agent_id_prefix, handle.as_str());
         let entry = AgentEntry {
             router_agent_id,
-            capabilities,
             dialects,
             state: AgentState::Connected,
             unhealthy_reason: None,
@@ -637,7 +624,6 @@ impl AgentEntry {
         AgentStatusSnapshot {
             agent_handle: handle.as_str().to_owned(),
             router_agent_id: self.router_agent_id.clone(),
-            capabilities: self.capabilities.clone(),
             dialects: self.dialects.clone(),
             state: self.state,
             queued_messages: self.queue.len(),
@@ -690,24 +676,12 @@ pub fn is_valid_agent_handle(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'))
 }
 
-fn validate_agent_advertisement(
-    capabilities: &[String],
-    dialects: &[String],
-) -> Result<(), AgentError> {
-    if capabilities.is_empty() {
-        return Err(AgentError::MissingCapability);
+fn validate_agent_advertisement(dialects: &[String]) -> Result<(), AgentError> {
+    if dialects.is_empty() {
+        return Err(AgentError::MissingDialect);
     }
 
     let mut seen = std::collections::HashSet::new();
-    for capability in capabilities {
-        validate_capability_name(capability)
-            .map_err(|error| AgentError::InvalidCapability(error.to_string()))?;
-        if !seen.insert(capability) {
-            return Err(AgentError::DuplicateCapability);
-        }
-    }
-
-    seen.clear();
     for dialect in dialects {
         validate_dialect_id(dialect)
             .map_err(|error| AgentError::InvalidDialect(error.to_string()))?;
@@ -1299,7 +1273,7 @@ mod tests {
         let store = agent_store(10, 100);
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
 
@@ -1340,7 +1314,7 @@ mod tests {
         let store = agent_store(1, 100);
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
         store
@@ -1377,7 +1351,7 @@ mod tests {
         let store = agent_store(10, 3);
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
 
@@ -1394,7 +1368,7 @@ mod tests {
         let store = agent_store(10, 100);
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
         store
@@ -1418,7 +1392,7 @@ mod tests {
         let store = agent_store(10, 100);
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
         let waiter_store = store.clone();
@@ -1455,7 +1429,7 @@ mod tests {
         let store = agent_store(10, 100);
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
 
@@ -1485,7 +1459,7 @@ mod tests {
         let store = agent_store(10, 100);
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
         let waiter_store = store.clone();
@@ -1528,11 +1502,7 @@ mod tests {
         let handle = handle();
 
         let snapshot = store
-            .insert_connected(
-                handle.clone(),
-                vec!["code:edit".to_owned(), "code:test".to_owned()],
-                vec!["elf".to_owned()],
-            )
+            .insert_connected(handle.clone(), vec!["elf".to_owned(), "arena-v1".to_owned()])
             .await
             .expect("agent should insert");
 
@@ -1541,8 +1511,7 @@ mod tests {
             snapshot.router_agent_id,
             format!("local-agent-{}", handle.as_str())
         );
-        assert_eq!(snapshot.capabilities, ["code:edit", "code:test"]);
-        assert_eq!(snapshot.dialects, ["elf"]);
+        assert_eq!(snapshot.dialects, ["elf", "arena-v1"]);
         assert_eq!(snapshot.state, super::AgentState::Connected);
     }
 
@@ -1553,29 +1522,14 @@ mod tests {
 
         assert_eq!(
             store
-                .insert_connected(handle.clone(), vec![], vec![])
+                .insert_connected(handle.clone(), vec![])
                 .await
-                .expect_err("missing capability should fail"),
-            super::AgentError::MissingCapability
+                .expect_err("missing dialect should fail"),
+            super::AgentError::MissingDialect
         );
         assert_eq!(
             store
-                .insert_connected(
-                    handle.clone(),
-                    vec!["code:edit".to_owned(), "code:edit".to_owned()],
-                    vec![],
-                )
-                .await
-                .expect_err("duplicate capability should fail"),
-            super::AgentError::DuplicateCapability
-        );
-        assert_eq!(
-            store
-                .insert_connected(
-                    handle,
-                    vec!["code:edit".to_owned()],
-                    vec!["elf".to_owned(), "elf".to_owned()],
-                )
+                .insert_connected(handle, vec!["elf".to_owned(), "elf".to_owned()])
                 .await
                 .expect_err("duplicate dialect should fail"),
             super::AgentError::DuplicateDialect

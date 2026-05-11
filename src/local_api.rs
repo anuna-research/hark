@@ -86,8 +86,8 @@ pub struct SendResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CreateAgentRequest {
-    pub capabilities: Vec<String>,
-    #[serde(default)]
+    /// SPEC-009: capability ≡ dialect. The agent declares the dialects
+    /// it can perform; the daemon validates and forwards to the router.
     pub dialects: Vec<String>,
 }
 
@@ -95,7 +95,6 @@ pub struct CreateAgentRequest {
 pub struct CreateAgentResponse {
     pub agent_handle: String,
     pub router_agent_id: String,
-    pub capabilities: Vec<String>,
     pub dialects: Vec<String>,
     pub state: String,
 }
@@ -118,7 +117,6 @@ pub struct DaemonStatus {
 pub struct AgentStatus {
     pub agent_handle: String,
     pub router_agent_id: String,
-    pub capabilities: Vec<String>,
     pub dialects: Vec<String>,
     pub state: String,
     pub queued_messages: usize,
@@ -486,8 +484,7 @@ async fn create_agent(
 ) -> Result<Json<CreateAgentResponse>, ApiError> {
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
-    AgentStore::validate_advertisement(&request.capabilities, &request.dialects)
-        .map_err(agent_error_to_api)?;
+    AgentStore::validate_advertisement(&request.dialects).map_err(agent_error_to_api)?;
     let router = state
         .config
         .validate_router()
@@ -496,7 +493,6 @@ async fn create_agent(
         state.agents.clone(),
         &router,
         &state.config.agent.agent_id_prefix,
-        request.capabilities,
         request.dialects,
     )
     .await
@@ -505,7 +501,6 @@ async fn create_agent(
     Ok(Json(CreateAgentResponse {
         agent_handle: created.agent_handle.as_str().to_owned(),
         router_agent_id: created.router_agent_id,
-        capabilities: created.capabilities,
         dialects: created.dialects,
         state: "connected".to_owned(),
     }))
@@ -534,7 +529,6 @@ async fn agents(
         .map(|snapshot| AgentStatus {
             agent_handle: snapshot.agent_handle,
             router_agent_id: snapshot.router_agent_id,
-            capabilities: snapshot.capabilities,
             dialects: snapshot.dialects,
             state: snapshot.state.as_str().to_owned(),
             queued_messages: snapshot.queued_messages,
@@ -747,16 +741,10 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
             "agent queue overflowed",
             None,
         ),
-        AgentError::MissingCapability => ApiError::new(
+        AgentError::MissingDialect => ApiError::new(
             StatusCode::BAD_REQUEST,
-            "missing_capability",
-            "agent creation requires at least one capability",
-            None,
-        ),
-        AgentError::DuplicateCapability => ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "duplicate_capability",
-            "agent creation request repeats a capability",
+            "missing_dialect",
+            "agent creation requires at least one dialect",
             None,
         ),
         AgentError::DuplicateDialect => ApiError::new(
@@ -765,9 +753,6 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
             "agent creation request repeats a dialect",
             None,
         ),
-        AgentError::InvalidCapability(message) => {
-            ApiError::new(StatusCode::BAD_REQUEST, "invalid_capability", message, None)
-        }
         AgentError::InvalidDialect(message) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_dialect", message, None)
         }
@@ -1073,7 +1058,7 @@ mod tests {
         let store = agent_store();
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
         store
@@ -1108,7 +1093,7 @@ mod tests {
         let store = agent_store();
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
         let server = TestServer::start_with_store(None, store).await;
@@ -1137,7 +1122,7 @@ mod tests {
         let store = agent_store();
         let handle = handle();
         store
-            .insert_connected(handle.clone(), vec!["code:edit".to_owned()], vec![])
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
         let server = TestServer::start_with_store(None, store).await;
@@ -1175,11 +1160,7 @@ mod tests {
         let store = agent_store();
         let handle = handle();
         store
-            .insert_connected(
-                handle.clone(),
-                vec!["code:edit".to_owned()],
-                vec!["elf".to_owned()],
-            )
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
             .await
             .expect("agent should insert");
         let server = TestServer::start_with_store(None, store).await;
@@ -1193,7 +1174,6 @@ mod tests {
         assert_eq!(status.agents.len(), 1);
         assert_eq!(status.agents[0].agent_handle, handle.as_str());
         assert_eq!(status.agents[0].state, "connected");
-        assert_eq!(status.agents[0].capabilities, ["code:edit"]);
         assert_eq!(status.agents[0].dialects, ["elf"]);
 
         server.stop().await;
