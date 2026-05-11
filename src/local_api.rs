@@ -917,6 +917,29 @@ async fn meta_publish(
             "router reply did not include a name",
             Some(reply.clone()),
         ))?;
+
+    // Install into the publishing handle's local dialect cache so the
+    // outbound R5 pipeline (Phase B) can see the freshly-published
+    // shape/protocol on the very next `send`. Without this, agents that
+    // publish a dialect skip their own R5 constraints until they also
+    // `dialect query` the same name back. A local install failure here is
+    // not fatal: the router already accepted the teach, so we still report
+    // the publish as successful and surface a warn-level event.
+    let local_cache = state
+        .agents
+        .dialect_cache_handle(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    if let Err(error) = local_cache.try_install(&name, define) {
+        tracing::warn!(
+            target: "hark::dialect_cache",
+            handle = handle.as_str(),
+            name = %name,
+            ?error,
+            "publish: local dialect-cache install failed after router ack",
+        );
+    }
+
     Ok(Json(MetaPublishResponse {
         ok: true,
         agent_handle: handle.as_str().to_owned(),

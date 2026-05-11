@@ -289,10 +289,22 @@ Outbound fallback for unknown dialects: if the outer `(lang <name> …)` wrapper
 names a dialect that is not present in the per-handle registry, the daemon
 falls back to the lightweight `run_pipeline` (R1–R4 well-formedness only).
 This preserves existing behaviour for tests and agents that have not yet
-installed the dialect locally. The limitation is real: shape and protocol
-constraints from an uninstalled dialect are *not* enforced on outbound traffic
-for that connection until the dialect is fetched via `hark dialect query` or
-arrives over a `subscribe` push.
+installed the dialect locally. `hark dialect publish` installs the dialect
+into the publishing handle's local cache on successful router ack so the
+publishing agent is subject to its own constraints immediately; agents that
+receive a dialect via `subscribe` or fetch it via `query` likewise get the
+local install. An agent that never installs a dialect locally — and is not
+the publisher — will not have shape or protocol constraints from that
+dialect enforced on its outbound traffic.
+
+Scope of an installed dialect: the pipeline composes constraints across *all*
+dialects in the per-handle registry, not just the one named in `(lang …)`. If
+any installed dialect declares a `(shape …)` or `(protocol …)` clause that
+matches the message's performative — including core performatives such as
+`reply` or `tell` — that constraint applies. Consequently, an unwrapped
+`(reply …)` is still checked against any installed dialect whose protocol
+mentions `reply`. This follows cbcl-rs REQ-231 (complete monitoring: every
+matching constraint must pass via conjunction).
 
 Inbound violation policy: any `ShapeViolation`, `CausalViolation`, or
 `PipelineResult::Pending` on an ordinary inbound frame causes the daemon to
