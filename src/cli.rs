@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 
 use crate::cbcl_validation::{MessageKind, validate_for_send};
 use crate::config::{
-    SAMPLE_CONFIG, default_config_file, validate_capability_name, validate_dialect_id,
+    SAMPLE_CONFIG, default_config_file, validate_dialect_id,
 };
 use crate::constants::{COMMAND_NAME, DEFAULT_PROGRESS_DIALECT, MAX_RECV_TIMEOUT_MS};
 use crate::daemon::{
@@ -78,14 +78,11 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    #[arg(
-        long = "capability",
-        required = true,
-        help = "Capability to advertise; repeat for multiple capabilities"
-    )]
-    pub capabilities: Vec<String>,
+    /// SPEC-009 collapses capability ≡ dialect; agents advertise the
+    /// dialects they can perform. At least one is required.
     #[arg(
         long = "dialect",
+        required = true,
         help = "Dialect id to advertise; repeat for multiple dialects"
     )]
     pub dialects: Vec<String>,
@@ -209,7 +206,7 @@ fn write_new_config_file(path: &Path, contents: &str) -> AppResult<()> {
 }
 
 async fn init_command(args: InitArgs) -> AppResult<()> {
-    validate_init_advertisement(&args.capabilities, &args.dialects)?;
+    validate_init_advertisement(&args.dialects)?;
     let client = discover_live_client().await.map_err(|error| {
         if matches!(error, AppError::DaemonNotRunning) {
             eprintln!("daemon_not_running: run `hark daemon start` first");
@@ -218,7 +215,6 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
     })?;
     let response = client
         .create_agent(&CreateAgentRequest {
-            capabilities: args.capabilities,
             dialects: args.dialects,
         })
         .await
@@ -266,18 +262,13 @@ async fn close_command() -> AppResult<()> {
     Ok(())
 }
 
-fn validate_init_advertisement(capabilities: &[String], dialects: &[String]) -> AppResult<()> {
-    let mut seen = std::collections::HashSet::new();
-    for capability in capabilities {
-        validate_capability_name(capability).map_err(|error| AppError::Usage(error.to_string()))?;
-        if !seen.insert(capability) {
-            return Err(AppError::Usage(format!(
-                "duplicate capability: {capability}"
-            )));
-        }
+fn validate_init_advertisement(dialects: &[String]) -> AppResult<()> {
+    if dialects.is_empty() {
+        return Err(AppError::Usage(
+            "at least one --dialect is required".to_owned(),
+        ));
     }
-
-    seen.clear();
+    let mut seen = std::collections::HashSet::new();
     for dialect in dialects {
         validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
         if !seen.insert(dialect) {
@@ -375,10 +366,8 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "missing_router_auth_token"
                 | "router_auth_rejected"
                 | "router_connection_failed" => AppError::RouterConnection,
-                "missing_capability"
-                | "duplicate_capability"
+                "missing_dialect"
                 | "duplicate_dialect"
-                | "invalid_capability"
                 | "invalid_dialect" => AppError::Usage(error.error.message),
                 "cbcl_validation_failed"
                 | "message_kind_mismatch"
@@ -575,14 +564,12 @@ async fn daemon_status() -> AppResult<()> {
             println!("api_version: {}", agents.daemon.api_version);
             println!("agents: {}", agents.agents.len());
             for agent in agents.agents {
-                let capabilities = agent.capabilities.join(",");
                 let dialects = agent.dialects.join(",");
                 println!(
-                    "{} {} router_agent_id={} capabilities=[{}] dialects=[{}] queued_messages={} queued_bytes={}",
+                    "{} {} router_agent_id={} dialects=[{}] queued_messages={} queued_bytes={}",
                     agent.agent_handle,
                     agent.state,
                     agent.router_agent_id,
-                    capabilities,
                     dialects,
                     agent.queued_messages,
                     agent.queued_bytes
@@ -794,12 +781,10 @@ mod tests {
         let cli = Cli::parse_from([
             "hark",
             "init",
-            "--capability",
-            "code:edit",
-            "--capability",
-            "code:test",
             "--dialect",
             "elf",
+            "--dialect",
+            "arena-v1",
             "--json",
         ]);
 
@@ -807,13 +792,12 @@ mod tests {
             panic!("expected init command");
         };
 
-        assert_eq!(args.capabilities, ["code:edit", "code:test"]);
-        assert_eq!(args.dialects, ["elf"]);
+        assert_eq!(args.dialects, ["elf", "arena-v1"]);
         assert!(args.json);
     }
 
     #[test]
-    fn rejects_init_without_capability() {
+    fn rejects_init_without_dialect() {
         let error = Cli::try_parse_from(["hark", "init"]).unwrap_err();
         assert_eq!(
             error.kind(),
@@ -883,16 +867,11 @@ mod tests {
 
     #[test]
     fn validates_duplicate_init_values_before_api_call() {
+        // missing dialect → reject
+        assert!(validate_init_advertisement(&[]).is_err());
+        // duplicate dialect → reject
         assert!(
-            validate_init_advertisement(&["code:edit".to_owned(), "code:edit".to_owned()], &[])
-                .is_err()
-        );
-        assert!(
-            validate_init_advertisement(
-                &["code:edit".to_owned()],
-                &["elf".to_owned(), "elf".to_owned()]
-            )
-            .is_err()
+            validate_init_advertisement(&["elf".to_owned(), "elf".to_owned()]).is_err()
         );
     }
 }

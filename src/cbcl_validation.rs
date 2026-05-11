@@ -264,6 +264,91 @@ fn symbol_name(expr: Option<&SExpr>) -> Option<&str> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SPEC-009 inbound classification.
+//
+// validate_for_send/2 above is the outbound path — it rejects meta because
+// the only kinds clients send through that surface (reply/error/progress)
+// can't be meta. INCOMING frames are a separate concern: the router can push
+// `(meta (teach @<self> (define ...)))` announcements to subscribers, and
+// hark must surface those distinctly from ordinary work so the daemon can
+// install + cache the dialect before forwarding to the consumer.
+// ---------------------------------------------------------------------------
+
+/// What an inbound WS frame looks like once classified.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum InboundClass {
+    /// A SPEC-009 dialect push: `(meta (teach @<recipient> (define <name> ...)))`.
+    /// `define_form` holds the inner `(define ...)` form as raw bytes so the
+    /// daemon can re-canonicalise + hash without re-walking the SExpr.
+    DialectPush {
+        recipient: String,
+        name: String,
+        define_form: String,
+    },
+    /// Anything else — pass through to the agent's inbound queue verbatim.
+    Ordinary,
+    /// Couldn't even parse the frame. Caller decides whether to log/drop.
+    Malformed(String),
+}
+
+/// Best-effort classification of an inbound CBCL frame. Never panics; on
+/// parse failure returns `Malformed` so the caller can choose policy.
+pub fn classify_inbound(text: &str) -> InboundClass {
+    let sexpr = match cbcl_parser::parse(text) {
+        Ok(sexpr) => sexpr,
+        Err(error) => return InboundClass::Malformed(error.to_string()),
+    };
+    let Some(items) = list_items(&sexpr) else {
+        return InboundClass::Ordinary;
+    };
+    if symbol_name(items.first()) != Some("meta") {
+        return InboundClass::Ordinary;
+    }
+    // (meta <op-form>) — op-form's head decides the operation.
+    let Some(op_form) = items.get(1) else {
+        return InboundClass::Ordinary;
+    };
+    let Some(op_items) = list_items(op_form) else {
+        return InboundClass::Ordinary;
+    };
+    if symbol_name(op_items.first()) != Some("teach") {
+        return InboundClass::Ordinary;
+    }
+    // (teach @<recipient> (define <name> ...))
+    let Some(recipient_expr) = op_items.get(1) else {
+        return InboundClass::Ordinary;
+    };
+    let Some(recipient_sym) = symbol_name(Some(recipient_expr)) else {
+        return InboundClass::Ordinary;
+    };
+    let recipient = recipient_sym.trim_start_matches('@').to_owned();
+    let Some(define_expr) = op_items.get(2) else {
+        return InboundClass::Ordinary;
+    };
+    let Some(define_items) = list_items(define_expr) else {
+        return InboundClass::Ordinary;
+    };
+    if symbol_name(define_items.first()) != Some("define") {
+        return InboundClass::Ordinary;
+    }
+    let Some(name) = define_items.get(1).and_then(|e| symbol_name(Some(e))) else {
+        return InboundClass::Ordinary;
+    };
+    InboundClass::DialectPush {
+        recipient,
+        name: name.to_owned(),
+        define_form: define_expr.to_string(),
+    }
+}
+
+fn list_items(expr: &SExpr) -> Option<&Vec<SExpr>> {
+    match expr {
+        SExpr::List(items) => Some(items),
+        SExpr::Atom(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +478,56 @@ mod tests {
             MessageKind::Reply,
             "cbcl_unsupported_wrapper",
         );
+    }
+
+    // ----- SPEC-009 inbound classification -----
+
+    #[test]
+    fn classify_inbound_recognises_dialect_push() {
+        let frame = "(meta (teach @local-agent (define arena-v1 (cbcl) @author)))";
+        match classify_inbound(frame) {
+            InboundClass::DialectPush {
+                recipient,
+                name,
+                define_form,
+            } => {
+                assert_eq!(recipient, "local-agent");
+                assert_eq!(name, "arena-v1");
+                assert!(define_form.contains("define"));
+                assert!(define_form.contains("arena-v1"));
+            }
+            other => panic!("expected DialectPush, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_inbound_passes_through_ordinary_frames() {
+        let dispatched_ask =
+            r#"(lang arena-v1 (ask @worker "psi-commit" :n 7 :thread "rcp-1"))"#;
+        assert!(matches!(
+            classify_inbound(dispatched_ask),
+            InboundClass::Ordinary
+        ));
+    }
+
+    #[test]
+    fn classify_inbound_passes_through_meta_query_reply() {
+        // A teach-back from `(meta (query (speak? X)))` also matches the
+        // DialectPush shape — by design, since both deliver a define the
+        // client should install. The receive loop's behaviour for both is
+        // identical: install + forward.
+        let teach_back = "(meta (teach @asker (define answer (cbcl) @author)))";
+        assert!(matches!(
+            classify_inbound(teach_back),
+            InboundClass::DialectPush { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_inbound_marks_malformed() {
+        assert!(matches!(
+            classify_inbound("(unclosed"),
+            InboundClass::Malformed(_)
+        ));
     }
 }

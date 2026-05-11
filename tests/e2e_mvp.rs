@@ -34,7 +34,7 @@ fn e2e_mvp_happy_path_start_init_recv_progress_reply_close_stop() {
     );
 
     let init = env
-        .command(["init", "--capability", "code:edit", "--dialect", "elf"])
+        .command(["init", "--dialect", "elf"])
         .output()
         .expect("init runs");
     assert_success(&init);
@@ -47,7 +47,6 @@ fn e2e_mvp_happy_path_start_init_recv_progress_reply_close_stop() {
     assert_success(&status);
     let status_stdout = String::from_utf8_lossy(&status.stdout);
     assert!(status_stdout.contains("router_agent_id=local-agent-"));
-    assert!(status_stdout.contains("capabilities=[code:edit]"));
     assert!(status_stdout.contains("dialects=[elf]"));
 
     let recv = env
@@ -120,7 +119,7 @@ fn e2e_daemon_start_does_not_require_router_config() {
     assert_success(&start);
 
     let init = env
-        .command(["init", "--capability", "code:edit"])
+        .command(["init", "--dialect", "elf"])
         .output()
         .expect("init runs");
     assert_eq!(init.status.code(), Some(9), "{}", output_debug(&init));
@@ -142,7 +141,7 @@ fn e2e_init_reports_missing_malformed_and_rejected_router_config() {
             .expect("start runs"),
     );
     let output = missing
-        .command(["init", "--capability", "code:edit"])
+        .command(["init", "--dialect", "elf"])
         .output()
         .expect("init runs");
     assert_eq!(output.status.code(), Some(9), "{}", output_debug(&output));
@@ -162,7 +161,7 @@ fn e2e_init_reports_missing_malformed_and_rejected_router_config() {
             .expect("start runs"),
     );
     let output = malformed
-        .command(["init", "--capability", "code:edit"])
+        .command(["init", "--dialect", "elf"])
         .output()
         .expect("init runs");
     assert_eq!(output.status.code(), Some(9), "{}", output_debug(&output));
@@ -183,7 +182,7 @@ fn e2e_init_reports_missing_malformed_and_rejected_router_config() {
             .expect("start runs"),
     );
     let output = rejected
-        .command(["init", "--capability", "code:edit"])
+        .command(["init", "--dialect", "elf"])
         .output()
         .expect("init runs");
     assert_eq!(output.status.code(), Some(9), "{}", output_debug(&output));
@@ -217,7 +216,7 @@ fn e2e_unhealthy_handles_surface_for_router_close_error_and_queue_overflow() {
         );
 
         let init = env
-            .command(["init", "--capability", "code:edit"])
+            .command(["init", "--dialect", "elf"])
             .output()
             .expect("init runs");
         assert_success(&init);
@@ -264,7 +263,7 @@ fn e2e_local_send_failure_marks_handle_unusable() {
     );
 
     let init = env
-        .command(["init", "--capability", "code:edit"])
+        .command(["init", "--dialect", "elf"])
         .output()
         .expect("init runs");
     assert_success(&init);

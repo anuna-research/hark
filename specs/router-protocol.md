@@ -3,7 +3,7 @@
 ## Purpose
 
 This spec defines how `hark` maps local daemon and CLI actions to
-`cbcl-lfe-router` HTTP and WebSocket behavior.
+`cbcl-router` HTTP and WebSocket behavior.
 
 The MVP is an agent interface. It focuses on persistent WebSocket agent
 connections, receiving dispatched asks, and sending progress or terminal

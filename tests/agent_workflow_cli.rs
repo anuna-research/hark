@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use cbcl_router_client::config::{AppConfig, SAMPLE_CONFIG};
+use hark::config::{AppConfig, SAMPLE_CONFIG};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{net::TcpListener, task::JoinHandle, time::Duration};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -26,7 +26,7 @@ fn cli_workflow_init_recv_and_close_keeps_stdout_clean() {
     );
 
     let init = env
-        .command(["init", "--capability", "code:edit"])
+        .command(["init", "--dialect", "elf"])
         .output()
         .expect("init runs");
     assert_success(&init);
@@ -76,7 +76,7 @@ fn cli_init_json_outputs_api_response_only() {
     );
 
     let init = env
-        .command(["init", "--capability", "code:edit", "--json"])
+        .command(["init", "--dialect", "elf", "--json"])
         .output()
         .expect("init runs");
     assert_success(&init);
@@ -84,7 +84,7 @@ fn cli_init_json_outputs_api_response_only() {
     let json: serde_json::Value =
         serde_json::from_slice(&init.stdout).expect("init JSON should parse");
     assert!(json["agent_handle"].as_str().is_some());
-    assert_eq!(json["capabilities"], serde_json::json!(["code:edit"]));
+    assert_eq!(json["dialects"], serde_json::json!(["elf"]));
     assert_eq!(json["state"], "connected");
 
     assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
@@ -101,28 +101,9 @@ fn cli_rejects_missing_handle_and_duplicate_init_values() {
         .expect("recv runs");
     assert_eq!(recv.status.code(), Some(6), "{}", output_debug(&recv));
 
-    let duplicate_capability = env
-        .command([
-            "init",
-            "--capability",
-            "code:edit",
-            "--capability",
-            "code:edit",
-        ])
-        .output()
-        .expect("init runs");
-    assert_eq!(
-        duplicate_capability.status.code(),
-        Some(2),
-        "{}",
-        output_debug(&duplicate_capability)
-    );
-
     let duplicate_dialect = env
         .command([
             "init",
-            "--capability",
-            "code:edit",
             "--dialect",
             "elf",
             "--dialect",

@@ -72,10 +72,8 @@ Stable error codes used by the MVP local API:
 * `router_auth_rejected` - router rejected the WebSocket authentication.
 * `router_connection_failed` - router WebSocket connection failed for another
   network or protocol reason.
-* `missing_capability` - agent creation request has no capabilities.
-* `duplicate_capability` - agent creation request repeats a capability.
+* `missing_dialect` - agent creation request has no dialects.
 * `duplicate_dialect` - agent creation request repeats a dialect.
-* `invalid_capability` - capability value does not match the configured grammar.
 * `invalid_dialect` - dialect value does not match the configured grammar.
 * `malformed_agent_handle` - handle path component does not match the handle
   grammar.

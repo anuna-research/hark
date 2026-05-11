@@ -1,4 +1,4 @@
-use cbcl_router_client::{cli, errors::ExitCode};
+use hark::{cli, errors::ExitCode};
 use clap::Parser;
 
 #[tokio::main]

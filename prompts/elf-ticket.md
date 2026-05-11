@@ -1,6 +1,6 @@
 # elf:ticket Agent Contract
 
-You are handling CBCL asks routed through `cbcl-lfe-router` for capability
+You are handling CBCL asks routed through `cbcl-router` for capability
 `elf:ticket`.
 
 The caller starts `hark` before launching you. Assume the daemon is already

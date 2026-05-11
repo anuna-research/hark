@@ -1,7 +1,9 @@
+<img src="https://imagedelivery.net/O-SJhBv1S1zUZFvTxrBOhQ/d9aa7f21-ff82-4b9d-069a-c6b08aedf700/medlogo" alt="hark logo" width="350">
+
 # hark
 
 `hark` is a Rust CLI and local per-user daemon for agents that
-communicate through `cbcl-lfe-router`.
+communicate through `cbcl-router`.
 
 The daemon owns router WebSocket connections and local inbound queues. Short
 CLI invocations discover the daemon over loopback HTTP, authenticate with the
@@ -10,9 +12,39 @@ selected by `CBCL_AGENT_HANDLE`.
 
 ## Related Projects
 
-* `cbcl-lfe-router` - the capability-based router this client connects to.
+* `cbcl-router` - the dialect-based router this client connects to.
 * `cbcl-rs` - the Rust CBCL parser and validation implementation used locally
   before outbound messages are sent to the router.
+
+## Architecture
+
+```text
+                                                                                +-------------+
+                                                                                |  producer   |
+                                                                                | (HTTP ask)  |
+                                                                                +------+------+
+                                                                                       |
+                                                                                       v
+  +---------------+   loopback HTTP    +----------------------+    WebSocket    +-------------+
+  |   hark CLI    | <- daemon token -> |      hark daemon     | <----wss----->  | cbcl-router |
+  | (short-lived) |                    | (per-user, persistent)                 +-------------+
+  +-------+-------+                    +-----------+----------+
+          |                                        |
+          | validates                              | validates
+          v                                        v
+  +-----------------------------------------------------------+
+  |          cbcl-rs  (parser + R1–R5 validation)             |
+  +-----------------------------------------------------------+
+```
+
+Producers POST asks to `cbcl-router` at `/ingress/v1/messages`; the
+router then dispatches each ask to a connected agent over the agent
+WebSocket at `/agent/v1`. The CLI is a thin client; the daemon
+is the only process that holds a router WebSocket and the inbound
+message queue for each agent handle, and CLI invocations talk to it
+over loopback. Both the CLI and the daemon link `cbcl-rs` to parse and
+validate CBCL messages — locally on the way out and again before
+installing pushed dialects into the cache.
 
 ## Build
 
@@ -117,8 +149,6 @@ Create an agent connection and export its local handle:
 
 ```bash
 eval "$(hark init \
-  --capability code:edit \
-  --capability code:test \
   --dialect elf)"
 ```
 
@@ -131,7 +161,7 @@ export CBCL_AGENT_HANDLE='0123456789ABCDEFGHJKMNPQRS'
 For non-shell harnesses:
 
 ```bash
-hark init --capability code:edit --json
+hark init --dialect elf --json
 ```
 
 Receive dispatched work:
@@ -207,9 +237,8 @@ connections, and waits until the daemon stops responding.
 
 ### `init`
 
-Creates one ephemeral agent instance. `--capability` is required at least once;
-`--dialect` is optional and repeatable. Duplicate capabilities and dialects are
-rejected before the daemon is called.
+Creates one ephemeral agent instance. `--dialect` is required at least once and
+is repeatable. Duplicate dialects are rejected before the daemon is called.
 
 ### `recv`
 
@@ -260,8 +289,7 @@ The daemon returns stable JSON errors on its loopback API. Common codes include:
 * `missing_router_ws_url`, `invalid_router_ws_url`,
   `missing_router_auth_token`
 * `router_auth_rejected`, `router_connection_failed`
-* `missing_capability`, `duplicate_capability`, `duplicate_dialect`,
-  `invalid_capability`, `invalid_dialect`
+* `missing_dialect`, `duplicate_dialect`, `invalid_dialect`
 * `malformed_agent_handle`, `unknown_agent_handle`,
   `agent_handle_unhealthy`
 * `recv_already_waiting`, `recv_timeout`, `daemon_stopping`
@@ -308,10 +336,10 @@ hark daemon start
 Check that `CBCL_ROUTER_AUTH_TOKEN` or `[router].auth_token` is current and
 belongs to the expected router environment.
 
-Missing capabilities:
+Missing dialects:
 
 ```bash
-hark init --capability code:edit
+hark init --dialect elf
 ```
 
 Unhealthy handles:
@@ -321,7 +349,7 @@ fresh handle with `init`, or remove the unhealthy one:
 
 ```bash
 hark close
-eval "$(hark init --capability code:edit)"
+eval "$(hark init --dialect elf)"
 ```
 
 CBCL validation failures:
