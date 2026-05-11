@@ -192,7 +192,7 @@ async fn router_integration_marks_handle_unhealthy_on_router_error() {
 }
 
 #[tokio::test]
-async fn router_integration_rejects_duplicate_capability_before_router_connect() {
+async fn router_integration_rejects_duplicate_dialect_before_router_connect() {
     let router = MockRouter::start(RouterBehavior::SendDispatch).await;
     let local = LocalApi::start(router.ws_url()).await;
 

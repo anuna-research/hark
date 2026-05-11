@@ -439,10 +439,8 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "missing_router_auth_token"
                 | "router_auth_rejected"
                 | "router_connection_failed" => AppError::RouterConnection,
-                "missing_capability"
-                | "duplicate_capability"
+                "missing_dialect"
                 | "duplicate_dialect"
-                | "invalid_capability"
                 | "invalid_dialect" => AppError::Usage(error.error.message),
                 "cbcl_validation_failed"
                 | "message_kind_mismatch"
