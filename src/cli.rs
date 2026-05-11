@@ -21,8 +21,8 @@ use crate::daemon::{
 };
 use crate::errors::{AppError, AppResult};
 use crate::local_api::{
-    ClientPingError, CreateAgentRequest, LocalApiClient, LocalApiRequestError, SendMessageKind,
-    SendRequest, serve_local_api_with_agents,
+    ClientPingError, CreateAgentRequest, LocalApiClient, LocalApiRequestError, MetaSubscribeRequest,
+    SendMessageKind, SendRequest, serve_local_api_with_agents,
 };
 
 #[derive(Debug, Parser)]
@@ -50,8 +50,28 @@ pub enum Command {
     Error(MessageInputArgs),
     #[command(about = "Build and send a non-terminal progress message")]
     Progress(ProgressArgs),
+    #[command(about = "Dialect discovery, subscription, and publication")]
+    #[command(subcommand)]
+    Dialect(DialectCommand),
     #[command(about = "Close the current agent handle")]
     Close,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DialectCommand {
+    #[command(about = "Subscribe to router pushes for dialects matching a pattern")]
+    Subscribe(DialectSubscribeArgs),
+    #[command(about = "Drop the agent's dialect subscription on the router")]
+    Unsubscribe,
+}
+
+#[derive(Debug, Args)]
+pub struct DialectSubscribeArgs {
+    #[arg(
+        help = "Match pattern: exact name, `<prefix>*`, or `*` for all",
+        default_value = "*"
+    )]
+    pub pattern: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -141,6 +161,10 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args).await,
         Command::Error(args) => send_message_command(SendMessageKind::Error, args).await,
         Command::Progress(args) => progress_command(args).await,
+        Command::Dialect(command) => match command {
+            DialectCommand::Subscribe(args) => dialect_subscribe_command(args).await,
+            DialectCommand::Unsubscribe => dialect_unsubscribe_command().await,
+        },
         Command::Close => close_command().await,
     }
 }
@@ -309,6 +333,26 @@ async fn send_validated_message(kind: SendMessageKind, message: String) -> AppRe
     Ok(())
 }
 
+async fn dialect_subscribe_command(args: DialectSubscribeArgs) -> AppResult<()> {
+    let handle = resolve_agent_handle()?;
+    let client = discover_live_client().await?;
+    client
+        .meta_subscribe(&handle, &MetaSubscribeRequest { pattern: args.pattern })
+        .await
+        .map_err(map_local_api_request_error)?;
+    Ok(())
+}
+
+async fn dialect_unsubscribe_command() -> AppResult<()> {
+    let handle = resolve_agent_handle()?;
+    let client = discover_live_client().await?;
+    client
+        .meta_unsubscribe(&handle)
+        .await
+        .map_err(map_local_api_request_error)?;
+    Ok(())
+}
+
 fn read_message_input(message: Option<String>) -> AppResult<String> {
     if let Some(message) = message {
         return Ok(message);
@@ -368,7 +412,8 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "router_connection_failed" => AppError::RouterConnection,
                 "missing_dialect"
                 | "duplicate_dialect"
-                | "invalid_dialect" => AppError::Usage(error.error.message),
+                | "invalid_dialect"
+                | "invalid_subscribe_pattern" => AppError::Usage(error.error.message),
                 "cbcl_validation_failed"
                 | "message_kind_mismatch"
                 | "missing_thread"

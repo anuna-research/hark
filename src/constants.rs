@@ -1,5 +1,5 @@
 pub const COMMAND_NAME: &str = "hark";
-pub const LOCAL_API_VERSION: u16 = 2;
+pub const LOCAL_API_VERSION: u16 = 3;
 
 pub const DEFAULT_AGENT_ID_PREFIX: &str = "local-agent";
 pub const DEFAULT_DAEMON_BIND: &str = "127.0.0.1:0";

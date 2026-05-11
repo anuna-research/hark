@@ -85,6 +85,17 @@ pub struct SendResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaSubscribeRequest {
+    pub pattern: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaAckResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CreateAgentRequest {
     /// SPEC-009: capability ≡ dialect. The agent declares the dialects
     /// it can perform; the daemon validates and forwards to the router.
@@ -327,6 +338,42 @@ impl LocalApiClient {
         decode_api_response(response).await
     }
 
+    pub async fn meta_subscribe(
+        &self,
+        handle: &AgentHandle,
+        request: &MetaSubscribeRequest,
+    ) -> Result<MetaAckResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!(
+                "/v1/agents/{}/meta/subscribe",
+                handle.as_str()
+            )))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    pub async fn meta_unsubscribe(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<MetaAckResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!(
+                "/v1/agents/{}/meta/unsubscribe",
+                handle.as_str()
+            )))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
     pub async fn close(&self, handle: &AgentHandle) -> Result<CloseResponse, LocalApiRequestError> {
         let response = self
             .http
@@ -472,6 +519,14 @@ fn router(state: AppState) -> Router {
         .route("/v1/agents", get(agents).post(create_agent))
         .route("/v1/agents/{handle}/recv", get(recv))
         .route("/v1/agents/{handle}/send", post(send))
+        .route(
+            "/v1/agents/{handle}/meta/subscribe",
+            post(meta_subscribe),
+        )
+        .route(
+            "/v1/agents/{handle}/meta/unsubscribe",
+            post(meta_unsubscribe),
+        )
         .route("/v1/agents/{handle}", delete(close_agent))
         .route("/v1/stop", post(stop))
         .with_state(state)
@@ -613,6 +668,70 @@ async fn send(
         ok: true,
         agent_handle: handle.as_str().to_owned(),
     }))
+}
+
+async fn meta_subscribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Json(request): Json<MetaSubscribeRequest>,
+) -> Result<Json<MetaAckResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let pattern = validate_subscribe_pattern(&request.pattern)?;
+    let frame = crate::router::build_meta_subscribe_frame(pattern);
+    state
+        .agents
+        .send_outbound(&handle, frame)
+        .await
+        .map_err(agent_error_to_api)?;
+    Ok(Json(MetaAckResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
+    }))
+}
+
+async fn meta_unsubscribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Result<Json<MetaAckResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let frame = crate::router::build_meta_unsubscribe_frame();
+    state
+        .agents
+        .send_outbound(&handle, frame)
+        .await
+        .map_err(agent_error_to_api)?;
+    Ok(Json(MetaAckResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
+    }))
+}
+
+/// Reject patterns containing characters that would break the canonical
+/// `(subscribe (speak? <pattern>))` envelope. Slice 2 router supports the
+/// pattern grammar `*`, `<prefix>*`, and `<exact>` — all of which are
+/// composed of CBCL symbol characters. Anything with whitespace, parens,
+/// or quotes here would either fail upstream parsing or smuggle extra
+/// list elements past the builder; reject it locally with a clear code.
+fn validate_subscribe_pattern(pattern: &str) -> Result<&str, ApiError> {
+    if pattern.is_empty()
+        || pattern
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\\'))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_subscribe_pattern",
+            "subscribe pattern must be a non-empty CBCL symbol",
+            None,
+        ));
+    }
+    Ok(pattern)
 }
 
 async fn close_agent(

@@ -143,6 +143,20 @@ pub fn build_meta_subscribe_frame(pattern: &str) -> String {
     format!("(meta (subscribe (speak? {pattern})))")
 }
 
+/// `(meta (unsubscribe))` — drop the agent's subscription without closing
+/// the WebSocket. Pattern-less: the router keys subscriptions by the
+/// agent's connected pid and stores at most one entry per agent.
+pub fn build_meta_unsubscribe_frame() -> String {
+    "(meta (unsubscribe))".to_owned()
+}
+
+/// `(meta (query (list)))` — enumerate every dialect the router knows. The
+/// router replies with `(reply @<asker> "ok" :thread "..." :names "a b c")`,
+/// space-separated. Slice-3 router protocol addition.
+pub fn build_meta_query_list_frame() -> String {
+    "(meta (query (list)))".to_owned()
+}
+
 async fn connect(router: &ValidatedRouterConfig) -> Result<RouterWebSocket, RouterError> {
     let mut request = router
         .ws_url
@@ -402,8 +416,9 @@ fn escape_cbcl_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_hello_frame, build_meta_query_frame, build_meta_subscribe_frame,
-        build_meta_teach_frame, is_router_error_frame,
+        build_hello_frame, build_meta_query_frame, build_meta_query_list_frame,
+        build_meta_subscribe_frame, build_meta_teach_frame, build_meta_unsubscribe_frame,
+        is_router_error_frame,
     };
 
     #[test]
@@ -474,5 +489,15 @@ mod tests {
         assert_eq!(exact, "(meta (subscribe (speak? arena-v1)))");
         assert_eq!(prefix, "(meta (subscribe (speak? arena-*)))");
         assert_eq!(wildcard, "(meta (subscribe (speak? *)))");
+    }
+
+    #[test]
+    fn meta_unsubscribe_frame_has_no_parameters() {
+        assert_eq!(build_meta_unsubscribe_frame(), "(meta (unsubscribe))");
+    }
+
+    #[test]
+    fn meta_query_list_frame_has_no_parameters() {
+        assert_eq!(build_meta_query_list_frame(), "(meta (query (list)))");
     }
 }
