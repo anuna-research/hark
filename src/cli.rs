@@ -22,7 +22,8 @@ use crate::daemon::{
 use crate::errors::{AppError, AppResult};
 use crate::local_api::{
     ClientPingError, CreateAgentRequest, LocalApiClient, LocalApiRequestError, MetaPublishRequest,
-    MetaSubscribeRequest, SendMessageKind, SendRequest, serve_local_api_with_agents,
+    MetaQueryRequest, MetaSubscribeRequest, SendMessageKind, SendRequest,
+    serve_local_api_with_agents,
 };
 
 #[derive(Debug, Parser)]
@@ -61,6 +62,10 @@ pub enum Command {
 pub enum DialectCommand {
     #[command(about = "Publish a dialect to the router via (meta (teach @router <define>))")]
     Publish(DialectPublishArgs),
+    #[command(about = "Ask the router whether it knows a dialect by name and install the teach-back")]
+    Query(DialectQueryArgs),
+    #[command(about = "List every dialect currently known to the router")]
+    List,
     #[command(about = "Subscribe to router pushes for dialects matching a pattern")]
     Subscribe(DialectSubscribeArgs),
     #[command(about = "Drop the agent's dialect subscription on the router")]
@@ -74,6 +79,14 @@ pub struct DialectPublishArgs {
         help = "Complete `(define <name> ...)` CBCL form; if absent, read stdin until EOF"
     )]
     pub define: Option<String>,
+    #[arg(long = "json", help = "Print JSON instead of `digest name` text")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DialectQueryArgs {
+    #[arg(help = "Dialect name to ask the router about")]
+    pub name: String,
     #[arg(long = "json", help = "Print JSON instead of `digest name` text")]
     pub json: bool,
 }
@@ -176,6 +189,8 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Progress(args) => progress_command(args).await,
         Command::Dialect(command) => match command {
             DialectCommand::Publish(args) => dialect_publish_command(args).await,
+            DialectCommand::Query(args) => dialect_query_command(args).await,
+            DialectCommand::List => dialect_list_command().await,
             DialectCommand::Subscribe(args) => dialect_subscribe_command(args).await,
             DialectCommand::Unsubscribe => dialect_unsubscribe_command().await,
         },
@@ -368,6 +383,39 @@ async fn dialect_publish_command(args: DialectPublishArgs) -> AppResult<()> {
     Ok(())
 }
 
+async fn dialect_query_command(args: DialectQueryArgs) -> AppResult<()> {
+    let handle = resolve_agent_handle()?;
+    let client = discover_live_client().await?;
+    let response = client
+        .meta_query(&handle, &MetaQueryRequest { name: args.name })
+        .await
+        .map_err(map_local_api_request_error)?;
+    if args.json {
+        let json = serde_json::json!({
+            "digest": response.digest,
+            "name": response.name,
+            "define": response.define,
+        });
+        println!("{json}");
+    } else {
+        println!("{} {}", response.digest, response.name);
+    }
+    Ok(())
+}
+
+async fn dialect_list_command() -> AppResult<()> {
+    let handle = resolve_agent_handle()?;
+    let client = discover_live_client().await?;
+    let response = client
+        .meta_list(&handle)
+        .await
+        .map_err(map_local_api_request_error)?;
+    for name in &response.names {
+        println!("{name}");
+    }
+    Ok(())
+}
+
 async fn dialect_subscribe_command(args: DialectSubscribeArgs) -> AppResult<()> {
     let handle = resolve_agent_handle()?;
     let client = discover_live_client().await?;
@@ -449,7 +497,8 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 "missing_dialect"
                 | "duplicate_dialect"
                 | "invalid_dialect"
-                | "invalid_subscribe_pattern" => AppError::Usage(error.error.message),
+                | "invalid_subscribe_pattern"
+                | "dialect_unknown_to_router" => AppError::Usage(error.error.message),
                 "cbcl_validation_failed"
                 | "message_kind_mismatch"
                 | "missing_thread"

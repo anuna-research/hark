@@ -112,6 +112,27 @@ pub struct MetaPublishResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaQueryRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaQueryResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+    pub digest: String,
+    pub name: String,
+    pub define: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaListResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CreateAgentRequest {
     /// SPEC-009: capability ≡ dialect. The agent declares the dialects
     /// it can perform; the daemon validates and forwards to the router.
@@ -409,6 +430,36 @@ impl LocalApiClient {
         decode_api_response(response).await
     }
 
+    pub async fn meta_query(
+        &self,
+        handle: &AgentHandle,
+        request: &MetaQueryRequest,
+    ) -> Result<MetaQueryResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/v1/agents/{}/meta/query", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    pub async fn meta_list(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<MetaListResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/v1/agents/{}/meta/list", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
     pub async fn close(&self, handle: &AgentHandle) -> Result<CloseResponse, LocalApiRequestError> {
         let response = self
             .http
@@ -563,6 +614,8 @@ fn router(state: AppState) -> Router {
             post(meta_unsubscribe),
         )
         .route("/v1/agents/{handle}/meta/publish", post(meta_publish))
+        .route("/v1/agents/{handle}/meta/query", post(meta_query))
+        .route("/v1/agents/{handle}/meta/list", post(meta_list))
         .route("/v1/agents/{handle}", delete(close_agent))
         .route("/v1/stop", post(stop))
         .with_state(state)
@@ -795,6 +848,121 @@ async fn meta_publish(
         digest,
         name,
     }))
+}
+
+async fn meta_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Json(request): Json<MetaQueryRequest>,
+) -> Result<Json<MetaQueryResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    validate_dialect_name(&request.name)?;
+    let frame = crate::router::build_meta_query_frame(&request.name);
+    let reply = state
+        .agents
+        .send_meta_and_await(&handle, frame, META_REPLY_TIMEOUT)
+        .await
+        .map_err(agent_error_to_api)?;
+    // Two shapes possible: (meta (teach @<self> (define <name> ...))) on
+    // hit, or a `(reply ...)` with `:reason "router-does-not-speak"` on
+    // miss. Distinguish by leading symbol.
+    let trimmed = reply.trim_start();
+    if trimmed.starts_with("(meta") {
+        match crate::cbcl_validation::classify_inbound(&reply) {
+            crate::cbcl_validation::InboundClass::DialectPush {
+                name, define_form, ..
+            } => {
+                let digest = sha256_hex(define_form.as_bytes());
+                Ok(Json(MetaQueryResponse {
+                    ok: true,
+                    agent_handle: handle.as_str().to_owned(),
+                    digest,
+                    name,
+                    define: define_form,
+                }))
+            }
+            _ => Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "meta_reply_malformed",
+                "router teach-back could not be classified",
+                Some(reply),
+            )),
+        }
+    } else {
+        let parsed = parse_meta_reply_params(&reply).unwrap_or_default();
+        let reason = parsed
+            .get("reason")
+            .cloned()
+            .unwrap_or_else(|| "router-does-not-speak".to_owned());
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "dialect_unknown_to_router",
+            reason,
+            Some(reply),
+        ))
+    }
+}
+
+async fn meta_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Result<Json<MetaListResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let frame = crate::router::build_meta_query_list_frame();
+    let reply = state
+        .agents
+        .send_meta_and_await(&handle, frame, META_REPLY_TIMEOUT)
+        .await
+        .map_err(agent_error_to_api)?;
+    let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
+        StatusCode::BAD_GATEWAY,
+        "meta_reply_malformed",
+        format!("router list reply could not be parsed: {reason}"),
+        Some(reply.clone()),
+    ))?;
+    let names = parsed
+        .get("names")
+        .map(|joined| {
+            joined
+                .split_whitespace()
+                .map(|s| s.to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Json(MetaListResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
+        names,
+    }))
+}
+
+fn validate_dialect_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\\'))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_dialect",
+            "dialect name must be a non-empty CBCL symbol",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 const META_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);

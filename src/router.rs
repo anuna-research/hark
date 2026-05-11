@@ -326,17 +326,11 @@ async fn process_inbound(
         return InboundOutcome::Exit;
     }
     let class = classify_inbound(&text);
-    // Meta-reply correlation: if a `send_meta_and_await` call is in flight
-    // for this agent, route the next reply / teach-back to it instead of
-    // forwarding to the recv queue. Falls through when nobody is waiting.
-    let text = if matches!(class, InboundClass::DialectPush { .. } | InboundClass::MetaReply) {
-        match store.try_route_meta_reply(handle, text).await {
-            None => return InboundOutcome::Continue,
-            Some(text) => text,
-        }
-    } else {
-        text
-    };
+    // Cache install runs on every DialectPush regardless of routing —
+    // teach-back responses to a `query (speak? X)` install identically to
+    // subscriber pushes, so the daemon-local cache is kept consistent
+    // whichever path produced the frame. Re-install is idempotent under
+    // content addressing.
     let mut installed: Option<String> = None;
     if let InboundClass::DialectPush {
         name, define_form, ..
@@ -362,6 +356,22 @@ async fn process_inbound(
             }
         }
     }
+    // Meta-reply correlation: if a `send_meta_and_await` call is in flight
+    // for this agent, route the next reply / teach-back to it instead of
+    // forwarding to the recv queue. Falls through when nobody is waiting.
+    let text = if matches!(class, InboundClass::DialectPush { .. } | InboundClass::MetaReply) {
+        match store.try_route_meta_reply(handle, text).await {
+            None => {
+                if let Some(name) = installed {
+                    return InboundOutcome::Installed(name);
+                }
+                return InboundOutcome::Continue;
+            }
+            Some(text) => text,
+        }
+    } else {
+        text
+    };
     if store.enqueue_inbound(handle, text).await.is_err() {
         return InboundOutcome::Exit;
     }
