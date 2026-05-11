@@ -70,8 +70,14 @@ pub async fn create_router_agent(
         .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
     // SPEC-009 dialect cache. One per agent — installations made by this
     // session don't leak across sessions, and the cache dies with the
-    // WebSocket process when the user disconnects.
-    let dialect_cache = DialectCache::new();
+    // WebSocket process when the user disconnects. R5 Phase B moved
+    // ownership onto the per-agent `AgentEntry` so both this receive
+    // loop AND the outbound send handler in `local_api.rs` can share
+    // the same cache.
+    let dialect_cache = store
+        .dialect_cache_handle(&handle)
+        .await
+        .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
     spawn_receive_loop(ReceiveLoopArgs {
         store,
         handle: handle.clone(),

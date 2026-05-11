@@ -26,6 +26,7 @@ use cbcl_core::{
 use crate::{
     config::validate_dialect_id,
     constants::LOCAL_API_VERSION,
+    dialect_cache::DialectCache,
     local_api::PingResponse,
 };
 
@@ -154,6 +155,14 @@ struct AgentEntry {
     /// the synchronous pipeline call. Wrapped in `Arc` to be cloned out
     /// to async tasks without holding `AgentRegistry`.
     pub store: Arc<Mutex<ThreadedMessageStore>>,
+    /// Per-agent dialect cache (R5 Phase B). SPEC-009 comment in
+    /// `router.rs` notes the cache is per-agent ("installations made by
+    /// this session don't leak across sessions"); to make the cache
+    /// reachable from BOTH the router receive loop AND the outbound
+    /// send handler in `local_api.rs` it lives on the registry entry.
+    /// The router-create path replaces the default with its own cache.
+    /// Cheap to clone — `DialectCache` is `Arc<RwLock<_>>` internally.
+    pub dialect_cache: DialectCache,
 }
 
 #[derive(Debug)]
@@ -427,6 +436,7 @@ impl AgentStore {
             send_channel,
             pending_meta_reply: None,
             store: Arc::new(Mutex::new(ThreadedMessageStore::new())),
+            dialect_cache: DialectCache::new(),
         };
         inner.agents.insert(handle.clone(), entry);
         Ok(inner
@@ -768,6 +778,18 @@ impl AgentStore {
         let inner = self.inner.lock().await;
         let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
         Ok(Arc::clone(&entry.store))
+    }
+
+    /// Clone out the per-agent dialect cache. Cheap (`Arc<RwLock<_>>`
+    /// internally). R5 Phase B: callers use this to snapshot the
+    /// `DialectRegistry` for `run_pipeline_full`.
+    pub async fn dialect_cache_handle(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<DialectCache, AgentError> {
+        let inner = self.inner.lock().await;
+        let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
+        Ok(entry.dialect_cache.clone())
     }
 
     /// Append a message into a handle's causal store. Returns `Ok(true)`

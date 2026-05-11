@@ -1,8 +1,12 @@
 use cbcl_core::{
+    dialect::DialectRegistry,
     message::{CorePerformative, Message, Performative},
     sexpr::{Atom, SExpr},
+    store::ThreadedMessageStore,
 };
-use cbcl_parser::{ParseError, PipelineResult, ValidationError, run_pipeline};
+use cbcl_parser::{
+    ParseError, PipelineContext, PipelineResult, ValidationError, run_pipeline, run_pipeline_full,
+};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -34,6 +38,9 @@ impl MessageKind {
 pub struct ValidatedMessage {
     pub kind: MessageKind,
     pub thread: String,
+    /// Parsed message returned by the pipeline. R5 Phase B: callers
+    /// append this into the per-handle causal store on successful send.
+    pub message: Message,
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
@@ -131,15 +138,68 @@ pub fn validate_for_send(
     input: &str,
     expected_kind: MessageKind,
 ) -> Result<ValidatedMessage, CbclValidationError> {
-    let message = match run_pipeline(input) {
+    validate_for_send_inner(input, expected_kind, None)
+}
+
+/// R5 Phase B variant: drive [`run_pipeline_full`] with a runtime context so
+/// outbound shape (REQ-220, REQ-231 step 6b) and causal (REQ-200, REQ-231
+/// step 6a) violations surface as `ShapeViolation` / `CausalViolation` codes
+/// instead of being lumped under `cbcl_malformed`.
+///
+/// Falls back to the lightweight pipeline when the message's `lang <name>`
+/// wrapper references a dialect that isn't installed in `registry`: the
+/// agent advertises a dialect name but we may not yet have the define
+/// pushed from the router, in which case there's no protocol/shape to
+/// verify against. Bare (un-`lang`-wrapped) messages always go through
+/// the full pipeline using base-dialect rules.
+pub fn validate_for_send_with_context(
+    input: &str,
+    expected_kind: MessageKind,
+    registry: &DialectRegistry,
+    store: &mut ThreadedMessageStore,
+) -> Result<ValidatedMessage, CbclValidationError> {
+    validate_for_send_inner(input, expected_kind, Some((registry, store)))
+}
+
+fn validate_for_send_inner(
+    input: &str,
+    expected_kind: MessageKind,
+    ctx: Option<(&DialectRegistry, &mut ThreadedMessageStore)>,
+) -> Result<ValidatedMessage, CbclValidationError> {
+    let message = match run_validation_pipeline(input, ctx) {
         PipelineResult::Success(message) => message,
         PipelineResult::ParseError(error) => return Err(malformed_parse(error)),
         PipelineResult::ValidationError(error) => {
-            return Err(CbclValidationError::Malformed(error.to_string()));
+            return Err(match CbclValidationError::from_pipeline_validation(
+                &error,
+                violation_performative(&error),
+                violation_thread(&error),
+            ) {
+                Some(err) => err,
+                None => CbclValidationError::Malformed(error.to_string()),
+            });
         }
-        PipelineResult::Pending { .. } | PipelineResult::Buffered { .. } => {
+        PipelineResult::Pending { message, reason } => {
+            // Under the default `Reject` policy this means a `:caused-by`
+            // hash isn't in the per-handle store yet — surface as a causal
+            // violation so the CLI gets the new exit code instead of a
+            // generic malformed error.
+            return Err(CbclValidationError::CausalViolation {
+                detail: format!("causal predecessor unknown: {reason:?}"),
+                performative: message
+                    .innermost_simple()
+                    .and_then(|m| m.performative())
+                    .map(|p| p.name().to_owned()),
+                thread: message
+                    .innermost_simple()
+                    .and_then(|m| m.thread())
+                    .map(String::from),
+            });
+        }
+        PipelineResult::Buffered { .. } => {
+            // We never opt into Buffer policy; treat as internal mismatch.
             return Err(CbclValidationError::Malformed(
-                "unexpected pipeline state during local validation".to_owned(),
+                "unexpected buffered pipeline state during local validation".to_owned(),
             ));
         }
     };
@@ -161,15 +221,81 @@ pub fn validate_for_send(
 
     let thread = validate_thread(&inner_expr)?;
     validate_kind(simple, expected_kind)?;
+    let simple_owned = simple.clone();
 
     Ok(ValidatedMessage {
         kind: expected_kind,
         thread,
+        message: simple_owned,
     })
 }
 
 fn malformed_parse(error: ParseError) -> CbclValidationError {
     CbclValidationError::Malformed(error.to_string())
+}
+
+/// Run the appropriate pipeline for outbound validation.
+///
+/// Uses [`run_pipeline_full`] when a runtime context is supplied AND the
+/// message can be verified against the local registry. Falls back to
+/// [`run_pipeline`] when the outer `lang <name>` wrapper names a dialect
+/// the daemon has not yet been taught — fail-closed verification against
+/// an unknown dialect would reject otherwise-valid traffic on agents that
+/// advertised a name but haven't received the corresponding `(define ...)`
+/// push.
+fn run_validation_pipeline(
+    input: &str,
+    ctx: Option<(&DialectRegistry, &mut ThreadedMessageStore)>,
+) -> PipelineResult {
+    let Some((registry, store)) = ctx else {
+        return run_pipeline(input);
+    };
+    if !can_verify_against_registry(input, registry) {
+        return run_pipeline(input);
+    }
+    let pipeline_ctx = PipelineContext::new(registry, store);
+    run_pipeline_full(input, &pipeline_ctx)
+}
+
+/// Best-effort: parse the outer wrapper to decide whether `run_pipeline_full`
+/// can complete without tripping over an unknown dialect. Returns `false`
+/// only when the outer form is `(lang <name> ...)` and `<name>` is missing
+/// from the registry; everything else delegates to the full pipeline (which
+/// applies the appropriate fail-closed checks itself).
+fn can_verify_against_registry(input: &str, registry: &DialectRegistry) -> bool {
+    let Ok(sexpr) = cbcl_parser::parse(input) else {
+        // Parse will fail again inside the pipeline; let it produce the
+        // structured `ParseError` rather than short-circuiting here.
+        return true;
+    };
+    let SExpr::List(items) = &sexpr else {
+        return true;
+    };
+    if symbol_name(items.first()) != Some("lang") {
+        return true;
+    }
+    let Some(dialect_name) = items.get(1).and_then(|e| symbol_name(Some(e))) else {
+        return true;
+    };
+    registry.find_by_name(dialect_name).is_some()
+}
+
+fn violation_performative(error: &ValidationError) -> Option<String> {
+    match error {
+        ValidationError::ShapeViolation { blame, .. }
+        | ValidationError::CausalViolation { blame, .. } => {
+            blame.performative.as_ref().map(String::from)
+        }
+        _ => None,
+    }
+}
+
+fn violation_thread(error: &ValidationError) -> Option<String> {
+    match error {
+        ValidationError::ShapeViolation { blame, .. }
+        | ValidationError::CausalViolation { blame, .. } => blame.thread_id.clone(),
+        _ => None,
+    }
 }
 
 fn unwrap_supported_message<'a>(
@@ -587,5 +713,200 @@ mod tests {
             classify_inbound("(unclosed"),
             InboundClass::Malformed(_)
         ));
+    }
+
+    // ----- R5 Phase B: shape + causal verification on outbound -----
+    //
+    // These exercise `validate_for_send_with_context` directly so the
+    // assertions are independent of the HTTP plumbing. They install a
+    // synthetic dialect into a `DialectRegistry`, then send a message
+    // that triggers the protocol/shape rule and check the error code
+    // maps to the new `shape_violation` / `causal_violation` variants.
+
+    use cbcl_core::dialect::{Dialect, DialectRegistry, PerformativeDef, ResourceBounds};
+    use cbcl_core::protocol::{CausalProtocol, NodeRef, StepDecl};
+    use cbcl_core::shape::{ShapeConstraint, ShapeRule, TypeConstraint};
+    use cbcl_core::store::ThreadedMessageStore;
+    use std::collections::BTreeMap;
+
+    fn effect_template(action: &str) -> SExpr {
+        SExpr::List(vec![
+            SExpr::Atom(Atom::Symbol(String::from("effect"))),
+            SExpr::Atom(Atom::Symbol(String::from(action))),
+        ])
+    }
+
+    /// Registry with a `shape-dialect` whose `reply` shape requires a
+    /// `:package` string keyword on its `track` performative. A
+    /// `(track @router :thread ...)` send with no `:package` must fail
+    /// with `shape_violation`.
+    ///
+    /// Shape constraints can target inherited core performatives in
+    /// principle, but cbcl-rs's R5 validator requires shape rules to
+    /// reference a performative that *is* defined by the dialect (or
+    /// inherited), so we pin the rule to the dialect-local `track`
+    /// performative to keep the fixture self-contained.
+    fn shape_constraint_registry() -> DialectRegistry {
+        let mut registry = DialectRegistry::new();
+        registry
+            .install(Dialect {
+                name: String::from("shape-dialect"),
+                extends: vec![String::from("cbcl")],
+                author: None,
+                performatives: vec![PerformativeDef {
+                    name: String::from("track"),
+                    params: vec![],
+                    template: effect_template("track-action"),
+                }],
+                resources: ResourceBounds {
+                    max_depth: 8,
+                    max_expansion_size: 512,
+                    verification_time_ms: 10,
+                },
+                examples: vec![],
+                signature: None,
+                hash: None,
+                protocol: None,
+                causal_protocol: None,
+                shapes: vec![ShapeConstraint {
+                    performative: String::from("track"),
+                    rules: vec![ShapeRule::Require {
+                        keyword: String::from("package"),
+                        type_constraint: Some(TypeConstraint::String),
+                        children: vec![],
+                    }],
+                }],
+            })
+            .expect("shape-dialect installs cleanly");
+        registry
+    }
+
+    /// Registry with a `causal-dialect` whose protocol declares
+    /// `begin → notify`. A `notify` with `:caused-by` referencing a
+    /// hash that isn't in the per-handle store must fail with
+    /// `causal_violation` under the default Reject policy.
+    ///
+    /// Uses a non-core performative `notify` because core performatives
+    /// (R3) cannot be redefined by a child dialect, and the protocol
+    /// step decl only matches performative names that resolve through
+    /// the registry.
+    fn causal_protocol_registry() -> DialectRegistry {
+        let mut steps = BTreeMap::new();
+        steps.insert(
+            "begin".into(),
+            StepDecl {
+                performative: "begin".into(),
+                predecessors: vec![],
+                successors: vec![NodeRef::Single("notify".into())],
+            },
+        );
+        steps.insert(
+            "notify".into(),
+            StepDecl {
+                performative: "notify".into(),
+                predecessors: vec![NodeRef::Single("begin".into())],
+                successors: vec![],
+            },
+        );
+        let mut registry = DialectRegistry::new();
+        registry
+            .install(Dialect {
+                name: String::from("causal-dialect"),
+                extends: vec![String::from("cbcl")],
+                author: None,
+                performatives: vec![
+                    PerformativeDef {
+                        name: String::from("begin"),
+                        params: vec![],
+                        template: effect_template("begin-action"),
+                    },
+                    PerformativeDef {
+                        name: String::from("notify"),
+                        params: vec![],
+                        template: effect_template("notify-action"),
+                    },
+                ],
+                resources: ResourceBounds {
+                    max_depth: 8,
+                    max_expansion_size: 512,
+                    verification_time_ms: 10,
+                },
+                examples: vec![],
+                signature: None,
+                hash: None,
+                protocol: None,
+                causal_protocol: Some(CausalProtocol { steps }),
+                shapes: vec![],
+            })
+            .expect("causal-dialect installs cleanly");
+        registry
+    }
+
+    #[test]
+    fn validate_for_send_surfaces_shape_violation() {
+        // The outbound surface only emits reply/error/progress, but
+        // `validate_for_send_with_context` rejects on shape before the
+        // kind check — we want to confirm the violation code surfaces
+        // through `from_pipeline_validation`. Use `MessageKind::Reply`
+        // and a `track` message; the shape check fires first because
+        // its dialect rule matches the `track` performative.
+        let registry = shape_constraint_registry();
+        let mut store = ThreadedMessageStore::new();
+        let error = validate_for_send_with_context(
+            r#"(lang shape-dialect (track @worker :thread "rcp-1"))"#,
+            MessageKind::Reply,
+            &registry,
+            &mut store,
+        )
+        .expect_err("missing :package must violate shape constraint");
+        assert_eq!(
+            error.code(),
+            "shape_violation",
+            "expected shape_violation, got: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_for_send_surfaces_causal_violation_for_unknown_predecessor() {
+        let registry = causal_protocol_registry();
+        let mut store = ThreadedMessageStore::new();
+        // `notify` declares `begin` as its only predecessor; with
+        // `:caused-by` referencing a hash that isn't in the store, the
+        // default Reject policy returns `Pending`, which the outbound
+        // validator maps to `causal_violation` (the predecessor is
+        // unknown, so we can't accept the message in order).
+        let error = validate_for_send_with_context(
+            r#"(lang causal-dialect (notify @worker :thread "rcp-1" :caused-by "sha256:unknown"))"#,
+            MessageKind::Reply,
+            &registry,
+            &mut store,
+        )
+        .expect_err("unknown causal predecessor must be rejected");
+        assert_eq!(
+            error.code(),
+            "causal_violation",
+            "expected causal_violation, got: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_for_send_passes_through_when_lang_dialect_unknown() {
+        // The agent advertises `elf` but the daemon hasn't received
+        // its `(define ...)` push yet. Fall back to the lightweight
+        // pipeline rather than fail-closed on `UnknownDialect`, so
+        // existing happy-path tests in `tests/router_integration.rs`
+        // (which use `lang elf` with an empty registry) continue to
+        // pass. R5 enforcement kicks in once the dialect is installed.
+        let registry = DialectRegistry::new(); // base only
+        let mut store = ThreadedMessageStore::new();
+        let validated = validate_for_send_with_context(
+            r#"(lang elf (reply "done" :thread "rcp-1"))"#,
+            MessageKind::Reply,
+            &registry,
+            &mut store,
+        )
+        .expect("unknown lang dialect must fall back to the lightweight pipeline");
+        assert_eq!(validated.kind, MessageKind::Reply);
+        assert_eq!(validated.thread, "rcp-1");
     }
 }

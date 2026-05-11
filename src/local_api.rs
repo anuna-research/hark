@@ -19,7 +19,7 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::oneshot};
 
-use crate::cbcl_validation::{CbclValidationError, MessageKind, validate_for_send};
+use crate::cbcl_validation::{CbclValidationError, MessageKind, validate_for_send_with_context};
 use crate::{
     config::{AppConfig, ConfigError},
     constants::{COMMAND_NAME, LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
@@ -534,8 +534,7 @@ impl fmt::Display for ClientPingError {
                 cli_api_version,
             } => write!(
                 formatter,
-                "daemon_api_incompatible: CLI API version {cli_api_version}, daemon API version {:?}, daemon version {:?}",
-                daemon_api_version, daemon_version
+                "daemon_api_incompatible: CLI API version {cli_api_version}, daemon API version {daemon_api_version:?}, daemon version {daemon_version:?}",
             ),
             Self::RequestFailed(error) => write!(formatter, "request failed: {error}"),
             Self::UnexpectedStatus(status) => write!(formatter, "unexpected HTTP status: {status}"),
@@ -747,7 +746,41 @@ async fn send(
     reject_if_stopping(&state)?;
     let handle = parse_handle(handle)?;
     let kind = MessageKind::from(request.kind);
-    validate_for_send(&request.message, kind).map_err(cbcl_validation_error_to_api)?;
+
+    // R5 Phase B: drive `run_pipeline_full` for outbound simple-message
+    // validation so shape (REQ-220) and causal (REQ-200) violations are
+    // surfaced as the dedicated error codes / HTTP 422 / CLI exit 8. The
+    // per-handle dialect cache supplies the registry; the per-handle
+    // causal store supplies the predecessor index used by step 6a.
+    let dialect_cache = state
+        .agents
+        .dialect_cache_handle(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let store_arc = state
+        .agents
+        .store_handle(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let registry = dialect_cache.registry_snapshot();
+    let validated = {
+        let mut guard = store_arc.lock().await;
+        validate_for_send_with_context(&request.message, kind, &registry, &mut guard)
+            .map_err(cbcl_validation_error_to_api)?
+    };
+
+    // Append the successfully-validated outbound message into the handle's
+    // causal store BEFORE the WebSocket write so a subsequent reply in
+    // this thread can reference it via `:caused-by`. Dedup-false (REQ-310)
+    // simply means we've already accepted this exact frame; not fatal.
+    let entry = build_outbound_store_entry(&validated);
+    if let Some((hash, thread, message)) = entry {
+        let _ = state
+            .agents
+            .append_message(&handle, hash, thread, message)
+            .await;
+    }
+
     state
         .agents
         .send_outbound(&handle, request.message)
@@ -757,6 +790,35 @@ async fn send(
         ok: true,
         agent_handle: handle.as_str().to_owned(),
     }))
+}
+
+/// Compute the `(hash, thread, message)` triple to append for an outbound
+/// simple message. Mirrors the inbound helper in `router.rs` (Phase C) so
+/// both directions share the same content-hash recipe — sha256 over the
+/// canonical encoding of the innermost simple message's s-expression.
+fn build_outbound_store_entry(
+    validated: &crate::cbcl_validation::ValidatedMessage,
+) -> Option<(
+    cbcl_core::store::ContentHash,
+    cbcl_core::store::ThreadId,
+    cbcl_core::message::Message,
+)> {
+    use cbcl_core::canonical::canonical_encode;
+    use cbcl_core::sexpr::SExpr;
+    use cbcl_core::store::{ContentHash, ThreadId};
+    use sha2::{Digest, Sha256};
+
+    let simple = validated.message.innermost_simple()?;
+    let cbcl_core::message::Message::Simple { thread, .. } = simple else {
+        return None;
+    };
+    let thread_id = ThreadId(thread.clone().unwrap_or_else(|| String::from("default")));
+    let sexpr: SExpr = simple.into();
+    let bytes = canonical_encode(&sexpr);
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = format!("sha256:{:x}", hasher.finalize());
+    Some((ContentHash(digest), thread_id, simple.clone()))
 }
 
 async fn meta_subscribe(
