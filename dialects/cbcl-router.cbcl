@@ -5,13 +5,13 @@
      (verification-time 50)))
 
   (extend speaks? (name)
-    (ask @router (query speaks name)))
+    (meta (query (speak? name))))
 
   (extend list-dialects ()
-    (ask @router (query list)))
+    (meta (query (list))))
 
   (extend subscribe-dialects (pattern)
-    (tell @router (subscribe pattern)))
+    (meta (subscribe (speak? pattern))))
 
   (extend unsubscribe-dialects ()
-    (tell @router (unsubscribe))))
+    (meta (unsubscribe))))
