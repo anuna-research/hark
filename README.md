@@ -1,6 +1,6 @@
-# hark
+<img src="https://imagedelivery.net/O-SJhBv1S1zUZFvTxrBOhQ/d9aa7f21-ff82-4b9d-069a-c6b08aedf700/medlogo" alt="hark logo" width="350">
 
-<img src="https://imagedelivery.net/O-SJhBv1S1zUZFvTxrBOhQ/d9aa7f21-ff82-4b9d-069a-c6b08aedf700/smalllogo" alt="hark logo" width="240">
+# hark
 
 `hark` is a Rust CLI and local per-user daemon for agents that
 communicate through `cbcl-router`.
