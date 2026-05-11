@@ -1,0 +1,17 @@
+(define cbcl-router (cbcl) @anuna
+  (:resource-requirements
+    ((max-depth 8)
+     (max-expansion-size 1024)
+     (verification-time 50)))
+
+  (extend speaks? (name)
+    (ask @router (query speaks name)))
+
+  (extend list-dialects ()
+    (ask @router (query list)))
+
+  (extend subscribe-dialects (pattern)
+    (tell @router (subscribe pattern)))
+
+  (extend unsubscribe-dialects ()
+    (tell @router (unsubscribe))))
