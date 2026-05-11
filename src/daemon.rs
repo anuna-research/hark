@@ -101,6 +101,10 @@ pub enum AgentError {
     DuplicateDialect,
     #[error("invalid dialect: {0}")]
     InvalidDialect(String),
+    #[error("a meta send is already awaiting a router reply for this handle")]
+    MetaSendBusy,
+    #[error("meta send timed out waiting for router reply")]
+    MetaReplyTimeout,
 }
 
 #[derive(Debug)]
@@ -123,6 +127,66 @@ struct AgentEntry {
     notify: Arc<Notify>,
     close_tx: Option<oneshot::Sender<()>>,
     send_channel: Option<AgentSendChannel>,
+    /// Single-slot waiter for routing the next router meta-reply (a
+    /// `(reply ...)` or `(meta (teach @<self> ...))` frame) back to a
+    /// caller blocked in `send_meta_and_await`. `None` when no caller is
+    /// waiting; the inbound classifier then falls through to the normal
+    /// recv queue. One slot per agent — meta sends are serialised; a
+    /// second concurrent call returns `MetaSendBusy`. The expectation
+    /// filters which inbound frames satisfy the waiter, so an unsolicited
+    /// dialect push from an active subscription cannot be misrouted as a
+    /// reply to an in-flight publish/list/query.
+    pending_meta_reply: Option<PendingMetaReply>,
+}
+
+#[derive(Debug)]
+struct PendingMetaReply {
+    expectation: MetaReplyExpectation,
+    sender: oneshot::Sender<MetaReplyDelivery>,
+}
+
+/// What kind of router frame a `send_meta_and_await` caller is willing to
+/// accept as the reply to their in-flight meta send. Used by
+/// [`AgentStore::try_route_meta_reply`] to ignore unrelated frames (e.g. an
+/// unsolicited dialect push arriving on an active subscription) so they
+/// don't steal another command's slot.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum MetaReplyExpectation {
+    /// Only a bare `(reply ...)` frame satisfies the waiter. Used by
+    /// `publish` (meta teach reply) and `list` (meta query list reply).
+    Reply,
+    /// Either a bare `(reply ...)` (the miss case, e.g.
+    /// `:reason "router-does-not-speak"`) OR a dialect-push teach-back
+    /// whose inner `(define <name> ...)` matches the named dialect. Used
+    /// by `query` (meta query speak?). Pushes for any other name fall
+    /// through to the normal inbound queue.
+    ReplyOrPushNamed(String),
+}
+
+/// What the router-receive loop hands to [`AgentStore::try_route_meta_reply`]
+/// when an inbound frame may satisfy a pending meta waiter. Carries enough
+/// information to (a) decide whether the expectation matches, and (b)
+/// surface the install outcome to the awaiting caller so a teach-back that
+/// failed R1–R5 is reported as an error instead of a successful query.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum MetaReplyDelivery {
+    /// A bare `(reply ...)` frame. The string is the verbatim wire bytes.
+    Reply(String),
+    /// A dialect push that installed cleanly into the daemon cache.
+    PushInstalled {
+        name: String,
+        define_form: String,
+        digest: String,
+        frame: String,
+    },
+    /// A dialect push whose `(define ...)` failed R1–R5; the cache rejected
+    /// it. The waiter should treat this as an upstream protocol error
+    /// rather than a successful query result.
+    PushInstallFailed {
+        name: String,
+        reason: String,
+        frame: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -344,6 +408,7 @@ impl AgentStore {
             notify: Arc::new(Notify::new()),
             close_tx,
             send_channel,
+            pending_meta_reply: None,
         };
         inner.agents.insert(handle.clone(), entry);
         Ok(inner
@@ -412,6 +477,111 @@ impl AgentStore {
                     detail: Some(detail),
                 })
             }
+        }
+    }
+
+    /// Send a meta frame to the router and await the next reply frame for
+    /// this agent. The receive loop calls [`try_route_meta_reply`] before
+    /// forwarding inbound frames to the recv queue — if a pending sender
+    /// is registered here, that frame is routed to it instead.
+    ///
+    /// Single-slot per agent: a concurrent call while another meta send is
+    /// in flight returns `MetaSendBusy` rather than queuing.
+    pub async fn send_meta_and_await(
+        &self,
+        handle: &AgentHandle,
+        message: String,
+        expectation: MetaReplyExpectation,
+        timeout: Duration,
+    ) -> Result<MetaReplyDelivery, AgentError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut inner = self.inner.lock().await;
+            let entry = inner.agents.get_mut(handle).ok_or(AgentError::UnknownHandle)?;
+            entry.ensure_healthy()?;
+            if entry.pending_meta_reply.is_some() {
+                return Err(AgentError::MetaSendBusy);
+            }
+            entry.pending_meta_reply = Some(PendingMetaReply {
+                expectation,
+                sender: reply_tx,
+            });
+        }
+
+        if let Err(error) = self.send_outbound(handle, message).await {
+            // Clear the slot so subsequent attempts aren't stuck on the
+            // bookkeeping. Best-effort: if the handle vanished mid-flight
+            // the next get_mut will simply miss.
+            let mut inner = self.inner.lock().await;
+            if let Some(entry) = inner.agents.get_mut(handle) {
+                entry.pending_meta_reply = None;
+            }
+            return Err(error);
+        }
+
+        match tokio::time::timeout(timeout, reply_rx).await {
+            Ok(Ok(delivery)) => Ok(delivery),
+            Ok(Err(_recv)) => {
+                // Sender dropped without sending — happens if the receive
+                // loop exited or `mark_unhealthy` cleared the slot while we
+                // were awaiting. Surface as unhealthy so meta callers fail
+                // fast on a closed/dead connection instead of waiting out
+                // the full timeout.
+                Err(AgentError::Unhealthy {
+                    reason: "meta_reply_channel_closed".to_owned(),
+                    detail: Some(
+                        "router connection closed before meta reply arrived".to_owned(),
+                    ),
+                })
+            }
+            Err(_elapsed) => {
+                // Timed out — clear the slot so the next attempt can proceed.
+                let mut inner = self.inner.lock().await;
+                if let Some(entry) = inner.agents.get_mut(handle) {
+                    entry.pending_meta_reply = None;
+                }
+                Err(AgentError::MetaReplyTimeout)
+            }
+        }
+    }
+
+    /// Hook for the router receive loop. If a meta-reply slot is filled
+    /// for this agent AND the pending caller's expectation matches the
+    /// classified inbound, deliver and return `None` (the frame is
+    /// consumed; do not forward to the recv queue). If no waiter is
+    /// registered, or the waiter is expecting a different shape (e.g.
+    /// awaiting a `Reply` while an unsolicited subscription push arrived),
+    /// return `Some(frame)` so the caller can fall through to
+    /// `enqueue_inbound` and the awaited reply isn't stolen by an
+    /// unrelated push.
+    pub async fn try_route_meta_reply(
+        &self,
+        handle: &AgentHandle,
+        delivery: MetaReplyDelivery,
+    ) -> Option<String> {
+        let mut inner = self.inner.lock().await;
+        let Some(entry) = inner.agents.get_mut(handle) else {
+            return Some(delivery.frame().to_owned());
+        };
+        let matches = entry
+            .pending_meta_reply
+            .as_ref()
+            .is_some_and(|pending| expectation_matches(&pending.expectation, &delivery));
+        if !matches {
+            return Some(delivery.frame().to_owned());
+        }
+        // Safe to unwrap: we just verified `is_some_and` above and still
+        // hold the lock so no other task can take it.
+        let pending = entry
+            .pending_meta_reply
+            .take()
+            .expect("pending meta waiter taken under lock after match check");
+        match pending.sender.send(delivery) {
+            Ok(()) => None,
+            // Receiver dropped (caller timed out / cancelled) — the frame
+            // becomes orphaned. Drop it rather than queueing, since the
+            // caller no longer wants it.
+            Err(_returned) => None,
         }
     }
 
@@ -575,6 +745,39 @@ impl AgentSendChannel {
     }
 }
 
+impl MetaReplyDelivery {
+    fn frame(&self) -> &str {
+        match self {
+            MetaReplyDelivery::Reply(frame)
+            | MetaReplyDelivery::PushInstalled { frame, .. }
+            | MetaReplyDelivery::PushInstallFailed { frame, .. } => frame,
+        }
+    }
+
+    pub fn frame_owned(self) -> String {
+        match self {
+            MetaReplyDelivery::Reply(frame)
+            | MetaReplyDelivery::PushInstalled { frame, .. }
+            | MetaReplyDelivery::PushInstallFailed { frame, .. } => frame,
+        }
+    }
+}
+
+fn expectation_matches(
+    expectation: &MetaReplyExpectation,
+    delivery: &MetaReplyDelivery,
+) -> bool {
+    match (expectation, delivery) {
+        (_, MetaReplyDelivery::Reply(_)) => true,
+        (MetaReplyExpectation::Reply, _) => false,
+        (
+            MetaReplyExpectation::ReplyOrPushNamed(expected),
+            MetaReplyDelivery::PushInstalled { name, .. }
+            | MetaReplyDelivery::PushInstallFailed { name, .. },
+        ) => expected == name,
+    }
+}
+
 impl AgentEntry {
     fn allocate_recv_waiter_id(&mut self) -> RecvWaiterId {
         let waiter_id = RecvWaiterId(self.next_recv_waiter_id);
@@ -612,6 +815,13 @@ impl AgentEntry {
         self.state = AgentState::Unhealthy;
         self.unhealthy_reason = Some(reason.into());
         self.unhealthy_detail = detail;
+        // Drop any pending meta waiter on every unhealthy path — including
+        // `enqueue_inbound`'s queue-overflow case, which calls us directly
+        // without going through `AgentStore::mark_unhealthy`. Without this,
+        // a full inbound queue (now reachable when unrelated subscription
+        // pushes fall through) can close the connection while a
+        // publish/list/query waiter stays armed until META_REPLY_TIMEOUT.
+        self.pending_meta_reply = None;
     }
 
     fn close_connection(&mut self) {
@@ -1534,6 +1744,149 @@ mod tests {
                 .expect_err("duplicate dialect should fail"),
             super::AgentError::DuplicateDialect
         );
+    }
+
+    #[tokio::test]
+    async fn try_route_meta_reply_does_not_steal_unrelated_push() {
+        // A `Reply`-expecting waiter (publish/list) must not be satisfied
+        // by an unsolicited subscription push. The push should fall through
+        // to the inbound queue so the awaited reply arrives correctly.
+        use super::{MetaReplyDelivery, MetaReplyExpectation, PendingMetaReply};
+        let store = agent_store(8, 4096);
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("insert");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut inner = store.inner.lock().await;
+            let entry = inner.agents.get_mut(&handle).expect("entry");
+            entry.pending_meta_reply = Some(PendingMetaReply {
+                expectation: MetaReplyExpectation::Reply,
+                sender: tx,
+            });
+        }
+
+        let push = MetaReplyDelivery::PushInstalled {
+            name: "arena-v1".to_owned(),
+            define_form: "(define arena-v1 ...)".to_owned(),
+            digest: "deadbeef".to_owned(),
+            frame: "(meta (teach @local (define arena-v1 ...)))".to_owned(),
+        };
+        let leftover = store
+            .try_route_meta_reply(&handle, push)
+            .await
+            .expect("push must NOT be consumed by a Reply waiter");
+        assert!(leftover.starts_with("(meta (teach"));
+
+        // Waiter remains armed; an actual reply still routes to it.
+        let reply = MetaReplyDelivery::Reply("(reply @x \"ok\" :thread \"t-1\")".to_owned());
+        assert!(store.try_route_meta_reply(&handle, reply).await.is_none());
+        let delivered = rx.await.expect("waiter should receive reply");
+        assert!(matches!(delivered, MetaReplyDelivery::Reply(_)));
+    }
+
+    #[tokio::test]
+    async fn try_route_meta_reply_filters_push_by_name() {
+        // A query for `arena-v1` must not consume a push for `other-dialect`.
+        use super::{MetaReplyDelivery, MetaReplyExpectation, PendingMetaReply};
+        let store = agent_store(8, 4096);
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("insert");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        {
+            let mut inner = store.inner.lock().await;
+            let entry = inner.agents.get_mut(&handle).expect("entry");
+            entry.pending_meta_reply = Some(PendingMetaReply {
+                expectation: MetaReplyExpectation::ReplyOrPushNamed("arena-v1".to_owned()),
+                sender: tx,
+            });
+        }
+
+        let unrelated = MetaReplyDelivery::PushInstalled {
+            name: "other-dialect".to_owned(),
+            define_form: "(define other-dialect ...)".to_owned(),
+            digest: "abc".to_owned(),
+            frame: "(meta (teach @local (define other-dialect ...)))".to_owned(),
+        };
+        assert!(
+            store
+                .try_route_meta_reply(&handle, unrelated)
+                .await
+                .is_some(),
+            "mismatched push name must NOT be consumed by the query waiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_clears_pending_meta_waiter() {
+        // The inbound-queue overflow path calls `AgentEntry::mark_unhealthy`
+        // directly. With the meta-reply correlation in place, unrelated
+        // subscription pushes can fall through to the queue, so this path
+        // is now reachable while a publish/list/query waiter is armed —
+        // the waiter must observe the close immediately rather than
+        // waiting META_REPLY_TIMEOUT.
+        use super::{MetaReplyExpectation, PendingMetaReply};
+        let store = agent_store(1, 64);
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("insert");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut inner = store.inner.lock().await;
+            let entry = inner.agents.get_mut(&handle).expect("entry");
+            entry.pending_meta_reply = Some(PendingMetaReply {
+                expectation: MetaReplyExpectation::Reply,
+                sender: tx,
+            });
+        }
+
+        // First enqueue fits; second blows the per-handle cap and triggers
+        // `mark_unhealthy("queue_overflow", _)` on the entry directly.
+        store
+            .enqueue_inbound(&handle, "first".to_owned())
+            .await
+            .expect("first enqueue");
+        let _ = store.enqueue_inbound(&handle, "second".to_owned()).await;
+
+        rx.await
+            .expect_err("waiter sender should drop on queue-overflow unhealthy path");
+    }
+
+    #[tokio::test]
+    async fn mark_unhealthy_clears_pending_meta_waiter() {
+        use super::{MetaReplyExpectation, PendingMetaReply};
+        let store = agent_store(8, 4096);
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("insert");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut inner = store.inner.lock().await;
+            let entry = inner.agents.get_mut(&handle).expect("entry");
+            entry.pending_meta_reply = Some(PendingMetaReply {
+                expectation: MetaReplyExpectation::Reply,
+                sender: tx,
+            });
+        }
+
+        store
+            .mark_unhealthy(&handle, "router_closed", Some("test".to_owned()))
+            .await
+            .expect("mark_unhealthy");
+
+        // The pending sender must have been dropped so the awaiting caller
+        // observes a closed channel immediately, not META_REPLY_TIMEOUT.
+        rx.await
+            .expect_err("waiter sender should be dropped when handle goes unhealthy");
     }
 
     fn agent_store(max_messages: usize, max_bytes: usize) -> super::AgentStore {

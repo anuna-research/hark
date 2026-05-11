@@ -286,6 +286,12 @@ pub enum InboundClass {
         name: String,
         define_form: String,
     },
+    /// A bare `(reply ...)` frame from the router — typically the response
+    /// to an agent-initiated `(meta (teach ...))` or `(meta (query (list)))`.
+    /// Used by the daemon to route the next meta-reply to a pending
+    /// `send_meta_and_await` waiter. Normal asks arrive wrapped in
+    /// `(lang <dialect> (ask ...))` and stay as `Ordinary`.
+    MetaReply,
     /// Anything else — pass through to the agent's inbound queue verbatim.
     Ordinary,
     /// Couldn't even parse the frame. Caller decides whether to log/drop.
@@ -302,6 +308,9 @@ pub fn classify_inbound(text: &str) -> InboundClass {
     let Some(items) = list_items(&sexpr) else {
         return InboundClass::Ordinary;
     };
+    if symbol_name(items.first()) == Some("reply") {
+        return InboundClass::MetaReply;
+    }
     if symbol_name(items.first()) != Some("meta") {
         return InboundClass::Ordinary;
     }

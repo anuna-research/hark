@@ -143,6 +143,20 @@ pub fn build_meta_subscribe_frame(pattern: &str) -> String {
     format!("(meta (subscribe (speak? {pattern})))")
 }
 
+/// `(meta (unsubscribe))` — drop the agent's subscription without closing
+/// the WebSocket. Pattern-less: the router keys subscriptions by the
+/// agent's connected pid and stores at most one entry per agent.
+pub fn build_meta_unsubscribe_frame() -> String {
+    "(meta (unsubscribe))".to_owned()
+}
+
+/// `(meta (query (list)))` — enumerate every dialect the router knows. The
+/// router replies with `(reply @<asker> "ok" :thread "..." :names "a b c")`,
+/// space-separated. Slice-3 router protocol addition.
+pub fn build_meta_query_list_frame() -> String {
+    "(meta (query (list)))".to_owned()
+}
+
 async fn connect(router: &ValidatedRouterConfig) -> Result<RouterWebSocket, RouterError> {
     let mut request = router
         .ws_url
@@ -311,12 +325,17 @@ async fn process_inbound(
             .await;
         return InboundOutcome::Exit;
     }
+    let class = classify_inbound(&text);
+    // Cache install runs on every DialectPush regardless of routing —
+    // teach-back responses to a `query (speak? X)` install identically to
+    // subscriber pushes, so the daemon-local cache is kept consistent
+    // whichever path produced the frame. Re-install is idempotent under
+    // content addressing.
     let mut installed: Option<String> = None;
-    if let InboundClass::DialectPush {
-        name, define_form, ..
-    } = classify_inbound(&text)
-    {
-        match dialect_cache.try_install(&name, &define_form) {
+    let delivery = match &class {
+        InboundClass::DialectPush {
+            name, define_form, ..
+        } => match dialect_cache.try_install(name, define_form) {
             Ok(digest) => {
                 tracing::info!(
                     target = "hark::dialect_cache",
@@ -324,7 +343,13 @@ async fn process_inbound(
                     digest = %digest,
                     "installed pushed dialect"
                 );
-                installed = Some(name);
+                installed = Some(name.clone());
+                Some(crate::daemon::MetaReplyDelivery::PushInstalled {
+                    name: name.clone(),
+                    define_form: define_form.clone(),
+                    digest,
+                    frame: text.clone(),
+                })
             }
             Err(error) => {
                 tracing::warn!(
@@ -333,9 +358,35 @@ async fn process_inbound(
                     error = %error,
                     "pushed dialect failed R1–R5; not cached"
                 );
+                Some(crate::daemon::MetaReplyDelivery::PushInstallFailed {
+                    name: name.clone(),
+                    reason: error.to_string(),
+                    frame: text.clone(),
+                })
             }
+        },
+        InboundClass::MetaReply => {
+            Some(crate::daemon::MetaReplyDelivery::Reply(text.clone()))
         }
-    }
+        _ => None,
+    };
+    // Meta-reply correlation: only consume frames whose shape matches the
+    // pending caller's expectation. An unrelated dialect push arriving while
+    // `publish`/`list`/`query` is in flight falls through to the inbound
+    // queue so it can't be misrouted as the awaited reply.
+    let text = if let Some(delivery) = delivery {
+        match store.try_route_meta_reply(handle, delivery).await {
+            None => {
+                if let Some(name) = installed {
+                    return InboundOutcome::Installed(name);
+                }
+                return InboundOutcome::Continue;
+            }
+            Some(text) => text,
+        }
+    } else {
+        text
+    };
     if store.enqueue_inbound(handle, text).await.is_err() {
         return InboundOutcome::Exit;
     }
@@ -402,8 +453,9 @@ fn escape_cbcl_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_hello_frame, build_meta_query_frame, build_meta_subscribe_frame,
-        build_meta_teach_frame, is_router_error_frame,
+        build_hello_frame, build_meta_query_frame, build_meta_query_list_frame,
+        build_meta_subscribe_frame, build_meta_teach_frame, build_meta_unsubscribe_frame,
+        is_router_error_frame,
     };
 
     #[test]
@@ -474,5 +526,15 @@ mod tests {
         assert_eq!(exact, "(meta (subscribe (speak? arena-v1)))");
         assert_eq!(prefix, "(meta (subscribe (speak? arena-*)))");
         assert_eq!(wildcard, "(meta (subscribe (speak? *)))");
+    }
+
+    #[test]
+    fn meta_unsubscribe_frame_has_no_parameters() {
+        assert_eq!(build_meta_unsubscribe_frame(), "(meta (unsubscribe))");
+    }
+
+    #[test]
+    fn meta_query_list_frame_has_no_parameters() {
+        assert_eq!(build_meta_query_list_frame(), "(meta (query (list)))");
     }
 }

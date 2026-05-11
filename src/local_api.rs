@@ -25,7 +25,7 @@ use crate::{
     constants::{COMMAND_NAME, LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
     daemon::{
         AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord,
-        authenticated_headers,
+        MetaReplyDelivery, MetaReplyExpectation, authenticated_headers,
     },
     router::{RouterError, create_router_agent},
 };
@@ -82,6 +82,54 @@ pub enum SendMessageKind {
 pub struct SendResponse {
     pub ok: bool,
     pub agent_handle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaSubscribeRequest {
+    pub pattern: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaAckResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaPublishRequest {
+    /// Complete `(define <name> ...)` CBCL form. The daemon validates it
+    /// through cbcl-rs's R1–R5 pipeline before sending the
+    /// `(meta (teach @router <define>))` envelope to the router.
+    pub define: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaPublishResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+    pub digest: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaQueryRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaQueryResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+    pub digest: String,
+    pub name: String,
+    pub define: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MetaListResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+    pub names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -327,6 +375,91 @@ impl LocalApiClient {
         decode_api_response(response).await
     }
 
+    pub async fn meta_subscribe(
+        &self,
+        handle: &AgentHandle,
+        request: &MetaSubscribeRequest,
+    ) -> Result<MetaAckResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!(
+                "/v1/agents/{}/meta/subscribe",
+                handle.as_str()
+            )))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    pub async fn meta_unsubscribe(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<MetaAckResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!(
+                "/v1/agents/{}/meta/unsubscribe",
+                handle.as_str()
+            )))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    pub async fn meta_publish(
+        &self,
+        handle: &AgentHandle,
+        request: &MetaPublishRequest,
+    ) -> Result<MetaPublishResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!(
+                "/v1/agents/{}/meta/publish",
+                handle.as_str()
+            )))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    pub async fn meta_query(
+        &self,
+        handle: &AgentHandle,
+        request: &MetaQueryRequest,
+    ) -> Result<MetaQueryResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/v1/agents/{}/meta/query", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    pub async fn meta_list(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<MetaListResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/v1/agents/{}/meta/list", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
     pub async fn close(&self, handle: &AgentHandle) -> Result<CloseResponse, LocalApiRequestError> {
         let response = self
             .http
@@ -472,6 +605,17 @@ fn router(state: AppState) -> Router {
         .route("/v1/agents", get(agents).post(create_agent))
         .route("/v1/agents/{handle}/recv", get(recv))
         .route("/v1/agents/{handle}/send", post(send))
+        .route(
+            "/v1/agents/{handle}/meta/subscribe",
+            post(meta_subscribe),
+        )
+        .route(
+            "/v1/agents/{handle}/meta/unsubscribe",
+            post(meta_unsubscribe),
+        )
+        .route("/v1/agents/{handle}/meta/publish", post(meta_publish))
+        .route("/v1/agents/{handle}/meta/query", post(meta_query))
+        .route("/v1/agents/{handle}/meta/list", post(meta_list))
         .route("/v1/agents/{handle}", delete(close_agent))
         .route("/v1/stop", post(stop))
         .with_state(state)
@@ -615,6 +759,412 @@ async fn send(
     }))
 }
 
+async fn meta_subscribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Json(request): Json<MetaSubscribeRequest>,
+) -> Result<Json<MetaAckResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let pattern = validate_subscribe_pattern(&request.pattern)?;
+    let frame = crate::router::build_meta_subscribe_frame(pattern);
+    state
+        .agents
+        .send_outbound(&handle, frame)
+        .await
+        .map_err(agent_error_to_api)?;
+    Ok(Json(MetaAckResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
+    }))
+}
+
+async fn meta_unsubscribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Result<Json<MetaAckResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let frame = crate::router::build_meta_unsubscribe_frame();
+    state
+        .agents
+        .send_outbound(&handle, frame)
+        .await
+        .map_err(agent_error_to_api)?;
+    Ok(Json(MetaAckResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
+    }))
+}
+
+async fn meta_publish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Json(request): Json<MetaPublishRequest>,
+) -> Result<Json<MetaPublishResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let define = request.define.trim();
+    validate_define_for_publish(define)?;
+    let frame = crate::router::build_meta_teach_frame(define);
+    let delivery = state
+        .agents
+        .send_meta_and_await(&handle, frame, MetaReplyExpectation::Reply, META_REPLY_TIMEOUT)
+        .await
+        .map_err(agent_error_to_api)?;
+    let reply = match delivery {
+        MetaReplyDelivery::Reply(frame) => frame,
+        // Expectation::Reply filters out pushes — this is the daemon
+        // protocol invariant being broken, not a user error.
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "meta_reply_malformed",
+                "router responded with a dialect push to a publish request",
+                Some(other.frame_owned()),
+            ));
+        }
+    };
+    let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
+        StatusCode::BAD_GATEWAY,
+        "meta_reply_malformed",
+        format!("router reply could not be parsed: {reason}"),
+        Some(reply.clone()),
+    ))?;
+    let digest = parsed
+        .get("digest")
+        .cloned()
+        .ok_or_else(|| ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "meta_reply_missing_digest",
+            "router reply did not include a digest",
+            Some(reply.clone()),
+        ))?;
+    let name = parsed
+        .get("name")
+        .cloned()
+        .ok_or_else(|| ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "meta_reply_missing_name",
+            "router reply did not include a name",
+            Some(reply.clone()),
+        ))?;
+    Ok(Json(MetaPublishResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
+        digest,
+        name,
+    }))
+}
+
+async fn meta_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Json(request): Json<MetaQueryRequest>,
+) -> Result<Json<MetaQueryResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    validate_dialect_name(&request.name)?;
+    let frame = crate::router::build_meta_query_frame(&request.name);
+    let delivery = state
+        .agents
+        .send_meta_and_await(
+            &handle,
+            frame,
+            MetaReplyExpectation::ReplyOrPushNamed(request.name.clone()),
+            META_REPLY_TIMEOUT,
+        )
+        .await
+        .map_err(agent_error_to_api)?;
+    // Three shapes possible:
+    //   * `PushInstalled` — `(meta (teach @<self> (define <name> ...)))`
+    //     that passed R1–R5 and is now in the daemon cache. Report success.
+    //   * `PushInstallFailed` — same shape but the define was rejected.
+    //     Surface as a gateway-level validation failure rather than
+    //     returning a digest for a body that wasn't actually installed.
+    //   * `Reply` — miss reply, typically with `:reason "..."`.
+    match delivery {
+        MetaReplyDelivery::PushInstalled {
+            name,
+            define_form,
+            digest,
+            ..
+        } => Ok(Json(MetaQueryResponse {
+            ok: true,
+            agent_handle: handle.as_str().to_owned(),
+            digest,
+            name,
+            define: define_form,
+        })),
+        MetaReplyDelivery::PushInstallFailed { reason, frame, .. } => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "teach_back_rejected",
+            format!("router teach-back failed R1–R5: {reason}"),
+            Some(frame),
+        )),
+        MetaReplyDelivery::Reply(reply) => {
+            let parsed = parse_meta_reply_params(&reply).unwrap_or_default();
+            let reason = parsed
+                .get("reason")
+                .cloned()
+                .unwrap_or_else(|| "router-does-not-speak".to_owned());
+            Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "dialect_unknown_to_router",
+                reason,
+                Some(reply),
+            ))
+        }
+    }
+}
+
+async fn meta_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Result<Json<MetaListResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let frame = crate::router::build_meta_query_list_frame();
+    let delivery = state
+        .agents
+        .send_meta_and_await(&handle, frame, MetaReplyExpectation::Reply, META_REPLY_TIMEOUT)
+        .await
+        .map_err(agent_error_to_api)?;
+    let reply = match delivery {
+        MetaReplyDelivery::Reply(frame) => frame,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "meta_reply_malformed",
+                "router responded with a dialect push to a list request",
+                Some(other.frame_owned()),
+            ));
+        }
+    };
+    let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
+        StatusCode::BAD_GATEWAY,
+        "meta_reply_malformed",
+        format!("router list reply could not be parsed: {reason}"),
+        Some(reply.clone()),
+    ))?;
+    let names = parsed
+        .get("names")
+        .map(|joined| {
+            joined
+                .split_whitespace()
+                .map(|s| s.to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Json(MetaListResponse {
+        ok: true,
+        agent_handle: handle.as_str().to_owned(),
+        names,
+    }))
+}
+
+fn validate_dialect_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\\'))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_dialect",
+            "dialect name must be a non-empty CBCL symbol",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+const META_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run cbcl-rs's R1–R5 pipeline on `(meta <define>)` so we don't ship a
+/// malformed define to the router. Mirrors the dialect-cache's
+/// `try_install` guard on the receive path.
+fn validate_define_for_publish(define: &str) -> Result<(), ApiError> {
+    if define.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cbcl_validation_failed",
+            "define body is empty",
+            None,
+        ));
+    }
+    // Require the body's outermost form to be `(define ...)`. `run_pipeline`
+    // also accepts other meta operations (e.g. `(query ...)`) when wrapped,
+    // and those would otherwise smuggle past the publish surface as a teach.
+    match cbcl_parser::parse(define) {
+        Ok(cbcl_core::sexpr::SExpr::List(items))
+            if matches!(
+                items.first(),
+                Some(cbcl_core::sexpr::SExpr::Atom(cbcl_core::sexpr::Atom::Symbol(s)))
+                    if s.as_str() == "define"
+            ) => {}
+        Ok(_) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "cbcl_validation_failed",
+                "publish body must be a `(define ...)` form",
+                None,
+            ));
+        }
+        Err(error) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "cbcl_validation_failed",
+                format!("define failed to parse: {error}"),
+                None,
+            ));
+        }
+    }
+    let envelope = format!("(meta {define})");
+    match cbcl_parser::run_pipeline(&envelope) {
+        cbcl_parser::PipelineResult::Success(_) => Ok(()),
+        cbcl_parser::PipelineResult::ParseError(error) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cbcl_validation_failed",
+            format!("define failed to parse: {error}"),
+            None,
+        )),
+        cbcl_parser::PipelineResult::ValidationError(error) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cbcl_validation_failed",
+            format!("define failed R1–R5: {error}"),
+            None,
+        )),
+        cbcl_parser::PipelineResult::Pending { .. }
+        | cbcl_parser::PipelineResult::Buffered { .. } => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cbcl_validation_failed",
+            "define pipeline returned unexpected pending/buffered state",
+            None,
+        )),
+    }
+}
+
+/// Extract `:<key> "<value>"` and `:<key> <symbol>` pairs from a reply
+/// frame like
+/// `(reply @asker "ok" :thread "rcp-..." :digest "abc..." :name foo)`.
+/// Stops at the first close-paren outside a string and ignores positional
+/// args (the recipient, the status content). Strings are unescaped for
+/// `\\` and `\"`. Best-effort: returns `Err(_)` if the frame doesn't
+/// look like a single top-level list at all.
+fn parse_meta_reply_params(text: &str) -> Result<std::collections::HashMap<String, String>, String> {
+    let bytes = text.as_bytes();
+    let mut params = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return Err("reply does not start with `(`".to_owned());
+    }
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let key = std::str::from_utf8(&bytes[start..j])
+                .map_err(|_| "non-utf8 keyword".to_owned())?
+                .to_owned();
+            // skip whitespace to the value
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                return Err(format!(":{key} had no value"));
+            }
+            if bytes[j] == b'"' {
+                // quoted string with `\\` and `\"` escapes
+                j += 1;
+                let mut buf = String::new();
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'\\' if j + 1 < bytes.len() => {
+                            buf.push(bytes[j + 1] as char);
+                            j += 2;
+                        }
+                        b'"' => {
+                            j += 1;
+                            break;
+                        }
+                        c => {
+                            buf.push(c as char);
+                            j += 1;
+                        }
+                    }
+                }
+                params.insert(key, buf);
+            } else {
+                let start = j;
+                while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b')' {
+                    j += 1;
+                }
+                let value = std::str::from_utf8(&bytes[start..j])
+                    .map_err(|_| "non-utf8 value".to_owned())?
+                    .to_owned();
+                params.insert(key, value);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(params)
+}
+
+/// Reject patterns containing characters that would break the canonical
+/// `(subscribe (speak? <pattern>))` envelope. Slice 2 router supports the
+/// pattern grammar `*`, `<prefix>*`, and `<exact>` — all of which are
+/// composed of CBCL symbol characters. Anything with whitespace, parens,
+/// or quotes here would either fail upstream parsing or smuggle extra
+/// list elements past the builder; reject it locally with a clear code.
+fn validate_subscribe_pattern(pattern: &str) -> Result<&str, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_subscribe_pattern",
+            "subscribe pattern must be a non-empty CBCL symbol; wildcard \
+             grammar is `*`, `<prefix>*`, or an exact name",
+            None,
+        )
+    };
+    if pattern.is_empty()
+        || pattern
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\\'))
+    {
+        return Err(invalid());
+    }
+    // Wildcard grammar: at most one `*`, only as the whole pattern or as a
+    // trailing suffix. Patterns like `foo*bar`, `**`, or `*foo` violate the
+    // router's documented matcher and should fail-fast before fire-and-forget
+    // subscribe silently routes them across the wire.
+    let stars = pattern.matches('*').count();
+    if stars > 1 {
+        return Err(invalid());
+    }
+    if stars == 1 && pattern != "*" && !pattern.ends_with('*') {
+        return Err(invalid());
+    }
+    Ok(pattern)
+}
+
 async fn close_agent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -756,6 +1306,18 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
         AgentError::InvalidDialect(message) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_dialect", message, None)
         }
+        AgentError::MetaSendBusy => ApiError::new(
+            StatusCode::CONFLICT,
+            "meta_send_busy",
+            "another meta send is already awaiting a router reply",
+            None,
+        ),
+        AgentError::MetaReplyTimeout => ApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "meta_reply_timeout",
+            "router did not reply to the meta send in time",
+            None,
+        ),
     }
 }
 
@@ -1287,5 +1849,56 @@ mod tests {
             .expect("error response should decode")
             .error
             .code
+    }
+
+    #[test]
+    fn publish_rejects_non_define_body() {
+        // `(query (speak? arena-v1))` is a valid meta op so `run_pipeline`
+        // accepts it under `(meta ...)`, but it must not pass the publish
+        // surface — that would silently teach a non-define payload to the
+        // router.
+        let error = super::validate_define_for_publish("(query (speak? arena-v1))")
+            .expect_err("non-define publish body should be rejected");
+        assert_eq!(error.code, "cbcl_validation_failed");
+    }
+
+    #[test]
+    fn publish_rejects_unparseable_body() {
+        let error = super::validate_define_for_publish("(define oops")
+            .expect_err("syntax error should be rejected");
+        assert_eq!(error.code, "cbcl_validation_failed");
+    }
+
+    #[test]
+    fn subscribe_rejects_internal_wildcards() {
+        // `foo*bar` and `**` have no banned characters but violate the
+        // documented `(* | prefix* | exact)` grammar. The router would
+        // treat them as exact, leaving the user with a silently invalid
+        // subscription; reject locally.
+        assert_eq!(
+            super::validate_subscribe_pattern("foo*bar")
+                .expect_err("internal wildcard should be rejected")
+                .code,
+            "invalid_subscribe_pattern"
+        );
+        assert_eq!(
+            super::validate_subscribe_pattern("**")
+                .expect_err("double wildcard should be rejected")
+                .code,
+            "invalid_subscribe_pattern"
+        );
+        assert_eq!(
+            super::validate_subscribe_pattern("*foo")
+                .expect_err("leading wildcard should be rejected")
+                .code,
+            "invalid_subscribe_pattern"
+        );
+    }
+
+    #[test]
+    fn subscribe_accepts_documented_grammar() {
+        assert!(super::validate_subscribe_pattern("*").is_ok());
+        assert!(super::validate_subscribe_pattern("arena-*").is_ok());
+        assert!(super::validate_subscribe_pattern("arena-v1").is_ok());
     }
 }

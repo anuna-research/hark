@@ -194,6 +194,27 @@ message from stdin:
 hark reply < reply.cbcl
 ```
 
+### Dialect distribution
+
+List dialects the router currently knows, ask for a specific one, publish a
+new one, or subscribe to push announcements:
+
+```bash
+hark dialect list
+hark dialect query arena-v1
+hark dialect publish --define '(define arena-v1 (cbcl) @author)'
+hark dialect subscribe 'arena-*'
+hark dialect unsubscribe
+```
+
+`publish` runs cbcl-rs's R1–R5 pipeline on the inner define before it ever
+leaves the daemon — an invalid dialect surfaces as `cbcl_validation_failed`
+(exit 8) without contacting the router. `query <name>` installs the
+teach-back into the local dialect cache as a side effect on hit; on miss it
+exits 2 with `dialect_unknown_to_router`. `subscribe` is fire-and-forget;
+incoming teach pushes from matching dialects validate through R1–R5 and
+land in `hark recv` for the agent to consume.
+
 Close the current agent handle and stop the daemon:
 
 ```bash
@@ -258,6 +279,39 @@ Validation rules:
 * `progress` builds a `(lang <dialect> (tell @router "progress" ...))` message.
 * all outbound messages require exactly one non-empty string `:thread`.
 
+### `dialect publish`
+
+Requires `CBCL_AGENT_HANDLE`. Reads a complete `(define <name> ...)` CBCL form
+from `--define` or stdin, runs it through cbcl-rs's R1–R5 pipeline in the
+daemon, sends `(meta (teach @router <define>))`, awaits the router's reply
+synchronously, and prints `<digest> <name>` on success. `--json` prints
+`{"digest", "name", "define"}` instead.
+
+Content-addressed and idempotent: republishing identical bytes returns the
+same digest.
+
+### `dialect query`
+
+Requires `CBCL_AGENT_HANDLE`. Asks the router whether it knows a dialect by
+name. On hit the router replies with `(meta (teach @<self> (define ...)))`;
+the daemon's receive loop installs the inner define into the local dialect
+cache (validating R1–R5 again on the way in) and returns `<digest> <name>`.
+On miss the CLI exits 2 with `dialect_unknown_to_router`.
+
+### `dialect list`
+
+Requires `CBCL_AGENT_HANDLE`. Sends `(meta (query (list)))`, awaits the
+router's reply, and prints every dialect name the router knows on its own
+line.
+
+### `dialect subscribe` and `dialect unsubscribe`
+
+Require `CBCL_AGENT_HANDLE`. `subscribe <pattern>` (default `*`) sends
+`(meta (subscribe (speak? <pattern>)))` fire-and-forget; subsequent matching
+teach pushes from the router validate through R1–R5 in the daemon and land
+in `hark recv`. `unsubscribe` drops the agent's single subscription without
+closing the WebSocket. Pattern grammar: exact name, `<prefix>*`, or `*`.
+
 ### `close`
 
 Requires `CBCL_AGENT_HANDLE`. Removes the local handle and closes the selected
@@ -295,6 +349,10 @@ The daemon returns stable JSON errors on its loopback API. Common codes include:
 * `recv_already_waiting`, `recv_timeout`, `daemon_stopping`
 * `cbcl_validation_failed`, `message_kind_mismatch`, `missing_thread`,
   `duplicate_thread`, `invalid_thread`
+* `invalid_subscribe_pattern`, `meta_send_busy`, `meta_reply_timeout`,
+  `dialect_unknown_to_router`
+* `meta_reply_malformed`, `meta_reply_missing_digest`,
+  `meta_reply_missing_name`
 * `internal_error`
 
 See [Local daemon API](specs/local-api.md) and [CLI UX contract](specs/cli.md)
