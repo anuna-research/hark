@@ -332,11 +332,10 @@ async fn process_inbound(
     // whichever path produced the frame. Re-install is idempotent under
     // content addressing.
     let mut installed: Option<String> = None;
-    if let InboundClass::DialectPush {
-        name, define_form, ..
-    } = &class
-    {
-        match dialect_cache.try_install(name, define_form) {
+    let delivery = match &class {
+        InboundClass::DialectPush {
+            name, define_form, ..
+        } => match dialect_cache.try_install(name, define_form) {
             Ok(digest) => {
                 tracing::info!(
                     target = "hark::dialect_cache",
@@ -345,6 +344,12 @@ async fn process_inbound(
                     "installed pushed dialect"
                 );
                 installed = Some(name.clone());
+                Some(crate::daemon::MetaReplyDelivery::PushInstalled {
+                    name: name.clone(),
+                    define_form: define_form.clone(),
+                    digest,
+                    frame: text.clone(),
+                })
             }
             Err(error) => {
                 tracing::warn!(
@@ -353,14 +358,24 @@ async fn process_inbound(
                     error = %error,
                     "pushed dialect failed R1–R5; not cached"
                 );
+                Some(crate::daemon::MetaReplyDelivery::PushInstallFailed {
+                    name: name.clone(),
+                    reason: error.to_string(),
+                    frame: text.clone(),
+                })
             }
+        },
+        InboundClass::MetaReply => {
+            Some(crate::daemon::MetaReplyDelivery::Reply(text.clone()))
         }
-    }
-    // Meta-reply correlation: if a `send_meta_and_await` call is in flight
-    // for this agent, route the next reply / teach-back to it instead of
-    // forwarding to the recv queue. Falls through when nobody is waiting.
-    let text = if matches!(class, InboundClass::DialectPush { .. } | InboundClass::MetaReply) {
-        match store.try_route_meta_reply(handle, text).await {
+        _ => None,
+    };
+    // Meta-reply correlation: only consume frames whose shape matches the
+    // pending caller's expectation. An unrelated dialect push arriving while
+    // `publish`/`list`/`query` is in flight falls through to the inbound
+    // queue so it can't be misrouted as the awaited reply.
+    let text = if let Some(delivery) = delivery {
+        match store.try_route_meta_reply(handle, delivery).await {
             None => {
                 if let Some(name) = installed {
                     return InboundOutcome::Installed(name);

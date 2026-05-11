@@ -25,7 +25,7 @@ use crate::{
     constants::{COMMAND_NAME, LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
     daemon::{
         AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord,
-        authenticated_headers,
+        MetaReplyDelivery, MetaReplyExpectation, authenticated_headers,
     },
     router::{RouterError, create_router_agent},
 };
@@ -813,11 +813,24 @@ async fn meta_publish(
     let define = request.define.trim();
     validate_define_for_publish(define)?;
     let frame = crate::router::build_meta_teach_frame(define);
-    let reply = state
+    let delivery = state
         .agents
-        .send_meta_and_await(&handle, frame, META_REPLY_TIMEOUT)
+        .send_meta_and_await(&handle, frame, MetaReplyExpectation::Reply, META_REPLY_TIMEOUT)
         .await
         .map_err(agent_error_to_api)?;
+    let reply = match delivery {
+        MetaReplyDelivery::Reply(frame) => frame,
+        // Expectation::Reply filters out pushes — this is the daemon
+        // protocol invariant being broken, not a user error.
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "meta_reply_malformed",
+                "router responded with a dialect push to a publish request",
+                Some(other.frame_owned()),
+            ));
+        }
+    };
     let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
         StatusCode::BAD_GATEWAY,
         "meta_reply_malformed",
@@ -861,48 +874,55 @@ async fn meta_query(
     let handle = parse_handle(handle)?;
     validate_dialect_name(&request.name)?;
     let frame = crate::router::build_meta_query_frame(&request.name);
-    let reply = state
+    let delivery = state
         .agents
-        .send_meta_and_await(&handle, frame, META_REPLY_TIMEOUT)
+        .send_meta_and_await(
+            &handle,
+            frame,
+            MetaReplyExpectation::ReplyOrPushNamed(request.name.clone()),
+            META_REPLY_TIMEOUT,
+        )
         .await
         .map_err(agent_error_to_api)?;
-    // Two shapes possible: (meta (teach @<self> (define <name> ...))) on
-    // hit, or a `(reply ...)` with `:reason "router-does-not-speak"` on
-    // miss. Distinguish by leading symbol.
-    let trimmed = reply.trim_start();
-    if trimmed.starts_with("(meta") {
-        match crate::cbcl_validation::classify_inbound(&reply) {
-            crate::cbcl_validation::InboundClass::DialectPush {
-                name, define_form, ..
-            } => {
-                let digest = sha256_hex(define_form.as_bytes());
-                Ok(Json(MetaQueryResponse {
-                    ok: true,
-                    agent_handle: handle.as_str().to_owned(),
-                    digest,
-                    name,
-                    define: define_form,
-                }))
-            }
-            _ => Err(ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "meta_reply_malformed",
-                "router teach-back could not be classified",
+    // Three shapes possible:
+    //   * `PushInstalled` — `(meta (teach @<self> (define <name> ...)))`
+    //     that passed R1–R5 and is now in the daemon cache. Report success.
+    //   * `PushInstallFailed` — same shape but the define was rejected.
+    //     Surface as a gateway-level validation failure rather than
+    //     returning a digest for a body that wasn't actually installed.
+    //   * `Reply` — miss reply, typically with `:reason "..."`.
+    match delivery {
+        MetaReplyDelivery::PushInstalled {
+            name,
+            define_form,
+            digest,
+            ..
+        } => Ok(Json(MetaQueryResponse {
+            ok: true,
+            agent_handle: handle.as_str().to_owned(),
+            digest,
+            name,
+            define: define_form,
+        })),
+        MetaReplyDelivery::PushInstallFailed { reason, frame, .. } => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "teach_back_rejected",
+            format!("router teach-back failed R1–R5: {reason}"),
+            Some(frame),
+        )),
+        MetaReplyDelivery::Reply(reply) => {
+            let parsed = parse_meta_reply_params(&reply).unwrap_or_default();
+            let reason = parsed
+                .get("reason")
+                .cloned()
+                .unwrap_or_else(|| "router-does-not-speak".to_owned());
+            Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "dialect_unknown_to_router",
+                reason,
                 Some(reply),
-            )),
+            ))
         }
-    } else {
-        let parsed = parse_meta_reply_params(&reply).unwrap_or_default();
-        let reason = parsed
-            .get("reason")
-            .cloned()
-            .unwrap_or_else(|| "router-does-not-speak".to_owned());
-        Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "dialect_unknown_to_router",
-            reason,
-            Some(reply),
-        ))
     }
 }
 
@@ -915,11 +935,22 @@ async fn meta_list(
     reject_if_stopping(&state)?;
     let handle = parse_handle(handle)?;
     let frame = crate::router::build_meta_query_list_frame();
-    let reply = state
+    let delivery = state
         .agents
-        .send_meta_and_await(&handle, frame, META_REPLY_TIMEOUT)
+        .send_meta_and_await(&handle, frame, MetaReplyExpectation::Reply, META_REPLY_TIMEOUT)
         .await
         .map_err(agent_error_to_api)?;
+    let reply = match delivery {
+        MetaReplyDelivery::Reply(frame) => frame,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "meta_reply_malformed",
+                "router responded with a dialect push to a list request",
+                Some(other.frame_owned()),
+            ));
+        }
+    };
     let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
         StatusCode::BAD_GATEWAY,
         "meta_reply_malformed",
@@ -958,13 +989,6 @@ fn validate_dialect_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
 const META_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run cbcl-rs's R1–R5 pipeline on `(meta <define>)` so we don't ship a
@@ -978,6 +1002,33 @@ fn validate_define_for_publish(define: &str) -> Result<(), ApiError> {
             "define body is empty",
             None,
         ));
+    }
+    // Require the body's outermost form to be `(define ...)`. `run_pipeline`
+    // also accepts other meta operations (e.g. `(query ...)`) when wrapped,
+    // and those would otherwise smuggle past the publish surface as a teach.
+    match cbcl_parser::parse(define) {
+        Ok(cbcl_core::sexpr::SExpr::List(items))
+            if matches!(
+                items.first(),
+                Some(cbcl_core::sexpr::SExpr::Atom(cbcl_core::sexpr::Atom::Symbol(s)))
+                    if s.as_str() == "define"
+            ) => {}
+        Ok(_) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "cbcl_validation_failed",
+                "publish body must be a `(define ...)` form",
+                None,
+            ));
+        }
+        Err(error) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "cbcl_validation_failed",
+                format!("define failed to parse: {error}"),
+                None,
+            ));
+        }
     }
     let envelope = format!("(meta {define})");
     match cbcl_parser::run_pipeline(&envelope) {
@@ -1084,17 +1135,32 @@ fn parse_meta_reply_params(text: &str) -> Result<std::collections::HashMap<Strin
 /// or quotes here would either fail upstream parsing or smuggle extra
 /// list elements past the builder; reject it locally with a clear code.
 fn validate_subscribe_pattern(pattern: &str) -> Result<&str, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_subscribe_pattern",
+            "subscribe pattern must be a non-empty CBCL symbol; wildcard \
+             grammar is `*`, `<prefix>*`, or an exact name",
+            None,
+        )
+    };
     if pattern.is_empty()
         || pattern
             .chars()
             .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\\'))
     {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_subscribe_pattern",
-            "subscribe pattern must be a non-empty CBCL symbol",
-            None,
-        ));
+        return Err(invalid());
+    }
+    // Wildcard grammar: at most one `*`, only as the whole pattern or as a
+    // trailing suffix. Patterns like `foo*bar`, `**`, or `*foo` violate the
+    // router's documented matcher and should fail-fast before fire-and-forget
+    // subscribe silently routes them across the wire.
+    let stars = pattern.matches('*').count();
+    if stars > 1 {
+        return Err(invalid());
+    }
+    if stars == 1 && pattern != "*" && !pattern.ends_with('*') {
+        return Err(invalid());
     }
     Ok(pattern)
 }
@@ -1783,5 +1849,56 @@ mod tests {
             .expect("error response should decode")
             .error
             .code
+    }
+
+    #[test]
+    fn publish_rejects_non_define_body() {
+        // `(query (speak? arena-v1))` is a valid meta op so `run_pipeline`
+        // accepts it under `(meta ...)`, but it must not pass the publish
+        // surface — that would silently teach a non-define payload to the
+        // router.
+        let error = super::validate_define_for_publish("(query (speak? arena-v1))")
+            .expect_err("non-define publish body should be rejected");
+        assert_eq!(error.code, "cbcl_validation_failed");
+    }
+
+    #[test]
+    fn publish_rejects_unparseable_body() {
+        let error = super::validate_define_for_publish("(define oops")
+            .expect_err("syntax error should be rejected");
+        assert_eq!(error.code, "cbcl_validation_failed");
+    }
+
+    #[test]
+    fn subscribe_rejects_internal_wildcards() {
+        // `foo*bar` and `**` have no banned characters but violate the
+        // documented `(* | prefix* | exact)` grammar. The router would
+        // treat them as exact, leaving the user with a silently invalid
+        // subscription; reject locally.
+        assert_eq!(
+            super::validate_subscribe_pattern("foo*bar")
+                .expect_err("internal wildcard should be rejected")
+                .code,
+            "invalid_subscribe_pattern"
+        );
+        assert_eq!(
+            super::validate_subscribe_pattern("**")
+                .expect_err("double wildcard should be rejected")
+                .code,
+            "invalid_subscribe_pattern"
+        );
+        assert_eq!(
+            super::validate_subscribe_pattern("*foo")
+                .expect_err("leading wildcard should be rejected")
+                .code,
+            "invalid_subscribe_pattern"
+        );
+    }
+
+    #[test]
+    fn subscribe_accepts_documented_grammar() {
+        assert!(super::validate_subscribe_pattern("*").is_ok());
+        assert!(super::validate_subscribe_pattern("arena-*").is_ok());
+        assert!(super::validate_subscribe_pattern("arena-v1").is_ok());
     }
 }
