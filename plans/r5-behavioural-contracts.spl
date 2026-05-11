@@ -1,0 +1,349 @@
+; =============================================================================
+; R5 Behavioural Contracts — wire shape + causal-protocol runtime enforcement
+; from cbcl-rs SPEC-002 into the hark daemon's outbound and inbound paths.
+; =============================================================================
+;
+; Background (read once):
+;
+;   cbcl-rs SPEC-002 defines R5 in two layers:
+;     install-time well-formedness — already done in hark via
+;     `cbcl_parser::run_pipeline` on (define ...) forms in dialect_cache.rs
+;     and local_api.rs `validate_define`.
+;
+;     runtime behavioural enforcement — NOT yet done in hark. For every
+;     simple (non-meta) message that flows through the daemon, the dialect's
+;     `(protocol ...)` and `(shape ...)` clauses must be checked against the
+;     message before it reaches its destination:
+;
+;       outbound — between `validate_for_send` and the router write
+;       inbound  — in `process_inbound` for InboundClass::Ordinary, before
+;                  the message lands on the recv queue
+;
+;   cbcl-parser exposes `run_pipeline_full(input, &PipelineContext<S>)` which
+;   does parse → R1–R5 install + (for simple messages) causal verify (6a) →
+;   evaluate → shape check (6b) in one pass. It needs a `DialectRegistry` and
+;   a `MessageStore` (cbcl-core ships `ThreadedMessageStore`).
+;
+;   hark's `dialect_cache.rs` currently stores the raw `(define …)` text per
+;   digest+name. It does NOT keep parsed `cbcl_core::dialect::Dialect`
+;   structures and does NOT maintain a `DialectRegistry`. There is also no
+;   message store anywhere in the daemon — `AgentEntry` only has an inbound
+;   queue. Both gaps must be filled before run_pipeline_full can be called.
+
+(meta plan
+  (title "R5 behavioural contracts — runtime shape + causal verification")
+  (status "active")
+  (description
+    "Wire cbcl-rs run_pipeline_full into hark outbound/inbound message paths "
+    "so simple messages are checked against installed dialects' shape and "
+    "causal-protocol clauses. Adds a DialectRegistry alongside the existing "
+    "raw-form dialect cache and a per-handle ThreadedMessageStore. Surfaces "
+    "two new validation error codes: shape_violation and causal_violation.")
+  (created "2026-05-11")
+  (branch "feat/r5-runtime-behavioural-contracts"))
+
+; -----------------------------------------------------------------------------
+; AGENTS
+; -----------------------------------------------------------------------------
+; One worker — hugo (the orchestrator). Subagents dispatched via the Agent
+; tool inherit hugo's identity for the purpose of this plan.
+(given agent-hugo-available)
+
+; -----------------------------------------------------------------------------
+; TASKS
+; -----------------------------------------------------------------------------
+(given task-infra)          ; A. DialectRegistry + MessageStore plumbing
+(given task-outbound)       ; B. Outbound R5 wiring (reply/error/progress)
+(given task-inbound)        ; C. Inbound R5 wiring (router push → recv)
+(given task-tests)          ; D. Integration tests for outbound + inbound
+(given task-specs-docs)     ; E. Spec + README updates
+(given task-polish)         ; F. Build, clippy, final commit, PR-ready
+
+; -----------------------------------------------------------------------------
+; TASK METADATA
+; -----------------------------------------------------------------------------
+(meta task-infra
+  (description
+    "Extend src/dialect_cache.rs to keep a cbcl_core::dialect::DialectRegistry "
+    "of parsed Dialect objects in lockstep with the existing raw-form cache. "
+    "Add per-handle ThreadedMessageStore inside AgentEntry (src/daemon.rs). "
+    "Add CausalViolation and ShapeViolation variants to CbclValidationError "
+    "in src/cbcl_validation.rs and map them to JSON error responses in "
+    "src/local_api.rs (new codes: causal_violation, shape_violation, both "
+    "mapped to HTTP 422 and CLI exit code 8 to match other validation "
+    "failures). No behaviour change yet — this only lays the plumbing.")
+  (acceptance
+    "1. `cargo check -p hark` clean. 2. dialect_cache_install now also parses "
+    "into a registry and exposes a method to read the current registry. 3. "
+    "AgentEntry has a thread-scoped message store with insert + lookup-by-hash. "
+    "4. Two new error variants compile and route to 422/exit-8. No call sites "
+    "for the new wiring yet — outbound + inbound still use run_pipeline."))
+
+(meta task-outbound
+  (description
+    "In src/local_api.rs send/reply/error/progress handlers, replace the "
+    "`cbcl_parser::run_pipeline` call with `run_pipeline_full(envelope, "
+    "&PipelineContext::new(&registry, &mut store))`, where registry and "
+    "store come from the AgentEntry resolved from CBCL_AGENT_HANDLE. On "
+    "ValidationError::CausalViolation or ShapeViolation, return the new "
+    "JSON error codes from task-infra. On Success, append the sent message "
+    "into the store keyed by its content hash and thread, so subsequent "
+    "outbound replies can causally reference it. Surface "
+    "PipelineResult::Pending as causal_violation for now (defer Buffer "
+    "policy to a follow-up).")
+  (acceptance
+    "1. Outbound a message that violates the dialect's shape → daemon "
+    "responds 422 with {error: \"shape_violation\", detail: …}; CLI exits 8. "
+    "2. Outbound a reply with :caused-by referencing an unknown hash → "
+    "daemon responds 422 with {error: \"causal_violation\"}. 3. Happy-path "
+    "outbound (matching shape, valid :caused-by or none) still succeeds. 4. "
+    "Sent message is observable in the per-handle store afterwards."))
+
+(meta task-inbound
+  (description
+    "In src/router.rs `process_inbound` InboundClass::Ordinary branch, run "
+    "`run_pipeline_full` against the same registry+store as outbound before "
+    "calling `enqueue_inbound`. On violation: emit a tracing::warn event with "
+    "the blame s-expression, drop the message (do NOT enqueue), and increment "
+    "an internal counter exposed via `daemon status` once that wiring exists "
+    "(if it doesn't yet, just log). On success, append the message into the "
+    "store before enqueueing. Keep meta pushes (teach/etc.) on their existing "
+    "code path — only Ordinary frames are affected.")
+  (acceptance
+    "1. Inbound a router-pushed message that violates installed dialect's "
+    "shape → message is dropped, warn-level log records the violation, "
+    "recv never sees it. 2. Same for causal-violation. 3. Inbound a "
+    "well-formed dialect-wrapped ask is enqueued normally and visible in "
+    "the store afterwards. 4. Inbound meta teach pushes are unaffected."))
+
+(meta task-tests
+  (description
+    "Add integration tests under tests/ modelled on the existing "
+    "router_integration.rs and local_api.rs patterns. Cover: outbound "
+    "shape-violation rejected; outbound causal-violation rejected; outbound "
+    "happy path succeeds and populates the store; inbound shape-violation "
+    "dropped; inbound causal-violation dropped; inbound happy path enqueues "
+    "and recv receives. Use a small fixture dialect that defines one "
+    "performative with one require-rule and a two-step causal protocol.")
+  (acceptance
+    "`cargo test -p hark` adds at least six new integration tests covering "
+    "the six scenarios above and they all pass."))
+
+(meta task-specs-docs
+  (description
+    "Update specs/router-protocol.md with a new \"R5 Runtime Behavioural "
+    "Verification\" section after the existing thread/receipt section, "
+    "documenting shape + causal enforcement on outbound and inbound simple "
+    "messages and the policy on Pending (treat as causal_violation for "
+    "now). Update specs/local-api.md error-code list to include "
+    "shape_violation and causal_violation. Update specs/cli.md exit-code "
+    "table footnote if needed (likely just reuse exit 8). Update README.md "
+    "in the appropriate section to mention runtime R5 behavioural checks.")
+  (acceptance
+    "All three spec files describe the new behaviour and error codes "
+    "consistently. README mentions runtime R5 enforcement in the validation "
+    "flow."))
+
+(meta task-polish
+  (description
+    "Final pass: `cargo build`, `cargo test`, `cargo clippy --all-targets`. "
+    "Resolve any warnings introduced by the new code. Stage changes; commit "
+    "in 3–4 focused commits matching the phase boundaries (infra, outbound, "
+    "inbound, tests+docs). Print a PR-ready summary for the user.")
+  (acceptance
+    "Clean build, clean tests, clean clippy, commits pushed to "
+    "feat/r5-runtime-behavioural-contracts. Final message lists each commit "
+    "hash and a one-line summary."))
+
+; -----------------------------------------------------------------------------
+; DEPENDENCIES
+; -----------------------------------------------------------------------------
+(given infra-has-no-deps)
+
+; outbound and inbound both need the registry + store + error variants
+(given outbound-needs-infra)
+(given inbound-needs-infra)
+
+; tests need both message paths wired
+(given tests-need-outbound)
+(given tests-need-inbound)
+
+; specs/docs can start as soon as outbound + inbound are designed; we model
+; them as depending on both so the docs reflect what was actually built
+(given docs-need-outbound)
+(given docs-need-inbound)
+
+; polish needs everything finished
+(given polish-needs-tests)
+(given polish-needs-docs)
+
+; -----------------------------------------------------------------------------
+; READINESS RULES
+; -----------------------------------------------------------------------------
+(normally r-ready-infra
+  (and task-infra infra-has-no-deps)
+  ready-infra)
+
+(normally r-ready-outbound
+  (and task-outbound outbound-needs-infra completed-infra)
+  ready-outbound)
+
+(normally r-ready-inbound
+  (and task-inbound inbound-needs-infra completed-infra)
+  ready-inbound)
+
+(normally r-ready-tests
+  (and task-tests tests-need-outbound tests-need-inbound
+       completed-outbound completed-inbound)
+  ready-tests)
+
+(normally r-ready-specs-docs
+  (and task-specs-docs docs-need-outbound docs-need-inbound
+       completed-outbound completed-inbound)
+  ready-specs-docs)
+
+(normally r-ready-polish
+  (and task-polish polish-needs-tests polish-needs-docs
+       completed-tests completed-specs-docs)
+  ready-polish)
+
+; -----------------------------------------------------------------------------
+; ASSIGNMENT RULES — single agent (hugo) does everything via subagents
+; -----------------------------------------------------------------------------
+(normally r-assign-infra
+  (and ready-infra agent-hugo-available)
+  assign-to-infra-hugo)
+
+(normally r-assign-outbound
+  (and ready-outbound agent-hugo-available)
+  assign-to-outbound-hugo)
+
+(normally r-assign-inbound
+  (and ready-inbound agent-hugo-available)
+  assign-to-inbound-hugo)
+
+(normally r-assign-tests
+  (and ready-tests agent-hugo-available)
+  assign-to-tests-hugo)
+
+(normally r-assign-specs-docs
+  (and ready-specs-docs agent-hugo-available)
+  assign-to-specs-docs-hugo)
+
+(normally r-assign-polish
+  (and ready-polish agent-hugo-available)
+  assign-to-polish-hugo)
+
+(claims agent:hugo
+  :at "2026-05-11T13:53:50Z"
+  (given claim-v1-infra)
+  (normally r-cl-state-v1-infra claim-v1-infra state-claimed-v1-infra)
+  (normally r-cl-chain-v1-infra state-claimed-v1-infra claimed-infra)
+)
+
+;; Propagation rules: failures in 'infra' block downstream tasks
+(normally r-propagate-inbound-from-infra-failed failed-infra upstream-blocked-inbound)
+(normally r-propagate-inbound-from-infra-permanently-failed permanently-failed-infra upstream-blocked-inbound)
+(normally r-propagate-inbound-from-infra-stale-v1 stale-v1-infra upstream-blocked-inbound)
+(normally r-propagate-inbound-from-infra-timeout-v1 timeout-v1-infra upstream-blocked-inbound)
+(normally r-propagate-inbound-from-infra-blocked upstream-blocked-infra upstream-blocked-inbound)
+(normally r-propagate-outbound-from-infra-failed failed-infra upstream-blocked-outbound)
+(normally r-propagate-outbound-from-infra-permanently-failed permanently-failed-infra upstream-blocked-outbound)
+(normally r-propagate-outbound-from-infra-stale-v1 stale-v1-infra upstream-blocked-outbound)
+(normally r-propagate-outbound-from-infra-timeout-v1 timeout-v1-infra upstream-blocked-outbound)
+(normally r-propagate-outbound-from-infra-blocked upstream-blocked-infra upstream-blocked-outbound)
+
+;; Transitive propagation: upstream-blocked cascades through dependency chain
+(normally r-propagate-specs-docs-from-inbound-blocked upstream-blocked-inbound upstream-blocked-specs-docs)
+(normally r-propagate-tests-from-inbound-blocked upstream-blocked-inbound upstream-blocked-tests)
+(normally r-propagate-specs-docs-from-outbound-blocked upstream-blocked-outbound upstream-blocked-specs-docs)
+(normally r-propagate-tests-from-outbound-blocked upstream-blocked-outbound upstream-blocked-tests)
+(normally r-propagate-polish-from-specs-docs-blocked upstream-blocked-specs-docs upstream-blocked-polish)
+(normally r-propagate-polish-from-tests-blocked upstream-blocked-tests upstream-blocked-polish)
+
+(claims agent:hugo
+  :at "2026-05-11T14:03:01Z"
+  (given completed-infra))
+
+(claims agent:hugo
+  :at "2026-05-11T14:03:01Z"
+  (given claim-v1-outbound)
+  (normally r-cl-state-v1-outbound claim-v1-outbound state-claimed-v1-outbound)
+  (normally r-cl-chain-v1-outbound state-claimed-v1-outbound claimed-outbound)
+)
+
+;; Propagation rules: failures in 'outbound' block downstream tasks
+(normally r-propagate-specs-docs-from-outbound-failed failed-outbound upstream-blocked-specs-docs)
+(normally r-propagate-specs-docs-from-outbound-permanently-failed permanently-failed-outbound upstream-blocked-specs-docs)
+(normally r-propagate-specs-docs-from-outbound-stale-v1 stale-v1-outbound upstream-blocked-specs-docs)
+(normally r-propagate-specs-docs-from-outbound-timeout-v1 timeout-v1-outbound upstream-blocked-specs-docs)
+(normally r-propagate-tests-from-outbound-failed failed-outbound upstream-blocked-tests)
+(normally r-propagate-tests-from-outbound-permanently-failed permanently-failed-outbound upstream-blocked-tests)
+(normally r-propagate-tests-from-outbound-stale-v1 stale-v1-outbound upstream-blocked-tests)
+(normally r-propagate-tests-from-outbound-timeout-v1 timeout-v1-outbound upstream-blocked-tests)
+
+(claims agent:hugo
+  :at "2026-05-11T14:03:01Z"
+  (given claim-v1-inbound)
+  (normally r-cl-state-v1-inbound claim-v1-inbound state-claimed-v1-inbound)
+  (normally r-cl-chain-v1-inbound state-claimed-v1-inbound claimed-inbound)
+)
+
+;; Propagation rules: failures in 'inbound' block downstream tasks
+(normally r-propagate-specs-docs-from-inbound-failed failed-inbound upstream-blocked-specs-docs)
+(normally r-propagate-specs-docs-from-inbound-permanently-failed permanently-failed-inbound upstream-blocked-specs-docs)
+(normally r-propagate-specs-docs-from-inbound-stale-v1 stale-v1-inbound upstream-blocked-specs-docs)
+(normally r-propagate-specs-docs-from-inbound-timeout-v1 timeout-v1-inbound upstream-blocked-specs-docs)
+(normally r-propagate-tests-from-inbound-failed failed-inbound upstream-blocked-tests)
+(normally r-propagate-tests-from-inbound-permanently-failed permanently-failed-inbound upstream-blocked-tests)
+(normally r-propagate-tests-from-inbound-stale-v1 stale-v1-inbound upstream-blocked-tests)
+(normally r-propagate-tests-from-inbound-timeout-v1 timeout-v1-inbound upstream-blocked-tests)
+
+(claims agent:hugo
+  :at "2026-05-11T14:22:21Z"
+  (given completed-outbound))
+
+(claims agent:hugo
+  :at "2026-05-11T14:22:21Z"
+  (given completed-inbound))
+
+(claims agent:hugo
+  :at "2026-05-11T14:22:21Z"
+  (given claim-v1-tests)
+  (normally r-cl-state-v1-tests claim-v1-tests state-claimed-v1-tests)
+  (normally r-cl-chain-v1-tests state-claimed-v1-tests claimed-tests)
+)
+
+;; Propagation rules: failures in 'tests' block downstream tasks
+(normally r-propagate-polish-from-tests-failed failed-tests upstream-blocked-polish)
+(normally r-propagate-polish-from-tests-permanently-failed permanently-failed-tests upstream-blocked-polish)
+(normally r-propagate-polish-from-tests-stale-v1 stale-v1-tests upstream-blocked-polish)
+(normally r-propagate-polish-from-tests-timeout-v1 timeout-v1-tests upstream-blocked-polish)
+
+(claims agent:hugo
+  :at "2026-05-11T14:22:21Z"
+  (given claim-v1-specs-docs)
+  (normally r-cl-state-v1-specs-docs claim-v1-specs-docs state-claimed-v1-specs-docs)
+  (normally r-cl-chain-v1-specs-docs state-claimed-v1-specs-docs claimed-specs-docs)
+)
+
+;; Propagation rules: failures in 'specs-docs' block downstream tasks
+(normally r-propagate-polish-from-specs-docs-failed failed-specs-docs upstream-blocked-polish)
+(normally r-propagate-polish-from-specs-docs-permanently-failed permanently-failed-specs-docs upstream-blocked-polish)
+(normally r-propagate-polish-from-specs-docs-stale-v1 stale-v1-specs-docs upstream-blocked-polish)
+(normally r-propagate-polish-from-specs-docs-timeout-v1 timeout-v1-specs-docs upstream-blocked-polish)
+
+(claims agent:hugo
+  :at "2026-05-11T14:37:05Z"
+  (given completed-tests))
+
+(claims agent:hugo
+  :at "2026-05-11T14:37:05Z"
+  (given completed-specs-docs))
+
+(claims agent:hugo
+  :at "2026-05-11T14:37:05Z"
+  (given claim-v1-polish)
+  (normally r-cl-state-v1-polish claim-v1-polish state-claimed-v1-polish)
+  (normally r-cl-chain-v1-polish state-claimed-v1-polish claimed-polish)
+)
