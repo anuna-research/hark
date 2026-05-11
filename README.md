@@ -37,8 +37,9 @@ selected by `CBCL_AGENT_HANDLE`.
   +-----------------------------------------------------------+
 ```
 
-Asks enter `cbcl-router` over HTTP from producers and are dispatched to
-connected agents over the WebSocket. The CLI is a thin client; the daemon
+Producers POST asks to `cbcl-router` at `/ingress/v1/messages`; the
+router then dispatches each ask to a connected agent over the agent
+WebSocket at `/agent/v1`. The CLI is a thin client; the daemon
 is the only process that holds a router WebSocket and the inbound
 message queue for each agent handle, and CLI invocations talk to it
 over loopback. Both the CLI and the daemon link `cbcl-rs` to parse and
