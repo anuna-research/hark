@@ -40,7 +40,8 @@
 //! life of the daemon process. SPEC-009 §"Open for follow-up work" notes
 //! Mnesia / disk-backed promotion as a follow-up alongside `cbcl-storage`.
 
-use cbcl_parser::{PipelineResult, run_pipeline};
+use cbcl_core::dialect::DialectRegistry;
+use cbcl_parser::{PipelineResult, parse, parse_dialect, run_pipeline};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -81,6 +82,11 @@ struct Inner {
     /// Name → latest-pushed digest. Latest-write-wins; versioned routing
     /// is future work, mirroring the router-side `resolve-name/1`.
     latest_by_name: HashMap<String, String>,
+    /// Parsed registry of installed dialects, kept in lock-step with
+    /// `by_digest`. R5 Phase B/C plumbing: outbound/inbound pipelines
+    /// will snapshot this to build a `PipelineContext`. Always contains
+    /// the base dialect at index 0 (invariant of `DialectRegistry`).
+    registry: DialectRegistry,
 }
 
 impl DialectCache {
@@ -103,7 +109,18 @@ impl DialectCache {
         let name = name.into();
         let envelope = format!("(meta {define_form})");
         match run_pipeline(&envelope) {
-            PipelineResult::Success(_) => Ok(self.install_unchecked(name, define_form)),
+            PipelineResult::Success(_) => {
+                // Pipeline already validated R1–R5; now parse into a
+                // structured `Dialect` and install into the in-memory
+                // registry. A parse error here is treated as a rejection:
+                // if the pipeline accepted the form but we can't extract
+                // a `Dialect`, the cache and registry would drift.
+                let sexpr = parse(&define_form).map_err(|e| {
+                    InstallError::Rejected(format!("define_form parse failed: {e}"))
+                })?;
+                let dialect = parse_dialect(&sexpr).map_err(InstallError::Rejected)?;
+                Ok(self.install_unchecked_with_dialect(name, define_form, Some(dialect)))
+            }
             PipelineResult::ParseError(error) => Err(InstallError::Rejected(error.to_string())),
             PipelineResult::ValidationError(error) => {
                 Err(InstallError::Rejected(error.to_string()))
@@ -128,6 +145,21 @@ impl DialectCache {
     ) -> String {
         let define_form = define_form.into();
         let name = name.into();
+        // Test-only entrypoint: try to parse the form into a Dialect so
+        // the registry stays in sync where possible, but tolerate fixture
+        // strings that aren't well-formed defines.
+        let parsed = parse(&define_form)
+            .ok()
+            .and_then(|sexpr| parse_dialect(&sexpr).ok());
+        self.install_unchecked_with_dialect(name, define_form, parsed)
+    }
+
+    fn install_unchecked_with_dialect(
+        &self,
+        name: String,
+        define_form: String,
+        dialect: Option<cbcl_core::dialect::Dialect>,
+    ) -> String {
         let digest = sha256_hex(define_form.as_bytes());
         let cached = CachedDialect {
             digest: digest.clone(),
@@ -137,7 +169,26 @@ impl DialectCache {
         };
         let mut inner = self.inner.write().expect("dialect-cache lock poisoned");
         inner.by_digest.insert(digest.clone(), cached);
-        inner.latest_by_name.insert(name, digest.clone());
+        inner.latest_by_name.insert(name.clone(), digest.clone());
+        if let Some(d) = dialect {
+            // The registry rejects duplicates by name only implicitly
+            // (latest-write-wins is our cache contract). Skip re-install
+            // if the registry already has it; this preserves the
+            // base-dialect-at-index-0 invariant and avoids `Vec` churn.
+            if inner.registry.find_by_name(&d.name).is_none() {
+                // R1–R5 already passed in `try_install`; an install error
+                // here would indicate a registry/pipeline mismatch. Log
+                // and continue: the textual cache is authoritative.
+                if let Err(err) = inner.registry.install(d) {
+                    tracing::warn!(
+                        target: "dialect_cache",
+                        error = %err,
+                        name = %name,
+                        "registry install failed after pipeline acceptance"
+                    );
+                }
+            }
+        }
         digest
     }
 
@@ -164,6 +215,25 @@ impl DialectCache {
     /// True iff the cache already knows this name (any version).
     pub fn knows(&self, name: &str) -> bool {
         self.resolve_name(name).is_some()
+    }
+
+    /// Snapshot the in-memory dialect registry. Cheap-ish (clones a
+    /// `Vec<Dialect>`); intended for building a `PipelineContext` per
+    /// outbound/inbound message in later R5 phases.
+    pub fn registry_snapshot(&self) -> DialectRegistry {
+        self.inner
+            .read()
+            .expect("dialect-cache lock poisoned")
+            .registry
+            .clone()
+    }
+
+    /// Borrow the in-memory registry under the cache lock. Use when the
+    /// caller only needs read access and wants to avoid cloning the
+    /// underlying `Vec<Dialect>`.
+    pub fn with_registry<R>(&self, f: impl FnOnce(&DialectRegistry) -> R) -> R {
+        let inner = self.inner.read().expect("dialect-cache lock poisoned");
+        f(&inner.registry)
     }
 
     pub fn len(&self) -> usize {
@@ -248,5 +318,29 @@ mod tests {
         let cache = DialectCache::new();
         let result = cache.try_install("syntax", "(define oops");
         assert!(matches!(result, Err(InstallError::Rejected(_))));
+    }
+
+    #[test]
+    fn try_install_populates_registry_snapshot() {
+        let cache = DialectCache::new();
+        cache
+            .try_install("cache-fixture", GOOD_DEFINE)
+            .expect("R1–R5-clean fixture must install");
+
+        let snapshot = cache.registry_snapshot();
+        assert!(
+            snapshot.find_by_name("cache-fixture").is_some(),
+            "registry must contain the installed dialect"
+        );
+        // Base dialect remains at index 0 alongside the installed one.
+        assert!(snapshot.len() >= 2);
+
+        // with_registry must observe the same state.
+        cache.with_registry(|r| {
+            let d = r
+                .find_by_name("cache-fixture")
+                .expect("with_registry must see the installed dialect");
+            assert_eq!(d.name, "cache-fixture");
+        });
     }
 }

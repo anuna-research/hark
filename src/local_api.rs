@@ -1405,6 +1405,18 @@ fn cbcl_validation_error_to_api(error: CbclValidationError) -> ApiError {
             error.to_string(),
             None,
         ),
+        CbclValidationError::ShapeViolation { ref detail, .. } => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "shape_violation",
+            detail.clone(),
+            None,
+        ),
+        CbclValidationError::CausalViolation { ref detail, .. } => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "causal_violation",
+            detail.clone(),
+            None,
+        ),
         _ => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "cbcl_validation_failed",

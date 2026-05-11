@@ -503,7 +503,9 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "message_kind_mismatch"
                 | "missing_thread"
                 | "duplicate_thread"
-                | "invalid_thread" => AppError::CbclValidation,
+                | "invalid_thread"
+                | "shape_violation"
+                | "causal_violation" => AppError::CbclValidation,
                 "meta_reply_malformed"
                 | "meta_reply_missing_digest"
                 | "meta_reply_missing_name" => {

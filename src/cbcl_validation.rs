@@ -2,7 +2,7 @@ use cbcl_core::{
     message::{CorePerformative, Message, Performative},
     sexpr::{Atom, SExpr},
 };
-use cbcl_parser::{ParseError, PipelineResult, run_pipeline};
+use cbcl_parser::{ParseError, PipelineResult, ValidationError, run_pipeline};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -60,6 +60,24 @@ pub enum CbclValidationError {
     InvalidProgressRecipient,
     #[error("progress messages must have string content \"progress\"")]
     InvalidProgressContent,
+    /// R5 shape constraint violation surfaced from `run_pipeline_full`
+    /// (REQ-220, REQ-231 step 6b). Phase A plumbing: variant added so
+    /// outbound/inbound paths can carry the structured error once they
+    /// switch from `run_pipeline` to `run_pipeline_full` in B/C.
+    #[error("CBCL shape violation: {detail}")]
+    ShapeViolation {
+        detail: String,
+        performative: Option<String>,
+        thread: Option<String>,
+    },
+    /// Causal protocol violation surfaced from `run_pipeline_full`
+    /// (REQ-200, REQ-231 step 6a). Same plumbing rationale as above.
+    #[error("CBCL causal violation: {detail}")]
+    CausalViolation {
+        detail: String,
+        performative: Option<String>,
+        thread: Option<String>,
+    },
 }
 
 impl CbclValidationError {
@@ -74,6 +92,37 @@ impl CbclValidationError {
             CbclValidationError::NonStringThread => "cbcl_thread_non_string",
             CbclValidationError::InvalidProgressRecipient => "cbcl_progress_recipient",
             CbclValidationError::InvalidProgressContent => "cbcl_progress_content",
+            CbclValidationError::ShapeViolation { .. } => "shape_violation",
+            CbclValidationError::CausalViolation { .. } => "causal_violation",
+        }
+    }
+
+    /// Build a hark `CbclValidationError` from a cbcl-parser
+    /// `ValidationError::ShapeViolation` / `CausalViolation`. Returns
+    /// `None` for variants that don't map to a shape/causal error —
+    /// callers should fall back to `Malformed` for those.
+    ///
+    /// Phase A: factory only; no caller yet (outbound/inbound paths
+    /// keep using `run_pipeline`, which never returns these two
+    /// variants). Wired in Phase B/C alongside the switch to
+    /// `run_pipeline_full`.
+    pub fn from_pipeline_validation(
+        error: &ValidationError,
+        performative: Option<String>,
+        thread: Option<String>,
+    ) -> Option<Self> {
+        match error {
+            ValidationError::ShapeViolation { .. } => Some(Self::ShapeViolation {
+                detail: error.to_string(),
+                performative,
+                thread,
+            }),
+            ValidationError::CausalViolation { .. } => Some(Self::CausalViolation {
+                detail: error.to_string(),
+                performative,
+                thread,
+            }),
+            _ => None,
         }
     }
 }
