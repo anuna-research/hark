@@ -300,6 +300,72 @@ Stderr:
 
 Validation errors must not be sent to the router.
 
+### `dialect publish`
+
+Publishes a CBCL dialect to the router by reading a `(define <name> ...)`
+form from `--define` or stdin, running it through cbcl-rs's R1–R5 pipeline
+in the daemon, and sending `(meta (teach @router <define>))`. Awaits the
+router's `(reply ...)` synchronously and prints `<digest> <name>` (or JSON
+with `--json`).
+
+Stdout:
+
+* default: `<sha256-hex-digest> <dialect-name>` followed by a newline
+* `--json`: a JSON object `{"digest": ..., "name": ...}`
+
+Exit codes:
+
+* `0` - dialect published
+* `2` - usage error (missing handle, bad CLI flags)
+* `6` - `CBCL_AGENT_HANDLE` is missing
+* `7` - handle is unknown or another meta send is in flight
+  (`meta_send_busy`)
+* `8` - define failed R1–R5 validation (cbcl-rs pipeline rejected it)
+* `9` - router connection failure
+* `10` - router did not reply in time (`meta_reply_timeout`)
+
+Content addressing makes publish idempotent: republishing identical bytes
+returns the same digest.
+
+### `dialect query`
+
+Asks the router whether it knows a dialect by name. On hit the daemon
+installs the teach-back into the local cache (R1–R5 validated again on the
+way in) and prints `<digest> <name>`. On miss the CLI exits 2 with the
+router's reason text in stderr.
+
+Stdout:
+
+* default: `<sha256-hex-digest> <dialect-name>` followed by a newline
+* `--json`: a JSON object `{"digest", "name", "define"}` carrying the full
+  installed define form
+
+Exit codes:
+
+* `0` - router knows the dialect; teach-back installed locally
+* `2` - dialect unknown to the router (`dialect_unknown_to_router`)
+* `6` - `CBCL_AGENT_HANDLE` is missing
+* `7` - handle is unknown or another meta send is in flight
+* `9` - router connection failure
+* `10` - timeout
+
+### `dialect list`
+
+Asks the router for every dialect name it knows via
+`(meta (query (list)))`. Prints one name per line. Exit codes mirror the
+other meta verbs; `0` even when the router returns an empty list.
+
+### `dialect subscribe` and `dialect unsubscribe`
+
+`subscribe <pattern>` (default `*`) registers the agent for push
+announcements; subsequent matching teach pushes from the router land in
+`hark recv` after R1–R5 validation. `unsubscribe` drops the agent's single
+subscription. Both are fire-and-forget — exit `0` once the daemon has
+written the meta frame to the router socket.
+
+Pattern grammar: exact name, `<prefix>*`, or `*`. Anything else (whitespace,
+parens, quotes) exits `2` with `invalid_subscribe_pattern`.
+
 ### `close`
 
 Closes the WebSocket connection and removes daemon state for

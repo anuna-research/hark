@@ -87,6 +87,18 @@ Stable error codes used by the MVP local API:
 * `missing_thread` - sent message has no `:thread`.
 * `duplicate_thread` - sent message has more than one `:thread`.
 * `invalid_thread` - sent message has an empty or non-string `:thread`.
+* `invalid_subscribe_pattern` - subscribe pattern is empty or contains
+  characters that would break the canonical envelope.
+* `meta_send_busy` - another meta send is already awaiting a router reply
+  for this agent handle. Single-slot per agent.
+* `meta_reply_timeout` - the router did not reply to the meta send within
+  the daemon's wait window.
+* `dialect_unknown_to_router` - the router replied to a `query <name>`
+  with `router-does-not-speak`.
+* `meta_reply_malformed` - router reply could not be parsed as a CBCL
+  reply / teach-back.
+* `meta_reply_missing_digest`, `meta_reply_missing_name` - publish reply
+  lacked the expected `:digest` or `:name` keyword.
 * `internal_error` - unexpected daemon failure.
 
 ## Endpoints
@@ -361,6 +373,110 @@ Response:
 {
   "ok": true,
   "agent_handle": "01JX8F4V2QK8GZP9H6W5"
+}
+```
+
+### `POST /v1/agents/{handle}/meta/subscribe`
+
+Sends `(meta (subscribe (speak? <pattern>)))` to the router on behalf of the
+agent. Fire-and-forget: no router reply is awaited. The router pins the
+subscription to the agent's WebSocket pid; on disconnect the subscription is
+auto-evicted.
+
+Request body:
+
+```json
+{ "pattern": "arena-*" }
+```
+
+`pattern` is required and must be a CBCL symbol — non-empty and free of
+whitespace, parens, and quote characters. Returns
+`400 invalid_subscribe_pattern` otherwise.
+
+Response (`200`):
+
+```json
+{ "ok": true, "agent_handle": "..." }
+```
+
+### `POST /v1/agents/{handle}/meta/unsubscribe`
+
+Sends `(meta (unsubscribe))`. Drops the agent's single subscription without
+closing the WebSocket. Idempotent; succeeds whether or not the agent had an
+active subscription. Empty request body.
+
+Response (`200`):
+
+```json
+{ "ok": true, "agent_handle": "..." }
+```
+
+### `POST /v1/agents/{handle}/meta/publish`
+
+Runs cbcl-rs's R1–R5 pipeline on `(meta <define>)` first, rejecting locally
+with `400 cbcl_validation_failed` on any violation. On pass, sends
+`(meta (teach @router <define>))`, awaits the router's `(reply ...)`, and
+returns the parsed `:digest` + `:name`. Single-slot meta-await per agent —
+concurrent calls return `409 meta_send_busy`. Default wait is 10 seconds
+before `408 meta_reply_timeout`.
+
+Request body:
+
+```json
+{ "define": "(define <name> ...)" }
+```
+
+Response (`200`):
+
+```json
+{
+  "ok": true,
+  "agent_handle": "...",
+  "digest": "<sha256 hex>",
+  "name": "<dialect-name>"
+}
+```
+
+### `POST /v1/agents/{handle}/meta/query`
+
+Sends `(meta (query (speak? <name>)))`, awaits the router's reply. On hit
+(router has the dialect) the reply is a teach-back
+`(meta (teach @<self> (define <name> ...)))`; the daemon's receive loop
+installs the inner define into the local dialect cache (validating R1–R5)
+and the handler returns `digest`, `name`, and the canonical `define` form.
+On miss returns `404 dialect_unknown_to_router` with the router's reason
+text.
+
+Request body:
+
+```json
+{ "name": "arena-v1" }
+```
+
+Response (`200`):
+
+```json
+{
+  "ok": true,
+  "agent_handle": "...",
+  "digest": "<sha256 hex>",
+  "name": "<dialect-name>",
+  "define": "(define <name> ...)"
+}
+```
+
+### `POST /v1/agents/{handle}/meta/list`
+
+Sends `(meta (query (list)))`, awaits the router's `(reply ... :names "a b c")`,
+and returns each name as a string. Empty request body.
+
+Response (`200`):
+
+```json
+{
+  "ok": true,
+  "agent_handle": "...",
+  "names": ["arena-v1", "arena-v2", "..."]
 }
 ```
 
