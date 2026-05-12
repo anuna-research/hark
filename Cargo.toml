@@ -3,7 +3,7 @@ name = "hark"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Local CLI and daemon client for cbcl-router agent connections"
+description = "Local CLI and per-user daemon for connecting an agent to cbcl-router"
 license = "Apache-2.0"
 
 [[bin]]
@@ -36,6 +36,7 @@ url = "2.5"
 
 [dev-dependencies]
 assert_cmd = "2.0"
+clap_mangen = "0.2"
 predicates = "3.1"
 tempfile = "3.16"
 tokio = { version = "1.44", features = ["test-util"] }

@@ -90,6 +90,7 @@ From this directory:
 make build        # cargo build --release
 make test         # cargo test
 make check        # lint + test
+make man          # generate target/hark.1 from the clap CLI
 ```
 
 During development, run the CLI against the current sources with:
@@ -98,12 +99,12 @@ During development, run the CLI against the current sources with:
 make run ARGS="daemon status"
 ```
 
-Install the release binary onto `PATH` (defaults to `$HOME/.local/bin`;
-override with `PREFIX=...`):
+Install the release binary and man page onto `PATH` (defaults to
+`$HOME/.local`; override with `PREFIX=...`):
 
 ```bash
-make install                  # -> $HOME/.local/bin/hark
-make install PREFIX=/usr/local  # -> /usr/local/bin/hark
+make install                    # -> $HOME/.local/{bin/hark,share/man/man1/hark.1}
+make install PREFIX=/usr/local  # -> /usr/local/{bin,share/man/man1}
 make uninstall
 ```
 
@@ -111,6 +112,7 @@ Once installed:
 
 ```bash
 hark --help
+man hark
 ```
 
 `make help` lists every target. The Makefile is a thin wrapper around `cargo`,

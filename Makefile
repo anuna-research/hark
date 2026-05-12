@@ -3,7 +3,7 @@
 
 PREFIX ?= $(HOME)/.local
 
-.PHONY: all build test check lint clippy fmt fmt-fix run install uninstall clean doc doc-open help
+.PHONY: all build test check lint clippy fmt fmt-fix run man install uninstall clean doc doc-open help
 
 all: build
 
@@ -33,15 +33,24 @@ fmt-fix:
 run:
 	cargo run -- $(ARGS)
 
-install: build
-	install -d $(PREFIX)/bin
+man: target/hark.1
+
+target/hark.1: examples/gen-man.rs src/cli.rs Cargo.toml
+	cargo run --quiet --example gen-man > $@
+
+install: build man
+	install -d $(PREFIX)/bin $(PREFIX)/share/man/man1
 	install -m 755 target/release/hark $(PREFIX)/bin/hark
+	install -m 644 target/hark.1 $(PREFIX)/share/man/man1/hark.1
 	@echo ""
 	@echo "Installed hark to $(PREFIX)/bin/hark"
-	@echo "Ensure $(PREFIX)/bin is on your PATH."
+	@echo "Installed man page to $(PREFIX)/share/man/man1/hark.1"
+	@echo "Ensure $(PREFIX)/bin is on your PATH and"
+	@echo "$(PREFIX)/share/man is on your MANPATH."
 
 uninstall:
 	rm -f $(PREFIX)/bin/hark
+	rm -f $(PREFIX)/share/man/man1/hark.1
 
 clean:
 	cargo clean
@@ -64,8 +73,9 @@ help:
 	@echo "  make fmt       - Check formatting"
 	@echo "  make fmt-fix   - Auto-fix formatting"
 	@echo "  make run       - cargo run -- \$$ARGS  (e.g. ARGS=\"daemon status\")"
-	@echo "  make install   - Install release binary to \$$PREFIX/bin"
-	@echo "  make uninstall - Remove installed binary"
+	@echo "  make man       - Generate target/hark.1 from the clap CLI"
+	@echo "  make install   - Install binary + man page under \$$PREFIX"
+	@echo "  make uninstall - Remove installed binary and man page"
 	@echo "  make clean     - Remove build artifacts"
 	@echo "  make doc       - Generate documentation"
 	@echo "  make doc-open  - Generate and open documentation"

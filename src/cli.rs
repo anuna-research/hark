@@ -124,8 +124,8 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    /// SPEC-009 collapses capability ≡ dialect; agents advertise the
-    /// dialects they can perform. At least one is required.
+    /// Capability ≡ dialect: agents advertise the dialects they can
+    /// perform. At least one is required.
     #[arg(
         long = "dialect",
         required = true,
