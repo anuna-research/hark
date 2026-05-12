@@ -137,6 +137,13 @@ pub struct CreateAgentRequest {
     /// SPEC-009: capability ≡ dialect. The agent declares the dialects
     /// it can perform; the daemon validates and forwards to the router.
     pub dialects: Vec<String>,
+    /// Best-effort fetch+install each advertised dialect from the router
+    /// after hello so R5 shape/protocol checks fire on the first message.
+    /// Defaults to `true`; tests with mock routers that don't speak meta
+    /// can set it to `false` to skip. Soft-fails per dialect (miss,
+    /// timeout, or transport error) without failing the agent creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_install_advertised: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -632,6 +639,13 @@ async fn create_agent(
         .config
         .validate_router()
         .map_err(config_error_to_api)?;
+    let dialects = request.dialects.clone();
+    // Per-request override wins; otherwise fall back to the daemon-level
+    // `[agent].auto_install_advertised` default (true in production, off
+    // in tests that set `CBCL_AGENT_AUTO_INSTALL_ADVERTISED=false`).
+    let auto_install = request
+        .auto_install_advertised
+        .unwrap_or(state.config.agent.auto_install_advertised);
     let created = create_router_agent(
         state.agents.clone(),
         &router,
@@ -641,6 +655,10 @@ async fn create_agent(
     .await
     .map_err(router_error_to_api)?;
 
+    if auto_install {
+        auto_install_advertised_dialects(&state.agents, &created.agent_handle, &dialects).await;
+    }
+
     Ok(Json(CreateAgentResponse {
         agent_handle: created.agent_handle.as_str().to_owned(),
         router_agent_id: created.router_agent_id,
@@ -648,6 +666,76 @@ async fn create_agent(
         state: "connected".to_owned(),
     }))
 }
+
+/// Per-dialect best-effort meta-query so the publisher's local R5 pipeline
+/// can enforce shape/protocol constraints on the very first outbound and
+/// inbound simple message. Each query is sequential (the agent's
+/// `pending_meta_reply` slot is single-occupancy) and uses a short timeout
+/// so a non-responsive router does not stall agent creation.
+///
+/// All failure modes — `Reply` (router does not yet know the dialect),
+/// `PushInstallFailed`, transport errors, timeouts — are logged at
+/// info/warn level under target `hark::auto_install` and do **not** fail
+/// the agent. The contract is "advertised dialects MAY be R5-enforced
+/// immediately"; nothing breaks if they aren't.
+async fn auto_install_advertised_dialects(
+    store: &crate::daemon::AgentStore,
+    handle: &crate::daemon::AgentHandle,
+    dialects: &[String],
+) {
+    use crate::daemon::{MetaReplyDelivery, MetaReplyExpectation};
+
+    for name in dialects {
+        let frame = crate::router::build_meta_query_frame(name);
+        let outcome = store
+            .send_meta_and_await(
+                handle,
+                frame,
+                MetaReplyExpectation::ReplyOrPushNamed(name.clone()),
+                AUTO_INSTALL_QUERY_TIMEOUT,
+            )
+            .await;
+        match outcome {
+            Ok(MetaReplyDelivery::PushInstalled { name: installed, digest, .. }) => {
+                tracing::info!(
+                    target: "hark::auto_install",
+                    handle = handle.as_str(),
+                    name = %installed,
+                    digest = %digest,
+                    "installed advertised dialect from router on init",
+                );
+            }
+            Ok(MetaReplyDelivery::Reply(_)) => {
+                tracing::info!(
+                    target: "hark::auto_install",
+                    handle = handle.as_str(),
+                    name = %name,
+                    "router does not yet know advertised dialect; R5 will not enforce its constraints until it is published locally or arrives over subscribe",
+                );
+            }
+            Ok(MetaReplyDelivery::PushInstallFailed { reason, .. }) => {
+                tracing::warn!(
+                    target: "hark::auto_install",
+                    handle = handle.as_str(),
+                    name = %name,
+                    %reason,
+                    "router teach-back for advertised dialect failed R5 locally; not installed",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "hark::auto_install",
+                    handle = handle.as_str(),
+                    name = %name,
+                    ?error,
+                    "meta query for advertised dialect failed; skipping local install",
+                );
+            }
+        }
+    }
+}
+
+const AUTO_INSTALL_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 async fn ping(
     State(state): State<AppState>,

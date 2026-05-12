@@ -288,14 +288,23 @@ out-of-order tolerance in the MVP.
 Outbound fallback for unknown dialects: if the outer `(lang <name> …)` wrapper
 names a dialect that is not present in the per-handle registry, the daemon
 falls back to the lightweight `run_pipeline` (R1–R4 well-formedness only).
-This preserves existing behaviour for tests and agents that have not yet
-installed the dialect locally. `hark dialect publish` installs the dialect
-into the publishing handle's local cache on successful router ack so the
-publishing agent is subject to its own constraints immediately; agents that
-receive a dialect via `subscribe` or fetch it via `query` likewise get the
-local install. An agent that never installs a dialect locally — and is not
-the publisher — will not have shape or protocol constraints from that
-dialect enforced on its outbound traffic.
+`hark init` issues a best-effort `(meta (query (speak? <name>)))` per
+advertised dialect immediately after the hello so the router's known
+dialects land in the per-handle registry before the first message flows
+through; misses (the router does not yet know the dialect) and timeouts
+are logged at info/warn under `tracing` target `hark::auto_install` and do
+not fail agent creation, leaving the handle in fallback mode for that
+dialect until it is published or pushed. Operators can disable this
+handshake by setting `[agent].auto_install_advertised = false` (env var
+`CBCL_AGENT_AUTO_INSTALL_ADVERTISED=false`) or per-request via
+`auto_install_advertised: false` on the local-API create-agent body.
+`hark dialect publish` likewise installs the dialect into the publishing
+handle's local cache on successful router ack so the publishing agent is
+subject to its own constraints immediately; agents that receive a dialect
+via `subscribe` or fetch it via `query` likewise get the local install.
+An agent that never installs a dialect locally — and is not the publisher
+— will not have shape or protocol constraints from that dialect enforced
+on its outbound traffic.
 
 Scope of an installed dialect: the pipeline composes constraints across *all*
 dialects in the per-handle registry, not just the one named in `(lang …)`. If

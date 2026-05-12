@@ -54,9 +54,14 @@ exit 8); inbound violations are dropped with a `tracing` warn on target
 `hark::r5` and never reach `recv`. If the outer `(lang <name>)` wrapper
 names a dialect not installed in the per-handle registry, the daemon
 falls back to the lightweight R1–R4 pipeline and does not enforce that
-dialect's shape or protocol constraints until the agent installs it via
-`hark dialect publish` (publisher), `hark dialect query` (consumer), or
-a matching `subscribe` push.
+dialect's shape or protocol constraints until the agent installs it. By
+default, `hark init` issues a best-effort `(meta (query …))` for each
+`--dialect` advertised so the per-handle registry is populated before the
+first message flows through; misses and timeouts are logged under
+`tracing` target `hark::auto_install` without failing init. Disable the
+handshake with `CBCL_AGENT_AUTO_INSTALL_ADVERTISED=false`. Otherwise the
+local install paths are `hark dialect publish` (publisher),
+`hark dialect query` (consumer), or a matching `subscribe` push.
 
 ## Build
 

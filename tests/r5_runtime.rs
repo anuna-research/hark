@@ -330,7 +330,13 @@ impl Harness {
         let response = reqwest::Client::new()
             .post(self.url("/v1/agents"))
             .header("authorization", format!("Bearer {}", self.record.token))
-            .json(&serde_json::json!({ "dialects": dialects }))
+            .json(&serde_json::json!({
+                "dialects": dialects,
+                // r5_runtime's mock router does not answer meta queries; the
+                // fixture is installed explicitly via `try_install` after this
+                // call. Opt out of auto-install so init does not stall.
+                "auto_install_advertised": false,
+            }))
             .send()
             .await
             .expect("create-agent request must complete");

@@ -269,6 +269,10 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
     let response = client
         .create_agent(&CreateAgentRequest {
             dialects: args.dialects,
+            // None → daemon-side default (true). The CLI does not expose a
+            // knob for this; production agents always want their advertised
+            // dialects R5-enforceable from the first message.
+            auto_install_advertised: None,
         })
         .await
         .map_err(map_local_api_request_error)?;

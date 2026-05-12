@@ -168,6 +168,16 @@ can perform, and the router treats each as the routable capability. An agent
 must advertise at least one dialect. If no `--dialect` value is supplied,
 `init` fails with a usage error and does not call the daemon.
 
+By default, `init` performs a best-effort `(meta (query (speak? <name>)))`
+for each advertised dialect after the router hello so the dialects' shape
+and protocol constraints take effect on the first outbound or inbound
+simple message. Misses, timeouts, and transport errors are logged under
+`tracing` target `hark::auto_install` and do not fail `init`; the dialect
+remains uninstalled locally and R5 will not enforce its constraints until
+it is published or arrives over `subscribe`. Operators disable the
+handshake with `[agent].auto_install_advertised = false` in the daemon
+config or `CBCL_AGENT_AUTO_INSTALL_ADVERTISED=false`.
+
 The CLI should reject duplicate dialect values before calling the daemon.
 Preserving the user-supplied order in successful requests is useful for
 predictable status output, but duplicate advertisements do not add
