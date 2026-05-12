@@ -192,6 +192,17 @@ pub struct ErrorBody {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Performative of the offending message, if applicable. Surfaced
+    /// for R5 violations (`shape_violation`, `causal_violation`) so
+    /// callers can correlate the rejection with the dialect's blame
+    /// rules without re-parsing the message body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performative: Option<String>,
+    /// Receipt thread of the offending message, if applicable.
+    /// Surfaced for R5 violations so callers can correlate the
+    /// rejection with the dispatched ask that originated the chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }
 
 #[derive(Clone)]
@@ -851,29 +862,32 @@ async fn send(
         .await
         .map_err(agent_error_to_api)?;
     let registry = dialect_cache.registry_snapshot();
-    let validated = {
-        let mut guard = store_arc.lock().await;
+
+    // Hold the per-handle store guard across validate → append → enqueue
+    // so concurrent /send requests serialize on it. Without this,
+    // sender A could pass validation and append its hash to the store,
+    // and sender B could then validate `:caused-by = hash_A` and reach
+    // `send_outbound` before A — the writer task pops the mpsc in FIFO
+    // order, so whichever request enqueues first wins the wire order,
+    // independent of which one appended first. Serialising the entire
+    // (validate, append, enqueue) sequence guarantees that a message
+    // is on the WebSocket queue strictly after any predecessor it
+    // depends on causally.
+    let mut guard = store_arc.lock().await;
+    let validated =
         validate_for_send_with_context(&request.message, kind, &registry, &mut guard)
-            .map_err(cbcl_validation_error_to_api)?
-    };
-
-    // Append the successfully-validated outbound message into the handle's
-    // causal store BEFORE the WebSocket write so a subsequent reply in
-    // this thread can reference it via `:caused-by`. Dedup-false (REQ-310)
-    // simply means we've already accepted this exact frame; not fatal.
-    let entry = build_outbound_store_entry(&validated);
-    if let Some((hash, thread, message)) = entry {
-        let _ = state
-            .agents
-            .append_message(&handle, hash, thread, message)
-            .await;
+            .map_err(cbcl_validation_error_to_api)?;
+    if let Some((hash, thread, message)) = build_outbound_store_entry(&validated) {
+        use cbcl_core::store::MessageStore as _;
+        let _ = guard.append(hash, thread, message);
     }
-
     state
         .agents
         .send_outbound(&handle, request.message)
         .await
         .map_err(agent_error_to_api)?;
+    drop(guard);
+
     Ok(Json(SendResponse {
         ok: true,
         agent_handle: handle.as_str().to_owned(),
@@ -1578,18 +1592,28 @@ fn cbcl_validation_error_to_api(error: CbclValidationError) -> ApiError {
             error.to_string(),
             None,
         ),
-        CbclValidationError::ShapeViolation { ref detail, .. } => ApiError::new(
+        CbclValidationError::ShapeViolation {
+            ref detail,
+            ref performative,
+            ref thread,
+        } => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "shape_violation",
             detail.clone(),
             None,
-        ),
-        CbclValidationError::CausalViolation { ref detail, .. } => ApiError::new(
+        )
+        .with_blame(performative.clone(), thread.clone()),
+        CbclValidationError::CausalViolation {
+            ref detail,
+            ref performative,
+            ref thread,
+        } => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "causal_violation",
             detail.clone(),
             None,
-        ),
+        )
+        .with_blame(performative.clone(), thread.clone()),
         _ => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "cbcl_validation_failed",
@@ -1615,6 +1639,8 @@ struct ApiError {
     code: &'static str,
     message: String,
     hint: Option<String>,
+    performative: Option<String>,
+    thread: Option<String>,
 }
 
 impl ApiError {
@@ -1629,7 +1655,23 @@ impl ApiError {
             code,
             message: message.into(),
             hint,
+            performative: None,
+            thread: None,
         }
+    }
+
+    /// Attach R5 blame context (performative + thread) so the JSON
+    /// error body surfaces what the spec advertises for
+    /// `shape_violation` and `causal_violation`. Either side may be
+    /// `None` when the pipeline couldn't extract it.
+    fn with_blame(
+        mut self,
+        performative: Option<String>,
+        thread: Option<String>,
+    ) -> Self {
+        self.performative = performative;
+        self.thread = thread;
+        self
     }
 
     fn internal(message: impl Into<String>) -> Self {
@@ -1651,6 +1693,8 @@ impl IntoResponse for ApiError {
                     code: self.code.to_owned(),
                     message: self.message,
                     hint: self.hint,
+                    performative: self.performative,
+                    thread: self.thread,
                 },
             }),
         )

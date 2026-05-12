@@ -84,13 +84,16 @@ Stable error codes used by the MVP local API:
 * `daemon_stopping` - daemon is shutting down.
 * `cbcl_validation_failed` - CBCL parsing or validation failed.
 * `shape_violation` - message failed the installed dialect's `(shape …)`
-  constraint during R5 runtime verification. Returned as HTTP 422 with a
-  payload that includes `detail`, `performative`, and `thread` alongside the
-  stable code.
+  constraint during R5 runtime verification. Returned as HTTP 422. The
+  error body carries the standard `code` and `message` fields plus
+  optional `performative` and `thread` strings extracted from the
+  offending message so callers can correlate the rejection without
+  re-parsing the body.
 * `causal_violation` - message's `:caused-by` references a hash not present in
   the per-handle `ThreadedMessageStore`, or violates the installed dialect's
-  `(protocol …)` predecessor declaration. Returned as HTTP 422 with `detail`,
-  `performative`, and `thread`.
+  `(protocol …)` predecessor declaration. Returned as HTTP 422 with the
+  same `code` / `message` / `performative` / `thread` shape as
+  `shape_violation`.
 * `message_kind_mismatch` - message performative does not match `kind`.
 * `missing_thread` - sent message has no `:thread`.
 * `duplicate_thread` - sent message has more than one `:thread`.

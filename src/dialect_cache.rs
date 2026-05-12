@@ -79,14 +79,26 @@ pub struct DialectCache {
 #[derive(Debug, Default)]
 struct Inner {
     by_digest: HashMap<String, CachedDialect>,
+    /// Parsed dialect bodies keyed by content-addressed digest. Kept in
+    /// lock-step with `by_digest`; absent for digests installed via the
+    /// test-only `install_unchecked` escape hatch when the body did not
+    /// parse cleanly.
+    parsed_by_digest: HashMap<String, cbcl_core::dialect::Dialect>,
     /// Name → latest-pushed digest. Latest-write-wins; versioned routing
     /// is future work, mirroring the router-side `resolve-name/1`.
     latest_by_name: HashMap<String, String>,
-    /// Parsed registry of installed dialects, kept in lock-step with
-    /// `by_digest`. R5 Phase B/C plumbing: outbound/inbound pipelines
-    /// will snapshot this to build a `PipelineContext`. Always contains
-    /// the base dialect at index 0 (invariant of `DialectRegistry`).
-    registry: DialectRegistry,
+    /// First-install order of dialect names. Used to rebuild the
+    /// registry deterministically so child dialects that `(extend …)`
+    /// a custom parent get installed after their parent.
+    install_order: Vec<String>,
+    /// Memoised registry snapshot. Cleared whenever `latest_by_name`
+    /// or `parsed_by_digest` mutate; rebuilt lazily on the next
+    /// `registry_snapshot` / `with_registry` call. Without this
+    /// invalidation, a same-name update (e.g. publish v1 then publish
+    /// v2 of `greet-d`) would keep the registry pinned to v1 even
+    /// though `latest_by_name` resolves to v2's digest, so the R5
+    /// pipeline would enforce stale shape/protocol rules.
+    cached_registry: Option<DialectRegistry>,
 }
 
 impl DialectCache {
@@ -169,27 +181,46 @@ impl DialectCache {
         };
         let mut inner = self.inner.write().expect("dialect-cache lock poisoned");
         inner.by_digest.insert(digest.clone(), cached);
-        inner.latest_by_name.insert(name.clone(), digest.clone());
         if let Some(d) = dialect {
-            // The registry rejects duplicates by name only implicitly
-            // (latest-write-wins is our cache contract). Skip re-install
-            // if the registry already has it; this preserves the
-            // base-dialect-at-index-0 invariant and avoids `Vec` churn.
-            if inner.registry.find_by_name(&d.name).is_none() {
-                // R1–R5 already passed in `try_install`; an install error
-                // here would indicate a registry/pipeline mismatch. Log
-                // and continue: the textual cache is authoritative.
-                if let Err(err) = inner.registry.install(d) {
-                    tracing::warn!(
-                        target: "dialect_cache",
-                        error = %err,
-                        name = %name,
-                        "registry install failed after pipeline acceptance"
-                    );
-                }
+            inner.parsed_by_digest.insert(digest.clone(), d);
+        }
+        let previous = inner.latest_by_name.insert(name.clone(), digest.clone());
+        if previous.is_none() {
+            inner.install_order.push(name.clone());
+        }
+        // Any mutation invalidates the memoised registry. The next
+        // `registry_snapshot` rebuilds from the current `latest_by_name`
+        // → `parsed_by_digest` pair so same-name updates take effect
+        // immediately, without leaving the prior version cached.
+        inner.cached_registry = None;
+        digest
+    }
+
+    /// Build a `DialectRegistry` from the currently-installed parsed
+    /// dialects, in stable insertion order. Caller must hold the inner
+    /// write lock.
+    fn build_registry_locked(inner: &Inner) -> DialectRegistry {
+        let mut registry = DialectRegistry::new();
+        for name in &inner.install_order {
+            let Some(digest) = inner.latest_by_name.get(name) else {
+                continue;
+            };
+            let Some(dialect) = inner.parsed_by_digest.get(digest) else {
+                // `install_unchecked` escape hatch may bypass parsing for
+                // test fixtures; such dialects never join the registry.
+                continue;
+            };
+            if let Err(err) = registry.install(dialect.clone()) {
+                tracing::warn!(
+                    target: "dialect_cache",
+                    error = %err,
+                    name = %name,
+                    digest = %digest,
+                    "registry rebuild rejected dialect that previously passed the pipeline"
+                );
             }
         }
-        digest
+        registry
     }
 
     /// Lookup by digest.
@@ -217,14 +248,30 @@ impl DialectCache {
         self.resolve_name(name).is_some()
     }
 
-    /// Snapshot the in-memory dialect registry. Cheap-ish (clones a
-    /// `Vec<Dialect>`); intended for building a `PipelineContext` per
-    /// outbound/inbound message in later R5 phases.
+    /// Snapshot the in-memory dialect registry. Rebuilds lazily after
+    /// any mutation so same-name updates (e.g. publishing v2 of a
+    /// dialect that was already v1 in the cache) are reflected.
+    /// Intended for building a `PipelineContext` per outbound/inbound
+    /// message in the R5 pipeline.
     pub fn registry_snapshot(&self) -> DialectRegistry {
-        self.inner
-            .read()
-            .expect("dialect-cache lock poisoned")
-            .registry
+        // Fast path: registry is already memoised under a read lock.
+        {
+            let inner = self.inner.read().expect("dialect-cache lock poisoned");
+            if let Some(cached) = inner.cached_registry.as_ref() {
+                return cached.clone();
+            }
+        }
+        // Slow path: rebuild under the write lock. Re-check the cache
+        // after acquiring it so a concurrent rebuilder doesn't pay the
+        // cost twice.
+        let mut inner = self.inner.write().expect("dialect-cache lock poisoned");
+        if inner.cached_registry.is_none() {
+            inner.cached_registry = Some(Self::build_registry_locked(&inner));
+        }
+        inner
+            .cached_registry
+            .as_ref()
+            .expect("registry built under write lock above")
             .clone()
     }
 
@@ -232,8 +279,21 @@ impl DialectCache {
     /// caller only needs read access and wants to avoid cloning the
     /// underlying `Vec<Dialect>`.
     pub fn with_registry<R>(&self, f: impl FnOnce(&DialectRegistry) -> R) -> R {
-        let inner = self.inner.read().expect("dialect-cache lock poisoned");
-        f(&inner.registry)
+        // Fast path: cached registry exists; borrow under read lock.
+        {
+            let inner = self.inner.read().expect("dialect-cache lock poisoned");
+            if let Some(cached) = inner.cached_registry.as_ref() {
+                return f(cached);
+            }
+        }
+        let mut inner = self.inner.write().expect("dialect-cache lock poisoned");
+        if inner.cached_registry.is_none() {
+            inner.cached_registry = Some(Self::build_registry_locked(&inner));
+        }
+        f(inner
+            .cached_registry
+            .as_ref()
+            .expect("registry built under write lock above"))
     }
 
     pub fn len(&self) -> usize {
@@ -341,6 +401,52 @@ mod tests {
                 .find_by_name("cache-fixture")
                 .expect("with_registry must see the installed dialect");
             assert_eq!(d.name, "cache-fixture");
+        });
+    }
+
+    #[test]
+    fn same_name_update_refreshes_registry_snapshot() {
+        // Reviewer's P2 case: install v1 of a dialect, take a snapshot,
+        // install v2 of the same name with different content, take a
+        // fresh snapshot. The new snapshot must reflect v2's parsed
+        // dialect, not v1's. Before the cached-registry invalidation
+        // fix this assertion failed: latest_by_name pointed at v2's
+        // digest but the registry kept v1's Dialect.
+        let cache = DialectCache::new();
+        // v1 has no protocol; v2 introduces one.
+        let v1 = "(define same-name-fixture (cbcl) @author)";
+        let v2 = "(define same-name-fixture (cbcl) @author \
+                  (protocol (then begin reply)))";
+        cache
+            .try_install("same-name-fixture", v1)
+            .expect("v1 must install");
+        let first = cache.registry_snapshot();
+        let first_dialect = first
+            .find_by_name("same-name-fixture")
+            .expect("v1 must be in first snapshot");
+        assert!(
+            first_dialect.causal_protocol.is_none(),
+            "v1 has no protocol clause"
+        );
+
+        cache
+            .try_install("same-name-fixture", v2)
+            .expect("v2 must install");
+        let second = cache.registry_snapshot();
+        let second_dialect = second
+            .find_by_name("same-name-fixture")
+            .expect("v2 must be in second snapshot");
+        assert!(
+            second_dialect.causal_protocol.is_some(),
+            "v2 must surface its (protocol ...) clause in the new snapshot",
+        );
+
+        // with_registry must observe the same updated state.
+        cache.with_registry(|r| {
+            let d = r
+                .find_by_name("same-name-fixture")
+                .expect("with_registry must see v2");
+            assert!(d.causal_protocol.is_some(), "with_registry must see v2");
         });
     }
 }

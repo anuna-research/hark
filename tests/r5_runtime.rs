@@ -100,6 +100,40 @@ async fn outbound_causal_violation_is_rejected_with_422() {
 }
 
 #[tokio::test]
+async fn outbound_r5_error_body_includes_performative_and_thread_blame() {
+    // P3: spec advertises that R5 violations surface `performative` and
+    // `thread` alongside `code`/`message` in the 422 payload so callers
+    // can route the rejection without re-parsing the message body. Pre-fix
+    // those fields were discarded by the error mapping arms.
+    let harness = Harness::start().await;
+    let created = harness.create_agent_with_fixture().await;
+
+    let response = harness
+        .post_send(
+            &created.agent_handle,
+            "reply",
+            r#"(lang greet-d (greet :thread "t-blame" :caused-by "begin"))"#,
+        )
+        .await
+        .expect("send request must complete");
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    let body = error_body(response).await;
+    assert_eq!(body.code, "shape_violation");
+    assert_eq!(
+        body.performative.as_deref(),
+        Some("greet"),
+        "shape_violation must surface the offending performative",
+    );
+    assert_eq!(
+        body.thread.as_deref(),
+        Some("t-blame"),
+        "shape_violation must surface the offending :thread",
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn outbound_happy_path_succeeds_and_appends_to_store() {
     let harness = Harness::start().await;
     let created = harness.create_agent_with_fixture().await;
@@ -607,6 +641,14 @@ async fn error_code(response: reqwest::Response) -> String {
         .expect("error response must decode")
         .error
         .code
+}
+
+async fn error_body(response: reqwest::Response) -> hark::local_api::ErrorBody {
+    response
+        .json::<ErrorResponse>()
+        .await
+        .expect("error response must decode")
+        .error
 }
 
 fn sample_record(addr: SocketAddr) -> DiscoveryRecord {
