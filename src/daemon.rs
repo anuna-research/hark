@@ -155,6 +155,15 @@ struct AgentEntry {
     /// the synchronous pipeline call. Wrapped in `Arc` to be cloned out
     /// to async tasks without holding `AgentRegistry`.
     pub store: Arc<Mutex<ThreadedMessageStore>>,
+    /// Per-handle send sequencer (R5 Phase B fix). Serialises the
+    /// (validate, append, enqueue) sequence across concurrent `/send`
+    /// requests on this handle so the wire order on the router
+    /// WebSocket matches the store-append order. **Must not be held by
+    /// the router receive loop** — only the local-API outbound handler
+    /// acquires this. The store mutex (`store`) is released before any
+    /// `await` on the writer's oneshot ack, so a blocked inbound
+    /// verification cannot deadlock the outbound writer.
+    pub send_sequencer: Arc<Mutex<()>>,
     /// Per-agent dialect cache (R5 Phase B). SPEC-009 comment in
     /// `router.rs` notes the cache is per-agent ("installations made by
     /// this session don't leak across sessions"); to make the cache
@@ -436,6 +445,7 @@ impl AgentStore {
             send_channel,
             pending_meta_reply: None,
             store: Arc::new(Mutex::new(ThreadedMessageStore::new())),
+            send_sequencer: Arc::new(Mutex::new(())),
             dialect_cache: DialectCache::new(),
         };
         inner.agents.insert(handle.clone(), entry);
@@ -778,6 +788,21 @@ impl AgentStore {
         let inner = self.inner.lock().await;
         let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
         Ok(Arc::clone(&entry.store))
+    }
+
+    /// Clone out the per-handle send sequencer mutex. Held by the
+    /// local-API `/send` handler for the duration of (validate, append,
+    /// enqueue) so concurrent senders on this handle agree on the wire
+    /// order matching their store-append order. Never taken by the
+    /// router receive loop — taking it there would re-introduce the
+    /// inbound-vs-outbound deadlock this sequencer was added to avoid.
+    pub async fn send_sequencer(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<Arc<Mutex<()>>, AgentError> {
+        let inner = self.inner.lock().await;
+        let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
+        Ok(Arc::clone(&entry.send_sequencer))
     }
 
     /// Clone out the per-agent dialect cache. Cheap (`Arc<RwLock<_>>`

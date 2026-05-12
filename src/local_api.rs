@@ -863,30 +863,48 @@ async fn send(
         .map_err(agent_error_to_api)?;
     let registry = dialect_cache.registry_snapshot();
 
-    // Hold the per-handle store guard across validate → append → enqueue
-    // so concurrent /send requests serialize on it. Without this,
-    // sender A could pass validation and append its hash to the store,
-    // and sender B could then validate `:caused-by = hash_A` and reach
-    // `send_outbound` before A — the writer task pops the mpsc in FIFO
-    // order, so whichever request enqueues first wins the wire order,
-    // independent of which one appended first. Serialising the entire
-    // (validate, append, enqueue) sequence guarantees that a message
-    // is on the WebSocket queue strictly after any predecessor it
-    // depends on causally.
-    let mut guard = store_arc.lock().await;
-    let validated =
-        validate_for_send_with_context(&request.message, kind, &registry, &mut guard)
-            .map_err(cbcl_validation_error_to_api)?;
-    if let Some((hash, thread, message)) = build_outbound_store_entry(&validated) {
-        use cbcl_core::store::MessageStore as _;
-        let _ = guard.append(hash, thread, message);
+    // Serialise concurrent /send requests on this handle through a
+    // per-handle send sequencer. Within the critical section we run
+    // (validate, append, enqueue) so the wire order on the router
+    // WebSocket matches the store-append order: a frame whose
+    // :caused-by references another frame from this handle is
+    // guaranteed to be enqueued strictly after its predecessor.
+    //
+    // Critically, the *store* mutex is released BEFORE we await the
+    // writer task's oneshot ack inside `send_outbound`. Holding both
+    // across that await would deadlock: the router receive loop runs
+    // outbound writes AND inbound `verify_inbound_against_registry`
+    // in the same `tokio::select!` task; the inbound branch needs the
+    // store mutex, the outbound branch is what posts the ack we're
+    // waiting on. The sequencer mutex, by contrast, is only taken by
+    // this handler — never by the receive loop — so holding it across
+    // the ack is safe.
+    let sequencer = state
+        .agents
+        .send_sequencer(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let _send_seq = sequencer.lock().await;
+
+    {
+        let mut guard = store_arc.lock().await;
+        let validated =
+            validate_for_send_with_context(&request.message, kind, &registry, &mut guard)
+                .map_err(cbcl_validation_error_to_api)?;
+        if let Some((hash, thread, message)) = build_outbound_store_entry(&validated) {
+            use cbcl_core::store::MessageStore as _;
+            let _ = guard.append(hash, thread, message);
+        }
+        // `guard` drops here, releasing the store mutex before the
+        // ack-await below.
     }
+
     state
         .agents
         .send_outbound(&handle, request.message)
         .await
         .map_err(agent_error_to_api)?;
-    drop(guard);
+    drop(_send_seq);
 
     Ok(Json(SendResponse {
         ok: true,

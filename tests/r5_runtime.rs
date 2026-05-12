@@ -232,6 +232,92 @@ async fn inbound_causal_violation_is_dropped() {
     harness.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_outbound_and_inbound_do_not_deadlock() {
+    // P1 regression: the per-handle send sequencer must NOT hold the
+    // causal store mutex across `send_outbound`'s writer-ack await.
+    // The router receive loop runs outbound writes AND inbound
+    // `verify_inbound_against_registry` in the same `tokio::select!`
+    // task; the inbound branch takes the store mutex. If /send held
+    // that mutex across its ack await, the inbound branch would block,
+    // the writer branch would never run, and /send would never get its
+    // ack — both directions wedged on the same handle.
+    //
+    // This test interleaves a burst of router-dispatched inbound
+    // frames with concurrent /send requests on the same handle and
+    // asserts that ALL of them complete within a short timeout. Under
+    // the deadlocked variant of the fix this hangs at the 5s outer
+    // guard rather than passing.
+    let harness = Harness::start().await;
+    let created = harness.create_agent_with_fixture().await;
+    let handle =
+        AgentHandle::new(created.agent_handle.clone()).expect("returned handle must be valid");
+
+    const BURST: usize = 8;
+
+    let inbound_bodies: Vec<String> = (0..BURST)
+        .map(|i| format!(r#"(lang greet-d (reply "ok" :thread "t-in-{i}" :caused-by "begin"))"#))
+        .collect();
+    let outbound_bodies: Vec<String> = (0..BURST)
+        .map(|i| {
+            format!(
+                r#"(lang greet-d (reply @router "ok" :thread "t-out-{i}" :caused-by "begin"))"#
+            )
+        })
+        .collect();
+
+    // Interleave inbound dispatch and outbound /send so the receive
+    // loop has inbound work pending while /send handlers are mid-flight.
+    // The deadlock window is: send_outbound has put the OutboundFrame
+    // on send_rx but not yet been popped by the writer arm, while the
+    // inbound arm has been selected and is blocked on the store mutex.
+    // Pre-fix that's a livelock since the writer can't run until the
+    // inbound arm completes, which is blocked on us releasing the
+    // store mutex — which we only do after the writer's ack.
+    let outcome = timeout(Duration::from_secs(5), async {
+        let mut sends = Vec::with_capacity(BURST);
+        let mut recvs = Vec::with_capacity(BURST);
+        // Strict interleave: fire an outbound /send concurrently with
+        // an inbound dispatch on each iteration. This maximises the
+        // chance that the receive loop is in `process_inbound` (holding
+        // the store mutex via `verify_inbound_against_registry`) while
+        // /send is mid-`send_outbound.await` — the exact deadlock window.
+        for i in 0..BURST {
+            let send_body = outbound_bodies[i].clone();
+            let inbound_body = inbound_bodies[i].clone();
+            let send_fut = harness.post_send(&created.agent_handle, "reply", &send_body);
+            let dispatch_fut = harness.router.dispatch(&inbound_body);
+            let (send_resp, _) = tokio::join!(send_fut, dispatch_fut);
+            sends.push(send_resp.expect("send request must complete"));
+            let received = harness
+                .agents
+                .recv(&handle, Some(Duration::from_secs(1)))
+                .await
+                .expect("recv must succeed");
+            recvs.push(received);
+        }
+        (sends, recvs)
+    })
+    .await
+    .expect("concurrent send + recv must complete within 5s (deadlock regression)");
+
+    let (sends, recvs) = outcome;
+    for (i, response) in sends.into_iter().enumerate() {
+        assert!(
+            response.status().is_success(),
+            "send #{i} must succeed, got {}",
+            response.status()
+        );
+    }
+    assert_eq!(
+        recvs.len(),
+        BURST,
+        "all inbound frames must be enqueued and drained"
+    );
+
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn inbound_happy_path_enqueues_and_appends_to_store() {
     let harness = Harness::start().await;
