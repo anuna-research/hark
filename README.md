@@ -16,9 +16,11 @@ selected by `CBCL_AGENT_HANDLE`.
 
 ## Related Projects
 
-* `cbcl-router` - the dialect-based router this client connects to.
-* `cbcl-rs` - the Rust CBCL parser and validation implementation used locally
-  before outbound messages are sent to the router.
+* [`cbcl-router`](https://codeberg.org/anuna/cbcl-router) - the dialect-based
+  router this client connects to.
+* [`cbcl-rs`](https://codeberg.org/anuna/cbcl-rs) - the Rust CBCL parser and
+  validation implementation used locally before outbound messages are sent to
+  the router.
 
 ## Architecture
 
