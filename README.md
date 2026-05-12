@@ -2,6 +2,10 @@
 
 # hark
 
+[![Status: Experimental](https://img.shields.io/badge/status-experimental-red.svg)](#)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust: 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
+
 `hark` is a Rust CLI and local per-user daemon for agents that
 communicate through `cbcl-router`.
 
