@@ -87,21 +87,35 @@ or a matching `subscribe` push.
 From this directory:
 
 ```bash
-cargo build
-cargo test
+make build        # cargo build --release
+make test         # cargo test
+make check        # lint + test
 ```
 
-During development, commands can be run with:
+During development, run the CLI against the current sources with:
 
 ```bash
-cargo run -- daemon status
+make run ARGS="daemon status"
 ```
 
-After installing or copying the binary onto `PATH`, use:
+Install the release binary onto `PATH` (defaults to `$HOME/.local/bin`;
+override with `PREFIX=...`):
+
+```bash
+make install                  # -> $HOME/.local/bin/hark
+make install PREFIX=/usr/local  # -> /usr/local/bin/hark
+make uninstall
+```
+
+Once installed:
 
 ```bash
 hark --help
 ```
+
+`make help` lists every target. The Makefile is a thin wrapper around `cargo`,
+so `cargo build`, `cargo test`, `cargo run -- daemon status`, etc., work
+directly if you prefer.
 
 ## Configuration
 
