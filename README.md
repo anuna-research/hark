@@ -23,22 +23,35 @@ selected by `CBCL_AGENT_HANDLE`.
 ## Architecture
 
 ```text
-                                                                                +-------------+
-                                                                                |  producer   |
-                                                                                | (HTTP ask)  |
-                                                                                +------+------+
-                                                                                       |
-                                                                                       v
-  +---------------+   loopback HTTP    +----------------------+    WebSocket    +-------------+
-  |   hark CLI    | <- daemon token -> |      hark daemon     | <----wss----->  | cbcl-router |
-  | (short-lived) |                    | (per-user, persistent)                 +-------------+
-  +-------+-------+                    +-----------+----------+
-          |                                        |
-          | validates                              | validates
-          v                                        v
-  +-----------------------------------------------------------+
-  |          cbcl-rs  (parser + R1–R5 validation)             |
-  +-----------------------------------------------------------+
++-------------+
+|  producer   |
+| (HTTP ask)  |
++------+------+
+       | HTTP
+       v
++-------------+
+| cbcl-router |
++------+------+
+       ^
+       | wss
+       v
++-------------+
+| hark daemon |---+
+| (per-user)  |   |
++------+------+   |
+       ^          | validates
+       | loopback |  (both)
+       | + token  |
+       v          |
++-------------+   |
+|  hark CLI   |---+
+|(short-lived)|   |
++-------------+   v
+            +-----------+
+            |  cbcl-rs  |
+            | parser +  |
+            |   R1-R5   |
+            +-----------+
 ```
 
 Producers POST asks to `cbcl-router` at `/ingress/v1/messages`; the
