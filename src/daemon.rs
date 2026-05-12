@@ -18,9 +18,15 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
+use cbcl_core::{
+    message::Message,
+    store::{ContentHash, MessageStore, ThreadId, ThreadedMessageStore},
+};
+
 use crate::{
     config::validate_dialect_id,
     constants::LOCAL_API_VERSION,
+    dialect_cache::DialectCache,
     local_api::PingResponse,
 };
 
@@ -137,6 +143,35 @@ struct AgentEntry {
     /// dialect push from an active subscription cannot be misrouted as a
     /// reply to an in-flight publish/list/query.
     pending_meta_reply: Option<PendingMetaReply>,
+    /// Per-handle append-only causal message store (R5 Phase A plumbing).
+    ///
+    /// Each agent connection has its own causal world: messages it has
+    /// sent or received form an independent DAG keyed by `:thread`. The
+    /// outbound (Phase B) and inbound (Phase C) pipelines will lock this
+    /// store to feed `run_pipeline_full(&PipelineContext { store, .. })`.
+    ///
+    /// Held behind a `tokio::sync::Mutex` so the caller can drop the
+    /// outer `AgentRegistry` lock (which also guards the queue) before
+    /// the synchronous pipeline call. Wrapped in `Arc` to be cloned out
+    /// to async tasks without holding `AgentRegistry`.
+    pub store: Arc<Mutex<ThreadedMessageStore>>,
+    /// Per-handle send sequencer (R5 Phase B fix). Serialises the
+    /// (validate, append, enqueue) sequence across concurrent `/send`
+    /// requests on this handle so the wire order on the router
+    /// WebSocket matches the store-append order. **Must not be held by
+    /// the router receive loop** — only the local-API outbound handler
+    /// acquires this. The store mutex (`store`) is released before any
+    /// `await` on the writer's oneshot ack, so a blocked inbound
+    /// verification cannot deadlock the outbound writer.
+    pub send_sequencer: Arc<Mutex<()>>,
+    /// Per-agent dialect cache (R5 Phase B). SPEC-009 comment in
+    /// `router.rs` notes the cache is per-agent ("installations made by
+    /// this session don't leak across sessions"); to make the cache
+    /// reachable from BOTH the router receive loop AND the outbound
+    /// send handler in `local_api.rs` it lives on the registry entry.
+    /// The router-create path replaces the default with its own cache.
+    /// Cheap to clone — `DialectCache` is `Arc<RwLock<_>>` internally.
+    pub dialect_cache: DialectCache,
 }
 
 #[derive(Debug)]
@@ -409,6 +444,9 @@ impl AgentStore {
             close_tx,
             send_channel,
             pending_meta_reply: None,
+            store: Arc::new(Mutex::new(ThreadedMessageStore::new())),
+            send_sequencer: Arc::new(Mutex::new(())),
+            dialect_cache: DialectCache::new(),
         };
         inner.agents.insert(handle.clone(), entry);
         Ok(inner
@@ -736,6 +774,74 @@ impl AgentStore {
         if let Some(entry) = inner.agents.get_mut(handle) {
             entry.clear_recv_waiter_if_match(waiter_id);
         }
+    }
+
+    /// Borrow the per-handle causal message store (R5 Phase A plumbing).
+    ///
+    /// Returns an `Arc<Mutex<_>>` cloned out from `AgentEntry` so the
+    /// caller can lock it independently of the `AgentRegistry` mutex.
+    /// This is the entry point Phase B/C will use to feed the pipeline.
+    pub async fn store_handle(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<Arc<Mutex<ThreadedMessageStore>>, AgentError> {
+        let inner = self.inner.lock().await;
+        let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
+        Ok(Arc::clone(&entry.store))
+    }
+
+    /// Clone out the per-handle send sequencer mutex. Held by the
+    /// local-API `/send` handler for the duration of (validate, append,
+    /// enqueue) so concurrent senders on this handle agree on the wire
+    /// order matching their store-append order. Never taken by the
+    /// router receive loop — taking it there would re-introduce the
+    /// inbound-vs-outbound deadlock this sequencer was added to avoid.
+    pub async fn send_sequencer(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<Arc<Mutex<()>>, AgentError> {
+        let inner = self.inner.lock().await;
+        let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
+        Ok(Arc::clone(&entry.send_sequencer))
+    }
+
+    /// Clone out the per-agent dialect cache. Cheap (`Arc<RwLock<_>>`
+    /// internally). R5 Phase B: callers use this to snapshot the
+    /// `DialectRegistry` for `run_pipeline_full`.
+    pub async fn dialect_cache_handle(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<DialectCache, AgentError> {
+        let inner = self.inner.lock().await;
+        let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
+        Ok(entry.dialect_cache.clone())
+    }
+
+    /// Append a message into a handle's causal store. Returns `Ok(true)`
+    /// if newly inserted, `Ok(false)` if deduplicated (REQ-310).
+    pub async fn append_message(
+        &self,
+        handle: &AgentHandle,
+        hash: ContentHash,
+        thread: ThreadId,
+        message: Message,
+    ) -> Result<bool, AgentError> {
+        let store = self.store_handle(handle).await?;
+        let mut guard = store.lock().await;
+        Ok(guard.append(hash, thread, message))
+    }
+
+    /// Look up a message by content hash across all threads of this
+    /// handle's store. Clones the message because the lock can't be held
+    /// across the await boundary by callers.
+    pub async fn lookup_message(
+        &self,
+        handle: &AgentHandle,
+        hash: &ContentHash,
+    ) -> Result<Option<Message>, AgentError> {
+        let store = self.store_handle(handle).await?;
+        let guard = store.lock().await;
+        Ok(guard.lookup(hash).cloned())
     }
 }
 
@@ -1887,6 +1993,61 @@ mod tests {
         // observes a closed channel immediately, not META_REPLY_TIMEOUT.
         rx.await
             .expect_err("waiter sender should be dropped when handle goes unhealthy");
+    }
+
+    #[tokio::test]
+    async fn per_handle_store_appends_and_looks_up_messages() {
+        use cbcl_core::{
+            message::{CorePerformative, Message, Performative},
+            sexpr::{Atom, SExpr},
+            store::{ContentHash, ThreadId},
+        };
+
+        let store = agent_store(10, 1024);
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("agent should insert");
+
+        let message = Message::Simple {
+            performative: Performative::Core(CorePerformative::Tell),
+            recipient: None,
+            content: SExpr::Atom(Atom::Str("hello".into())),
+            params: Vec::new(),
+            thread: Some("rcp-1".into()),
+            sender: None,
+            caused_by: Some(cbcl_core::message::CausedBy::Begin),
+        };
+        let hash = ContentHash("hash-a".into());
+        let thread = ThreadId("rcp-1".into());
+
+        let inserted = store
+            .append_message(&handle, hash.clone(), thread.clone(), message.clone())
+            .await
+            .expect("append should succeed");
+        assert!(inserted, "first append must report new insertion");
+
+        // Second append of same hash is a dedup.
+        let dup = store
+            .append_message(&handle, hash.clone(), thread, message.clone())
+            .await
+            .expect("append should succeed");
+        assert!(!dup, "duplicate hash must be deduplicated");
+
+        let found = store
+            .lookup_message(&handle, &hash)
+            .await
+            .expect("lookup should succeed");
+        assert_eq!(found.as_ref(), Some(&message));
+
+        // Unknown handle path.
+        let missing = super::AgentHandle::new("ZZZZZZZZZZZZZZZZZZZZZZZZZZ").unwrap();
+        let err = store
+            .append_message(&missing, hash, ThreadId("rcp-1".into()), message)
+            .await
+            .expect_err("unknown handle must error");
+        assert!(matches!(err, super::AgentError::UnknownHandle));
     }
 
     fn agent_store(max_messages: usize, max_bytes: usize) -> super::AgentStore {

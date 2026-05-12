@@ -335,8 +335,8 @@ turns a local daemon process into a router-visible agent:
 
 ```bash
 eval "$(hark init \
-  --capability code:edit \
-  --capability code:test)"
+  --dialect elf \
+  --dialect arena-v1)"
 ```
 
 Shell output:

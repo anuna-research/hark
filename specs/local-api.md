@@ -83,6 +83,17 @@ Stable error codes used by the MVP local API:
 * `recv_timeout` - blocking receive reached its timeout.
 * `daemon_stopping` - daemon is shutting down.
 * `cbcl_validation_failed` - CBCL parsing or validation failed.
+* `shape_violation` - message failed the installed dialect's `(shape …)`
+  constraint during R5 runtime verification. Returned as HTTP 422. The
+  error body carries the standard `code` and `message` fields plus
+  optional `performative` and `thread` strings extracted from the
+  offending message so callers can correlate the rejection without
+  re-parsing the body.
+* `causal_violation` - message's `:caused-by` references a hash not present in
+  the per-handle `ThreadedMessageStore`, or violates the installed dialect's
+  `(protocol …)` predecessor declaration. Returned as HTTP 422 with the
+  same `code` / `message` / `performative` / `thread` shape as
+  `shape_violation`.
 * `message_kind_mismatch` - message performative does not match `kind`.
 * `missing_thread` - sent message has no `:thread`.
 * `duplicate_thread` - sent message has more than one `:thread`.
@@ -309,6 +320,20 @@ unwrapped shape rather than relying on that CLI behavior.
 
 If validation or kind checking fails, the daemon must return an error and must
 not send the frame to the router.
+
+After parse and kind checking, the daemon runs the cbcl-rs R5 behavioural
+pipeline (`run_pipeline_full`) against the per-handle dialect registry
+snapshot and the per-handle `ThreadedMessageStore`. Shape and causal-protocol
+constraints declared by the installed dialect are enforced here. On success
+the innermost simple message is content-hashed and inserted into the store
+keyed by `(hash, thread)` before the frame is forwarded to the router. On
+failure the daemon returns `422` with `error.code = "shape_violation"` or
+`"causal_violation"` and does not write the frame. If the outer
+`(lang <name> …)` wrapper names a dialect that is not installed in the
+per-handle registry, the daemon falls back to the lightweight R1–R4 pipeline
+and does not enforce shape or protocol constraints from that dialect.
+[`router-protocol.md`](router-protocol.md) describes the full R5 runtime flow
+and the inbound counterpart.
 
 A successful `/send` response means:
 

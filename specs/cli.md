@@ -91,7 +91,7 @@ Default output should be human-readable.
 Status should distinguish these cases:
 
 * live daemon: print daemon address, version, active handles, connection states,
-  capabilities, and queue sizes; exit `0`.
+  advertised dialects, and queue sizes; exit `0`.
 * no `daemon.json`: print that the daemon is not running; exit `3`.
 * stale `daemon.json` with free lock: print stale discovery details and say that
   `daemon start` or `daemon stop` can clean it; exit `5`.
@@ -130,8 +130,8 @@ Example:
 hark daemon start
 
 eval "$(hark init \
-  --capability code:edit \
-  --capability code:test)"
+  --dialect elf \
+  --dialect arena-v1)"
 ```
 
 Default stdout:
@@ -153,26 +153,35 @@ With `--json`, stdout:
 {
   "agent_handle": "01JX8F4V2QK8GZP9H6W5",
   "router_agent_id": "local-agent-01JX8F4V2QK8GZP9H6W5",
-  "capabilities": ["code:edit", "code:test"],
-  "dialects": [],
+  "dialects": ["elf", "arena-v1"],
   "state": "connected"
 }
 ```
 
 Useful options:
 
-* `--capability <name>` - required at least once; may be repeated.
-* `--dialect <id>` - may be repeated.
+* `--dialect <id>` - required at least once; may be repeated.
 * `--json` - print JSON instead of shell exports.
 
-An agent must advertise at least one capability. Capabilities are per-agent,
-not daemon-level defaults. If no `--capability` value is supplied, `init` fails
-with a usage error and does not call the daemon.
+SPEC-009 collapses capability ≡ dialect: an agent advertises the dialects it
+can perform, and the router treats each as the routable capability. An agent
+must advertise at least one dialect. If no `--dialect` value is supplied,
+`init` fails with a usage error and does not call the daemon.
 
-The CLI should reject duplicate capability values and duplicate dialect values
-before calling the daemon. Preserving the user-supplied order in successful
-requests is useful for predictable status output, but duplicate advertisements
-do not add information and make tests and diagnostics noisier.
+By default, `init` performs a best-effort `(meta (query (speak? <name>)))`
+for each advertised dialect after the router hello so the dialects' shape
+and protocol constraints take effect on the first outbound or inbound
+simple message. Misses, timeouts, and transport errors are logged under
+`tracing` target `hark::auto_install` and do not fail `init`; the dialect
+remains uninstalled locally and R5 will not enforce its constraints until
+it is published or arrives over `subscribe`. Operators disable the
+handshake with `[agent].auto_install_advertised = false` in the daemon
+config or `CBCL_AGENT_AUTO_INSTALL_ADVERTISED=false`.
+
+The CLI should reject duplicate dialect values before calling the daemon.
+Preserving the user-supplied order in successful requests is useful for
+predictable status output, but duplicate advertisements do not add
+information and make tests and diagnostics noisier.
 
 ### `recv`
 
@@ -206,6 +215,13 @@ duration to `timeout_ms` for the local API and rejects zero or negative values.
 The maximum finite timeout is `2160h` (90 days). This supports agents that wait
 for work for days or weeks while still rejecting values likely to overflow
 local timers. Omitting `--timeout` means no finite client-side timeout.
+
+Inbound R5 violations (shape or causal-protocol) on router-dispatched frames
+are dropped by the daemon before they reach the recv queue. Such drops never
+surface as `recv` output and do not transition the handle to an error state.
+Operators can correlate drops via the daemon's `tracing` events under target
+`hark::r5`. See [router-protocol.md](router-protocol.md) for the policy
+details.
 
 ### `reply`, `error`, and `progress`
 
@@ -308,6 +324,14 @@ in the daemon, and sending `(meta (teach @router <define>))`. Awaits the
 router's `(reply ...)` synchronously and prints `<digest> <name>` (or JSON
 with `--json`).
 
+On router ack the daemon also installs the published define into the
+publishing handle's local dialect cache so the publishing agent is subject to
+its dialect's R5 shape and protocol constraints on subsequent outbound
+traffic without a separate `dialect query` round-trip. A local install
+failure after a successful router ack does not change the exit status — the
+publish is still reported as successful and the install failure is logged
+under `tracing` target `hark::dialect_cache`.
+
 Stdout:
 
 * default: `<sha256-hex-digest> <dialect-name>` followed by a newline
@@ -409,7 +433,11 @@ on common failure modes:
 * `5` - stale daemon state
 * `6` - missing `CBCL_AGENT_HANDLE`
 * `7` - unknown, unhealthy, or busy agent handle
-* `8` - CBCL validation or command-kind validation failure
+* `8` - CBCL validation or command-kind validation failure, including R1–R5
+  well-formedness failures on `dialect publish` and R5 runtime shape or
+  causal-protocol violations on outbound `reply`, `error`, and `progress`
+  (local API codes `cbcl_validation_failed`, `shape_violation`, and
+  `causal_violation`)
 * `9` - router connection or router authentication failure
 * `10` - timeout
 * `11` - local daemon authentication failure

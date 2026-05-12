@@ -43,6 +43,13 @@ pub struct RouterConfig {
 #[serde(default)]
 pub struct AgentConfig {
     pub agent_id_prefix: String,
+    /// Default for `CreateAgentRequest.auto_install_advertised` when the
+    /// caller does not specify. When `true`, `init` issues a meta query
+    /// per advertised dialect after the hello so R5 can enforce that
+    /// dialect's shape and protocol from the very first message. Set to
+    /// `false` for tests or for mock-router environments where meta-query
+    /// round-trips are not supported.
+    pub auto_install_advertised: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
@@ -82,6 +89,7 @@ impl Default for AppConfig {
             router: RouterConfig::default(),
             agent: AgentConfig {
                 agent_id_prefix: DEFAULT_AGENT_ID_PREFIX.to_owned(),
+                auto_install_advertised: DEFAULT_AUTO_INSTALL_ADVERTISED,
             },
             daemon: DaemonConfig {
                 bind: DEFAULT_DAEMON_BIND.to_owned(),
@@ -93,10 +101,13 @@ impl Default for AppConfig {
     }
 }
 
+const DEFAULT_AUTO_INSTALL_ADVERTISED: bool = true;
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             agent_id_prefix: DEFAULT_AGENT_ID_PREFIX.to_owned(),
+            auto_install_advertised: DEFAULT_AUTO_INSTALL_ADVERTISED,
         }
     }
 }
@@ -252,7 +263,11 @@ fn load_file_backed_config(config_file: Option<PathBuf>) -> Result<AppConfig, Co
             "daemon.max_bytes_per_handle",
             DEFAULT_MAX_BYTES_PER_HANDLE as u64,
         )?
-        .set_default("daemon.overflow_policy", DEFAULT_OVERFLOW_POLICY)?;
+        .set_default("daemon.overflow_policy", DEFAULT_OVERFLOW_POLICY)?
+        .set_default(
+            "agent.auto_install_advertised",
+            DEFAULT_AUTO_INSTALL_ADVERTISED,
+        )?;
 
     if let Some(config_file) = config_file {
         builder = builder.add_source(File::from(config_file).required(false));
@@ -270,6 +285,10 @@ fn apply_environment_overrides(config: &mut AppConfig) -> Result<(), ConfigError
     }
     if let Some(value) = env_value("CBCL_AGENT_ID_PREFIX") {
         config.agent.agent_id_prefix = value;
+    }
+    if let Some(value) = env_value("CBCL_AGENT_AUTO_INSTALL_ADVERTISED") {
+        config.agent.auto_install_advertised =
+            parse_bool_env("CBCL_AGENT_AUTO_INSTALL_ADVERTISED", &value)?;
     }
     if let Some(value) = env_value("CBCL_DAEMON_BIND") {
         config.daemon.bind = value;
@@ -291,6 +310,17 @@ fn apply_environment_overrides(config: &mut AppConfig) -> Result<(), ConfigError
 
 fn env_value(name: &str) -> Option<String> {
     env::var(name).ok()
+}
+
+fn parse_bool_env(var: &'static str, value: &str) -> Result<bool, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidEnv {
+            var,
+            reason: "expected one of 1/0, true/false, yes/no, on/off".to_owned(),
+        }),
+    }
 }
 
 fn parse_positive_env_usize(var: &'static str, value: &str) -> Result<usize, ConfigError> {

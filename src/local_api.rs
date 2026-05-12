@@ -19,7 +19,7 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::oneshot};
 
-use crate::cbcl_validation::{CbclValidationError, MessageKind, validate_for_send};
+use crate::cbcl_validation::{CbclValidationError, MessageKind, validate_for_send_with_context};
 use crate::{
     config::{AppConfig, ConfigError},
     constants::{COMMAND_NAME, LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
@@ -137,6 +137,13 @@ pub struct CreateAgentRequest {
     /// SPEC-009: capability ≡ dialect. The agent declares the dialects
     /// it can perform; the daemon validates and forwards to the router.
     pub dialects: Vec<String>,
+    /// Best-effort fetch+install each advertised dialect from the router
+    /// after hello so R5 shape/protocol checks fire on the first message.
+    /// Defaults to `true`; tests with mock routers that don't speak meta
+    /// can set it to `false` to skip. Soft-fails per dialect (miss,
+    /// timeout, or transport error) without failing the agent creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_install_advertised: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -185,6 +192,17 @@ pub struct ErrorBody {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Performative of the offending message, if applicable. Surfaced
+    /// for R5 violations (`shape_violation`, `causal_violation`) so
+    /// callers can correlate the rejection with the dialect's blame
+    /// rules without re-parsing the message body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performative: Option<String>,
+    /// Receipt thread of the offending message, if applicable.
+    /// Surfaced for R5 violations so callers can correlate the
+    /// rejection with the dispatched ask that originated the chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }
 
 #[derive(Clone)]
@@ -534,8 +552,7 @@ impl fmt::Display for ClientPingError {
                 cli_api_version,
             } => write!(
                 formatter,
-                "daemon_api_incompatible: CLI API version {cli_api_version}, daemon API version {:?}, daemon version {:?}",
-                daemon_api_version, daemon_version
+                "daemon_api_incompatible: CLI API version {cli_api_version}, daemon API version {daemon_api_version:?}, daemon version {daemon_version:?}",
             ),
             Self::RequestFailed(error) => write!(formatter, "request failed: {error}"),
             Self::UnexpectedStatus(status) => write!(formatter, "unexpected HTTP status: {status}"),
@@ -633,6 +650,13 @@ async fn create_agent(
         .config
         .validate_router()
         .map_err(config_error_to_api)?;
+    let dialects = request.dialects.clone();
+    // Per-request override wins; otherwise fall back to the daemon-level
+    // `[agent].auto_install_advertised` default (true in production, off
+    // in tests that set `CBCL_AGENT_AUTO_INSTALL_ADVERTISED=false`).
+    let auto_install = request
+        .auto_install_advertised
+        .unwrap_or(state.config.agent.auto_install_advertised);
     let created = create_router_agent(
         state.agents.clone(),
         &router,
@@ -642,6 +666,10 @@ async fn create_agent(
     .await
     .map_err(router_error_to_api)?;
 
+    if auto_install {
+        auto_install_advertised_dialects(&state.agents, &created.agent_handle, &dialects).await;
+    }
+
     Ok(Json(CreateAgentResponse {
         agent_handle: created.agent_handle.as_str().to_owned(),
         router_agent_id: created.router_agent_id,
@@ -649,6 +677,76 @@ async fn create_agent(
         state: "connected".to_owned(),
     }))
 }
+
+/// Per-dialect best-effort meta-query so the publisher's local R5 pipeline
+/// can enforce shape/protocol constraints on the very first outbound and
+/// inbound simple message. Each query is sequential (the agent's
+/// `pending_meta_reply` slot is single-occupancy) and uses a short timeout
+/// so a non-responsive router does not stall agent creation.
+///
+/// All failure modes — `Reply` (router does not yet know the dialect),
+/// `PushInstallFailed`, transport errors, timeouts — are logged at
+/// info/warn level under target `hark::auto_install` and do **not** fail
+/// the agent. The contract is "advertised dialects MAY be R5-enforced
+/// immediately"; nothing breaks if they aren't.
+async fn auto_install_advertised_dialects(
+    store: &crate::daemon::AgentStore,
+    handle: &crate::daemon::AgentHandle,
+    dialects: &[String],
+) {
+    use crate::daemon::{MetaReplyDelivery, MetaReplyExpectation};
+
+    for name in dialects {
+        let frame = crate::router::build_meta_query_frame(name);
+        let outcome = store
+            .send_meta_and_await(
+                handle,
+                frame,
+                MetaReplyExpectation::ReplyOrPushNamed(name.clone()),
+                AUTO_INSTALL_QUERY_TIMEOUT,
+            )
+            .await;
+        match outcome {
+            Ok(MetaReplyDelivery::PushInstalled { name: installed, digest, .. }) => {
+                tracing::info!(
+                    target: "hark::auto_install",
+                    handle = handle.as_str(),
+                    name = %installed,
+                    digest = %digest,
+                    "installed advertised dialect from router on init",
+                );
+            }
+            Ok(MetaReplyDelivery::Reply(_)) => {
+                tracing::info!(
+                    target: "hark::auto_install",
+                    handle = handle.as_str(),
+                    name = %name,
+                    "router does not yet know advertised dialect; R5 will not enforce its constraints until it is published locally or arrives over subscribe",
+                );
+            }
+            Ok(MetaReplyDelivery::PushInstallFailed { reason, .. }) => {
+                tracing::warn!(
+                    target: "hark::auto_install",
+                    handle = handle.as_str(),
+                    name = %name,
+                    %reason,
+                    "router teach-back for advertised dialect failed R5 locally; not installed",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "hark::auto_install",
+                    handle = handle.as_str(),
+                    name = %name,
+                    ?error,
+                    "meta query for advertised dialect failed; skipping local install",
+                );
+            }
+        }
+    }
+}
+
+const AUTO_INSTALL_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 async fn ping(
     State(state): State<AppState>,
@@ -747,16 +845,100 @@ async fn send(
     reject_if_stopping(&state)?;
     let handle = parse_handle(handle)?;
     let kind = MessageKind::from(request.kind);
-    validate_for_send(&request.message, kind).map_err(cbcl_validation_error_to_api)?;
+
+    // R5 Phase B: drive `run_pipeline_full` for outbound simple-message
+    // validation so shape (REQ-220) and causal (REQ-200) violations are
+    // surfaced as the dedicated error codes / HTTP 422 / CLI exit 8. The
+    // per-handle dialect cache supplies the registry; the per-handle
+    // causal store supplies the predecessor index used by step 6a.
+    let dialect_cache = state
+        .agents
+        .dialect_cache_handle(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let store_arc = state
+        .agents
+        .store_handle(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let registry = dialect_cache.registry_snapshot();
+
+    // Serialise concurrent /send requests on this handle through a
+    // per-handle send sequencer. Within the critical section we run
+    // (validate, append, enqueue) so the wire order on the router
+    // WebSocket matches the store-append order: a frame whose
+    // :caused-by references another frame from this handle is
+    // guaranteed to be enqueued strictly after its predecessor.
+    //
+    // Critically, the *store* mutex is released BEFORE we await the
+    // writer task's oneshot ack inside `send_outbound`. Holding both
+    // across that await would deadlock: the router receive loop runs
+    // outbound writes AND inbound `verify_inbound_against_registry`
+    // in the same `tokio::select!` task; the inbound branch needs the
+    // store mutex, the outbound branch is what posts the ack we're
+    // waiting on. The sequencer mutex, by contrast, is only taken by
+    // this handler — never by the receive loop — so holding it across
+    // the ack is safe.
+    let sequencer = state
+        .agents
+        .send_sequencer(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let _send_seq = sequencer.lock().await;
+
+    {
+        let mut guard = store_arc.lock().await;
+        let validated =
+            validate_for_send_with_context(&request.message, kind, &registry, &mut guard)
+                .map_err(cbcl_validation_error_to_api)?;
+        if let Some((hash, thread, message)) = build_outbound_store_entry(&validated) {
+            use cbcl_core::store::MessageStore as _;
+            let _ = guard.append(hash, thread, message);
+        }
+        // `guard` drops here, releasing the store mutex before the
+        // ack-await below.
+    }
+
     state
         .agents
         .send_outbound(&handle, request.message)
         .await
         .map_err(agent_error_to_api)?;
+    drop(_send_seq);
+
     Ok(Json(SendResponse {
         ok: true,
         agent_handle: handle.as_str().to_owned(),
     }))
+}
+
+/// Compute the `(hash, thread, message)` triple to append for an outbound
+/// simple message. Mirrors the inbound helper in `router.rs` (Phase C) so
+/// both directions share the same content-hash recipe — sha256 over the
+/// canonical encoding of the innermost simple message's s-expression.
+fn build_outbound_store_entry(
+    validated: &crate::cbcl_validation::ValidatedMessage,
+) -> Option<(
+    cbcl_core::store::ContentHash,
+    cbcl_core::store::ThreadId,
+    cbcl_core::message::Message,
+)> {
+    use cbcl_core::canonical::canonical_encode;
+    use cbcl_core::sexpr::SExpr;
+    use cbcl_core::store::{ContentHash, ThreadId};
+    use sha2::{Digest, Sha256};
+
+    let simple = validated.message.innermost_simple()?;
+    let cbcl_core::message::Message::Simple { thread, .. } = simple else {
+        return None;
+    };
+    let thread_id = ThreadId(thread.clone().unwrap_or_else(|| String::from("default")));
+    let sexpr: SExpr = simple.into();
+    let bytes = canonical_encode(&sexpr);
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = format!("sha256:{:x}", hasher.finalize());
+    Some((ContentHash(digest), thread_id, simple.clone()))
 }
 
 async fn meta_subscribe(
@@ -855,6 +1037,29 @@ async fn meta_publish(
             "router reply did not include a name",
             Some(reply.clone()),
         ))?;
+
+    // Install into the publishing handle's local dialect cache so the
+    // outbound R5 pipeline (Phase B) can see the freshly-published
+    // shape/protocol on the very next `send`. Without this, agents that
+    // publish a dialect skip their own R5 constraints until they also
+    // `dialect query` the same name back. A local install failure here is
+    // not fatal: the router already accepted the teach, so we still report
+    // the publish as successful and surface a warn-level event.
+    let local_cache = state
+        .agents
+        .dialect_cache_handle(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    if let Err(error) = local_cache.try_install(&name, define) {
+        tracing::warn!(
+            target: "hark::dialect_cache",
+            handle = handle.as_str(),
+            name = %name,
+            ?error,
+            "publish: local dialect-cache install failed after router ack",
+        );
+    }
+
     Ok(Json(MetaPublishResponse {
         ok: true,
         agent_handle: handle.as_str().to_owned(),
@@ -1405,6 +1610,28 @@ fn cbcl_validation_error_to_api(error: CbclValidationError) -> ApiError {
             error.to_string(),
             None,
         ),
+        CbclValidationError::ShapeViolation {
+            ref detail,
+            ref performative,
+            ref thread,
+        } => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "shape_violation",
+            detail.clone(),
+            None,
+        )
+        .with_blame(performative.clone(), thread.clone()),
+        CbclValidationError::CausalViolation {
+            ref detail,
+            ref performative,
+            ref thread,
+        } => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "causal_violation",
+            detail.clone(),
+            None,
+        )
+        .with_blame(performative.clone(), thread.clone()),
         _ => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "cbcl_validation_failed",
@@ -1430,6 +1657,8 @@ struct ApiError {
     code: &'static str,
     message: String,
     hint: Option<String>,
+    performative: Option<String>,
+    thread: Option<String>,
 }
 
 impl ApiError {
@@ -1444,7 +1673,23 @@ impl ApiError {
             code,
             message: message.into(),
             hint,
+            performative: None,
+            thread: None,
         }
+    }
+
+    /// Attach R5 blame context (performative + thread) so the JSON
+    /// error body surfaces what the spec advertises for
+    /// `shape_violation` and `causal_violation`. Either side may be
+    /// `None` when the pipeline couldn't extract it.
+    fn with_blame(
+        mut self,
+        performative: Option<String>,
+        thread: Option<String>,
+    ) -> Self {
+        self.performative = performative;
+        self.thread = thread;
+        self
     }
 
     fn internal(message: impl Into<String>) -> Self {
@@ -1466,6 +1711,8 @@ impl IntoResponse for ApiError {
                     code: self.code.to_owned(),
                     message: self.message,
                     hint: self.hint,
+                    performative: self.performative,
+                    thread: self.thread,
                 },
             }),
         )

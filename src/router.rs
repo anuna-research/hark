@@ -15,7 +15,14 @@ use crate::{
     daemon::{AgentHandle, AgentSendChannel, AgentStore},
     dialect_cache::DialectCache,
 };
-use cbcl_core::message::{CorePerformative, Message, Performative};
+use cbcl_core::{
+    canonical::canonical_encode,
+    message::{CorePerformative, Message, Performative},
+    sexpr::SExpr,
+    store::{ContentHash, ThreadId},
+};
+use cbcl_parser::{PipelineContext, PipelineResult, run_pipeline_full};
+use sha2::{Digest, Sha256};
 
 pub const AGENT_WS_PATH: &str = "/agent/v1";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -70,8 +77,14 @@ pub async fn create_router_agent(
         .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
     // SPEC-009 dialect cache. One per agent — installations made by this
     // session don't leak across sessions, and the cache dies with the
-    // WebSocket process when the user disconnects.
-    let dialect_cache = DialectCache::new();
+    // WebSocket process when the user disconnects. R5 Phase B moved
+    // ownership onto the per-agent `AgentEntry` so both this receive
+    // loop AND the outbound send handler in `local_api.rs` can share
+    // the same cache.
+    let dialect_cache = store
+        .dialect_cache_handle(&handle)
+        .await
+        .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
     spawn_receive_loop(ReceiveLoopArgs {
         store,
         handle: handle.clone(),
@@ -374,7 +387,7 @@ async fn process_inbound(
     // pending caller's expectation. An unrelated dialect push arriving while
     // `publish`/`list`/`query` is in flight falls through to the inbound
     // queue so it can't be misrouted as the awaited reply.
-    let text = if let Some(delivery) = delivery {
+    let (text, fell_through_meta) = if let Some(delivery) = delivery {
         match store.try_route_meta_reply(handle, delivery).await {
             None => {
                 if let Some(name) = installed {
@@ -382,17 +395,185 @@ async fn process_inbound(
                 }
                 return InboundOutcome::Continue;
             }
-            Some(text) => text,
+            Some(text) => (text, true),
         }
     } else {
-        text
+        (text, false)
     };
+
+    // R5 Phase C: runtime shape + causal verification on inbound ordinary
+    // frames (REQ-231). Meta pushes / meta-replies that fell through from
+    // the meta-reply correlator skip this gate — pushes were already
+    // R1–R5-checked in `dialect_cache.try_install`, and a stray reply has
+    // no expanded payload to shape-check. Only frames that classify as
+    // Ordinary carry an applicative simple message whose registry-resident
+    // shape/causal protocol we need to enforce here.
+    if matches!(class, InboundClass::Ordinary) && !fell_through_meta {
+        match verify_inbound_against_registry(store, handle, dialect_cache, &text).await {
+            InboundVerification::Accept(append) => {
+                if let Some(boxed) = append {
+                    let (hash, thread, message) = *boxed;
+                    if let Err(error) = store.append_message(handle, hash, thread, message).await {
+                        // Unknown-handle path: agent went away mid-frame.
+                        // Treat as fatal for the receive loop.
+                        tracing::warn!(
+                            target: "hark::r5",
+                            error = %error,
+                            "failed to append inbound message to causal store"
+                        );
+                        return InboundOutcome::Exit;
+                    }
+                }
+            }
+            InboundVerification::Drop => {
+                // Violation already logged at warn level; do not enqueue.
+                return InboundOutcome::Continue;
+            }
+        }
+    }
+
     if store.enqueue_inbound(handle, text).await.is_err() {
         return InboundOutcome::Exit;
     }
     match installed {
         Some(name) => InboundOutcome::Installed(name),
         None => InboundOutcome::Continue,
+    }
+}
+
+/// Outcome of running the full R5 pipeline against an inbound ordinary
+/// frame. `Accept` carries an optional triple to append to the agent's
+/// causal store (REQ-310 dedup is handled by the store itself); `Drop`
+/// means the frame violated shape or causal protocol and MUST NOT reach
+/// the recv queue. The triple is boxed to keep the enum's discriminant
+/// cheap — `Message` is ~232 bytes and `Drop` is the common steady-state
+/// for violating frames.
+enum InboundVerification {
+    Accept(Option<Box<(ContentHash, ThreadId, Message)>>),
+    Drop,
+}
+
+/// Run `run_pipeline_full` for one inbound `(lang ...)` / bare-message
+/// frame against the agent's registry snapshot + per-handle causal store.
+///
+/// On `Success`, computes the canonical content hash so the caller can
+/// append the message into the store before delivering — this is what
+/// makes subsequent inbound frames in the same thread see this message
+/// as a valid `:caused-by` predecessor.
+///
+/// On `ValidationError::ShapeViolation` / `CausalViolation` or `Pending`,
+/// emits a structured `tracing::warn` and returns `Drop`. Other pipeline
+/// failures (`ParseError`, malformed messages, R1–R4 meta-envelope
+/// validation, unknown-dialect eval errors, and `Buffered` under a
+/// non-Reject policy) fall through to the existing enqueue path: Phase
+/// C's contract is shape + causal enforcement only; dropping on
+/// unknown-dialect would break agents that advertise a dialect name
+/// before the matching `(define ...)` push has arrived.
+async fn verify_inbound_against_registry(
+    store: &AgentStore,
+    handle: &AgentHandle,
+    dialect_cache: &DialectCache,
+    text: &str,
+) -> InboundVerification {
+    let registry = dialect_cache.registry_snapshot();
+    let store_arc = match store.store_handle(handle).await {
+        Ok(arc) => arc,
+        Err(error) => {
+            tracing::warn!(
+                target: "hark::r5",
+                error = %error,
+                "failed to acquire causal store for inbound verification"
+            );
+            return InboundVerification::Drop;
+        }
+    };
+
+    let result = {
+        let guard = store_arc.lock().await;
+        let ctx = PipelineContext::new(&registry, &*guard);
+        run_pipeline_full(text, &ctx)
+    };
+
+    match result {
+        PipelineResult::Success(message) => {
+            let append = build_store_entry(&message).map(Box::new);
+            InboundVerification::Accept(append)
+        }
+        PipelineResult::ValidationError(ref error)
+            if matches!(
+                error,
+                cbcl_parser::ValidationError::ShapeViolation { .. }
+                    | cbcl_parser::ValidationError::CausalViolation { .. }
+            ) =>
+        {
+            let (performative, thread, blame) = describe_violation(error);
+            tracing::warn!(
+                target: "hark::r5",
+                performative = ?performative,
+                thread = ?thread,
+                blame = %blame,
+                "inbound r5 violation, dropping"
+            );
+            InboundVerification::Drop
+        }
+        PipelineResult::Pending { reason, message } => {
+            let thread = message.thread().map(String::from);
+            let performative = message.performative().map(|p| p.name().to_owned());
+            tracing::warn!(
+                target: "hark::r5",
+                performative = ?performative,
+                thread = ?thread,
+                reason = ?reason,
+                "inbound r5 pending (unknown causal predecessor), dropping"
+            );
+            InboundVerification::Drop
+        }
+        // Everything else — `ParseError`, malformed message, R1–R4 meta
+        // envelope errors, eval errors like `UnknownDialect`, and
+        // `Buffered` under a non-Reject policy — passes through. The
+        // existing enqueue path remains the system of record for those
+        // frames.
+        PipelineResult::ValidationError(_)
+        | PipelineResult::ParseError(_)
+        | PipelineResult::Buffered { .. } => InboundVerification::Accept(None),
+    }
+}
+
+/// Build the `(hash, thread, message)` triple for the per-handle causal
+/// store. Only `Simple` messages reach here (via `innermost_simple` —
+/// `Dialect` and `Wrapped` defer to their inner). Meta messages are not
+/// expected on the Ordinary path; returning `None` for them is a safe
+/// no-op (the frame still enqueues; the store just doesn't grow).
+fn build_store_entry(message: &Message) -> Option<(ContentHash, ThreadId, Message)> {
+    let simple = message.innermost_simple()?;
+    let Message::Simple { thread, .. } = simple else {
+        return None;
+    };
+    let thread_id = ThreadId(thread.clone().unwrap_or_else(|| String::from("default")));
+    let sexpr: SExpr = simple.into();
+    let bytes = canonical_encode(&sexpr);
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = format!("sha256:{:x}", hasher.finalize());
+    Some((ContentHash(digest), thread_id, simple.clone()))
+}
+
+/// Extract performative / thread / blame s-expr from a pipeline
+/// `ValidationError` for the `hark::r5` warn-log. Shape and causal
+/// variants carry a structured `ViolationError`; the rest fall back to
+/// the `Display` impl.
+fn describe_violation(
+    error: &cbcl_parser::ValidationError,
+) -> (Option<String>, Option<String>, String) {
+    use cbcl_parser::ValidationError;
+    match error {
+        ValidationError::ShapeViolation { blame, .. }
+        | ValidationError::CausalViolation { blame, .. } => {
+            let performative = blame.performative.clone();
+            let thread = blame.thread_id.clone();
+            (performative, thread, blame.to_string())
+        }
+        other => (None, None, other.to_string()),
     }
 }
 
@@ -536,5 +717,61 @@ mod tests {
     #[test]
     fn meta_query_list_frame_has_no_parameters() {
         assert_eq!(build_meta_query_list_frame(), "(meta (query (list)))");
+    }
+
+    // R5 Phase C: end-to-end check that `process_inbound` enforces shape
+    // contracts. With a dialect installed whose `(shape greet …)` requires
+    // `:target` on the expanded form, an inbound `(lang greet-d (greet
+    // :name "alice" :thread "rcp-1"))` (missing `:target`) MUST be dropped
+    // before reaching the recv queue.
+    #[tokio::test]
+    async fn process_inbound_drops_ordinary_frame_failing_shape_check() {
+        use crate::daemon::{AgentHandle, AgentStore, AgentStoreConfig};
+        use tokio::time::{Duration, timeout};
+
+        let store = AgentStore::new(AgentStoreConfig {
+            agent_id_prefix: "local-agent".to_owned(),
+            max_messages_per_handle: 16,
+            max_bytes_per_handle: 4096,
+        });
+        let handle =
+            AgentHandle::new("0123456789ABCDEFGHJKMNPQRS").expect("handle should be valid");
+        store
+            .insert_connected(handle.clone(), vec!["greet-d".to_owned()])
+            .await
+            .expect("agent insert should succeed");
+
+        // Install a dialect whose shape on `greet` requires `:target`.
+        // The performative expands to `(greet-action …)`; the shape is
+        // attached to the `greet` performative name so the pipeline
+        // applies it after expansion (REQ-223, REQ-231 step 6b).
+        let cache = store
+            .dialect_cache_handle(&handle)
+            .await
+            .expect("cache handle should resolve");
+        let define = "(define greet-d (cbcl) @author \
+            (extend greet (name) (effect greet-action)) \
+            (shape greet (require :target string)))";
+        cache
+            .try_install("greet-d", define)
+            .expect("R5-clean fixture must install");
+
+        // Missing :target — must fail the shape and be dropped.
+        let frame = r#"(lang greet-d (greet :name "alice" :thread "rcp-1"))"#;
+        let outcome = super::process_inbound(&store, &handle, &cache, frame.to_owned()).await;
+        assert!(matches!(outcome, super::InboundOutcome::Continue));
+
+        // A short-timeout recv must time out — nothing should have been
+        // enqueued by `process_inbound`.
+        let recv = timeout(
+            Duration::from_millis(50),
+            store.recv(&handle, Some(Duration::from_millis(10))),
+        )
+        .await
+        .expect("outer timeout must not fire before inner");
+        assert!(
+            matches!(recv, Err(crate::daemon::AgentError::RecvTimeout)),
+            "expected RecvTimeout, got {recv:?}"
+        );
     }
 }

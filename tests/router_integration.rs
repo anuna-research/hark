@@ -611,6 +611,9 @@ impl LocalApi {
             .header("authorization", format!("Bearer {}", self.record.token))
             .json(&serde_json::json!({
                 "dialects": dialects,
+                // Mock routers in these tests do not handle the meta query
+                // round-trip; opt out so init does not stall.
+                "auto_install_advertised": false,
             }))
             .send()
             .await

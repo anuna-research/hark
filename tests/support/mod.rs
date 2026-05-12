@@ -76,7 +76,12 @@ impl TestEnv {
             .env_remove("CBCL_ROUTER_WS")
             .env_remove("CBCL_ROUTER_AUTH_TOKEN")
             .env_remove("CBCL_DAEMON_MAX_MESSAGES_PER_HANDLE")
-            .env_remove("CBCL_DAEMON_MAX_BYTES_PER_HANDLE");
+            .env_remove("CBCL_DAEMON_MAX_BYTES_PER_HANDLE")
+            // Production daemons fetch advertised dialects from the router on
+            // init so R5 can fire immediately. The mock routers used by these
+            // integration tests don't answer meta queries, so we disable the
+            // auto-install handshake to keep init fast and deterministic.
+            .env("CBCL_AGENT_AUTO_INSTALL_ADVERTISED", "false");
         if let Some(value) = &self.router_ws_url {
             command.env("CBCL_ROUTER_WS", value);
         }
