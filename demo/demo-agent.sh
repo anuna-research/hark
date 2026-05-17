@@ -50,8 +50,14 @@ resolve_under_prefix() {
     # detail and not part of the dialect's contract.
     [[ $raw == /* ]] || return 1
 
+    # Lexically collapse `..` and `.` segments. We use os.path.normpath
+    # rather than realpath because (a) BSD realpath on macOS lacks GNU's
+    # `-m` flag for non-existent paths and (b) we want lexical-only
+    # normalisation: symlink resolution would let a symlink inside the
+    # allowlist point outside it. Python is available on every macOS
+    # and Linux host the demo runs on.
     local resolved
-    if ! resolved=$(realpath -m -- "$raw" 2>/dev/null); then
+    if ! resolved=$(python3 -c 'import os, sys; print(os.path.normpath(sys.argv[1]))' "$raw" 2>/dev/null); then
         return 1
     fi
 
