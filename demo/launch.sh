@@ -20,6 +20,12 @@
 
 set -e
 
+# tmux on macOS spawns non-login shells whose PATH doesn't include
+# ~/.cargo/bin or other common cargo-install locations. Prepend the
+# usual suspects so `hark` and `cbcl-cli` resolve regardless of how
+# this script is invoked.
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+
 # Start the per-user hark daemon if it isn't already up.
 if ! hark daemon status >/dev/null 2>&1; then
     echo "launch: starting hark daemon" >&2
