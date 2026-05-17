@@ -33,6 +33,37 @@ readonly GIT_LOG_MAX_N=20
 
 # --- helpers ---------------------------------------------------------------
 
+# Normalise a path and verify it falls inside ALLOWED_PREFIX. Returns the
+# resolved path on stdout; returns non-zero if the path is empty, escapes
+# the allowlist via `..` segments, or is a sibling whose name happens to
+# start with the prefix string (e.g. "/foo/Codeextra" against "/foo/Code").
+#
+# realpath -m resolves relative segments without requiring the target to
+# exist, so we can reject path-traversal attempts even when the resolved
+# path doesn't name a real file.
+resolve_under_prefix() {
+    local raw=$1
+    [[ -z $raw ]] && return 1
+
+    # Only absolute paths are accepted. Relative paths would otherwise
+    # be resolved against the agent's cwd, which is implementation
+    # detail and not part of the dialect's contract.
+    [[ $raw == /* ]] || return 1
+
+    local resolved
+    if ! resolved=$(realpath -m -- "$raw" 2>/dev/null); then
+        return 1
+    fi
+
+    # Match either the prefix exactly or anything strictly beneath it.
+    # The trailing "/" anchor stops "Codeextra" matching "Code".
+    if [[ $resolved == "$ALLOWED_PREFIX" || $resolved == "$ALLOWED_PREFIX"/* ]]; then
+        printf '%s' "$resolved"
+        return 0
+    fi
+    return 1
+}
+
 # CBCL string escape: backslash and double-quote.
 escape_cbcl_string() {
     local s=${1//\\/\\\\}
@@ -104,20 +135,19 @@ dispatch() {
 
     case "$perf" in
         ls)
-            local path=$content
-            if [[ -z $path || $path != ${ALLOWED_PREFIX}* ]]; then
-                reject "path outside allowlist: ${path}" "$thread"
+            local path
+            if ! path=$(resolve_under_prefix "$content"); then
+                reject "path outside allowlist: ${content}" "$thread"
                 return
             fi
             stdout=$(ls -1 -- "$path" 2>&1) || exit_code=$?
             ;;
 
         cat)
-            local path=$content
-            local bytes_max
+            local path bytes_max
             bytes_max=$(jq -r '.[0].Atom.Num // 0' <<< "$params")
-            if [[ -z $path || $path != ${ALLOWED_PREFIX}* ]]; then
-                reject "path outside allowlist: ${path}" "$thread"
+            if ! path=$(resolve_under_prefix "$content"); then
+                reject "path outside allowlist: ${content}" "$thread"
                 return
             fi
             if (( bytes_max <= 0 || bytes_max > CAT_MAX_BYTES )); then
