@@ -14,6 +14,9 @@
 #   - cbcl-cli and jq on PATH
 #   - CLI_DEMO_REPOS set to a colon-separated allowlist of git-log paths
 #     (e.g. CLI_DEMO_REPOS=cbcl-rs=/home/hugo/Code/cbcl-rs:hark=/home/hugo/Code/hark)
+#   - CLI_DEMO_ALLOWED_PREFIX overrides the path allowlist used by ls/cat.
+#     Defaults to /home/hugo/Code. On macOS the host path is typically
+#     /Users/<user>/Code, so export accordingly.
 
 set -euo pipefail
 
@@ -24,7 +27,7 @@ set -euo pipefail
 # this is the second wall, against in-dialect requests that name paths
 # outside the demo's intended scope.
 
-readonly ALLOWED_PREFIX="/home/hugo/Code"
+readonly ALLOWED_PREFIX="${CLI_DEMO_ALLOWED_PREFIX:-/home/hugo/Code}"
 readonly CAT_MAX_BYTES=8192
 readonly GIT_LOG_MAX_N=20
 
