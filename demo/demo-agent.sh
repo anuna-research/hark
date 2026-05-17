@@ -200,11 +200,17 @@ main() {
             continue
         fi
 
+        local perf
+        perf=$(jq -r '.Dialect.inner.Simple.performative.Custom // "?"' <<< "$parsed")
+        echo "demo-agent: handling ${perf}" >&2
+
         local reply
         reply=$(dispatch "$parsed")
 
         if ! printf '%s' "$reply" | hark reply 2>/dev/null; then
             echo "demo-agent: hark reply failed" >&2
+        else
+            echo "demo-agent: replied (${perf})" >&2
         fi
     done
 }
