@@ -126,25 +126,16 @@ dispatch() {
             stdout=$(head -c "$bytes_max" -- "$path" 2>&1) || exit_code=$?
             ;;
 
-        pwd)
-            stdout=$(pwd)
-            ;;
-
-        uptime)
-            stdout=$(uptime -p 2>&1) || exit_code=$?
-            ;;
-
-        uname)
-            stdout=$(uname -srm)
-            ;;
-
         localtime)
-            # The visual punchline: ISO8601 with offset (e.g. +10:00 for
+            # The visual punchline: ISO 8601 with offset (e.g. +10:00 for
             # AEST) plus the resolved IANA tz name. The audience sees the
             # timezone in the reply and knows the message reached Sydney.
+            # The :format keyword arg is accepted but the only supported
+            # format is "iso8601" — extra space for future formats without
+            # breaking the dialect.
             local iso tz
-            iso=$(date -Iseconds)
-            tz=$(timedatectl show -p Timezone --value 2>/dev/null || readlink /etc/localtime | sed 's|.*zoneinfo/||')
+            iso=$(date -Iseconds 2>/dev/null || date "+%Y-%m-%dT%H:%M:%S%z")
+            tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*zoneinfo/||')
             stdout="${iso} ${tz}"
             ;;
 
@@ -161,10 +152,6 @@ dispatch() {
                 n=$GIT_LOG_MAX_N
             fi
             stdout=$(git -C "$repo_path" log --oneline -n "$n" 2>&1) || exit_code=$?
-            ;;
-
-        disk-free)
-            stdout=$(df -h --output=source,size,used,avail,pcent / 2>&1) || exit_code=$?
             ;;
 
         *)
