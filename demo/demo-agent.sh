@@ -210,11 +210,38 @@ dispatch() {
 main() {
     echo "demo-agent: ready; waiting for cbcl-cli messages" >&2
     while true; do
-        local msg
-        if ! msg=$(hark recv --timeout 60s 2>/dev/null); then
-            # Recv timeout or daemon hiccup. systemd Restart=always handles
-            # daemon death; transient recv failures just loop.
-            continue
+        local msg rc=0
+        msg=$(hark recv --timeout 60s 2>/dev/null) || rc=$?
+        if (( rc != 0 )); then
+            # hark exposes the failure class as a stable exit code; act on it
+            # rather than treating every non-zero recv the same (which would
+            # busy-loop on a dead handle, since unhealthy/daemon-down failures
+            # return immediately rather than waiting out --timeout).
+            case $rc in
+                10)
+                    # recv_timeout: handle is healthy, just idle. Keep waiting.
+                    continue
+                    ;;
+                7|3)
+                    # 7 = agent_handle_unhealthy (hark marked the handle dead
+                    #     after the router WebSocket dropped) or unknown handle;
+                    # 3 = hark daemon not running.
+                    # The handle cannot recover in place: hark deliberately
+                    # never reconnects a dropped router socket, because a silent
+                    # reconnect could miss frames and break the causal ordering
+                    # it enforces. Exit so launch.sh mints a fresh handle (a new
+                    # router connection with a clean causal store) and restarts.
+                    echo "demo-agent: recv rc=$rc (handle/daemon gone); exiting for re-init" >&2
+                    exit "$rc"
+                    ;;
+                *)
+                    # Unknown transient failure: back off rather than spinning
+                    # the CPU re-forking hark recv, then retry.
+                    echo "demo-agent: recv rc=$rc (transient); backing off" >&2
+                    sleep 1
+                    continue
+                    ;;
+            esac
         fi
         if [[ -z $msg ]]; then
             continue
