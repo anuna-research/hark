@@ -36,18 +36,22 @@ pub fn encode_frame(payload: &[u8], signer: &dyn FrameSigner) -> Vec<u8> {
 }
 
 /// Extract the payload bytes from a hub-delivered frame, or `None` if the frame
-/// is malformed/short (drop it, keep the connection — SPEC-001 REQ-016). The
-/// trailing signature is intentionally ignored (see module docs).
+/// is malformed (drop it, keep the connection — SPEC-001 REQ-016). The trailing
+/// signature is not verified by the agent (see module docs) but it MUST be
+/// present and the frame MUST be exactly `len(4) ‖ payload(len) ‖ sig(64)`: a
+/// frame whose total length is not `LEN_PREFIX + len + SIG_LEN` is malformed
+/// (truncated, over-long, or framed against a different format) and is rejected
+/// rather than silently treating trailing bytes as absent.
 pub fn decode_payload(frame: &[u8]) -> Option<&[u8]> {
     if frame.len() < LEN_PREFIX {
         return None;
     }
     let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
-    let end = LEN_PREFIX.checked_add(len)?;
-    if frame.len() < end {
+    let expected = LEN_PREFIX.checked_add(len)?.checked_add(SIG_LEN)?;
+    if frame.len() != expected {
         return None;
     }
-    Some(&frame[LEN_PREFIX..end])
+    Some(&frame[LEN_PREFIX..LEN_PREFIX + len])
 }
 
 /// A stub signer for Phase 1 — emits an all-zero signature. The real hub will
@@ -64,7 +68,7 @@ impl FrameSigner for NullSigner {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_payload, encode_frame, FrameSigner, NullSigner, LEN_PREFIX, SIG_LEN};
+    use super::{FrameSigner, LEN_PREFIX, NullSigner, SIG_LEN, decode_payload, encode_frame};
 
     /// A signer that fills the signature with a constant, to check placement.
     struct ConstSigner(u8);
@@ -104,6 +108,27 @@ mod tests {
         assert_eq!(decode_payload(&[0, 0]), None); // shorter than length prefix
         // Declares len=10 but only 2 payload bytes present.
         assert_eq!(decode_payload(&[0, 0, 0, 10, b'a', b'b']), None);
+    }
+
+    #[test]
+    fn rejects_frame_missing_signature() {
+        // len=2 ‖ "hi" but no trailing 64-byte signature: malformed.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u32.to_be_bytes());
+        frame.extend_from_slice(b"hi");
+        assert_eq!(decode_payload(&frame), None);
+        // Payload + partial signature is also rejected (not exactly SIG_LEN).
+        frame.extend_from_slice(&[0u8; SIG_LEN - 1]);
+        assert_eq!(decode_payload(&frame), None);
+    }
+
+    #[test]
+    fn rejects_overlong_frame() {
+        // A correctly framed payload with extra trailing bytes is rejected
+        // rather than silently truncated to the declared length.
+        let mut frame = encode_frame(b"hi", &NullSigner);
+        frame.push(0xFF);
+        assert_eq!(decode_payload(&frame), None);
     }
 
     #[test]

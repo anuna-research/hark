@@ -15,7 +15,9 @@
 //! additive and do not change the connect/frame path proven here.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use cbcl_core::sexpr::{Atom, SExpr};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
@@ -27,6 +29,14 @@ use crate::identity::ChatIdentity;
 
 pub const CHAT_WS_PATH: &str = "/chat/v1";
 
+/// How long to wait for the hub's join acknowledgement (`roomcfg`/`presence`)
+/// or rejection (`error`) after sending the signed `hello`, before giving up.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The negotiated WebSocket stream type for a `/chat/v1` connection.
+type ChatSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChatError {
     #[error("chat connection failed: {0}")]
@@ -35,6 +45,10 @@ pub enum ChatError {
     Hello(String),
     #[error("failed to send hello: {0}")]
     HelloSendFailed(String),
+    #[error("hub rejected the join: {0}")]
+    JoinRejected(String),
+    #[error("hub did not acknowledge the join within {0:?}")]
+    JoinTimeout(Duration),
     #[error("agent store rejected the connection: {0}")]
     Store(String),
 }
@@ -79,6 +93,14 @@ pub async fn create_chat_agent(
         .await
         .map_err(|error| ChatError::HelloSendFailed(error.to_string()))?;
 
+    // Block until the hub acknowledges the join (`roomcfg`) or rejects it
+    // (`error @room "slug"`). The hub keeps the socket open on rejection
+    // (bad-signature / no-such-channel / forbidden-room), so returning Ok before
+    // this would hand back a "joined" handle the agent is not actually a member
+    // of. On rejection or timeout the websocket drops here, before any store
+    // entry exists — nothing to mark unhealthy or clean up.
+    await_join_ack(&mut websocket).await?;
+
     let handle = AgentHandle::generate();
     let (close_tx, close_rx) = oneshot::channel();
     let (send_tx, send_rx) = mpsc::channel(8);
@@ -107,12 +129,90 @@ pub async fn create_chat_agent(
 struct ReceiveLoopArgs {
     store: AgentStore,
     handle: AgentHandle,
-    websocket: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    websocket: ChatSocket,
     close_rx: oneshot::Receiver<()>,
     send_rx: mpsc::Receiver<crate::daemon::OutboundFrame>,
     identity: Arc<ChatIdentity>,
+}
+
+/// Wait for the hub's verdict on a freshly sent `hello`. A successful join leads
+/// with a `roomcfg` frame (then backfill + a `presence` broadcast); a rejected
+/// one is a single `(error @room "slug")` with the socket left open. We consume
+/// only the acknowledging frame and leave any backfill/presence for the receive
+/// loop to enqueue.
+async fn await_join_ack(websocket: &mut ChatSocket) -> Result<(), ChatError> {
+    let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+    loop {
+        let message = match tokio::time::timeout_at(deadline, websocket.next()).await {
+            Err(_elapsed) => return Err(ChatError::JoinTimeout(JOIN_TIMEOUT)),
+            Ok(None) => {
+                return Err(ChatError::ConnectionFailed(
+                    "hub closed the connection before acknowledging the join".to_owned(),
+                ));
+            }
+            Ok(Some(Ok(message))) => message,
+            Ok(Some(Err(error))) => {
+                return Err(ChatError::ConnectionFailed(sanitize(&error.to_string())));
+            }
+        };
+        let text = match message {
+            WsMessage::Binary(bytes) => match decode_payload(&bytes) {
+                Some(payload) => String::from_utf8_lossy(payload).into_owned(),
+                None => continue, // malformed frame: ignore, keep waiting for the verdict
+            },
+            WsMessage::Text(text) => text.to_string(),
+            WsMessage::Close(frame) => {
+                let detail = frame
+                    .map(|f| format!("code={:?} reason=\"{}\"", f.code, f.reason))
+                    .unwrap_or_else(|| "no close frame".to_owned());
+                return Err(ChatError::ConnectionFailed(format!(
+                    "hub closed during join: {}",
+                    sanitize(&detail)
+                )));
+            }
+            _ => continue, // ping/pong/etc.
+        };
+        match frame_performative(&text).as_deref() {
+            Some("roomcfg") | Some("presence") => return Ok(()),
+            Some("error") => {
+                return Err(ChatError::JoinRejected(
+                    error_slug(&text).unwrap_or_else(|| "unknown".to_owned()),
+                ));
+            }
+            // Any other frame (e.g. backfill arriving before the leading roomcfg
+            // on some hub ordering) is not a verdict — keep waiting.
+            _ => continue,
+        }
+    }
+}
+
+/// The performative (head symbol) of a CBCL frame, if it parses as a list led by
+/// a symbol. Classifies hub control frames without fragile substring matching:
+/// `(error @x "...")` → `error`, never a `(tell @x "error")` body.
+fn frame_performative(text: &str) -> Option<String> {
+    match cbcl_parser::parse(text).ok()? {
+        SExpr::List(items) => match items.first()? {
+            SExpr::Atom(Atom::Symbol(symbol)) => Some(symbol.clone()),
+            _ => None,
+        },
+        SExpr::Atom(_) => None,
+    }
+}
+
+/// The slug from an `(error @room "slug")` frame. Returns `None` if `text` is not
+/// an error frame; the slug is the frame's string atom.
+fn error_slug(text: &str) -> Option<String> {
+    let SExpr::List(items) = cbcl_parser::parse(text).ok()? else {
+        return None;
+    };
+    match items.first()? {
+        SExpr::Atom(Atom::Symbol(symbol)) if symbol == "error" => {}
+        _ => return None,
+    }
+    items.iter().find_map(|item| match item {
+        SExpr::Atom(Atom::Str(slug)) => Some(slug.clone()),
+        _ => None,
+    })
 }
 
 fn spawn_receive_loop(args: ReceiveLoopArgs) {
@@ -195,7 +295,57 @@ fn sanitize(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::payload_bytes;
+    use super::{error_slug, frame_performative, payload_bytes};
+
+    #[test]
+    fn classifies_join_ack_frames() {
+        assert_eq!(
+            frame_performative("(roomcfg @general :enc false)").as_deref(),
+            Some("roomcfg")
+        );
+        assert_eq!(
+            frame_performative("(presence @general :members (@aria @bo))").as_deref(),
+            Some("presence")
+        );
+        assert_eq!(
+            frame_performative("(error @general \"no-such-channel\")").as_deref(),
+            Some("error")
+        );
+    }
+
+    #[test]
+    fn performative_is_the_head_not_a_body_substring() {
+        // A message whose *content* mentions "error" must not be read as an error frame.
+        assert_eq!(
+            frame_performative("(tell @x \"an error occurred\")").as_deref(),
+            Some("tell")
+        );
+        assert_eq!(
+            frame_performative("(tell @x \"an error occurred\")"),
+            Some("tell".to_owned())
+        );
+        assert!(error_slug("(tell @x \"an error occurred\")").is_none());
+    }
+
+    #[test]
+    fn extracts_error_slug() {
+        assert_eq!(
+            error_slug("(error @general \"bad-signature\")").as_deref(),
+            Some("bad-signature")
+        );
+        assert_eq!(
+            error_slug("(error @ \"forbidden-room\")").as_deref(),
+            Some("forbidden-room")
+        );
+        // Not an error frame -> no slug.
+        assert!(error_slug("(roomcfg @general :enc true)").is_none());
+    }
+
+    #[test]
+    fn non_cbcl_has_no_performative() {
+        assert!(frame_performative("not (((valid").is_none());
+        assert!(error_slug("not (((valid").is_none());
+    }
 
     #[test]
     fn payload_bytes_validates_and_passes_through() {
