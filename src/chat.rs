@@ -18,12 +18,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cbcl_core::sexpr::{Atom, SExpr};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use url::Url;
 
 use crate::chat_frame::{decode_payload, encode_frame};
+use crate::chat_responder::{Action, Responder, WindowOutcome};
 use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore};
 use crate::identity::ChatIdentity;
 
@@ -84,6 +86,7 @@ fn cap_part(cap: Option<&str>) -> String {
 /// standing cap or a bounded invite token (the hub's `allow-join?` /
 /// `join-allowed?`, SPEC-001). Public channels ignore it; pass `None` to enter
 /// a public channel.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_chat_agent(
     store: AgentStore,
     ws_url: &Url,
@@ -91,6 +94,8 @@ pub async fn create_chat_agent(
     agent_handle: &str,
     dialects: Vec<String>,
     cap: Option<String>,
+    claim_window: Duration,
+    liveness_timeout: Duration,
     identity: Arc<ChatIdentity>,
 ) -> Result<AgentHandle, ChatError> {
     AgentStore::validate_advertisement(&dialects)
@@ -122,6 +127,9 @@ pub async fn create_chat_agent(
     let handle = AgentHandle::generate();
     let (close_tx, close_rx) = oneshot::channel();
     let (send_tx, send_rx) = mpsc::channel(8);
+    // The advertised dialects are both the store's record and the responder's
+    // capability set (SPEC-003 REQ-002).
+    let capability = dialects.clone();
     store
         .insert_connected_with_router_channels(
             handle.clone(),
@@ -133,6 +141,7 @@ pub async fn create_chat_agent(
         .await
         .map_err(|error| ChatError::Store(error.to_string()))?;
 
+    let responder = Responder::new(agent_handle.to_owned(), channel.to_owned(), capability);
     spawn_receive_loop(ReceiveLoopArgs {
         store,
         handle: handle.clone(),
@@ -140,6 +149,9 @@ pub async fn create_chat_agent(
         close_rx,
         send_rx,
         identity,
+        responder,
+        claim_window,
+        liveness_timeout,
     });
 
     Ok(handle)
@@ -152,6 +164,17 @@ struct ReceiveLoopArgs {
     close_rx: oneshot::Receiver<()>,
     send_rx: mpsc::Receiver<crate::daemon::OutboundFrame>,
     identity: Arc<ChatIdentity>,
+    responder: Responder,
+    claim_window: Duration,
+    liveness_timeout: Duration,
+}
+
+/// A scheduled responder timer fired by the receive loop (SPEC-003 REQ-005/007).
+enum ClaimTimer {
+    /// The Δ claim window for `ask_id` has closed — elect a winner.
+    Window(String),
+    /// The liveness fallback for `ask_id` is due — take over if still unanswered.
+    Fallback(String),
 }
 
 /// Wait for the hub's verdict on a freshly sent `hello`. A successful join leads
@@ -242,8 +265,13 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         mut close_rx,
         mut send_rx,
         identity,
+        mut responder,
+        claim_window,
+        liveness_timeout,
     } = args;
     tokio::spawn(async move {
+        // Pending Δ-window and liveness-fallback timers, fired into the select.
+        let mut timers: FuturesUnordered<BoxFuture<'static, ClaimTimer>> = FuturesUnordered::new();
         loop {
             tokio::select! {
                 _ = &mut close_rx => {
@@ -274,6 +302,32 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         }
                     }
                 }
+                // A responder timer fired (guarded so an empty set does not busy-loop).
+                maybe_timer = timers.next(), if !timers.is_empty() => {
+                    let Some(timer) = maybe_timer else { continue };
+                    match timer {
+                        ClaimTimer::Window(ask_id) => match responder.on_window_closed(&ask_id) {
+                            WindowOutcome::Win(payload) => {
+                                if store.enqueue_inbound(&handle, payload).await.is_err() { break; }
+                            }
+                            WindowOutcome::Hold { rank } => {
+                                // Rank-k waits k liveness periods; if no reply is seen
+                                // it takes over (REQ-007).
+                                let delay = liveness_timeout.saturating_mul(rank as u32);
+                                timers.push(async move {
+                                    tokio::time::sleep(delay).await;
+                                    ClaimTimer::Fallback(ask_id)
+                                }.boxed());
+                            }
+                            WindowOutcome::Idle => {}
+                        },
+                        ClaimTimer::Fallback(ask_id) => {
+                            if let Some(payload) = responder.on_fallback(&ask_id) {
+                                if store.enqueue_inbound(&handle, payload).await.is_err() { break; }
+                            }
+                        }
+                    }
+                }
                 message = websocket.next() => {
                     let payload_text = match message {
                         Some(Ok(WsMessage::Binary(bytes))) => {
@@ -299,9 +353,29 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             break;
                         }
                     };
-                    if store.enqueue_inbound(&handle, payload_text).await.is_err() {
-                        break;
+                    // The responder decides: claim for answerable asks, deliver to
+                    // `recv` only when elected, drop everything else (REQ-002).
+                    let mut send_failed = false;
+                    for action in responder.on_inbound(&payload_text) {
+                        let Action::Claim { ask_id, frame_text } = action;
+                        match payload_bytes(&frame_text) {
+                            Ok(payload) => {
+                                let frame = encode_frame(&payload, identity.as_ref());
+                                if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
+                                    let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(sanitize(&error.to_string()))).await;
+                                    send_failed = true;
+                                }
+                            }
+                            // Our own claim should always be valid CBCL; skip if not.
+                            Err(_) => continue,
+                        }
+                        let delay = claim_window;
+                        timers.push(async move {
+                            tokio::time::sleep(delay).await;
+                            ClaimTimer::Window(ask_id)
+                        }.boxed());
                     }
+                    if send_failed { break; }
                 }
             }
         }

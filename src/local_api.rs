@@ -767,6 +767,8 @@ async fn create_chat_transport_agent(
         wire_handle,
         request.dialects,
         request.cap.clone(),
+        chat.claim_window,
+        chat.liveness_timeout,
         std::sync::Arc::new(identity),
     )
     .await

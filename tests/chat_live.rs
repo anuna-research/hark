@@ -47,6 +47,8 @@ async fn signed_hello_is_accepted_by_live_hub() {
         "@hark-test",
         vec!["cite".to_owned()],
         None, // public channel: no cap
+        Duration::from_millis(400),
+        Duration::from_secs(2),
         identity,
     )
     .await
@@ -76,6 +78,8 @@ async fn join_to_unknown_channel_is_rejected() {
         "@hark-test-reject",
         vec!["cite".to_owned()],
         None,
+        Duration::from_millis(400),
+        Duration::from_secs(2),
         identity,
     )
     .await;

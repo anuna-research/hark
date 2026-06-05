@@ -70,6 +70,12 @@ pub struct ChatConfig {
     /// Directory holding one Ed25519 seed per wire handle (`<dir>/<handle>.key`).
     /// Each agent process gets its own handle and its own key here.
     pub identity_dir: Option<String>,
+    /// Δ: how long to collect claims before electing an answerer, in
+    /// milliseconds (SPEC-003 NFR-001). Defaults to 400 ms.
+    pub claim_window_ms: Option<u64>,
+    /// T: per-rank liveness timeout before a fallback agent takes over, in
+    /// milliseconds (SPEC-003 REQ-007/NFR-002). Defaults to 2000 ms.
+    pub liveness_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
@@ -107,7 +113,16 @@ pub struct ValidatedChatConfig {
     pub ws_url: Url,
     pub channel: String,
     pub identity_dir: PathBuf,
+    /// Δ — the claim-collection window (SPEC-003 NFR-001).
+    pub claim_window: std::time::Duration,
+    /// T — the per-rank liveness timeout (SPEC-003 REQ-007).
+    pub liveness_timeout: std::time::Duration,
 }
+
+/// Default Δ claim window (SPEC-003 NFR-001: ≤ 750 ms p95 for N ≤ 8 on LAN).
+pub const DEFAULT_CLAIM_WINDOW_MS: u64 = 400;
+/// Default T liveness timeout before a fallback agent answers.
+pub const DEFAULT_LIVENESS_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -296,10 +311,20 @@ impl AppConfig {
                     .to_owned(),
             })?,
         };
+        let claim_window = std::time::Duration::from_millis(
+            self.chat.claim_window_ms.unwrap_or(DEFAULT_CLAIM_WINDOW_MS),
+        );
+        let liveness_timeout = std::time::Duration::from_millis(
+            self.chat
+                .liveness_timeout_ms
+                .unwrap_or(DEFAULT_LIVENESS_TIMEOUT_MS),
+        );
         Ok(ValidatedChatConfig {
             ws_url,
             channel,
             identity_dir,
+            claim_window,
+            liveness_timeout,
         })
     }
 }
@@ -618,6 +643,8 @@ mod tests {
             chat: ChatConfig {
                 channel: Some("@research".to_owned()),
                 identity_dir: Some("/tmp/hark-keys".to_owned()),
+                claim_window_ms: Some(250),
+                liveness_timeout_ms: None,
             },
             ..AppConfig::default()
         };
@@ -626,6 +653,12 @@ mod tests {
         assert_eq!(
             chat.identity_dir,
             std::path::PathBuf::from("/tmp/hark-keys")
+        );
+        // Δ overridden; T falls back to the default.
+        assert_eq!(chat.claim_window, std::time::Duration::from_millis(250));
+        assert_eq!(
+            chat.liveness_timeout,
+            std::time::Duration::from_millis(super::DEFAULT_LIVENESS_TIMEOUT_MS)
         );
         // Chat needs no auth token.
         assert_eq!(config.transport().unwrap(), Transport::Chat);
@@ -637,6 +670,8 @@ mod tests {
             chat: ChatConfig {
                 channel: Some("general".to_owned()),
                 identity_dir: None,
+                claim_window_ms: None,
+                liveness_timeout_ms: None,
             },
             ..config_with_ws("wss://hub.example/chat/v1")
         };
