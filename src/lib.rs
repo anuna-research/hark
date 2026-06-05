@@ -6,6 +6,7 @@ pub mod constants;
 pub mod daemon;
 pub mod dialect_cache;
 pub mod errors;
+pub mod identity;
 pub mod local_api;
 pub mod router;
 pub mod selector;
