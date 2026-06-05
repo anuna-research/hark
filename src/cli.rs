@@ -357,7 +357,7 @@ fn validate_init_advertisement(dialects: &[String]) -> AppResult<()> {
 
 async fn send_message_command(kind: SendMessageKind, args: MessageInputArgs) -> AppResult<()> {
     let message = read_message_input(args.message)?;
-    // The CLI only sends reply/error/progress; dispatch is API-only (kind=dispatch).
+    // The CLI only sends reply/error/progress; emit is API-only (kind=emit).
     let expected_kind = kind
         .message_kind()
         .expect("CLI send commands use reply/error/progress");

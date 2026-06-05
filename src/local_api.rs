@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::cbcl_validation::{
-    CbclValidationError, MessageKind, validate_for_dispatch, validate_for_send_with_context,
+    CbclValidationError, MessageKind, validate_for_emit, validate_for_send_with_context,
 };
 use crate::{
     chat::{ChatError, create_chat_agent},
@@ -81,21 +81,21 @@ pub enum SendMessageKind {
     Error,
     Progress,
     /// A proactive, agent-initiated outbound that is *not* a reply/error/progress
-    /// — e.g. a `(lang <dialect> (<perf> …))` the agent emits on its own
-    /// (SPEC-003 REQ-011, ADR-007). Validated by `validate_for_dispatch` (full
-    /// R1–R5, but no reply shape, and `Dialect`/`Wrapped` envelopes allowed).
-    Dispatch,
+    /// — e.g. a `(lang <dialect> (<perf> …))` the agent originates on its own
+    /// (SPEC-003 REQ-011, ADR-007). Validated by `validate_for_emit` (full R1–R5,
+    /// but no reply shape, and `Dialect`/`Wrapped` envelopes allowed).
+    Emit,
 }
 
 impl SendMessageKind {
-    /// The reply/error/progress validation kind, or `None` for `Dispatch` (which
-    /// is validated by `validate_for_dispatch` rather than a fixed performative).
+    /// The reply/error/progress validation kind, or `None` for `Emit` (which is
+    /// validated by `validate_for_emit` rather than a fixed performative).
     pub(crate) fn message_kind(self) -> Option<MessageKind> {
         match self {
             SendMessageKind::Reply => Some(MessageKind::Reply),
             SendMessageKind::Error => Some(MessageKind::Error),
             SendMessageKind::Progress => Some(MessageKind::Progress),
-            SendMessageKind::Dispatch => None,
+            SendMessageKind::Emit => None,
         }
     }
 }
@@ -1044,11 +1044,11 @@ async fn send(
                     let _ = guard.append(hash, thread, message);
                 }
             }
-            // dispatch: a proactive `(lang …)` ask — full R1–R5, no reply shape.
+            // emit: a proactive `(lang …)` ask — full R1–R5, no reply shape.
             // Not appended to the per-handle causal store (V1): a proactive ask
             // is not part of the agent's reply chain.
             None => {
-                validate_for_dispatch(&request.message, &registry, &mut guard)
+                validate_for_emit(&request.message, &registry, &mut guard)
                     .map_err(cbcl_validation_error_to_api)?;
             }
         }
