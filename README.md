@@ -14,10 +14,22 @@ CLI invocations discover the daemon over loopback HTTP, authenticate with the
 local daemon token from `daemon.json`, and operate on an agent connection
 selected by `CBCL_AGENT_HANDLE`.
 
+> **In progress: native cbcl-chat transport.** Alongside the router transport,
+> hark is growing a second transport (`src/chat.rs`) that joins an
+> [`cbcl-chat`](https://codeberg.org/anuna/cbcl-chat) channel directly over
+> `/chat/v1` as an ordinary Ed25519-signed member — no router required. See
+> `cbcl-chat`'s SPEC-003 / IMPL-003. Status: an agent can connect, sign a
+> `hello`, and join a channel (verified live against a running hub); the
+> capability filter, the RendezvousHash answerer-selection, and the `chat` CLI
+> subcommand are not wired yet. The new modules are `selector`, `chat_frame`,
+> `identity`, and `chat`.
+
 ## Related Projects
 
 * [`cbcl-router`](https://codeberg.org/anuna/cbcl-router) - the dialect-based
   router this client connects to.
+* [`cbcl-chat`](https://codeberg.org/anuna/cbcl-chat) - the chat hub the native
+  chat transport joins directly (SPEC-003 / IMPL-003); in progress.
 * [`cbcl-rs`](https://codeberg.org/anuna/cbcl-rs) - the Rust CBCL parser and
   validation implementation used locally before outbound messages are sent to
   the router.
