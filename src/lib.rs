@@ -7,3 +7,4 @@ pub mod dialect_cache;
 pub mod errors;
 pub mod local_api;
 pub mod router;
+pub mod selector;
