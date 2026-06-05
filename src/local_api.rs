@@ -19,7 +19,9 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::oneshot};
 
-use crate::cbcl_validation::{CbclValidationError, MessageKind, validate_for_send_with_context};
+use crate::cbcl_validation::{
+    CbclValidationError, MessageKind, validate_for_dispatch, validate_for_send_with_context,
+};
 use crate::{
     chat::{ChatError, create_chat_agent},
     config::{AppConfig, ConfigError, Transport, validate_chat_handle},
@@ -78,6 +80,24 @@ pub enum SendMessageKind {
     Reply,
     Error,
     Progress,
+    /// A proactive, agent-initiated outbound that is *not* a reply/error/progress
+    /// — e.g. a `(lang <dialect> (<perf> …))` the agent emits on its own
+    /// (SPEC-003 REQ-011, ADR-007). Validated by `validate_for_dispatch` (full
+    /// R1–R5, but no reply shape, and `Dialect`/`Wrapped` envelopes allowed).
+    Dispatch,
+}
+
+impl SendMessageKind {
+    /// The reply/error/progress validation kind, or `None` for `Dispatch` (which
+    /// is validated by `validate_for_dispatch` rather than a fixed performative).
+    pub(crate) fn message_kind(self) -> Option<MessageKind> {
+        match self {
+            SendMessageKind::Reply => Some(MessageKind::Reply),
+            SendMessageKind::Error => Some(MessageKind::Error),
+            SendMessageKind::Progress => Some(MessageKind::Progress),
+            SendMessageKind::Dispatch => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -85,6 +105,7 @@ pub struct SendResponse {
     pub ok: bool,
     pub agent_handle: String,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MetaSubscribeRequest {
@@ -969,7 +990,6 @@ async fn send(
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
     let handle = parse_handle(handle)?;
-    let kind = MessageKind::from(request.kind);
 
     // R5 Phase B: drive `run_pipeline_full` for outbound simple-message
     // validation so shape (REQ-220) and causal (REQ-200) violations are
@@ -1013,12 +1033,24 @@ async fn send(
 
     {
         let mut guard = store_arc.lock().await;
-        let validated =
-            validate_for_send_with_context(&request.message, kind, &registry, &mut guard)
-                .map_err(cbcl_validation_error_to_api)?;
-        if let Some((hash, thread, message)) = build_outbound_store_entry(&validated) {
-            use cbcl_core::store::MessageStore as _;
-            let _ = guard.append(hash, thread, message);
+        match request.kind.message_kind() {
+            // reply/error/progress: fixed-performative validation + causal append.
+            Some(kind) => {
+                let validated =
+                    validate_for_send_with_context(&request.message, kind, &registry, &mut guard)
+                        .map_err(cbcl_validation_error_to_api)?;
+                if let Some((hash, thread, message)) = build_outbound_store_entry(&validated) {
+                    use cbcl_core::store::MessageStore as _;
+                    let _ = guard.append(hash, thread, message);
+                }
+            }
+            // dispatch: a proactive `(lang …)` ask — full R1–R5, no reply shape.
+            // Not appended to the per-handle causal store (V1): a proactive ask
+            // is not part of the agent's reply chain.
+            None => {
+                validate_for_dispatch(&request.message, &registry, &mut guard)
+                    .map_err(cbcl_validation_error_to_api)?;
+            }
         }
         // `guard` drops here, releasing the store mutex before the
         // ack-await below.
@@ -1814,15 +1846,6 @@ fn cbcl_validation_error_to_api(error: CbclValidationError) -> ApiError {
     }
 }
 
-impl From<SendMessageKind> for MessageKind {
-    fn from(kind: SendMessageKind) -> Self {
-        match kind {
-            SendMessageKind::Reply => Self::Reply,
-            SendMessageKind::Error => Self::Error,
-            SendMessageKind::Progress => Self::Progress,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ApiError {

@@ -357,7 +357,10 @@ fn validate_init_advertisement(dialects: &[String]) -> AppResult<()> {
 
 async fn send_message_command(kind: SendMessageKind, args: MessageInputArgs) -> AppResult<()> {
     let message = read_message_input(args.message)?;
-    let expected_kind = MessageKind::from(kind);
+    // The CLI only sends reply/error/progress; dispatch is API-only (kind=dispatch).
+    let expected_kind = kind
+        .message_kind()
+        .expect("CLI send commands use reply/error/progress");
     validate_for_send(&message, expected_kind).map_err(|error| {
         eprintln!("{}: {error}", error.code());
         AppError::CbclValidation
