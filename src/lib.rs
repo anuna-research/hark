@@ -1,4 +1,5 @@
 pub mod cbcl_validation;
+pub mod chat_frame;
 pub mod cli;
 pub mod config;
 pub mod constants;
