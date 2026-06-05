@@ -132,6 +132,21 @@ pub struct InitArgs {
         help = "Dialect id to advertise; repeat for multiple dialects"
     )]
     pub dialects: Vec<String>,
+    #[arg(
+        long = "handle",
+        help = "Chat hub only: the agent's wire handle (@name); required on a chat hub, ignored by the router"
+    )]
+    pub handle: Option<String>,
+    #[arg(
+        long = "channel",
+        help = "Chat hub only: channel to join (@name); defaults to the configured [chat].channel"
+    )]
+    pub channel: Option<String>,
+    #[arg(
+        long = "cap",
+        help = "Chat hub only: capability token or invite for a private channel"
+    )]
+    pub cap: Option<String>,
     #[arg(long = "json", help = "Print JSON instead of shell exports")]
     pub json: bool,
 }
@@ -273,6 +288,10 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
             // knob for this; production agents always want their advertised
             // dialects R5-enforceable from the first message.
             auto_install_advertised: None,
+            // Chat-hub fields; the daemon ignores them on the router transport.
+            channel: args.channel,
+            handle: args.handle,
+            cap: args.cap,
         })
         .await
         .map_err(map_local_api_request_error)?;
@@ -497,7 +516,13 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "invalid_router_ws_url"
                 | "missing_router_auth_token"
                 | "router_auth_rejected"
-                | "router_connection_failed" => AppError::RouterConnection,
+                | "router_connection_failed"
+                | "chat_connection_failed" => AppError::RouterConnection,
+                "missing_chat_handle"
+                | "chat_join_rejected"
+                | "not_supported_on_chat_hub" => AppError::Usage(error.error.message),
+                "chat_join_timeout" => AppError::Timeout,
+                "chat_identity_unavailable" => AppError::Internal(error.error.message),
                 "missing_dialect"
                 | "duplicate_dialect"
                 | "invalid_dialect"

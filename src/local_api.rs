@@ -21,12 +21,14 @@ use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::cbcl_validation::{CbclValidationError, MessageKind, validate_for_send_with_context};
 use crate::{
-    config::{AppConfig, ConfigError},
+    chat::{ChatError, create_chat_agent},
+    config::{AppConfig, ConfigError, Transport, validate_chat_handle},
     constants::{COMMAND_NAME, LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
     daemon::{
         AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord,
         MetaReplyDelivery, MetaReplyExpectation, authenticated_headers,
     },
+    identity::ChatIdentity,
     router::{RouterError, create_router_agent},
 };
 
@@ -144,6 +146,19 @@ pub struct CreateAgentRequest {
     /// timeout, or transport error) without failing the agent creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_install_advertised: Option<bool>,
+    /// Chat transport only: the channel (`@name`) to join. Defaults to the
+    /// configured `[chat].channel`. Ignored by the router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Chat transport only: the agent's wire handle (`@name`), required for a
+    /// chat hub — each process is its own separately-keyed member. Ignored by
+    /// the router (which derives its wire id from the local handle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    /// Chat transport only: capability token or invite for a *private* channel
+    /// (the hub's `:cap`). Omit for public channels. Ignored by the router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -646,6 +661,20 @@ async fn create_agent(
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
     AgentStore::validate_advertisement(&request.dialects).map_err(agent_error_to_api)?;
+    // The configured hub URL's path decides the transport (config::transport).
+    match state.config.transport().map_err(config_error_to_api)? {
+        Transport::Router => create_router_transport_agent(state, request).await,
+        Transport::Chat => create_chat_transport_agent(state, request).await,
+    }
+}
+
+/// Router transport: connect to cbcl-router, advertise dialects, and best-effort
+/// install each advertised dialect via `@router` so R5 can enforce shape from
+/// the first message.
+async fn create_router_transport_agent(
+    state: AppState,
+    request: CreateAgentRequest,
+) -> Result<Json<CreateAgentResponse>, ApiError> {
     let router = state
         .config
         .validate_router()
@@ -676,6 +705,100 @@ async fn create_agent(
         dialects: created.dialects,
         state: "connected".to_owned(),
     }))
+}
+
+/// Chat transport: join a cbcl-chat channel as a signed member. The wire handle
+/// is per-process and required; its Ed25519 key lives at
+/// `<identity_dir>/<handle>.key` (loaded or created). The router-specific
+/// auto-install step is skipped — a chat hub has no `@router`.
+async fn create_chat_transport_agent(
+    state: AppState,
+    request: CreateAgentRequest,
+) -> Result<Json<CreateAgentResponse>, ApiError> {
+    let chat = state.config.validate_chat().map_err(config_error_to_api)?;
+    let wire_handle = request
+        .handle
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "missing_chat_handle",
+                "chat agents require a wire handle",
+                Some(
+                    "pass --handle @name, e.g. `hark init --handle @aria --channel @general --dialect cite`"
+                        .to_owned(),
+                ),
+            )
+        })?;
+    validate_chat_handle("handle", wire_handle).map_err(config_error_to_api)?;
+    let channel = match request
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(channel) => {
+            validate_chat_handle("channel", channel).map_err(config_error_to_api)?;
+            channel.to_owned()
+        }
+        None => chat.channel.clone(),
+    };
+    let dialects = request.dialects.clone();
+    let key_path = chat
+        .identity_dir
+        .join(format!("{}.key", chat_key_filename(wire_handle)));
+    let identity = ChatIdentity::load_or_create(&key_path).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chat_identity_unavailable",
+            format!(
+                "could not load or create the chat identity at {}: {error}",
+                key_path.display()
+            ),
+            None,
+        )
+    })?;
+    let handle = create_chat_agent(
+        state.agents.clone(),
+        &chat.ws_url,
+        &channel,
+        wire_handle,
+        request.dialects,
+        request.cap.clone(),
+        std::sync::Arc::new(identity),
+    )
+    .await
+    .map_err(chat_error_to_api)?;
+
+    Ok(Json(CreateAgentResponse {
+        agent_handle: handle.as_str().to_owned(),
+        router_agent_id: wire_handle.to_owned(),
+        dialects,
+        state: "connected".to_owned(),
+    }))
+}
+
+/// Map a wire handle to a key filename: strip the leading `@` and keep only
+/// filename-safe characters. Falls back to `agent` if nothing remains.
+fn chat_key_filename(handle: &str) -> String {
+    let name: String = handle
+        .trim_start_matches('@')
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.is_empty() {
+        "agent".to_owned()
+    } else {
+        name
+    }
 }
 
 /// Per-dialect best-effort meta-query so the publisher's local R5 pipeline
@@ -949,6 +1072,7 @@ async fn meta_subscribe(
 ) -> Result<Json<MetaAckResponse>, ApiError> {
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
+    reject_if_chat_transport(&state)?;
     let handle = parse_handle(handle)?;
     let pattern = validate_subscribe_pattern(&request.pattern)?;
     let frame = crate::router::build_meta_subscribe_frame(pattern);
@@ -970,6 +1094,7 @@ async fn meta_unsubscribe(
 ) -> Result<Json<MetaAckResponse>, ApiError> {
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
+    reject_if_chat_transport(&state)?;
     let handle = parse_handle(handle)?;
     let frame = crate::router::build_meta_unsubscribe_frame();
     state
@@ -991,6 +1116,7 @@ async fn meta_publish(
 ) -> Result<Json<MetaPublishResponse>, ApiError> {
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
+    reject_if_chat_transport(&state)?;
     let handle = parse_handle(handle)?;
     let define = request.define.trim();
     validate_define_for_publish(define)?;
@@ -1076,6 +1202,7 @@ async fn meta_query(
 ) -> Result<Json<MetaQueryResponse>, ApiError> {
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
+    reject_if_chat_transport(&state)?;
     let handle = parse_handle(handle)?;
     validate_dialect_name(&request.name)?;
     let frame = crate::router::build_meta_query_frame(&request.name);
@@ -1138,6 +1265,7 @@ async fn meta_list(
 ) -> Result<Json<MetaListResponse>, ApiError> {
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
+    reject_if_chat_transport(&state)?;
     let handle = parse_handle(handle)?;
     let frame = crate::router::build_meta_query_list_frame();
     let delivery = state
@@ -1584,6 +1712,49 @@ fn router_error_to_api(error: RouterError) -> ApiError {
     }
 }
 
+fn chat_error_to_api(error: ChatError) -> ApiError {
+    match error {
+        ChatError::JoinRejected(slug) => ApiError::new(
+            StatusCode::FORBIDDEN,
+            "chat_join_rejected",
+            format!("hub rejected the join: {slug}"),
+            Some("for a private channel pass --cap <token-or-invite>".to_owned()),
+        ),
+        ChatError::JoinTimeout(_) => ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "chat_join_timeout",
+            error.to_string(),
+            None,
+        ),
+        ChatError::ConnectionFailed(message)
+        | ChatError::Hello(message)
+        | ChatError::HelloSendFailed(message) => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "chat_connection_failed",
+            message,
+            None,
+        ),
+        ChatError::Store(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_dialect", message, None)
+        }
+    }
+}
+
+/// Reject router-only dialect operations on a chat hub: there is no `@router` to
+/// teach/query, and per-channel dialects (SPEC-005) are not yet implemented.
+fn reject_if_chat_transport(state: &AppState) -> Result<(), ApiError> {
+    if matches!(state.config.transport(), Ok(Transport::Chat)) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "not_supported_on_chat_hub",
+            "dialect/router operations are not available on a chat hub (there is no @router); \
+             per-channel dialects (SPEC-005) are not yet implemented",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 fn cbcl_validation_error_to_api(error: CbclValidationError) -> ApiError {
     match error {
         CbclValidationError::KindMismatch { .. } => ApiError::new(
@@ -1731,8 +1902,18 @@ mod tests {
 
     use super::{
         AgentsResponse, ClientPingError, ErrorResponse, LocalApiClient, PingResponse,
-        serve_local_api_with_agents,
+        chat_key_filename, serve_local_api_with_agents,
     };
+
+    #[test]
+    fn chat_key_filename_sanitizes_handle() {
+        assert_eq!(chat_key_filename("@aria"), "aria");
+        assert_eq!(chat_key_filename("@team-bot_1"), "team-bot_1");
+        // Path separators and other unsafe chars become underscores.
+        assert_eq!(chat_key_filename("@a/b.c"), "a_b_c");
+        // A handle that reduces to nothing falls back to a safe default.
+        assert_eq!(chat_key_filename("@"), "agent");
+    }
     use crate::{
         constants::LOCAL_API_VERSION,
         daemon::{AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord},

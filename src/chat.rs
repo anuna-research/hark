@@ -65,15 +65,32 @@ fn payload_bytes(text: &str) -> Result<Vec<u8>, String> {
     Ok(text.as_bytes().to_vec())
 }
 
+/// The ` :cap "<token>"` clause for a private-channel join, or empty for a
+/// public channel. A blank/whitespace cap is treated as absent. Embedded quotes
+/// are stripped (caps are opaque tokens, not free text) so the hello stays
+/// well-formed CBCL — mirrors the browser client's `cap.replace(/"/g, '')`.
+fn cap_part(cap: Option<&str>) -> String {
+    match cap.map(str::trim).filter(|token| !token.is_empty()) {
+        Some(token) => format!(" :cap \"{}\"", token.replace('"', "")),
+        None => String::new(),
+    }
+}
+
 /// Connect to `/chat/v1`, join `channel` as `agent_handle` with a signed
 /// `hello`, and spawn the receive loop. Returns the store handle for the
 /// connection (used by `recv`/`reply`).
+///
+/// `cap` is the capability presented for a *private* channel: the channel's
+/// standing cap or a bounded invite token (the hub's `allow-join?` /
+/// `join-allowed?`, SPEC-001). Public channels ignore it; pass `None` to enter
+/// a public channel.
 pub async fn create_chat_agent(
     store: AgentStore,
     ws_url: &Url,
     channel: &str,
     agent_handle: &str,
     dialects: Vec<String>,
+    cap: Option<String>,
     identity: Arc<ChatIdentity>,
 ) -> Result<AgentHandle, ChatError> {
     AgentStore::validate_advertisement(&dialects)
@@ -83,8 +100,9 @@ pub async fn create_chat_agent(
         .map_err(|error| ChatError::ConnectionFailed(error.to_string()))?;
 
     let hello = format!(
-        "(hello {channel} :from {agent_handle} :key \"{}\")",
-        identity.public_key_b64()
+        "(hello {channel} :from {agent_handle} :key \"{}\"{})",
+        identity.public_key_b64(),
+        cap_part(cap.as_deref()),
     );
     let payload = payload_bytes(&hello).map_err(ChatError::Hello)?;
     let frame = encode_frame(&payload, identity.as_ref());
@@ -110,6 +128,7 @@ pub async fn create_chat_agent(
             dialects,
             Some(close_tx),
             Some(AgentSendChannel::new(send_tx)),
+            Some(agent_handle.to_owned()), // the chat wire identity (@handle)
         )
         .await
         .map_err(|error| ChatError::Store(error.to_string()))?;
@@ -295,7 +314,24 @@ fn sanitize(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_slug, frame_performative, payload_bytes};
+    use super::{cap_part, error_slug, frame_performative, payload_bytes};
+
+    #[test]
+    fn cap_part_is_empty_when_absent_or_blank() {
+        assert_eq!(cap_part(None), "");
+        assert_eq!(cap_part(Some("")), "");
+        assert_eq!(cap_part(Some("   ")), "");
+    }
+
+    #[test]
+    fn cap_part_emits_clause_and_strips_quotes() {
+        assert_eq!(cap_part(Some("s3cret")), " :cap \"s3cret\"");
+        assert_eq!(cap_part(Some(" tok ")), " :cap \"tok\"");
+        assert_eq!(cap_part(Some("a\"b")), " :cap \"ab\"");
+        // The resulting hello must still parse as CBCL.
+        let hello = format!("(hello @r :from @a :key \"k\"{})", cap_part(Some("a\"b")));
+        assert!(cbcl_parser::parse(&hello).is_ok());
+    }
 
     #[test]
     fn classifies_join_ack_frames() {

@@ -416,7 +416,7 @@ impl AgentStore {
         dialects: Vec<String>,
         close_tx: Option<oneshot::Sender<()>>,
     ) -> Result<AgentStatusSnapshot, AgentError> {
-        self.insert_connected_with_router_channels(handle, dialects, close_tx, None)
+        self.insert_connected_with_router_channels(handle, dialects, close_tx, None, None)
             .await
     }
 
@@ -426,10 +426,15 @@ impl AgentStore {
         dialects: Vec<String>,
         close_tx: Option<oneshot::Sender<()>>,
         send_channel: Option<AgentSendChannel>,
+        wire_id: Option<String>,
     ) -> Result<AgentStatusSnapshot, AgentError> {
         validate_agent_advertisement(&dialects)?;
         let mut inner = self.inner.lock().await;
-        let router_agent_id = format!("{}-{}", inner.config.agent_id_prefix, handle.as_str());
+        // The router derives an upstream id from the local handle; the chat
+        // transport supplies its own `@handle` (its identity on the hub), so
+        // status reports the real wire identity for each transport.
+        let router_agent_id = wire_id
+            .unwrap_or_else(|| format!("{}-{}", inner.config.agent_id_prefix, handle.as_str()));
         let entry = AgentEntry {
             router_agent_id,
             dialects,

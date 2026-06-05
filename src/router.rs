@@ -72,6 +72,7 @@ pub async fn create_router_agent(
             dialects.clone(),
             Some(close_tx),
             Some(AgentSendChannel::new(send_tx)),
+            None, // router derives its wire id from the local handle
         )
         .await
         .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
