@@ -210,14 +210,27 @@ struct ReceiveLoopArgs {
     identity: Arc<ChatIdentity>,
 }
 
+/// How long to wait for the hub's conn-nonce bootstrap before giving up — a hub
+/// that accepts the upgrade then stalls must not hang `create_router_agent`.
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Receive + parse the hub's conn-nonce bootstrap (its first frame), yielding a
 /// `SignedConn` primed with the connection's `conn_nonce` + `hub_id`.
 async fn recv_bootstrap(ws: &mut RouterWebSocket) -> Result<SignedConn, RouterError> {
-    let msg = ws
-        .next()
-        .await
-        .ok_or_else(|| RouterError::ConnectionFailed("closed before conn-nonce bootstrap".into()))?
-        .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
+    let msg = match tokio::time::timeout(BOOTSTRAP_TIMEOUT, ws.next()).await {
+        Err(_) => {
+            return Err(RouterError::ConnectionFailed(
+                "timed out waiting for the conn-nonce bootstrap".into(),
+            ));
+        }
+        Ok(None) => {
+            return Err(RouterError::ConnectionFailed(
+                "closed before conn-nonce bootstrap".into(),
+            ));
+        }
+        Ok(Some(Err(error))) => return Err(RouterError::ConnectionFailed(error.to_string())),
+        Ok(Some(Ok(msg))) => msg,
+    };
     let text = match msg {
         WsMessage::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         WsMessage::Text(text) => text.to_string(),

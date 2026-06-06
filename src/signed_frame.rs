@@ -61,7 +61,7 @@ pub fn decode_frame(frame: &[u8]) -> Option<(u64, &[u8], &[u8])> {
     let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
     let seq = u64::from_be_bytes(frame[4..HEADER_LEN].try_into().ok()?);
     let body = &frame[HEADER_LEN..];
-    if body.len() != len + SIG_LEN {
+    if body.len() != len.checked_add(SIG_LEN)? {
         return None;
     }
     Some((seq, &body[..len], &body[len..]))

@@ -167,11 +167,21 @@ pub async fn create_chat_agent(
 /// Receive + parse the chat hub's conn-nonce bootstrap (its first frame:
 /// `(tell @client "conn-nonce" …)`), yielding a `SignedConn`.
 async fn recv_bootstrap(ws: &mut ChatSocket) -> Result<SignedConn, ChatError> {
-    let msg = ws
-        .next()
-        .await
-        .ok_or_else(|| ChatError::ConnectionFailed("closed before conn-nonce bootstrap".into()))?
-        .map_err(|error| ChatError::ConnectionFailed(error.to_string()))?;
+    // A hub that accepts the upgrade then stalls must not hang create_chat_agent.
+    let msg = match tokio::time::timeout(JOIN_TIMEOUT, ws.next()).await {
+        Err(_) => {
+            return Err(ChatError::ConnectionFailed(
+                "timed out waiting for the conn-nonce bootstrap".into(),
+            ));
+        }
+        Ok(None) => {
+            return Err(ChatError::ConnectionFailed(
+                "closed before conn-nonce bootstrap".into(),
+            ));
+        }
+        Ok(Some(Err(error))) => return Err(ChatError::ConnectionFailed(error.to_string())),
+        Ok(Some(Ok(msg))) => msg,
+    };
     // The chat hub bare-frames its hub->client frames (len ‖ payload ‖ sig), so
     // strip the framing before reading the payload text (unlike the router, whose
     // hub->agent frames are raw payload bytes).

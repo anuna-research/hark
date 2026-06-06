@@ -82,11 +82,6 @@ impl SignedConn {
         Self { hub_id: hub_id.into(), conn_nonce: conn_nonce.into(), seq: 0 }
     }
 
-    /// The next seq that `sign_frame` will use (current high-water + 1).
-    pub fn next_seq(&self) -> u64 {
-        self.seq + 1
-    }
-
     /// Sign `payload` for `audience` into a wire frame, advancing the connection
     /// seq. `signer` signs the domain-separated envelope (not the bare payload).
     pub fn sign_frame(&mut self, signer: &dyn FrameSigner, audience: &[u8], payload: &[u8]) -> Vec<u8> {
