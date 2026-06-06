@@ -12,3 +12,4 @@ pub mod identity;
 pub mod local_api;
 pub mod router;
 pub mod selector;
+pub mod signed_frame;
