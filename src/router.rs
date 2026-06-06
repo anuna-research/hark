@@ -1,12 +1,11 @@
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{
-        Message as WsMessage, client::IntoClientRequest, http::header::InvalidHeaderValue,
-    },
+    tungstenite::Message as WsMessage,
 };
 
 use crate::{
@@ -14,6 +13,8 @@ use crate::{
     config::ValidatedRouterConfig,
     daemon::{AgentHandle, AgentSendChannel, AgentStore},
     dialect_cache::DialectCache,
+    identity::ChatIdentity,
+    signed_transport::{SignedConn, build_router_hello, parse_conn_bootstrap},
 };
 use cbcl_core::{
     canonical::canonical_encode,
@@ -52,15 +53,23 @@ pub async fn create_router_agent(
     router: &ValidatedRouterConfig,
     agent_id_prefix: &str,
     dialects: Vec<String>,
+    identity: Arc<ChatIdentity>,
 ) -> Result<CreatedRouterAgent, RouterError> {
     AgentStore::validate_advertisement(&dialects)
         .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
     let handle = AgentHandle::generate();
     let router_agent_id = format!("{agent_id_prefix}-{}", handle.as_str());
     let mut websocket = connect(router).await?;
-    let hello = build_hello_frame(&router_agent_id, &dialects);
+
+    // SPEC-012 signed-member connect: the hub issues a conn-nonce bootstrap as
+    // its first frame; capture it into a per-connection signer, then send a
+    // per-frame-signed hello advertising our Ed25519 key. Identity is the key —
+    // there is no bearer token.
+    let mut conn = recv_bootstrap(&mut websocket).await?;
+    let hello = build_router_hello(&router_agent_id, &identity.public_key_b64(), &dialects);
+    let hello_frame = conn.sign_router_frame(&*identity, hello.as_bytes());
     websocket
-        .send(WsMessage::Binary(hello.into_bytes().into()))
+        .send(WsMessage::Binary(hello_frame.into()))
         .await
         .map_err(|error| RouterError::HelloSendFailed(error.to_string()))?;
 
@@ -95,6 +104,8 @@ pub async fn create_router_agent(
         dialect_cache,
         router_agent_id: snapshot.router_agent_id.clone(),
         initial_dialects: dialects.clone(),
+        conn,
+        identity,
     });
 
     Ok(CreatedRouterAgent {
@@ -171,22 +182,11 @@ pub fn build_meta_query_list_frame() -> String {
     "(meta (query (list)))".to_owned()
 }
 
+/// Connect to the router's `/agent/v1` WebSocket. SPEC-012 REQ-009: NO bearer /
+/// challenge-response connection auth — identity is established per-frame by
+/// Ed25519 signature (see the signed hello below). TLS (wss) secures the channel.
 async fn connect(router: &ValidatedRouterConfig) -> Result<RouterWebSocket, RouterError> {
-    let mut request = router
-        .ws_url
-        .as_str()
-        .into_client_request()
-        .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
-    request.headers_mut().insert(
-        "authorization",
-        format!("Bearer {}", router.auth_token)
-            .parse()
-            .map_err(|error: InvalidHeaderValue| {
-                RouterError::ConnectionFailed(error.to_string())
-            })?,
-    );
-
-    connect_async(request)
+    connect_async(router.ws_url.as_str())
         .await
         .map(|(websocket, _response)| websocket)
         .map_err(map_connect_error)
@@ -201,6 +201,33 @@ struct ReceiveLoopArgs {
     dialect_cache: DialectCache,
     router_agent_id: String,
     initial_dialects: Vec<String>,
+    /// Per-connection signer (conn_nonce + hub_id + seq) for every outbound frame.
+    conn: SignedConn,
+    /// The agent's Ed25519 identity key.
+    identity: Arc<ChatIdentity>,
+}
+
+/// Receive + parse the hub's conn-nonce bootstrap (its first frame), yielding a
+/// `SignedConn` primed with the connection's `conn_nonce` + `hub_id`.
+async fn recv_bootstrap(ws: &mut RouterWebSocket) -> Result<SignedConn, RouterError> {
+    let msg = ws
+        .next()
+        .await
+        .ok_or_else(|| RouterError::ConnectionFailed("closed before conn-nonce bootstrap".into()))?
+        .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
+    let text = match msg {
+        WsMessage::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        WsMessage::Text(text) => text.to_string(),
+        other => {
+            return Err(RouterError::ConnectionFailed(format!(
+                "unexpected first frame (expected conn-nonce bootstrap): {other:?}"
+            )));
+        }
+    };
+    let boot = parse_conn_bootstrap(&text).ok_or_else(|| {
+        RouterError::ConnectionFailed(format!("first frame was not a conn-nonce bootstrap: {text}"))
+    })?;
+    Ok(SignedConn::from_bootstrap(&boot))
 }
 
 fn spawn_receive_loop(args: ReceiveLoopArgs) {
@@ -213,6 +240,8 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         dialect_cache,
         router_agent_id,
         initial_dialects,
+        mut conn,
+        identity,
     } = args;
     tokio::spawn(async move {
         // Tracks dialects currently advertised by THIS session. Mutated on
@@ -230,7 +259,8 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     break;
                 }
                 _ = heartbeat.tick() => {
-                    if let Err(error) = websocket.send(WsMessage::Binary(HEARTBEAT_FRAME.as_bytes().to_vec().into())).await {
+                    let hb = conn.sign_router_frame(&*identity, HEARTBEAT_FRAME.as_bytes());
+                    if let Err(error) = websocket.send(WsMessage::Binary(hb.into())).await {
                         let detail = sanitize_diagnostic(&format!("heartbeat send failed: {error}"));
                         let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(detail)).await;
                         break;
@@ -241,7 +271,8 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         let _ = store.mark_unhealthy(&handle, "local_send_failed", Some("router send channel closed".to_owned())).await;
                         break;
                     };
-                    match websocket.send(WsMessage::Binary(outbound.message.into_bytes().into())).await {
+                    let frame = conn.sign_router_frame(&*identity, outbound.message.as_bytes());
+                    match websocket.send(WsMessage::Binary(frame.into())).await {
                         Ok(()) => {
                             let _ = outbound.result_tx.send(Ok(()));
                         }
@@ -280,9 +311,14 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         InboundOutcome::Installed(name) => {
                             if !advertised.contains(&name) {
                                 advertised.push(name.clone());
-                                let hello = build_hello_frame(&router_agent_id, &advertised);
+                                let hello = build_router_hello(
+                                    &router_agent_id,
+                                    &identity.public_key_b64(),
+                                    &advertised,
+                                );
+                                let hello_frame = conn.sign_router_frame(&*identity, hello.as_bytes());
                                 if let Err(error) = websocket
-                                    .send(WsMessage::Binary(hello.into_bytes().into()))
+                                    .send(WsMessage::Binary(hello_frame.into()))
                                     .await
                                 {
                                     let detail = sanitize_diagnostic(&format!(

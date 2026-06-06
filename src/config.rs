@@ -269,17 +269,12 @@ impl AppConfig {
 
     pub fn validate_router(&self) -> Result<ValidatedRouterConfig, ConfigError> {
         let ws_url = self.validate_ws_url()?;
-        let auth_token = self
-            .router
-            .auth_token
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(ConfigError::MissingRouterAuthToken)?;
+        // SPEC-012 REQ-009: the router no longer uses a bearer token — identity is
+        // established per frame by Ed25519 signature (see signed_transport). A
+        // legacy `auth_token` in the config is accepted but ignored.
+        let auth_token = self.router.auth_token.as_deref().unwrap_or("").to_owned();
 
-        Ok(ValidatedRouterConfig {
-            ws_url,
-            auth_token: auth_token.to_owned(),
-        })
+        Ok(ValidatedRouterConfig { ws_url, auth_token })
     }
 
     /// Validate the chat transport: the shared hub URL, plus the chat-only
@@ -345,6 +340,14 @@ pub fn validate_chat_handle(field: &'static str, value: &str) -> Result<(), Conf
 pub fn default_chat_identity_dir() -> Option<PathBuf> {
     let base_dirs = BaseDirs::new()?;
     Some(base_dirs.config_dir().join(COMMAND_NAME).join("chat-keys"))
+}
+
+/// Default router agent identity key: `<config-dir>/<command>/router-agent.key`.
+/// One stable Ed25519 key for the daemon's router connections (replaces the old
+/// `auth_token` bearer credential under SPEC-012). The hub TOFU-enrols it.
+pub fn default_router_identity_path() -> Option<PathBuf> {
+    let base_dirs = BaseDirs::new()?;
+    Some(base_dirs.config_dir().join(COMMAND_NAME).join("router-agent.key"))
 }
 
 pub fn default_config_file() -> Option<PathBuf> {
@@ -916,17 +919,20 @@ mod tests {
             Err(ConfigError::InvalidRouterWsUrl(_))
         ));
 
+        // SPEC-012 REQ-009: the router no longer requires a bearer token — a
+        // config with no auth_token now validates (identity is per-frame Ed25519).
         config.router.ws_url = Some("wss://router.example/agent/v1".to_owned());
         config.router.auth_token = None;
-        assert!(matches!(
-            config.validate_router(),
-            Err(ConfigError::MissingRouterAuthToken)
-        ));
+        let validated = config
+            .validate_router()
+            .expect("router config should pass without an auth token");
+        assert_eq!(validated.ws_url.as_str(), "wss://router.example/agent/v1");
+        assert_eq!(validated.auth_token, "");
 
+        // a legacy auth_token is accepted but ignored.
         config.router.auth_token = Some("shr_test.secret".to_owned());
         let validated = config.validate_router().expect("router config should pass");
         assert_eq!(validated.ws_url.as_str(), "wss://router.example/agent/v1");
-        assert_eq!(validated.auth_token, "shr_test.secret");
     }
 
     #[test]

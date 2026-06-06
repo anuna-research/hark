@@ -707,11 +707,28 @@ async fn create_router_transport_agent(
     let auto_install = request
         .auto_install_advertised
         .unwrap_or(state.config.agent.auto_install_advertised);
+    // SPEC-012: the router connection authenticates per-frame by Ed25519
+    // signature (no bearer token). Load the daemon's stable router identity key,
+    // creating it on first use; the hub TOFU-enrols it on the signed hello.
+    let identity_path = crate::config::default_router_identity_path().ok_or_else(|| {
+        router_error_to_api(RouterError::ConnectionFailed(
+            "no config directory for the router identity key".into(),
+        ))
+    })?;
+    let identity = std::sync::Arc::new(ChatIdentity::load_or_create(&identity_path).map_err(
+        |error| {
+            router_error_to_api(RouterError::ConnectionFailed(format!(
+                "router identity key {}: {error}",
+                identity_path.display()
+            )))
+        },
+    )?);
     let created = create_router_agent(
         state.agents.clone(),
         &router,
         &state.config.agent.agent_id_prefix,
         request.dialects,
+        identity,
     )
     .await
     .map_err(router_error_to_api)?;
