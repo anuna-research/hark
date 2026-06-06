@@ -39,9 +39,12 @@ pub struct ConnBootstrap {
 /// Recognise + parse the hub's conn-nonce bootstrap frame payload. Returns `None`
 /// for any other frame (so a normal message is not mistaken for the bootstrap).
 pub fn parse_conn_bootstrap(payload: &str) -> Option<ConnBootstrap> {
-    // Must be the transport bootstrap: a tell to @agent whose content is
-    // "conn-nonce" and which carries :nonce. Anything else is a real message.
-    if !payload.starts_with("(tell @agent ") || !payload.contains("\"conn-nonce\"") {
+    // Must be the transport bootstrap: a tell to @agent (router) or @client
+    // (chat) whose content is "conn-nonce" and which carries :nonce. Anything
+    // else is a real message.
+    let to_transport =
+        payload.starts_with("(tell @agent ") || payload.starts_with("(tell @client ");
+    if !to_transport || !payload.contains("\"conn-nonce\"") {
         return None;
     }
     let nonce_b64 = quoted_kw(payload, ":nonce")?;
@@ -97,6 +100,28 @@ impl SignedConn {
     pub fn sign_router_frame(&mut self, signer: &dyn FrameSigner, payload: &[u8]) -> Vec<u8> {
         self.sign_frame(signer, ROUTER_AUDIENCE, payload)
     }
+
+    /// Sign a frame for the chat hub. Unlike the router (which strips the sigil
+    /// and folds recipient-less terminals to the substrate), the chat hub binds
+    /// `audience` = the message's recipient WITH its `@` sigil (matching
+    /// `cbcl-core-msg:room`), so derive it from the payload.
+    pub fn sign_chat_frame(&mut self, signer: &dyn FrameSigner, payload: &[u8]) -> Vec<u8> {
+        let audience = chat_audience(payload).unwrap_or_default();
+        self.sign_frame(signer, &audience, payload)
+    }
+}
+
+/// The chat audience: the recipient handle (kept `@`-prefixed) — the first
+/// `@`-token in the canonical payload, i.e. the recipient immediately after the
+/// performative (a `(lang …)` wrapper's inner recipient is also the first `@`).
+pub fn chat_audience(payload: &[u8]) -> Option<Vec<u8>> {
+    let s = std::str::from_utf8(payload).ok()?;
+    let at = s.find('@')?;
+    let rest = &s[at..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ')' || c == '(')
+        .unwrap_or(rest.len());
+    Some(rest[..end].as_bytes().to_vec())
 }
 
 /// The signed-member router hello payload (replaces the old unsigned
@@ -175,5 +200,20 @@ mod tests {
     fn hello_has_signed_member_shape() {
         let h = build_router_hello("agent-x", "PUBKEYB64", &["demo".into(), "echo".into()]);
         assert_eq!(h, "(hello @router :from @agent-x :key \"PUBKEYB64\" :dialects (\"demo\" \"echo\"))");
+    }
+
+    #[test]
+    fn parses_chat_client_bootstrap() {
+        let p = "(tell @client \"conn-nonce\" :from @cbcl-chat :nonce \"BwcHBwcHBwcHBwcHBwcHBw==\" :hub \"cbcl-chat\")";
+        let b = parse_conn_bootstrap(p).expect("chat bootstrap");
+        assert_eq!(b.conn_nonce, vec![7u8; 16]);
+        assert_eq!(b.hub_id, b"cbcl-chat");
+    }
+
+    #[test]
+    fn chat_audience_keeps_the_sigil() {
+        assert_eq!(chat_audience(b"(hello @general :from @h :key \"k\")").unwrap(), b"@general");
+        assert_eq!(chat_audience(b"(keypub @hub :last \"l\" :from @a)").unwrap(), b"@hub");
+        assert_eq!(chat_audience(b"(lang cbcl-chat (tell @room \"x\" :from @a))").unwrap(), b"@room");
     }
 }

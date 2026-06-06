@@ -24,7 +24,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use url::Url;
 
-use crate::chat_frame::{decode_payload, encode_frame};
+use crate::chat_frame::decode_payload;
+use crate::signed_transport::{SignedConn, parse_conn_bootstrap};
 use crate::chat_responder::{Action, Responder, WindowOutcome};
 use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore};
 use crate::identity::ChatIdentity;
@@ -104,13 +105,18 @@ pub async fn create_chat_agent(
         .await
         .map_err(|error| ChatError::ConnectionFailed(error.to_string()))?;
 
+    // SPEC-012 signed-member connect: capture the hub's conn-nonce bootstrap into
+    // a per-connection signer, then sign the hello (and every later frame) over
+    // the domain-separated envelope. The chat audience is the recipient handle
+    // (@-kept), derived per frame by sign_chat_frame.
+    let mut conn = recv_bootstrap(&mut websocket).await?;
     let hello = format!(
         "(hello {channel} :from {agent_handle} :key \"{}\"{})",
         identity.public_key_b64(),
         cap_part(cap.as_deref()),
     );
     let payload = payload_bytes(&hello).map_err(ChatError::Hello)?;
-    let frame = encode_frame(&payload, identity.as_ref());
+    let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
     websocket
         .send(WsMessage::Binary(frame.into()))
         .await
@@ -152,9 +158,40 @@ pub async fn create_chat_agent(
         responder,
         claim_window,
         liveness_timeout,
+        conn,
     });
 
     Ok(handle)
+}
+
+/// Receive + parse the chat hub's conn-nonce bootstrap (its first frame:
+/// `(tell @client "conn-nonce" …)`), yielding a `SignedConn`.
+async fn recv_bootstrap(ws: &mut ChatSocket) -> Result<SignedConn, ChatError> {
+    let msg = ws
+        .next()
+        .await
+        .ok_or_else(|| ChatError::ConnectionFailed("closed before conn-nonce bootstrap".into()))?
+        .map_err(|error| ChatError::ConnectionFailed(error.to_string()))?;
+    // The chat hub bare-frames its hub->client frames (len ‖ payload ‖ sig), so
+    // strip the framing before reading the payload text (unlike the router, whose
+    // hub->agent frames are raw payload bytes).
+    let payload = match &msg {
+        WsMessage::Binary(bytes) => decode_payload(bytes).ok_or_else(|| {
+            ChatError::ConnectionFailed("malformed conn-nonce bootstrap frame".into())
+        })?,
+        WsMessage::Text(text) => text.as_bytes(),
+        other => {
+            return Err(ChatError::ConnectionFailed(format!(
+                "unexpected first frame (expected conn-nonce bootstrap): {other:?}"
+            )));
+        }
+    };
+    let text = String::from_utf8_lossy(payload).into_owned();
+    parse_conn_bootstrap(&text)
+        .map(|boot| SignedConn::from_bootstrap(&boot))
+        .ok_or_else(|| {
+            ChatError::ConnectionFailed(format!("first frame was not a conn-nonce bootstrap: {text}"))
+        })
 }
 
 struct ReceiveLoopArgs {
@@ -167,6 +204,8 @@ struct ReceiveLoopArgs {
     responder: Responder,
     claim_window: Duration,
     liveness_timeout: Duration,
+    /// Per-connection signer (conn_nonce + hub_id + seq) for every outbound frame.
+    conn: SignedConn,
 }
 
 /// A scheduled responder timer fired by the receive loop (SPEC-003 REQ-005/007).
@@ -268,6 +307,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         mut responder,
         claim_window,
         liveness_timeout,
+        mut conn,
     } = args;
     tokio::spawn(async move {
         // Pending Δ-window and liveness-fallback timers, fired into the select.
@@ -291,7 +331,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             continue;
                         }
                     };
-                    let frame = encode_frame(&payload, identity.as_ref());
+                    let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
                     match websocket.send(WsMessage::Binary(frame.into())).await {
                         Ok(()) => { let _ = outbound.result_tx.send(Ok(())); }
                         Err(error) => {
@@ -360,7 +400,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         let Action::Claim { ask_id, frame_text } = action;
                         match payload_bytes(&frame_text) {
                             Ok(payload) => {
-                                let frame = encode_frame(&payload, identity.as_ref());
+                                let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
                                 if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
                                     let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(sanitize(&error.to_string()))).await;
                                     send_failed = true;
