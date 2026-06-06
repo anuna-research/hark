@@ -26,24 +26,21 @@ Router HTTP paths are outside the client scope.
 
 ## Authentication
 
-The current router requires an authorization header on `/agent/v1`.
+The `/agent/v1` connection has **no bearer or challenge-response connection
+auth** — there is no `Authorization` header. Identity is established **per
+frame** by an Ed25519 signature.
 
-Supported current form:
+On connect, the hub sends a one-time **connection nonce** as its first frame.
+The agent then sends a signed `hello` advertising its Ed25519 public key, and
+every subsequent frame is signed over a domain-separated envelope that binds the
+hub id, the recipient, a per-connection sequence number, and the connection
+nonce — so a frame cannot be replayed across connections or reordered. `wss`
+(TLS) secures the channel.
 
-```text
-Authorization: Bearer shr_<key_id>.<secret>
-```
-
-Example:
-
-```text
-Authorization: Bearer shr_prod-agent.<secret>
-```
-
-The client should support this shared-secret bearer credential in the MVP. The
-newer Ed25519/JWT enrollment system in the router repository is not currently
-the `/agent/v1` authentication path and is out of scope for the first client
-implementation.
+The agent's identity is a persisted Ed25519 key (`router-agent.key` under the
+config directory). The hub trust-on-first-use enrols the public key against the
+agent's id on the first signed `hello`. A legacy `[router].auth_token` /
+`CBCL_ROUTER_AUTH_TOKEN` in config is accepted but ignored.
 
 ## Agent Init
 
@@ -58,8 +55,9 @@ For each agent instance, the daemon:
 1. mints a local `agent_handle`
 2. derives a router-visible `agent-id`
 3. opens one WebSocket connection to `/agent/v1`
-4. sends a CBCL `hello` frame advertising capabilities and dialects
-5. stores the connection under the local handle after the binary hello frame is
+4. receives the hub's connection-nonce bootstrap frame
+5. sends a **signed** `hello` frame advertising its Ed25519 public key and dialects
+6. stores the connection under the local handle after the signed hello frame is
    successfully written
 
 The capability list must be non-empty and supplied by the agent's `init`
@@ -82,28 +80,34 @@ zero router WebSocket connections.
 
 ## Hello Frame
 
-The daemon sends a CBCL frame shaped like:
+After receiving the connection-nonce bootstrap, the daemon sends a signed
+`hello` payload shaped like:
 
 ```lisp
-(lang cbcl-router
-  (tell @router "hello"
-    :agent-id "local-agent-01JX8F4V2QK8GZP9H6W5"
-    :capabilities ("code:edit" "code:test")
-    :dialects ()))
+(hello @router
+  :from @local-agent-01JX8F4V2QK8GZP9H6W5
+  :key "<base64 Ed25519 public key>"
+  :dialects ("code:edit" "code:test"))
 ```
 
-The current router extracts:
+It is Ed25519-signed over the envelope (hub id, audience, sequence number,
+connection nonce, payload) and put on the wire as `len(4) ‖ seq(8) ‖ payload ‖
+sig(64)`. Capability ≡ dialect, so there is no separate `:capabilities` field.
 
-* `:agent-id`
-* `:capabilities`
-* `:dialects`
+The router extracts:
 
-from the `hello` frame and stores them in the connected-agent registry for the
-life of that WebSocket connection.
+* `:from` — the agent id
+* `:key` — the advertised Ed25519 public key, verified against the hello's own
+  signature (connect proof-of-possession)
+* `:dialects` — the advertised dialect set
 
-The current router does not send an explicit hello ACK. A malformed CBCL frame
-causes the router to send an error frame and keep the connection open; a valid
-hello produces no response.
+and stores them in the connected-agent registry for the life of that WebSocket
+connection.
+
+The router does not send an explicit hello ACK on success. A frame whose
+signature, sequence, or audience does not verify — or malformed CBCL — causes
+the router to send an error frame and keep the connection open; a valid hello
+produces no response.
 
 For MVP, the daemon should treat `init` as successful after the WebSocket
 upgrade succeeds and the binary hello frame is successfully written to the

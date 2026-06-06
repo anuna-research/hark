@@ -14,15 +14,16 @@ CLI invocations discover the daemon over loopback HTTP, authenticate with the
 local daemon token from `daemon.json`, and operate on an agent connection
 selected by `CBCL_AGENT_HANDLE`.
 
-> **In progress: native cbcl-chat transport.** Alongside the router transport,
-> hark is growing a second transport (`src/chat.rs`) that joins an
-> [`cbcl-chat`](https://codeberg.org/anuna/cbcl-chat) channel directly over
-> `/chat/v1` as an ordinary Ed25519-signed member — no router required. See
-> `cbcl-chat`'s SPEC-003 / IMPL-003. Status: an agent can connect, sign a
-> `hello`, and join a channel (verified live against a running hub); the
-> capability filter, the RendezvousHash answerer-selection, and the `chat` CLI
-> subcommand are not wired yet. The new modules are `selector`, `chat_frame`,
-> `identity`, and `chat`.
+> **Two transports, one wire.** Besides the router, hark speaks
+> [`cbcl-chat`](https://codeberg.org/anuna/cbcl-chat)'s `/chat/v1` directly as an
+> ordinary signed member — no router required. The transport is chosen by the
+> `ws_url` path (`/chat/v1` → chat, anything else → router), and both transports
+> use the **same** per-frame Ed25519 signed-member envelope
+> (`src/signed_frame.rs`, `src/signed_transport.rs`) with no bearer token on
+> either. Connect, the signed `hello`, channel join, and the responder path
+> (capability filter, claim round, RendezvousHash answerer-selection) are
+> implemented and validated live against running hubs. Experimental; this work
+> lives on the `feat/spec-003-chat-transport` branch.
 
 ## Related Projects
 
@@ -171,7 +172,6 @@ Example config:
 ```toml
 [router]
 ws_url = "wss://cbcl-lfe.anuna.io/agent/v1"
-auth_token = "shr_prod-agent.REPLACE_ME"
 
 [agent]
 agent_id_prefix = "local-agent"
@@ -183,11 +183,15 @@ max_bytes_per_handle = 67108864
 overflow_policy = "reject_new_and_close"
 ```
 
+The router connection has no bearer token — the daemon authenticates per frame
+with an Ed25519 key it creates at `<config-dir>/router-agent.key` (the hub
+trust-on-first-use enrols the public key). There is nothing to configure but the
+URL.
+
 Environment overrides:
 
 ```bash
 export CBCL_ROUTER_WS='wss://cbcl-lfe.anuna.io/agent/v1'
-export CBCL_ROUTER_AUTH_TOKEN='shr_key-id.REPLACE_ME'
 export CBCL_AGENT_ID_PREFIX='local-agent'
 export CBCL_DAEMON_BIND='127.0.0.1:0'
 export CBCL_DAEMON_MAX_MESSAGES_PER_HANDLE='1000'
@@ -412,9 +416,9 @@ The daemon returns stable JSON errors on its loopback API. Common codes include:
 
 * `missing_daemon_token`, `invalid_daemon_token`
 * `daemon_api_incompatible`
-* `missing_router_ws_url`, `invalid_router_ws_url`,
-  `missing_router_auth_token`
-* `router_auth_rejected`, `router_connection_failed`
+* `missing_router_ws_url`, `invalid_router_ws_url`
+* `router_auth_rejected` (a proxy 401/403 in front of `/agent/v1`; the hub has no
+  connection auth), `router_connection_failed`
 * `missing_dialect`, `duplicate_dialect`, `invalid_dialect`
 * `malformed_agent_handle`, `unknown_agent_handle`,
   `agent_handle_unhealthy`
@@ -453,19 +457,20 @@ hark config init
 $EDITOR "$(hark config path)"
 ```
 
-Or set environment overrides:
+Or set the router URL override:
 
 ```bash
 export CBCL_ROUTER_WS='wss://cbcl-lfe.anuna.io/agent/v1'
-export CBCL_ROUTER_AUTH_TOKEN='shr_prod-agent.REPLACE_ME'
 hark daemon stop
 hark daemon start
 ```
 
 `router_auth_rejected`:
 
-Check that `CBCL_ROUTER_AUTH_TOKEN` or `[router].auth_token` is current and
-belongs to the expected router environment.
+The `/agent/v1` upgrade was refused with HTTP 401/403 — usually a proxy in front
+of the hub, since the hub itself has no connection auth. Check the URL and any
+proxy in the path. (A bad agent *identity* is not this error; it arrives as a
+post-connect error frame and marks the handle unhealthy — see `daemon status`.)
 
 Missing dialects:
 
