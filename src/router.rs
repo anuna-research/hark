@@ -40,7 +40,10 @@ pub struct CreatedRouterAgent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
-    #[error("router authentication rejected")]
+    /// The WebSocket upgrade was refused with HTTP 401/403 — e.g. a proxy in
+    /// front of `/agent/v1`. The hub itself has no connection auth (identity is
+    /// per-frame Ed25519), so this never originates from the hub.
+    #[error("router WebSocket upgrade refused (HTTP 401/403)")]
     AuthRejected,
     #[error("router connection failed: {0}")]
     ConnectionFailed(String),

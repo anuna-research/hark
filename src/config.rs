@@ -103,7 +103,6 @@ pub struct DaemonConfig {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ValidatedRouterConfig {
     pub ws_url: Url,
-    pub auth_token: String,
 }
 
 /// A validated chat-transport configuration: the hub URL plus the chat-only
@@ -136,8 +135,6 @@ pub enum ConfigError {
     MissingRouterWsUrl,
     #[error("invalid router WebSocket URL: {0}")]
     InvalidRouterWsUrl(String),
-    #[error("missing router authentication token")]
-    MissingRouterAuthToken,
 }
 
 impl Default for AppConfig {
@@ -199,7 +196,6 @@ impl fmt::Debug for ValidatedRouterConfig {
         formatter
             .debug_struct("ValidatedRouterConfig")
             .field("ws_url", &self.ws_url)
-            .field("auth_token", &"<redacted>")
             .finish()
     }
 }
@@ -268,13 +264,11 @@ impl AppConfig {
     }
 
     pub fn validate_router(&self) -> Result<ValidatedRouterConfig, ConfigError> {
+        // The router no longer uses a bearer token — identity is established per
+        // frame by Ed25519 signature (see signed_transport). A legacy
+        // `[router].auth_token` in the config is accepted but ignored.
         let ws_url = self.validate_ws_url()?;
-        // SPEC-012 REQ-009: the router no longer uses a bearer token — identity is
-        // established per frame by Ed25519 signature (see signed_transport). A
-        // legacy `auth_token` in the config is accepted but ignored.
-        let auth_token = self.router.auth_token.as_deref().unwrap_or("").to_owned();
-
-        Ok(ValidatedRouterConfig { ws_url, auth_token })
+        Ok(ValidatedRouterConfig { ws_url })
     }
 
     /// Validate the chat transport: the shared hub URL, plus the chat-only
@@ -919,15 +913,14 @@ mod tests {
             Err(ConfigError::InvalidRouterWsUrl(_))
         ));
 
-        // SPEC-012 REQ-009: the router no longer requires a bearer token — a
-        // config with no auth_token now validates (identity is per-frame Ed25519).
+        // The router no longer requires a bearer token — a config with no
+        // auth_token validates (identity is per-frame Ed25519).
         config.router.ws_url = Some("wss://router.example/agent/v1".to_owned());
         config.router.auth_token = None;
         let validated = config
             .validate_router()
             .expect("router config should pass without an auth token");
         assert_eq!(validated.ws_url.as_str(), "wss://router.example/agent/v1");
-        assert_eq!(validated.auth_token, "");
 
         // a legacy auth_token is accepted but ignored.
         config.router.auth_token = Some("shr_test.secret".to_owned());
@@ -950,13 +943,15 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("shr_secret.do-not-print"));
 
+        // The validated router config does not carry the legacy token at all —
+        // there is nothing to redact, and the secret cannot leak through it.
         let validated = config
             .validate_router()
             .expect("router config should validate");
         let debug = format!("{validated:?}");
 
-        assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("shr_secret.do-not-print"));
+        assert!(!debug.contains("auth_token"));
     }
 
     fn write_config(contents: &str) -> (TempDir, std::path::PathBuf) {

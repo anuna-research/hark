@@ -1723,14 +1723,6 @@ fn config_error_to_api(error: ConfigError) -> ApiError {
                 "run `{COMMAND_NAME} config path` to find config.toml"
             )),
         ),
-        ConfigError::MissingRouterAuthToken => ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "missing_router_auth_token",
-            "router authentication token is not configured",
-            Some(format!(
-                "run `{COMMAND_NAME} config init` or set CBCL_ROUTER_AUTH_TOKEN"
-            )),
-        ),
         error => ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_router_ws_url",
@@ -1745,7 +1737,8 @@ fn router_error_to_api(error: RouterError) -> ApiError {
         RouterError::AuthRejected => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "router_auth_rejected",
-            "router rejected WebSocket authentication",
+            "router WebSocket upgrade refused (HTTP 401/403) — likely a proxy; \
+             the hub has no connection auth",
             None,
         ),
         RouterError::ConnectionFailed(message) => ApiError::new(

@@ -517,7 +517,6 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 "meta_send_busy" => AppError::AgentHandleUnavailable,
                 "missing_router_ws_url"
                 | "invalid_router_ws_url"
-                | "missing_router_auth_token"
                 | "router_auth_rejected"
                 | "router_connection_failed"
                 | "chat_connection_failed" => AppError::RouterConnection,
