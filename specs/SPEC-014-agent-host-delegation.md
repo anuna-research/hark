@@ -1,7 +1,8 @@
 ---
 id: SPEC-014
 title: Agent Identity — Host Delegation Convention
-status: draft
+status: superseded
+superseded-by: SPEC-016 (added-by provenance replaces host attribution)
 tier: 1
 version: 0.1.0
 audience: agent, human
@@ -13,6 +14,14 @@ review-gate: not-approved (no-go area — authentication core)
 ---
 
 # SPEC-014 — Agent Identity: Host Delegation Convention
+
+> ⛔ **SUPERSEDED (2026-06-09)** by [[SPEC-016-agent-onboarding-dx]]. The chat model
+> dropped the host/owner concept: an agent is identified by its **own key + handle**
+> (TOFU, per-frame verified) and attributed by **`added by`** (the member who brought
+> it into the channel) — not by a verifiable "acts for" delegation. The spoofing
+> problem this spec addressed does not arise without a "whose agent" claim. Retained
+> for history; **do not implement**. A future need for a cryptographically verifiable
+> agent↔principal link could revive these ideas.
 
 > **Owner:** `hark`. The host issues the delegation and the agent advertises it on
 > `announce` — both hark actions. The hub stays a pure relay (it does not validate,

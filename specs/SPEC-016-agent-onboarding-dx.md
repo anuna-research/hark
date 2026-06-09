@@ -3,22 +3,22 @@ id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
 status: draft
 tier: 3
-version: 0.1.0
+version: 0.2.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 4.8)
 last-updated: 2026-06-09
 owner-repo: hark
 affects-repos: cbcl-bus (web client mints a pairing token; SPEC-015 declaration)
-depends-on: SPEC-015 (channel dialects), SPEC-014 (host delegation), the announce fix
+depends-on: SPEC-015 (channel dialects), the announce fix
 review-gate: standard (Tier-3 — developer experience; not a no-go area)
 ---
 
 # SPEC-016 — Agent Onboarding DX: Frictionless Join & Auto-Learn
 
 > **Owner:** `hark`. This is the **experience layer** that makes adding an agent
-> as easy as a human join. It consumes [[SPEC-015-channel-dialects]] (to auto-learn),
-> [[SPEC-014-agent-host-delegation]] (to be attributable), and the `announce` fix
-> (to be visibly an agent). Tier-3 — fast-moving, no crypto gate.
+> as easy as a human join. It consumes [[SPEC-015-channel-dialects]] (to auto-learn)
+> and the `announce` fix (to be visibly an agent). Agent attribution is **provenance**
+> (`added by`, [[#REQ-010]]), not a host/owner claim. Tier-3 — fast-moving, no crypto gate.
 
 ## 1. Context & Intent
 
@@ -47,13 +47,13 @@ the result should be legibly my agent, speaking the channel dialects I choose fo
 **In scope:** a prebuilt binary / install path; a one-shot `hark join`; session
 handle tracking without `eval`; a plain `hark say`; an **in-app pairing** flow
 (web → agent); **auto-learn-on-join** of the channel's declared dialects
-([[SPEC-015-channel-dialects]]); **legibility** on arrival (emit `announce`, carry
-the [[SPEC-014-agent-host-delegation|host delegation]]).
+([[SPEC-015-channel-dialects]]); **legibility** on arrival (emit `announce` to render
+as an agent); **added-by** provenance ([[#REQ-010]]).
 
-**Out of scope:** the crypto internals (MLS — [[SPEC-013-mls-private-channels]];
-delegation format — [[SPEC-014-agent-host-delegation]]); the channel-declaration
-protocol itself ([[SPEC-015-channel-dialects]]); the daemon's existing
-multi-agent/router responsibilities.
+**Out of scope:** MLS crypto internals ([[SPEC-013-mls-private-channels]]); the
+channel-declaration protocol itself ([[SPEC-015-channel-dialects]]); the daemon's
+existing multi-agent/router responsibilities; any verifiable host/owner claim
+(`added by` replaces it — [[SPEC-014-agent-host-delegation]] is superseded).
 
 ## 3. Users & Happy Paths
 
@@ -67,9 +67,10 @@ toolchain.
 config if absent, starts the daemon if needed, joins, and learns just the chosen
 `cite` dialect — **no TOML edit, no `eval`**. (`--speak` is the validated subset
 selection of [[#REQ-008]]; omit it to join without advertising any dialect.)
-**HP-3 — in-app pairing.** In the web app the operator hits "add agent" → a
-**pairing code / QR** (channel + invite + one-time code); `hark pair <code>` joins
-the right channel with the right cap — the two surfaces connect.
+**HP-3 — in-app pairing.** In the web app the operator **names** the agent and picks
+its dialects → a **pairing code / QR** carrying `{name, channel, invite-cap, dialects}`;
+`hark pair <code>` joins the right channel under that name with the right cap — the two
+surfaces connect, no `--as`/`--speak`.
 **HP-4 — plain chat.** `hark say "looking into it"` sends a normal message with an
 auto-thread — no hand-written CBCL.
 **HP-5 — discover, then selectively learn.** On join the agent reads the channel's
@@ -80,7 +81,8 @@ hark acquires the definitions for the chosen-but-unknown dialects and advertises
 the channel actually declares) and you never hand-install a definition — but the
 agent speaks **only the subset you chose**, never the whole menu.
 **HP-6 — legible + attributed.** The agent emits `announce` so it renders as an
-agent, carrying its host delegation so the roster shows *"aria — @hugo's agent ✓"*.
+agent (teal name + avatar); the roster shows it as *"aria · added by @mira"* — its
+identity is its own key, accountability is the **adding member** (no host/owner claim).
 
 ## 4. Requirements
 
@@ -109,20 +111,23 @@ agent, carrying its host delegation so the roster shows *"aria — @hugo's agent
   but SHALL NOT respond to an undeclared dialect here. An empty declared set yields an
   empty response scope (plain chat unaffected). Trace: `[[#TEST-009]]`.
 - **REQ-006 — Legibility.** On joining, the agent SHALL emit `announce` so it is
-  rendered as an agent, carrying its [[SPEC-014-agent-host-delegation|host
-  delegation]] when configured. Trace: `[[#TEST-006]]`.
-- **REQ-007 — In-app pairing carries the dialect selection.** The web client SHALL be
-  able to mint a pairing token bound to `{channel, invite-cap, adder, the operator-chosen
-  dialect set as (name, digest) pairs}`, and hark SHALL consume it via
-  `hark pair <code>` — joining the channel with the cap **and installing + advertising
-  the carried dialects by digest** (no `--speak` needed). The carried set is the
-  [[#REQ-008]] selection; `--speak` MAY override it. Trace: `[[#TEST-007]]`.
-- **REQ-010 — Added-by provenance (distinct from host).** An agent's channel membership
-  SHALL record the **member who added it** (`added_by` — the minter of the pairing token
-  / the inviting member), as **per-channel provenance distinct from** the agent's
-  [[SPEC-014-agent-host-delegation|host]] (who it *acts for*). The roster SHALL display
-  both; they MAY be the same member or different (e.g. `@mira` adds `@hugo`'s agent).
-  Trace: `[[#TEST-010]]`.
+  rendered as an agent (teal name + avatar). Trace: `[[#TEST-006]]`.
+- **REQ-007 — In-app pairing carries name + dialect selection.** The web client SHALL be
+  able to mint a pairing token bound to `{agent-name, channel, invite-cap, adder, the
+  operator-chosen dialect set as (name, digest) pairs}`, and hark SHALL consume it via
+  `hark pair <code>` — joining the channel **under that name** with the cap **and
+  installing + advertising the carried dialects by digest** (no `--as`/`--speak`
+  needed). The carried set is the [[#REQ-008]] selection. Trace: `[[#TEST-007]]`.
+- **REQ-010 — Added-by provenance.** An agent's channel membership SHALL record the
+  **member who added it** (`added_by` — the minter of the pairing token / the inviting
+  member) as **per-channel provenance** (who is accountable for it being here). The
+  roster SHALL display it. (There is no host/owner claim — see [[SPEC-014-agent-host-delegation]],
+  superseded.) Trace: `[[#TEST-010]]`.
+- **REQ-011 — Adder-set name.** The agent's channel handle SHALL be set by the **adder**
+  in the add flow and carried by the pairing token ([[#REQ-007]]); `hark pair` SHALL join
+  under it, with `--as` as an optional override. The same agent process MAY carry
+  different names in different channels (one handle per channel — the multi-instance
+  model). Trace: `[[#TEST-011]]`.
 
 ## 5. Non-Functional Requirements
 
@@ -161,8 +166,8 @@ agent, carrying its host delegation so the roster shows *"aria — @hugo's agent
 ## 7. Open Questions
 
 - **OQ-001 — Pairing record format, mint/redeem endpoint, lifetime.** The web "add
-  agent" mints a hub pairing record (a **mint** endpoint) carrying `{channel, cap,
-  adder, (name, digest) dialects}`; `hark pair` redeems it (a **redeem** endpoint).
+  agent" mints a hub pairing record (a **mint** endpoint) carrying `{agent-name, channel,
+  cap, adder, (name, digest) dialects}`; `hark pair` redeems it (a **redeem** endpoint).
   Settle the wire shape, the code↔record mapping, QR-vs-copy conveyance, TTL, and the
   one-time / at-most-once redemption semantics.
 - **OQ-002 — `say` vs the ask/reply model.** Does a free-chat verb fit hark's
@@ -171,9 +176,8 @@ agent, carrying its host delegation so the roster shows *"aria — @hugo's agent
   both; signing/notarisation for macOS.
 - **OQ-004 — Agent-removal authz.** Who may remove an *agent* from a channel? The
   **`added_by` member** (mirroring dialect delete-by-adder —
-  [[SPEC-015-channel-dialects#REQ-010]]); the agent's **host**; or any member?
-  (Removal = de-listing the agent's channel membership — orthogonal to the agent's own
-  decision to leave.)
+  [[SPEC-015-channel-dialects#REQ-010]]) or any member? (Removal = de-listing the agent's
+  channel membership — orthogonal to the agent's own decision to leave.)
 
 ## 8. Verification Strategy (Phase 2 — IMPL-016)
 
@@ -186,5 +190,6 @@ decomposition per REQ.
 ## 9. Traceability
 
 `REQ → TEST → CODE → OBS`, `[[wikilinks]]`, `zetl check --dead-links`. Depends on
-[[SPEC-015-channel-dialects]], [[SPEC-014-agent-host-delegation]], and the
-`announce` emission; sibling to [[SPEC-013-mls-private-channels]].
+[[SPEC-015-channel-dialects]] and the `announce` emission; sibling to
+[[SPEC-013-mls-private-channels]]. Supersedes [[SPEC-014-agent-host-delegation]]
+(host attribution → `added by` provenance).
