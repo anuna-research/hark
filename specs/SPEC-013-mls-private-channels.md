@@ -3,13 +3,13 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: draft
 tier: 1
-version: 0.2.0
+version: 0.3.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 4.8)
 last-updated: 2026-06-09
 owner-repo: hark
 affects-repos: cbcl-bus (web client + vendored cbcl-mls-wasm artifact), cbcl-chat (cbcl-mls-wasm crate)
-review-gate: not-approved — BLOCKED (round-1 cross-model review: 8 Critical/High findings folded in; re-review required — see docs/decisions/SPEC-013-design-review-findings.md)
+review-gate: not-approved — BLOCKED (rounds 1–2 cross-model review: 13 findings folded in; round-3 re-review required; OQ-002/003/004 OPEN; REQ-020 = immediate live-UI fix — see docs/decisions/SPEC-013-design-review-findings.md)
 ---
 
 # SPEC-013 — hark MLS: Agents in Encrypted Private Channels
@@ -56,7 +56,13 @@ record**, not as requirements:
   **unsigned hub-provided roster** — exploitable for split groups / committer capture
   (BUG-007, [[#REQ-016]]); and
 - **MLS removal is unwired** — leave drops fan-out only, so removed members can still
-  decrypt (BUG-005, [[#REQ-014]]).
+  decrypt (BUG-005, [[#REQ-014]]);
+- **(round 2)** inbound Commits/proposals are merged without app-level checks (any member
+  can inject an Add — BUG-008, [[#REQ-017]]); the **MLS sender** is discarded, so a member
+  can **forge `:from`** (BUG-009, [[#REQ-018]]); and REQ-011's pin source is **not
+  peer-verifiable** on today's wire (BUG-010, [[#REQ-019]]); and
+- **(round 2, operational)** the **live UI still claims E2EE** for private channels while
+  implementation is gated and broken (BUG-011, [[#REQ-020]]).
 
 ## 2. Scope
 
@@ -178,10 +184,11 @@ missing/stale persisted state → re-join, logged.
   committer** (the elected owner for the current roster — [[#REQ-004]]/[[#REQ-016]]), and
   (c) does **not silently replace** an existing group for the room. An unbound/unauthorised
   Welcome SHALL be rejected. Trace: `[[#TEST-012]]`. *(Closes BUG-002.)*
-- **REQ-013 — Single-use KeyPackages.** One-time KeyPackages SHALL be **enforced
-  single-use** (consumed atomically at the directory, not advisory); a re-served one-time
-  KeyPackage SHALL be treated as an error. Last-resort KeyPackage reuse SHALL be bounded
-  and its forward-secrecy cost documented. Trace: `[[#TEST-013]]`. *(Closes BUG-004; resolves [[#OQ-004]].)*
+- **REQ-013 — Single-use KeyPackages (client-enforced).** Single-use SHALL be enforced
+  **client-side**, not by the directory (the directory is the untrusted hub): clients SHALL
+  track used `KeyPackageRef`s — made **transcript-visible** — and **reject duplicate refs**
+  (replay). Last-resort KeyPackage reuse SHALL be bounded and its forward-secrecy cost
+  defined precisely. Trace: `[[#TEST-013]]`. *(Closes BUG-004; [[#OQ-004]] reopened for the mechanism.)*
 - **REQ-014 — MLS removal on room removal.** When a member leaves or is removed from a
   room, the group SHALL issue an [[MLS]] **Commit removing that member** — not merely drop
   fan-out — so a removed/compromised member cannot decrypt subsequent traffic. Trace:
@@ -194,6 +201,25 @@ missing/stale persisted state → re-join, logged.
   SHALL be robust to a hub serving **divergent rosters** (split-group resistance) — e.g. by
   binding membership changes to the verifiable [[MLS]] group state rather than the hub
   roster. Trace: `[[#TEST-016]]`. *(Closes BUG-007; refines [[#REQ-004]], [[#OQ-003]].)*
+- **REQ-017 — Inbound membership-change validation.** Before merging any inbound [[MLS]]
+  Commit or storing any standalone proposal, the agent SHALL inspect it: every **Add** leaf
+  SHALL satisfy [[#REQ-008]] (target handle + pinned wire key) and originate from an
+  **authorised committer** ([[#REQ-016]]); unauthorised or unvalidated proposals SHALL NOT
+  be stored or merged. Trace: `[[#TEST-017]]`. *(Closes BUG-008 — inbound, not just the local add path.)*
+- **REQ-018 — Sender-authenticated `:from`.** The agent SHALL obtain the **authenticated
+  MLS sender leaf** for each decrypted application message and SHALL **reject** (not render)
+  a message whose inner CBCL `:from` does not match that sender's **pinned handle**
+  ([[#REQ-011]]). Trace: `[[#TEST-018]]`. *(Closes BUG-009 — `:from` forgery by a member.)*
+- **REQ-019 — Peer-verifiable identity wire contract.** The chat wire SHALL carry a
+  **peer-verifiable** handle→wire-key assertion — either by fanning enough signed-member
+  envelope metadata for peers to verify each other's signatures, or via an explicit
+  **signed key-assertion** frame — so [[#REQ-011]] pinning is implementable without trusting
+  hub attestation. Trace: `[[#TEST-019]]`. *(Closes BUG-010; enables [[#REQ-011]]; refines [[#OQ-002]].)*
+- **REQ-020 — No unbacked E2EE claim in the UI (until the gate clears).** Until the
+  [[#8. Tier-1 Gate]] clears, the product UI SHALL NOT present private channels as providing
+  confidentiality or authenticity (E2EE); wording SHALL make no security claim the
+  implementation does not back. Trace: `[[#TEST-020]]`. *(Closes BUG-011; **immediate action
+  on the live deployment**.)*
 
 ## 5. Non-Functional Requirements
 
@@ -259,30 +285,33 @@ missing/stale persisted state → re-join, logged.
   ([[#ADR-002]]) is acceptable, **conditional on** a regression/property test asserting no
   collision under the pinned labels, required before [[#REQ-007]] is approved (§9).
 - **OQ-002 — Authenticated trust root for pinning — OPEN (gating).** [[#REQ-011]] pins from
-  the member's own signed frames (not hub assertion), which still has a **first-contact
-  TOFU gap** an untrusted hub can exploit. The strong fixes — out-of-band fingerprint
-  verification and/or **key transparency** — need design + re-review. The SPAKE2 pairing
-  ([[SPEC-016-agent-onboarding-dx#REQ-007]]) may give an authenticated channel to pin an
-  agent's key; humans need their own path. **This is the gating question.**
+  the member's own signed frames — but that is only possible once the wire carries a
+  **peer-verifiable** assertion ([[#REQ-019]]), which it does not today (BUG-010). Even
+  then a **first-contact TOFU gap** remains; the strong fixes — out-of-band fingerprint
+  and/or **key transparency** — need design. SPAKE2 ([[SPEC-016-agent-onboarding-dx#REQ-007]])
+  may pin an **agent's** key; **humans need their own path.** **This is the gating question.**
 - **OQ-003 — Roster/committer authenticity — OPEN (was "match naive").** Round-1 rejects
   matching the naive election as-is: it rests on unsigned hub presence (split-group /
   committer-capture risk). [[#REQ-016]] requires binding membership to verifiable [[MLS]]
   state; the concrete mechanism (and any web-client change) needs design.
-- **OQ-004 — KeyPackage directory — RESOLVED.** Enforce single-use ([[#REQ-013]]); bound +
-  document last-resort reuse and its forward-secrecy cost.
+- **OQ-004 — KeyPackage replay defence — REOPENED.** v0.2.0's "directory-enforced
+  single-use" trusts the untrusted hub. [[#REQ-013]] moves enforcement **client-side**
+  (transcript-visible `KeyPackageRef`s, duplicate-ref rejection); the precise mechanism
+  (ref visibility, last-resort compromise cost) needs design + re-review.
 - **OQ-005 — Persisted-state retention — OPEN (refined).** Specify the OpenMLS secret
   **retention policy** + migration/versioning so the [[#NFR-004]] compromise window is
   precise (how much past-message material survives a local compromise).
 
 ## 8. Tier-1 Gate
 
-**Status: not approved — BLOCKED.** Round-1 cross-model adversarial review is **complete**
-(8 Critical/High findings, [[SPEC-013-design-review-findings]]), folded into v0.2.0 as
-new/strengthened requirements. **OQ-002 (authenticated trust root) and OQ-003 (roster
-authenticity) remain OPEN** and gate sign-off. Per [[PROTO-001]], before implementation:
+**Status: not approved — BLOCKED.** Rounds 1–2 cross-model adversarial review **complete**
+(13 findings, [[SPEC-013-design-review-findings]]), folded into v0.3.0. **OQ-002
+(authenticated trust root), OQ-003 (roster authenticity), and OQ-004 (replay defence)
+remain OPEN** and gate sign-off; **REQ-020** requires an **immediate live-UI fix** (no
+unbacked E2EE claim). Per [[PROTO-001]], before implementation:
 
-1. **Re-review** of v0.2.0 (cross-model adversarial, fresh context — Principle 12),
-   confirming REQ-008/011/012/013/014/015/016 close BUG-001…007 and that OQ-002/003 resolve.
+1. **Round-3 re-review** of v0.3.0 (cross-model adversarial, fresh context — Principle 12),
+   confirming REQ-008/011…020 close BUG-001…011 and that OQ-002/003/004 resolve.
 2. **Human security/cryptography sign-off** resolving OQ-001…OQ-005 (the project
    owner may give this, accepting the cross-model review as basis, as was done for
    `cbcl-bus` `SPEC-012`).

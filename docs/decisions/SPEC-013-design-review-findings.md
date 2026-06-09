@@ -110,3 +110,68 @@ before REQ-007 is approved** (added to the verification strategy).
 Plus REQ-015 (directory input validation), REQ-016 (roster/committer authenticity), the
 NFR-004 compromise model, and the OQ-001 regression test. **Tier-1 remains blocked
 pending a re-review of v0.2.0.**
+
+---
+
+# Round 2 (re-review of v0.2.0)
+
+Round-1's REQs protected the **adder's local `keyget → add_member` path**, but not
+**inbound** membership changes, **sender** authenticity, or the **wire support** that
+REQ-011 assumes. Folded into **v0.3.0**.
+
+## BUG-008 (Critical) — Inbound Commits/proposals bypass adder verification
+
+REQ-008 guards the local add path, but current processing **merges any valid MLS Commit**
+and stores standalone proposals (`cbcl-mls-wasm/src/lib.rs:178`); any member can publish
+`deliver` (`cbcl-chat-session-ws.lfe:280`); OpenMLS `add_members` consumes pending
+proposal-store entries by default. **Attack:** a malicious member sends an Add proposal /
+direct Add Commit for an attacker KeyPackage; other clients accept the MLS-valid membership
+change **without** checking app-level target handle, pinned wire key, or authorised
+committer. **Disposition:** new [[SPEC-013-mls-private-channels#REQ-017]] — inspect every
+inbound Commit + pending proposal **before merge**; every Add leaf must satisfy
+target+wire-key pinning; reject unauthorised proposals.
+
+## BUG-009 (High) — MLS sender authentication discarded → `:from` forgery
+
+WASM returns only plaintext bytes from MLS application messages (`lib.rs:178`); the browser
+renders the decrypted inner CBCL `:from` as **verified** (`mls.js:141`, `app.js:524`).
+**Attack:** Mallory (a real member) encrypts `(tell @room "…" :from @alice)`; MLS
+authenticates *Mallory's* leaf, but the UI attributes it to Alice. **Disposition:** new
+[[SPEC-013-mls-private-channels#REQ-018]] — expose the authenticated MLS sender leaf and
+**reject decrypted CBCL whose `:from` ≠ that sender's pinned handle.**
+
+## BUG-010 (Critical, spec gap) — REQ-011's pin source isn't peer-verifiable on the wire
+
+REQ-011 says "pin from a member's own verified signed frames" — but server→client frames
+are bare/hub-attested and **clients do not verify inbound signatures**
+(`cbcl-chat-session-ws.lfe:13`, `app.js:255`, `hark/src/chat_frame.rs:10`); the hello
+`:key` is consumed by the hub, **not fanned** as a peer-verifiable assertion. So REQ-011 is
+**not implementable** on today's wire. **Disposition:** new
+[[SPEC-013-mls-private-channels#REQ-019]] — a **peer-verifiable identity/key-assertion wire
+contract** (fan enough signed-member envelope metadata for peers to verify, or an explicit
+signed key-assertion frame). REQ-011 depends on it; refines the [[SPEC-013-mls-private-channels#OQ-002]] trust root.
+
+## R2-4 (High) — OQ-004 "directory-enforced single-use" trusts the untrusted hub
+
+v0.2.0 REQ-013 said one-time packages are "consumed atomically **at the directory**" — but
+the directory **is** the untrusted hub, which can replay/drain/re-serve regardless.
+**Disposition:** **OQ-004 reopened**; REQ-013 corrected to **client-side** replay detection
+(transcript-visible `KeyPackageRef`s, reject duplicate refs; define last-resort compromise
+cost).
+
+## BUG-011 (High, operational) — the LIVE product still advertises unaudited E2EE
+
+Implementation is gated (`SPEC-013:21`), but private rooms are configured **encrypted**
+(`cbcl-chat-roomcfg.lfe:30`), the browser **boots MLS** (`app.js:29`), and the UI labels
+private channels **"end-to-end encrypted"** (`index.html:503`). The disclosure hedges, but
+the **security label** still makes a confidentiality/authenticity claim the implementation
+does not back (and round-1/2 show it is broken). **Disposition:** new
+[[SPEC-013-mls-private-channels#REQ-020]] — until the gate clears, the UI SHALL NOT claim
+E2EE/confidentiality for private channels. **Immediate action recommended on the live
+deployment** (downgrade wording or disable private-E2EE).
+
+## Non-finding — still no signature collision (OQ-001)
+
+Confirmed again. Keep the regression/property test before approving key reuse.
+
+**Tier-1 remains BLOCKED.** v0.3.0 needs round-3 re-review; OQ-002/003/004 are OPEN.
