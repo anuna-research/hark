@@ -3,13 +3,13 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: draft
 tier: 1
-version: 0.4.0
+version: 0.5.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 4.8)
 last-updated: 2026-06-09
 owner-repo: hark
 affects-repos: cbcl-bus (web client + vendored cbcl-mls-wasm artifact), cbcl-chat (cbcl-mls-wasm crate)
-review-gate: not-approved — BLOCKED (rounds 1–2 folded into v0.3; v0.4 adds the Authentication Service design — ADR-006, resolves OQ-002/003 PROPOSED; OQ-004 OPEN; round-3 review + human crypto sign-off required; REQ-020 = immediate live-UI fix — see docs/decisions/SPEC-013-design-review-findings.md)
+review-gate: not-approved — BLOCKED (rounds 1–2 folded into v0.3; v0.4 adds the Authentication Service design — ADR-006; v0.5 resolves OQ-004 + OQ-005 client-side — REQ-013/REQ-022. All OQs now RESOLVED-direction (PROPOSED); only a round-3 cross-model review + human crypto sign-off remain to gate implementation; REQ-020 = immediate live-UI fix — see docs/decisions/SPEC-013-design-review-findings.md)
 ---
 
 # SPEC-013 — hark MLS: Agents in Encrypted Private Channels
@@ -184,11 +184,14 @@ missing/stale persisted state → re-join, logged.
   committer** (the elected owner for the current roster — [[#REQ-004]]/[[#REQ-016]]), and
   (c) does **not silently replace** an existing group for the room. An unbound/unauthorised
   Welcome SHALL be rejected. Trace: `[[#TEST-012]]`. *(Closes BUG-002.)*
-- **REQ-013 — Single-use KeyPackages (client-enforced).** Single-use SHALL be enforced
-  **client-side**, not by the directory (the directory is the untrusted hub): clients SHALL
-  track used `KeyPackageRef`s — made **transcript-visible** — and **reject duplicate refs**
-  (replay). Last-resort KeyPackage reuse SHALL be bounded and its forward-secrecy cost
-  defined precisely. Trace: `[[#TEST-013]]`. *(Closes BUG-004; [[#OQ-004]] reopened for the mechanism.)*
+- **REQ-013 — Single-use KeyPackages (client-enforced, delete-on-use).** Single-use SHALL
+  be enforced **client-side** (the directory is the untrusted hub): on consuming a one-time
+  KeyPackage (Welcome processed), the publisher SHALL **delete its init private key from
+  memory AND persistent storage** — so a replayed Welcome to the same package is
+  **undecryptable/inert** with no later-compromisable key. Clients SHALL keep a ledger of
+  **consumed `KeyPackageRef`s** and reject re-use; `KeyPackageRef`s SHALL be
+  **transcript-visible** so the group rejects an Add reusing a ref ([[#REQ-017]]). Trace:
+  `[[#TEST-013]]`. *(Closes BUG-004; resolves [[#OQ-004]].)*
 - **REQ-014 — MLS removal on room removal.** When a member leaves or is removed from a
   room, the group SHALL issue an [[MLS]] **Commit removing that member** — not merely drop
   fan-out — so a removed/compromised member cannot decrypt subsequent traffic. Trace:
@@ -204,6 +207,15 @@ missing/stale persisted state → re-join, logged.
   ([[#REQ-008]]/[[#REQ-011]]/[[#REQ-017]]), and (c) a valid cap. The hub cannot fabricate
   MLS membership, so it cannot create a divergent valid group undetected ([[#REQ-021]]
   catches equivocation). Trace: `[[#TEST-016]]`. *(Closes BUG-007; resolves [[#OQ-003]]; refines [[#REQ-004]].)*
+- **REQ-022 — KeyPackage replenishment + bounded last-resort.** The publisher SHALL
+  maintain a pool of one-time KeyPackages, replenishing it (publish fresh, delete-on-use per
+  [[#REQ-013]]) as packages are consumed, and SHALL prefer one-time packages for every Add.
+  A **last-resort** KeyPackage MAY be used only when the one-time pool is exhausted; its
+  reuse is **bounded** (rotated on a documented schedule) and its weaker forward-secrecy
+  residual is recorded: a hub that **drains** the one-time pool can force last-resort use,
+  so a *later* init-key compromise can expose Welcomes encrypted to a reused last-resort
+  package. This residual is **accepted and documented**, not silently incurred. Trace:
+  `[[#TEST-022]]`. *(With [[#REQ-013]], resolves [[#OQ-004]].)*
 - **REQ-017 — Inbound membership-change validation.** Before merging any inbound [[MLS]]
   Commit or storing any standalone proposal, the agent SHALL inspect it: every **Add** leaf
   SHALL satisfy [[#REQ-008]] (target handle + pinned wire key) and originate from an
@@ -312,26 +324,37 @@ missing/stale persisted state → re-join, logged.
 - **OQ-003 — Roster/committer authenticity — RESOLVED (PROPOSED, round-3).** Authority
   derives from the verifiable [[MLS]] ratchet tree, not hub presence ([[#REQ-016]]); the
   concrete election mechanism + any web-client change are confirmed at round-3.
-- **OQ-004 — KeyPackage replay defence — REOPENED.** v0.2.0's "directory-enforced
-  single-use" trusts the untrusted hub. [[#REQ-013]] moves enforcement **client-side**
-  (transcript-visible `KeyPackageRef`s, duplicate-ref rejection); the precise mechanism
-  (ref visibility, last-resort compromise cost) needs design + re-review.
-- **OQ-005 — Persisted-state retention — OPEN (refined).** Specify the OpenMLS secret
-  **retention policy** + migration/versioning so the [[#NFR-004]] compromise window is
-  precise (how much past-message material survives a local compromise).
+- **OQ-004 — KeyPackage replay defence — RESOLVED (PROPOSED, round-3).** Enforcement moves
+  **client-side** (the directory is the untrusted hub): **delete-on-use** of the one-time
+  init private key from memory + storage, a **consumed-`KeyPackageRef` ledger**, and
+  **transcript-visible refs** so the group rejects an Add reusing a ref ([[#REQ-013]],
+  [[#REQ-017]]). Prefer one-time + **replenish** ([[#REQ-022]]); a bounded, documented
+  **last-resort** carries an explicit, accepted residual (a draining hub can force
+  last-resort → a later init-key compromise weakens forward secrecy for those Welcomes).
+  Round-3 confirms the ref-visibility mechanism + the residual's acceptability.
+- **OQ-005 — Persisted-state retention — RESOLVED (PROPOSED, round-3).** Same
+  retention-minimisation principle as [[#NFR-004]]: the agent SHALL retain only the secret
+  material OpenMLS needs for the **current** epoch (plus a bounded out-of-order decryption
+  window), **prune superseded epoch secrets** promptly to preserve forward secrecy, and
+  treat a storage-format **version bump as a re-join** (no silent migration of stale secret
+  state). This bounds the [[#NFR-004]] past-message window to the retained window. Round-3
+  confirms the concrete OpenMLS retention knobs.
 
 ## 8. Tier-1 Gate
 
-**Status: not approved — BLOCKED.** Rounds 1–2 review folded into v0.3.0; v0.4.0 adds the
+**Status: not approved — BLOCKED.** Rounds 1–2 review folded into v0.3.0; v0.4.0 added the
 **Authentication Service design** ([[#ADR-006]]) — invite-anchored TOFU + safety numbers
-(humans) + SPAKE2 (agents) — which **resolves OQ-002 + OQ-003 (PROPOSED)**. **OQ-004
-(replay defence) remains OPEN.** A **round-3 cross-model review** of the AS design + a
-**human crypto sign-off** gate implementation; **REQ-020** still requires the immediate
-live-UI fix. Per [[PROTO-001]], before implementation:
+(humans) + SPAKE2 (agents) — resolving OQ-002 + OQ-003 (PROPOSED). v0.5.0 resolves the last
+two open questions **client-side**: **OQ-004** (KeyPackage replay — delete-on-use + ledger +
+transcript-visible refs + bounded last-resort, [[#REQ-013]]/[[#REQ-022]]) and **OQ-005**
+(retention minimisation, [[#NFR-004]]). **All five OQs are now RESOLVED-direction
+(PROPOSED).** What remains to gate implementation: a **round-3 cross-model review** of the
+full design + a **human crypto sign-off**; **REQ-020** still requires the immediate live-UI
+fix (independent of the gate). Per [[PROTO-001]], before implementation:
 
-1. **Round-3 re-review** of v0.4.0 (cross-model adversarial, fresh context — Principle 12),
-   confirming the AS design + REQ-008/011…021 close BUG-001…011 and that the residual
-   first-contact assurance is adequate.
+1. **Round-3 re-review** of v0.5.0 (cross-model adversarial, fresh context — Principle 12),
+   confirming the AS design + REQ-008/011…022 close BUG-001…011 and that the residual
+   first-contact assurance + last-resort forward-secrecy residual are adequate.
 2. **Human security/cryptography sign-off** resolving OQ-001…OQ-005 (the project
    owner may give this, accepting the cross-model review as basis, as was done for
    `cbcl-bus` `SPEC-012`).
