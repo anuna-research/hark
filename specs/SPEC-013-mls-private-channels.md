@@ -3,13 +3,13 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: draft
 tier: 1
-version: 0.1.0
+version: 0.2.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 4.8)
 last-updated: 2026-06-09
 owner-repo: hark
 affects-repos: cbcl-bus (web client + vendored cbcl-mls-wasm artifact), cbcl-chat (cbcl-mls-wasm crate)
-review-gate: not-approved (no-go area — crypto + auth core)
+review-gate: not-approved — BLOCKED (round-1 cross-model review: 8 Critical/High findings folded in; re-review required — see docs/decisions/SPEC-013-design-review-findings.md)
 ---
 
 # SPEC-013 — hark MLS: Agents in Encrypted Private Channels
@@ -45,19 +45,28 @@ only as a **test oracle** and an interop target. Two known properties of the
 current implementation are treated as **defects to correct or constraints to
 record**, not as requirements:
 
-- the MLS leaf credential uses a **fresh keypair bound to the member only by
-  handle string** — it is *not* bound to the [[Signed-Member Wire]] [[Ed25519]]
-  identity (an identity-substitution exposure); and
-- group membership is driven by a **naive lexicographic [[Owner Election]]** with
-  no owner-churn or concurrent-owner handling.
+- **(core, per round-1 review)** MLS membership is anchored to **hub-mediated TOFU and
+  unchecked KeyPackages/Welcomes**, NOT to authenticated wire identity — so an untrusted
+  hub can substitute keys, inject KeyPackages, or push unsolicited Welcomes to control
+  group membership (BUG-001/002/003). This spec must **anchor MLS membership to the
+  authenticated wire identity** ([[#REQ-008]], [[#REQ-011]], [[#REQ-012]]);
+- the MLS leaf credential uses a **fresh keypair bound to the member only by handle
+  string** — not bound to the [[Signed-Member Wire]] [[Ed25519]] identity ([[#REQ-007]]);
+- group membership is driven by a **naive lexicographic [[Owner Election]]** over an
+  **unsigned hub-provided roster** — exploitable for split groups / committer capture
+  (BUG-007, [[#REQ-016]]); and
+- **MLS removal is unwired** — leave drops fan-out only, so removed members can still
+  decrypt (BUG-005, [[#REQ-014]]).
 
 ## 2. Scope
 
-**In scope (MVP):** an agent can be *added to* and *can commit members of* **one**
-encrypted private channel — exactly **one [[MLS]] group per agent connection**
-([[#ADR-005]]); encrypt/decrypt of application messages; KeyPackage publication;
-the [[#REQ-007|identity binding]] correction and [[#REQ-008|adder verification]];
-durable group-state persistence; interop with web members.
+**In scope (MVP):** an agent can be *added to*, *commit members of*, and *remove members
+from* **one** encrypted private channel — exactly **one [[MLS]] group per agent
+connection** ([[#ADR-005]]); encrypt/decrypt of application messages; KeyPackage
+publication with **enforced single-use** ([[#REQ-013]]); **MLS membership anchored to the
+authenticated wire identity** — the [[#REQ-007|binding]], [[#REQ-008|adder verification]],
+[[#REQ-011|key pinning]], and [[#REQ-012|app-bound Welcome]] requirements; **MLS removal
+on room removal** ([[#REQ-014]]); durable group-state persistence; interop with web members.
 
 **Precondition (already works — not in scope): room admission.** Joining a private
 channel via a `:cap` or invite token already works in hark: it presents
@@ -68,10 +77,11 @@ it is orthogonal to MLS group admission ([[#OQ-002]], [[#OQ-004]]). This spec
 assumes the agent is already room-admitted and adds only **MLS group admission** on
 top.
 
-**Out of scope (deferred, tracked):** member removal / leave; owner-churn and
-concurrent-owner robustness ([[#OQ-003]]); one-time-KeyPackage replenishment
-policy ([[#OQ-004]]); key-transparency / out-of-band identity verification beyond
-TOFU; metadata-privacy hardening against the hub-as-[[Delivery Service]];
+**Out of scope (deferred, tracked):** owner-churn / concurrent-owner *liveness* robustness
+beyond split-group resistance ([[#OQ-003]]); one-time-KeyPackage replenishment policy
+([[#OQ-004]]); **key transparency** — the strong fix for the TOFU first-contact gap
+([[#OQ-002]]); the MVP pins from observed signed frames + out-of-band fingerprint;
+metadata-privacy hardening against the hub-as-[[Delivery Service]];
 **single-identity multi-channel participation** (one agent identity in many
 channels over one connection, as the web client does) — deferred to a future hark
 multi-channel *transport* spec, on which a per-channel MLS-group registry would
@@ -109,10 +119,12 @@ content is emitted in the channel ([[#NFR-002]]).
 The daemon restarts; the agent reloads persisted group state ([[#REQ-009]]) and
 resumes decrypting the ongoing epoch without re-joining.
 
-**Failure modes:** wrong-`:for` Welcome (ignored); undecryptable frame
-(dropped, session survives — [[#REQ-006]]); KeyPackage whose leaf key ≠ the
-target's wire key (**rejected** — [[#REQ-008]]); missing/stale persisted state
-(re-join required, logged).
+**Failure modes:** an **unbound/unauthorised Welcome** (wrong room, unexpected committer,
+or one that would replace an existing group) is **rejected**, not joined ([[#REQ-012]]); a
+KeyPackage whose target handle or leaf key ≠ the target's **pinned wire key** is
+**rejected** ([[#REQ-008]], [[#REQ-011]]); a re-served one-time KeyPackage is an error
+([[#REQ-013]]); an undecryptable frame is dropped, session survives ([[#REQ-006]]);
+missing/stale persisted state → re-join, logged.
 
 ## 4. Requirements
 
@@ -144,15 +156,44 @@ target's wire key (**rejected** — [[#REQ-008]]); missing/stale persisted state
 - **REQ-007 — Identity binding.** The agent's MLS leaf credential signature key
   SHALL be its [[Signed-Member Wire]] [[Ed25519]] identity key — NOT a freshly
   generated key. Trace: `[[#TEST-007]]`.
-- **REQ-008 — Adder verification.** Before adding a fetched [[KeyPackage]] to a
-  group, the agent SHALL reject it unless its leaf signature key equals the target
-  handle's established wire key ([[TOFU]] reference per [[#OQ-002]]). Trace: `[[#TEST-008]]`.
+- **REQ-008 — Adder verification (target + key).** Before adding a fetched [[KeyPackage]]
+  to a group, the agent SHALL verify BOTH (a) the KeyPackage's credential identity is the
+  intended target handle, AND (b) its leaf signature key **equals that handle's pinned wire
+  key** ([[#REQ-011]]) — NOT a key asserted by the hub via `keypkg`/`keyget`/presence. Any
+  mismatch → reject. Trace: `[[#TEST-008]]`. *(Closes BUG-001.)*
 - **REQ-009 — Persist group state.** The agent SHALL persist [[MLS]] group state
   durably and reload it on restart, so a daemon restart does not lose the ability
   to decrypt the ongoing channel epoch. Trace: `[[#TEST-009]]`.
 - **REQ-010 — Web interop.** `hark` MLS members SHALL interoperate with
   web-client MLS members in the same channel (shared ciphersuite, wire encoding,
   and election). Trace: `[[#TEST-010]]`.
+- **REQ-011 — Authenticated handle→wire-key pinning.** The agent SHALL pin each handle's
+  wire [[Ed25519]] key from that handle's **own per-frame-signed messages** (signatures it
+  verified), NOT from any hub-asserted source (`keypkg`/`keyget` responses, presence). The
+  pin is first-observation [[TOFU]] at minimum; a later observation conflicting with the
+  pin SHALL be flagged and the key NOT silently rotated. The residual first-contact gap is
+  [[#OQ-002]]. Trace: `[[#TEST-011]]`. *(Closes BUG-003.)*
+- **REQ-012 — App-bound Welcome validation.** Before joining a group from a [[Welcome]],
+  the agent SHALL verify it is bound to (a) **this** app room/channel, (b) an **authorised
+  committer** (the elected owner for the current roster — [[#REQ-004]]/[[#REQ-016]]), and
+  (c) does **not silently replace** an existing group for the room. An unbound/unauthorised
+  Welcome SHALL be rejected. Trace: `[[#TEST-012]]`. *(Closes BUG-002.)*
+- **REQ-013 — Single-use KeyPackages.** One-time KeyPackages SHALL be **enforced
+  single-use** (consumed atomically at the directory, not advisory); a re-served one-time
+  KeyPackage SHALL be treated as an error. Last-resort KeyPackage reuse SHALL be bounded
+  and its forward-secrecy cost documented. Trace: `[[#TEST-013]]`. *(Closes BUG-004; resolves [[#OQ-004]].)*
+- **REQ-014 — MLS removal on room removal.** When a member leaves or is removed from a
+  room, the group SHALL issue an [[MLS]] **Commit removing that member** — not merely drop
+  fan-out — so a removed/compromised member cannot decrypt subsequent traffic. Trace:
+  `[[#TEST-014]]`. *(Closes BUG-005.)*
+- **REQ-015 — Directory input validation.** `keypub`/`keyget` inputs SHALL be validated
+  (size bounds, base64 well-formedness, structural validity) **before** mutating directory
+  state; malformed/oversized inputs SHALL be rejected. Trace: `[[#TEST-015]]`. *(Closes BUG-006.)*
+- **REQ-016 — Roster/committer authenticity.** The owner-election and add-authority SHALL
+  NOT rest on **unsigned hub-provided presence**; the committer/membership determination
+  SHALL be robust to a hub serving **divergent rosters** (split-group resistance) — e.g. by
+  binding membership changes to the verifiable [[MLS]] group state rather than the hub
+  roster. Trace: `[[#TEST-016]]`. *(Closes BUG-007; refines [[#REQ-004]], [[#OQ-003]].)*
 
 ## 5. Non-Functional Requirements
 
@@ -164,9 +205,13 @@ target's wire key (**rejected** — [[#REQ-008]]); missing/stale persisted state
   SHALL traverse the wire unencrypted, verified by frame inspection.
 - **NFR-003 — Guarantees preserved.** The [[#REQ-007|binding]] change SHALL NOT
   weaken MLS forward-secrecy / post-compromise-security relative to base [[RFC 9420]].
-- **NFR-004 — Group state at rest.** Persisted group secrets SHALL be protected
-  at rest at least as strongly as the wire identity seed (file mode `0600`, under
-  `identity_dir`).
+- **NFR-004 — Group state at rest (compromise model).** Persisted group secrets SHALL be
+  protected at rest at least as strongly as the wire identity seed (`0600`, under
+  `identity_dir`). The spec SHALL state a **precise compromise model**: a reader of
+  `identity_dir` obtains the wire identity **and** MLS group state → current/future
+  impersonation + decryption are in scope after local compromise; **past-message exposure**
+  is bounded by the OpenMLS **secret-retention policy** ([[#OQ-005]]) — retained ratchet
+  material SHALL be minimised to preserve forward secrecy.
 
 ## 6. Architecture Decisions (PROPOSED — pending Tier-1 sign-off)
 
@@ -207,32 +252,37 @@ target's wire key (**rejected** — [[#REQ-008]]); missing/stale persisted state
 
 ## 7. Open Questions (Tier-1 — require human crypto sign-off)
 
-- **OQ-001 — Cross-context key reuse.** Is reusing one [[Ed25519]] key across the
-  [[Signed-Member Wire]] envelope-signing context (`DS_TAG = cbcl-signed-member/v1`)
-  and the [[MLS]] signing context safe, given each domain-separates its inputs?
-  Requires a key-reuse / domain-separation analysis before [[#ADR-002]] is APPROVED.
-- **OQ-002 — Authentic handle→wire-key source for [[#REQ-008]].** What does the
-  adder check the fetched leaf key *against*? Candidates: [[TOFU]] on first
-  KeyPackage per handle; a presence-carried wire key; a cap-bound key. Must
-  account for the hub being an untrusted [[Delivery Service]].
-- **OQ-003 — Election robustness.** Match the naive lexicographic [[Owner Election]]
-  as-is for interop (deferring churn/concurrent-owner handling), or harden it
-  (and update the web client)? Affects [[#REQ-004]] and the deferred scope.
-- **OQ-004 — KeyPackage directory trust.** Consume-once is advisory, last-resort
-  packages are reused, and the hub does no validation. Acceptable for MVP, or does
-  the directory need hardening?
-- **OQ-005 — Persisted-state format & protection.** Storage provider format,
-  versioning/migration, and at-rest protection specifics for [[#REQ-009]]/[[#NFR-004]].
+> Updated after round-1 review (see [[SPEC-013-design-review-findings]]).
+
+- **OQ-001 — Cross-context key reuse — RESOLVED (pending test).** Round-1 found **no**
+  cross-protocol signature collision (wire `DS_TAG` vs OpenMLS `SignWithLabel`). Reuse
+  ([[#ADR-002]]) is acceptable, **conditional on** a regression/property test asserting no
+  collision under the pinned labels, required before [[#REQ-007]] is approved (§9).
+- **OQ-002 — Authenticated trust root for pinning — OPEN (gating).** [[#REQ-011]] pins from
+  the member's own signed frames (not hub assertion), which still has a **first-contact
+  TOFU gap** an untrusted hub can exploit. The strong fixes — out-of-band fingerprint
+  verification and/or **key transparency** — need design + re-review. The SPAKE2 pairing
+  ([[SPEC-016-agent-onboarding-dx#REQ-007]]) may give an authenticated channel to pin an
+  agent's key; humans need their own path. **This is the gating question.**
+- **OQ-003 — Roster/committer authenticity — OPEN (was "match naive").** Round-1 rejects
+  matching the naive election as-is: it rests on unsigned hub presence (split-group /
+  committer-capture risk). [[#REQ-016]] requires binding membership to verifiable [[MLS]]
+  state; the concrete mechanism (and any web-client change) needs design.
+- **OQ-004 — KeyPackage directory — RESOLVED.** Enforce single-use ([[#REQ-013]]); bound +
+  document last-resort reuse and its forward-secrecy cost.
+- **OQ-005 — Persisted-state retention — OPEN (refined).** Specify the OpenMLS secret
+  **retention policy** + migration/versioning so the [[#NFR-004]] compromise window is
+  precise (how much past-message material survives a local compromise).
 
 ## 8. Tier-1 Gate
 
-**Status: not approved.** Per [[PROTO-001]] this no-go area requires, before
-implementation:
+**Status: not approved — BLOCKED.** Round-1 cross-model adversarial review is **complete**
+(8 Critical/High findings, [[SPEC-013-design-review-findings]]), folded into v0.2.0 as
+new/strengthened requirements. **OQ-002 (authenticated trust root) and OQ-003 (roster
+authenticity) remain OPEN** and gate sign-off. Per [[PROTO-001]], before implementation:
 
-1. **Cross-model adversarial review** of this spec (a different model family,
-   fresh context, mandate to find defects — Principle 12 / Multi-Model Cognitive
-   Diversity), focused on [[#7. Open Questions (Tier-1 — require human crypto sign-off)]]
-   and the binding/verification requirements.
+1. **Re-review** of v0.2.0 (cross-model adversarial, fresh context — Principle 12),
+   confirming REQ-008/011/012/013/014/015/016 close BUG-001…007 and that OQ-002/003 resolve.
 2. **Human security/cryptography sign-off** resolving OQ-001…OQ-005 (the project
    owner may give this, accepting the cross-model review as basis, as was done for
    `cbcl-bus` `SPEC-012`).
@@ -244,7 +294,9 @@ implementation:
 Per the [[PROTO-001]] security-critical row, the test specification will select:
 
 - **Property-based**: MLS roundtrip (`decrypt(encrypt(m)) == m`), group-membership
-  invariants, election determinism.
+  invariants, election determinism, and a **no-cross-protocol-signature-collision**
+  regression (wire envelope vs OpenMLS `SignWithLabel`) — required before [[#REQ-007]] is
+  approved ([[#OQ-001]]).
 - **Mutation testing**: on the [[#REQ-008|adder-verification]] predicate and the
   [[#REQ-007|binding]] construction (these MUST kill mutants — a surviving mutant
   here is a security hole).
