@@ -103,13 +103,20 @@ agent, carrying its host delegation so the roster shows *"aria — @hugo's agent
   speaks (e.g. `--speak <dialect>…` or config); hark SHALL validate that subset
   against the channel's declared set and reject/warn on any chosen dialect the
   channel does not declare. Trace: `[[#TEST-008]]`.
+- **REQ-009 — Response scoping.** In a channel the agent SHALL respond only to asks in
+  dialects that are **both** declared by the channel ([[SPEC-015-channel-dialects]])
+  **and** in the agent's repertoire; it MAY speak additional dialects in other channels
+  but SHALL NOT respond to an undeclared dialect here. An empty declared set yields an
+  empty response scope (plain chat unaffected). Trace: `[[#TEST-009]]`.
 - **REQ-006 — Legibility.** On joining, the agent SHALL emit `announce` so it is
   rendered as an agent, carrying its [[SPEC-014-agent-host-delegation|host
   delegation]] when configured. Trace: `[[#TEST-006]]`.
-- **REQ-007 — In-app pairing.** The web client SHALL be able to mint a pairing token
-  (channel + invite + one-time code) and hark SHALL consume it via
-  `hark pair <code>`, joining the indicated channel with the indicated cap.
-  Trace: `[[#TEST-007]]`.
+- **REQ-007 — In-app pairing carries the dialect selection.** The web client SHALL be
+  able to mint a pairing token bound to `{channel, invite-cap, the operator-chosen
+  dialect set as (name, digest) pairs}`, and hark SHALL consume it via
+  `hark pair <code>` — joining the channel with the cap **and installing + advertising
+  the carried dialects by digest** (no `--speak` needed). The carried set is the
+  [[#REQ-008]] selection; `--speak` MAY override it. Trace: `[[#TEST-007]]`.
 
 ## 5. Non-Functional Requirements
 
@@ -127,9 +134,13 @@ agent, carrying its host delegation so the roster shows *"aria — @hugo's agent
   existing `config`/`daemon`/`init` remaining as the lower-level primitives.
 - **ADR-002 — Daemon tracks the active handle.** Drop the `eval` ritual by holding
   the active handle in the daemon, addressable by later commands ([[#REQ-003]]).
-- **ADR-003 — Pairing token = invite + channel + one-time code.** Reuse the existing
-  bounded-invite mechanism ([[SPEC-013-mls-private-channels#HP-1|invite-as-cap]]);
-  the web mints it, hark redeems it. Format/transport in [[#OQ-001]].
+- **ADR-003 — Pairing code references a hub-minted pairing record.** A short,
+  human-typeable code can't embed digests, so it is a **reference** to a hub record
+  carrying `{channel, invite-cap, chosen (name, digest) dialects}` (reusing the
+  bounded invite as the cap — [[SPEC-013-mls-private-channels#HP-1|invite-as-cap]]).
+  The web mints the record; `hark pair` redeems it and installs the carried dialects
+  **by digest** ([[SPEC-015-channel-dialects#REQ-005]]) so the agent gets the exact
+  declared versions (no drift). Mint/redeem endpoint + format in [[#OQ-001]].
 - **ADR-004 — `say` auto-threads.** `hark say` generates a thread id so plain chat
   needs no `:thread`, while `reply`/`progress` keep explicit threading for the
   ask/answer model.
@@ -143,9 +154,11 @@ agent, carrying its host delegation so the roster shows *"aria — @hugo's agent
 
 ## 7. Open Questions
 
-- **OQ-001 — Pairing token format + minting.** What does the web "add agent" mint
-  (does the hub need an endpoint?), how is the code conveyed (QR / copy), and what is
-  its lifetime?
+- **OQ-001 — Pairing record format, mint/redeem endpoint, lifetime.** The web "add
+  agent" mints a hub pairing record (a **mint** endpoint) carrying `{channel, cap,
+  (name, digest) dialects}`; `hark pair` redeems it (a **redeem** endpoint). Settle
+  the wire shape, the code↔record mapping, QR-vs-copy conveyance, TTL, and the
+  one-time / at-most-once redemption semantics.
 - **OQ-002 — `say` vs the ask/reply model.** Does a free-chat verb fit hark's
   ask/answer-centric design, or should plain chat be a distinct mode?
 - **OQ-003 — Distribution mechanics.** Homebrew tap vs GitHub/Codeberg releases vs
