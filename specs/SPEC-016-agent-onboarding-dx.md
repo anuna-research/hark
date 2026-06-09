@@ -112,11 +112,17 @@ agent, carrying its host delegation so the roster shows *"aria — @hugo's agent
   rendered as an agent, carrying its [[SPEC-014-agent-host-delegation|host
   delegation]] when configured. Trace: `[[#TEST-006]]`.
 - **REQ-007 — In-app pairing carries the dialect selection.** The web client SHALL be
-  able to mint a pairing token bound to `{channel, invite-cap, the operator-chosen
+  able to mint a pairing token bound to `{channel, invite-cap, adder, the operator-chosen
   dialect set as (name, digest) pairs}`, and hark SHALL consume it via
   `hark pair <code>` — joining the channel with the cap **and installing + advertising
   the carried dialects by digest** (no `--speak` needed). The carried set is the
   [[#REQ-008]] selection; `--speak` MAY override it. Trace: `[[#TEST-007]]`.
+- **REQ-010 — Added-by provenance (distinct from host).** An agent's channel membership
+  SHALL record the **member who added it** (`added_by` — the minter of the pairing token
+  / the inviting member), as **per-channel provenance distinct from** the agent's
+  [[SPEC-014-agent-host-delegation|host]] (who it *acts for*). The roster SHALL display
+  both; they MAY be the same member or different (e.g. `@mira` adds `@hugo`'s agent).
+  Trace: `[[#TEST-010]]`.
 
 ## 5. Non-Functional Requirements
 
@@ -156,13 +162,18 @@ agent, carrying its host delegation so the roster shows *"aria — @hugo's agent
 
 - **OQ-001 — Pairing record format, mint/redeem endpoint, lifetime.** The web "add
   agent" mints a hub pairing record (a **mint** endpoint) carrying `{channel, cap,
-  (name, digest) dialects}`; `hark pair` redeems it (a **redeem** endpoint). Settle
-  the wire shape, the code↔record mapping, QR-vs-copy conveyance, TTL, and the
+  adder, (name, digest) dialects}`; `hark pair` redeems it (a **redeem** endpoint).
+  Settle the wire shape, the code↔record mapping, QR-vs-copy conveyance, TTL, and the
   one-time / at-most-once redemption semantics.
 - **OQ-002 — `say` vs the ask/reply model.** Does a free-chat verb fit hark's
   ask/answer-centric design, or should plain chat be a distinct mode?
 - **OQ-003 — Distribution mechanics.** Homebrew tap vs GitHub/Codeberg releases vs
   both; signing/notarisation for macOS.
+- **OQ-004 — Agent-removal authz.** Who may remove an *agent* from a channel? The
+  **`added_by` member** (mirroring dialect delete-by-adder —
+  [[SPEC-015-channel-dialects#REQ-010]]); the agent's **host**; or any member?
+  (Removal = de-listing the agent's channel membership — orthogonal to the agent's own
+  decision to leave.)
 
 ## 8. Verification Strategy (Phase 2 — IMPL-016)
 
