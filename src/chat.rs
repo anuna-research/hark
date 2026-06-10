@@ -25,10 +25,11 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use url::Url;
 
 use crate::chat_frame::decode_payload;
-use crate::signed_transport::{SignedConn, parse_conn_bootstrap};
 use crate::chat_responder::{Action, Responder, WindowOutcome};
 use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore};
 use crate::identity::ChatIdentity;
+use crate::mls::session::{MlsSession, SessionEvent};
+use crate::signed_transport::{SignedConn, parse_conn_bootstrap};
 
 pub const CHAT_WS_PATH: &str = "/chat/v1";
 
@@ -54,6 +55,8 @@ pub enum ChatError {
     JoinTimeout(Duration),
     #[error("agent store rejected the connection: {0}")]
     Store(String),
+    #[error("encryption downgrade refused (REQ-023): {0}")]
+    DowngradeRefused(String),
 }
 
 /// The exact payload bytes to sign and transmit. We validate that `text`
@@ -98,6 +101,8 @@ pub async fn create_chat_agent(
     claim_window: Duration,
     liveness_timeout: Duration,
     identity: Arc<ChatIdentity>,
+    mut mls: Option<MlsSession>,
+    mls_create: bool,
 ) -> Result<AgentHandle, ChatError> {
     AgentStore::validate_advertisement(&dialects)
         .map_err(|error| ChatError::Store(error.to_string()))?;
@@ -128,7 +133,38 @@ pub async fn create_chat_agent(
     // this would hand back a "joined" handle the agent is not actually a member
     // of. On rejection or timeout the websocket drops here, before any store
     // entry exists — nothing to mark unhealthy or clean up.
-    await_join_ack(&mut websocket).await?;
+    let ack = await_join_ack(&mut websocket).await?;
+
+    // SPEC-013: judge the ack against the encryption-mode pin (REQ-023) —
+    // a `roomcfg :enc false` on a pinned-encrypted channel is a refused
+    // downgrade and the join fails closed — then publish KeyPackages and
+    // the self-signed idkey assertion (REQ-002, REQ-019).
+    if let Some(session) = mls.as_mut() {
+        session
+            .on_roomcfg(&ack)
+            .map_err(|e| ChatError::DowngradeRefused(e.to_string()))?;
+        if session.encrypted() {
+            // REQ-016 operator intent: bootstrap the MLS group as the room
+            // creator before publishing, so this agent is the sole member /
+            // elected owner and will add present members on presence.
+            if mls_create {
+                session
+                    .create_group_as_creator()
+                    .map_err(|e| ChatError::Hello(format!("mls create group: {e}")))?;
+            }
+            let frames = session
+                .join_frames()
+                .map_err(|e| ChatError::Hello(format!("mls join frames: {e}")))?;
+            for text in frames {
+                let payload = payload_bytes(&text).map_err(ChatError::Hello)?;
+                let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
+                websocket
+                    .send(WsMessage::Binary(frame.into()))
+                    .await
+                    .map_err(|e| ChatError::HelloSendFailed(e.to_string()))?;
+            }
+        }
+    }
 
     let handle = AgentHandle::generate();
     let (close_tx, close_rx) = oneshot::channel();
@@ -159,6 +195,7 @@ pub async fn create_chat_agent(
         claim_window,
         liveness_timeout,
         conn,
+        mls,
     });
 
     Ok(handle)
@@ -216,6 +253,9 @@ struct ReceiveLoopArgs {
     liveness_timeout: Duration,
     /// Per-connection signer (conn_nonce + hub_id + seq) for every outbound frame.
     conn: SignedConn,
+    /// SPEC-013 MLS session (Some when the channel is pinned encrypted, or
+    /// when prior MLS state exists for it).
+    mls: Option<MlsSession>,
 }
 
 /// A scheduled responder timer fired by the receive loop (SPEC-003 REQ-005/007).
@@ -229,9 +269,9 @@ enum ClaimTimer {
 /// Wait for the hub's verdict on a freshly sent `hello`. A successful join leads
 /// with a `roomcfg` frame (then backfill + a `presence` broadcast); a rejected
 /// one is a single `(error @room "slug")` with the socket left open. We consume
-/// only the acknowledging frame and leave any backfill/presence for the receive
-/// loop to enqueue.
-async fn await_join_ack(websocket: &mut ChatSocket) -> Result<(), ChatError> {
+/// only the acknowledging frame (returned for the REQ-023 mode-pin check) and
+/// leave any backfill/presence for the receive loop to enqueue.
+async fn await_join_ack(websocket: &mut ChatSocket) -> Result<String, ChatError> {
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
     loop {
         let message = match tokio::time::timeout_at(deadline, websocket.next()).await {
@@ -264,7 +304,7 @@ async fn await_join_ack(websocket: &mut ChatSocket) -> Result<(), ChatError> {
             _ => continue, // ping/pong/etc.
         };
         match frame_performative(&text).as_deref() {
-            Some("roomcfg") | Some("presence") => return Ok(()),
+            Some("roomcfg") | Some("presence") => return Ok(text),
             Some("error") => {
                 return Err(ChatError::JoinRejected(
                     error_slug(&text).unwrap_or_else(|| "unknown".to_owned()),
@@ -318,6 +358,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         claim_window,
         liveness_timeout,
         mut conn,
+        mut mls,
     } = args;
     tokio::spawn(async move {
         // Pending Δ-window and liveness-fallback timers, fired into the select.
@@ -333,8 +374,23 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         let _ = store.mark_unhealthy(&handle, "local_send_failed", Some("chat send channel closed".to_owned())).await;
                         break;
                     };
+                    // SPEC-013 REQ-005/REQ-023: in a pinned-encrypted channel
+                    // every outbound payload is wrapped as an MLS deliver
+                    // frame; there is no plaintext fallback (fail closed).
+                    let message_text = match mls.as_mut() {
+                        Some(session) if session.encrypted() => {
+                            match session.encrypt_outbound(&outbound.message) {
+                                Ok(wrapped) => wrapped,
+                                Err(error) => {
+                                    let _ = outbound.result_tx.send(Err(format!("mls encrypt refused: {error}")));
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => outbound.message.clone(),
+                    };
                     // Validate + sign + frame on the way out.
-                    let payload = match payload_bytes(&outbound.message) {
+                    let payload = match payload_bytes(&message_text) {
                         Ok(payload) => payload,
                         Err(error) => {
                             let _ = outbound.result_tx.send(Err(format!("outbound not valid CBCL: {error}")));
@@ -403,10 +459,54 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             break;
                         }
                     };
+                    // SPEC-013: the MLS session consumes its frames first —
+                    // welcome/deliver/keypkg/idkey/presence — decrypting
+                    // content and emitting any protocol frames to send. In a
+                    // pinned-encrypted channel ONLY decrypted content reaches
+                    // the responder (REQ-005/REQ-006/REQ-017/REQ-018).
+                    let responder_text: Option<String> = match mls.as_mut() {
+                        None => Some(payload_text),
+                        Some(session) => match session.handle_frame(&payload_text) {
+                            SessionEvent::NotMls => {
+                                if session.encrypted() {
+                                    // Plaintext content does not enter an
+                                    // encrypted channel's responder; control
+                                    // frames carry no content to answer.
+                                    None
+                                } else {
+                                    Some(payload_text)
+                                }
+                            }
+                            SessionEvent::Plaintext { text, .. } => Some(text),
+                            SessionEvent::Handled { outbound } => {
+                                let mut failed = false;
+                                for text in outbound {
+                                    let Ok(payload) = payload_bytes(&text) else { continue };
+                                    let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
+                                    if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
+                                        let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(sanitize(&error.to_string()))).await;
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                                if failed { break; }
+                                None
+                            }
+                            SessionEvent::Dropped { reason, probable_fork } => {
+                                if probable_fork {
+                                    tracing::warn!(reason, "mls probable fork/equivocation signal (REQ-006); compare safety numbers");
+                                } else {
+                                    tracing::debug!(reason, "mls frame dropped");
+                                }
+                                None
+                            }
+                        },
+                    };
+                    let Some(responder_text) = responder_text else { continue };
                     // The responder decides: claim for answerable asks, deliver to
                     // `recv` only when elected, drop everything else (REQ-002).
                     let mut send_failed = false;
-                    for action in responder.on_inbound(&payload_text) {
+                    for action in responder.on_inbound(&responder_text) {
                         let Action::Claim { ask_id, frame_text } = action;
                         match payload_bytes(&frame_text) {
                             Ok(payload) => {

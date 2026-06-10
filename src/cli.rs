@@ -56,6 +56,19 @@ pub enum Command {
     Dialect(DialectCommand),
     #[command(about = "Close the current agent handle")]
     Close,
+    #[command(
+        about = "Print the MLS identity safety number and epoch state hash for an encrypted channel (SPEC-013 REQ-024)",
+        name = "safety-number"
+    )]
+    SafetyNumber(SafetyNumberArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SafetyNumberArgs {
+    #[arg(long = "handle", help = "Wire handle (@name) whose session state to read")]
+    pub handle: String,
+    #[arg(long = "channel", help = "Channel; defaults to chat.channel from config")]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,6 +160,11 @@ pub struct InitArgs {
         help = "Chat hub only: capability token or invite for a private channel"
     )]
     pub cap: Option<String>,
+    #[arg(
+        long = "mls-create",
+        help = "Chat hub only: after joining an encrypted private channel, bootstrap its MLS group as the room creator (SPEC-013 REQ-016 operator intent). The agent then adds present members as the elected owner."
+    )]
+    pub mls_create: bool,
     #[arg(long = "json", help = "Print JSON instead of shell exports")]
     pub json: bool,
 }
@@ -210,7 +228,40 @@ pub async fn run(cli: Cli) -> AppResult<()> {
             DialectCommand::Unsubscribe => dialect_unsubscribe_command().await,
         },
         Command::Close => close_command().await,
+        Command::SafetyNumber(args) => safety_number_command(args),
     }
+}
+
+/// SPEC-013 REQ-024: a headless operator compares the identity safety number
+/// out-of-band — once at pairing time, again on a membership change or
+/// rotation. Reads the persisted session state directly (no daemon
+/// round-trip); the state is current as of the last group mutation.
+fn safety_number_command(args: SafetyNumberArgs) -> AppResult<()> {
+    let config = crate::config::AppConfig::load()
+        .map_err(|error| AppError::Usage(error.to_string()))?;
+    let chat = config
+        .validate_chat()
+        .map_err(|error| AppError::Usage(error.to_string()))?;
+    let channel = match args.channel {
+        Some(channel) => channel,
+        None => chat.channel.clone(),
+    };
+    let file_stem = crate::local_api::chat_key_filename(&args.handle);
+    let (numbers, _trust) = crate::mls::session::offline_safety_numbers(
+        &chat.identity_dir,
+        &file_stem,
+        &channel,
+    )
+    .map_err(|error| AppError::Usage(error.to_string()))?;
+    println!("channel: {channel}");
+    println!("identity safety number (compare out-of-band; stable across normal commits):");
+    println!("  {}", numbers.identity);
+    println!(
+        "epoch state hash (diagnostic; rotates every commit; epoch {}):",
+        numbers.epoch
+    );
+    println!("  {}", numbers.epoch_state);
+    Ok(())
 }
 
 fn config_path() -> AppResult<()> {
@@ -292,6 +343,7 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
             channel: args.channel,
             handle: args.handle,
             cap: args.cap,
+            mls_create: if args.mls_create { Some(true) } else { None },
         })
         .await
         .map_err(map_local_api_request_error)?;
