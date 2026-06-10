@@ -1,11 +1,11 @@
 ---
 id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
-status: approved (DX scope); pairing handshake BLOCKED pending SPEC-013 Tier-1 gate + crypto sign-off
+status: approved (DX scope); pairing handshake CONDITIONALLY CLEARED 2026-06-10 with SPEC-013 (see review-gate)
 tier: 3 (pairing handshake — Tier-1)
-version: 0.5.1
+version: 0.6.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off)
 last-updated: 2026-06-10
 approved-date: 2026-06-09
 approved-by: project owner (OQ-001…004 settled in dialogue; REQ-007 re-opened by round-3 — see below)
@@ -21,7 +21,11 @@ review-gate: Tier-3 DX scope approved; the SPAKE2 pairing handshake (REQ-007/OQ-
   record is hub-released and not authenticatable against the hub, so `enc` is **advisory** —
   the encryption pin derives from the record's **invite-cap presence**
   (SPEC-013 REQ-023(a)). Round 5 endorsed that call and documented the no-cap returning-member
-  availability cost. See hark/docs/decisions/SPEC-013-round5-review-findings.md.
+  availability cost. **The Tier-1 human sign-off was given 2026-06-10**
+  (hark/docs/decisions/SPEC-013-tier1-signoff.md): D-1 ratified; the pairing handshake is
+  CONDITIONALLY CLEARED with SPEC-013 — implementation merge waits on the round-6
+  independent-model spot-check (condition K), and the **`cbcl_ristretto` point-validation
+  audit (condition J) blocks IMPL-016's handshake implementation** specifically.
 ---
 
 # SPEC-016 — Agent Onboarding DX: Frictionless Join & Auto-Learn

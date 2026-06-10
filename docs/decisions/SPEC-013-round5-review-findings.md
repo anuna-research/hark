@@ -360,8 +360,14 @@ confirmed and extended):
 8. The identity-number / state-hash **detection split**: the transient-equivocation
    window between two (a) comparisons, which closes only if the operator re-compares
    on every flagged membership change (R4-04 / REQ-021).
-9. The genesis-extension durable-delivery path is **feasibility-pending** until the
-   R5-03 spike probe runs (source-confirmed, spike-untested).
+9. ~~The genesis-extension durable-delivery path is **feasibility-pending** until the
+   R5-03 spike probe runs (source-confirmed, spike-untested).~~ **CLEARED 2026-06-10**:
+   the probe ran (`experiments/spec-013-mls-spike`, `tests/genesis_extension.rs` +
+   `cross-stack/genesis_probe.mjs`) — round-trip confirmed with capabilities (incl.
+   pre-finalize read from the StagedWelcome, cross-stack to wasm32), fail-closed
+   confirmed against the real shipped `cbcl-mls-wasm` artifact
+   (`InsufficientCapabilities`), plus one method nuance: the creator-side check fires
+   at the first path-commit, not group creation (spec §10 updated).
 10. **Principle-12:** this round was run by the same model (Fable 5) that folded
     round 4 — independence is cross-context, not cross-model.
 
@@ -369,11 +375,12 @@ confirmed and extended):
 
 - **Independence (Principle 12):** I am Fable 5, the model that wrote the v0.7
   dispositions. This review is not the cross-model check the protocol intends.
-- **The genesis GroupContext-extension round-trip on openmls 0.8.1** — confirmed by
-  source reading (the `Unknown` extension + capabilities-validation paths), **not**
-  by execution. The §10 spike did not exercise unknown GC extensions, leaf
-  capabilities, `queued_proposals()`, or `update_path_leaf_node()`. R5-03's probe
-  is required to convert this from source-read to evidence.
+- **The genesis GroupContext-extension round-trip on openmls 0.8.1** — at review time,
+  confirmed by source reading only. **Subsequently converted to executed evidence**
+  (2026-06-10, post-review): the R5-03 probe ran and confirmed both halves (§10 of the
+  spec; `experiments/spec-013-mls-spike`). Still unexercised by any spike:
+  `queued_proposals()` / `update_path_leaf_node()` (the REQ-017 staged-inspection
+  surface) — source-confirmed only, carried to IMPL-013.
 - **The OpenMLS primitive behaviour already covered by the §10 spike** was not
   re-proven (rebind-Update acceptance, expired-KeyPackage rejection, persisted-state
   pruning, cross-stack interop) — treated as established input.

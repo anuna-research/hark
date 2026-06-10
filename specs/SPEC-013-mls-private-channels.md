@@ -3,13 +3,13 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: draft
 tier: 1
-version: 0.7.1
+version: 0.8.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off)
 last-updated: 2026-06-10
 owner-repo: hark
 affects-repos: cbcl-bus (web client + vendored cbcl-mls-wasm artifact), cbcl-chat (cbcl-mls-wasm crate)
-review-gate: not-approved — BLOCKED (rounds 1–2 folded into v0.3; v0.4 adds the Authentication Service design — ADR-006; v0.5 resolves OQ-004 + OQ-005 client-side — REQ-013/REQ-022; v0.6 folds round-3 cross-model findings; **v0.7 folds the round-4 confirmation review**; **v0.7.1 folds the round-5 spec tightenings** — removal-evidence epoch freshness, creator eviction authority residual, genesis-extension capability requirements + spike, canonical safety-number encoding, and low-risk residual clarifications. Round-5 was cross-context but not cross-model; human crypto sign-off and the Principle-12 spot-check remain before implementation — see docs/decisions/SPEC-013-round5-review-findings.md)
+review-gate: CONDITIONALLY CLEARED 2026-06-10 (human sign-off recorded in docs/decisions/SPEC-013-tier1-signoff.md — all residuals A–H explicitly accepted, D-1/D-2 ratified, ADRs APPROVED conditional. **Implementation merge waits on condition K**: the round-6 independent-model spot-check of R5-01/R5-02/R5-03 + D-1/D-2 (docs/decisions/SPEC-013-round6-spotcheck-prompt.md — a non-Fable, non-Opus model, per Principle 12). IMPL-bound conditions: A-t no-collision property test, I durable-provider delete fidelity, J cbcl_ristretto audit. IMPL-013 planning may begin. History: rounds 1–2 → v0.3; ADR-006 → v0.4; OQ-004/005 → v0.5; round-3 → v0.6; round-4 → v0.7; round-5 tightenings → v0.7.1; executed R5-03 probe → v0.7.2 — see docs/decisions/SPEC-013-round5-review-findings.md)
 ---
 
 # SPEC-013 — hark MLS: Agents in Encrypted Private Channels
@@ -22,10 +22,10 @@ review-gate: not-approved — BLOCKED (rounds 1–2 folded into v0.3; v0.4 adds 
 > encryption** and the **[[Signed-Member Wire|signed-member authentication core]]**.
 > Per [[PROTO-001]] AI Trust Boundaries, it is a **no-go area** requiring
 > **cross-model adversarial review** and a **human security/cryptography
-> sign-off** before any implementation. All `ADR-###` below are **PROPOSED**
-> (project-owner-directed in design dialogue) and become `APPROVED` only with
-> that sign-off. Implementation MUST NOT begin until the gate in [[#Tier-1 Gate]]
-> clears.
+> sign-off** before any implementation. **The sign-off was given 2026-06-10**
+> ([[SPEC-013-tier1-signoff]]): all `ADR-###` below are **APPROVED (conditional)**
+> — the gate in [[#8. Tier-1 Gate]] is CONDITIONALLY CLEARED; implementation
+> merge waits on the round-6 independent-model spot-check (condition K).
 
 ## 1. Context & Intent
 
@@ -287,7 +287,8 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
     break confidentiality by itself. *(Residuals, documented: if the creator is itself gone,
     an unresponsive member persists in the group until an authorized remover is available —
     availability-class; a malicious creator can unilaterally evict live members —
-    authority/integrity-class. Both are PROPOSED for sign-off.)*
+    authority/integrity-class. Both ACCEPTED by the 2026-06-10 sign-off —
+  [[SPEC-013-tier1-signoff]] item E.)*
   The evidence epoch is the **current MLS group epoch before applying the Remove Commit**.
   Evidence is valid only in that exact epoch: validators SHALL reject stale or future
   evidence, with no tolerance window. A re-added member is a new leaf in a later epoch, so
@@ -341,8 +342,12 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   `Capabilities`; group-creation configuration SHALL include the extension. A stack that
   omits the capability must fail closed during Add/Welcome validation rather than silently
   joining a group whose genesis extension it cannot process. This is a load-bearing
-  cross-repo requirement for both `hark` and `cbcl-mls-wasm`, and [[#10-experiment-spike]]
-  requires an explicit round-trip probe before IMPL-013 treats the mechanism as verified.
+  cross-repo requirement for both `hark` and `cbcl-mls-wasm`; the
+  [[#10-experiment-spike]] round-trip probe (DONE 2026-06-10) observed both halves —
+  round-trip with the capability, `InsufficientCapabilities` rejection of the shipped
+  default-capability KeyPackage without it — and one nuance: the **creator-side** check
+  fires at the first path-commit, not at group creation, so the create config MUST set
+  the capability or the group bricks on first use.
   At channel `claim` the hub SHALL record a **creator handle**
   (today `cbcl-room` stores none — affected-repo change), but that record is **bookkeeping,
   not trust** — it is hub-asserted. The hub cannot fabricate MLS membership inside an
@@ -546,7 +551,7 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   **residual** the durable provider's own test must close: that ADR-004's on-disk provider
   actually honours those delete calls (fsync fidelity). *(Concretised per R3-11; upstream half confirmed by the §10 spike.)*
 
-## 6. Architecture Decisions (PROPOSED — pending Tier-1 sign-off)
+## 6. Architecture Decisions (APPROVED 2026-06-10, conditional on the round-6 spot-check — [[SPEC-013-tier1-signoff]])
 
 - **ADR-001 — Fix identity binding now, across all three codebases.** Correct the
   unbound-identity defect in lockstep (cbcl-bus web + `cbcl-mls-wasm` crate +
@@ -598,10 +603,11 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   *capability*, not human *identity*). **Not key transparency** for the MVP — deferred as the
   strong upgrade; TOFU pins are forward-compatible with a future log. *Rationale:* private
   channels are small & invite-only, where Signal-style TOFU+safety-numbers fits, and the
-  out-of-band invite anchors first contact. *Residual (must be accepted by the human signer):*
-  first-contact TOFU is **winnable by an active hub by construction** until safety numbers are
-  actually compared — for humans (who may never compare) and for agents (structurally). *Owner
-  direction:* A, with the agent-AS claim re-scoped.
+  out-of-band invite anchors first contact. *Residual (ACCEPTED by the 2026-06-10 sign-off —
+  [[SPEC-013-tier1-signoff]] item B):* first-contact TOFU is **winnable by an active hub by
+  construction** until safety numbers are actually compared — for humans (who may never
+  compare) and for agents (structurally). *Owner direction:* A, with the agent-AS claim
+  re-scoped.
 
 ## 7. Open Questions (Tier-1 — require human crypto sign-off)
 
@@ -666,7 +672,15 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
 
 ## 8. Tier-1 Gate
 
-**Status: not approved — BLOCKED.** Rounds 1–2 folded into v0.3.0; v0.4.0 added the
+**Status: CONDITIONALLY CLEARED 2026-06-10** ([[SPEC-013-tier1-signoff]]) — the human
+sign-off accepted all documented residuals (A–H), ratified D-1/D-2, and approved the
+ADRs, **conditional on the round-6 independent-model spot-check** of R5-01/R5-02/R5-03 +
+D-1/D-2 ([[SPEC-013-round6-spotcheck-prompt]]; Principle 12 — round 5 was same-model-family
+as the fix author). IMPL-013 planning may begin; **implementation merge waits on that
+spot-check** plus the IMPL-bound conditions (A-t no-collision property test, I
+durable-provider delete fidelity, J `cbcl_ristretto` audit). Gate history follows.
+
+Rounds 1–2 folded into v0.3.0; v0.4.0 added the
 **Authentication Service design** ([[#ADR-006]]); v0.5.0 resolved OQ-004 + OQ-005
 client-side. The **round-3 cross-model review** (docs/decisions/SPEC-013-round3-review-findings.md)
 found **two Critical + four High** findings; **v0.6.0 folds their dispositions**:
@@ -727,23 +741,27 @@ not cross-model. **v0.7.1 folds the required pre-IMPL tightenings:**
 - **R5-02 → [[#REQ-014]]/[[#REQ-016]]/[[#OQ-003]]** — creator-as-removal-authority is documented
   as unilateral eviction authority, not merely liveness recovery.
 - **R5-03 → [[#REQ-016]]/[[#REQ-017]]/[[#10-experiment-spike]]** — the genesis GroupContext
-  extension requires cross-stack OpenMLS capabilities and a pre-IMPL round-trip probe.
+  extension requires cross-stack OpenMLS capabilities; the round-trip probe is **DONE**
+  (2026-06-10, §10) — round-trip + fail-closed both observed at openmls 0.8.1.
 - **R5-04 → [[#REQ-021]]/[[#REQ-024]]/[[#NFR-001]]** — the identity safety-number canonical
   encoding, sort order, hash, and display representation are pinned.
 - **R5-05/R5-06/R5-07** — residual/scoping clarifications for compromised-key rotation,
   `bye`'s reserved-verb implementation, and no-cap returning-member availability.
 
-What remains to gate implementation, per [[PROTO-001]]:
+Gate disposition, per [[PROTO-001]]:
 
-1. **Human security/cryptography sign-off** resolving OQ-001…OQ-005 and explicitly accepting
-   the residuals now documented: first-contact TOFU, last-resort forward-secrecy loss, hub
-   fan-out/evidence-suppression availability, durable-provider on-disk delete fidelity,
-   `cbcl_ristretto` point validation, creator unilateral eviction, hub-served-JS limits,
-   the identity-number/state-hash detection split, and the R5-03 feasibility-pending spike.
-2. **Principle-12 spot-check** by a genuinely independent model or human cryptographer for at
-   least R5-01, R5-02, and R5-03, because the round-5 reviewer was not cross-model independent.
-3. **AI Trust Boundary metadata** recorded for the synthesis trajectory (model, prompts,
-   drafts, adversarial findings).
+1. **Human security/cryptography sign-off — DONE 2026-06-10** ([[SPEC-013-tier1-signoff]]):
+   OQ-001…OQ-005 resolved; every documented residual explicitly accepted (first-contact
+   TOFU, last-resort forward-secrecy loss, hub fan-out/evidence-suppression availability,
+   creator unilateral eviction, hub-served-JS limits, the identity-number/state-hash
+   detection split); D-1/D-2 ratified; durable-provider delete fidelity and
+   `cbcl_ristretto` validation bound as IMPL conditions (I, J), the OQ-001 no-collision
+   property test as condition A-t. (The R5-03 spike is DONE — §10.)
+2. **Principle-12 spot-check — OUTSTANDING (condition K, blocks implementation merge):**
+   a genuinely independent model (not Fable, not Opus) re-checks R5-01, R5-02, R5-03 and
+   the D-1/D-2 endorsements ([[SPEC-013-round6-spotcheck-prompt]]), because the round-5
+   reviewer was not cross-model independent.
+3. **AI Trust Boundary metadata — DONE**: recorded in [[SPEC-013-tier1-signoff]].
 
 ## 9. Verification Strategy (Phase 2 — to be detailed in IMPL-013)
 
@@ -762,8 +780,8 @@ Per the [[PROTO-001]] security-critical row, the test specification will select:
 - **Adversarial testing** + **live interop test**: a `hark` agent and a web client
   in one private channel exchanging encrypted messages ([[#TEST-010]]).
 - **Round-5 interop vectors**: a shared [[#REQ-021]] identity safety-number vector for hark
-  and the web client, plus a genesis-extension capabilities round-trip probe before IMPL-013
-  treats [[#REQ-016]] durable delivery as empirically verified.
+  and the web client. (The genesis-extension capabilities round-trip probe is DONE — §10;
+  IMPL-013 re-runs it as a regression plus the omitted-capability-creator negative test.)
 
 Each `REQ` gets requirement-targeted decomposition (positive / negative-input /
 negative-output) so failures attribute to a single clause.
@@ -772,13 +790,31 @@ negative-output) so failures attribute to a single clause.
 
 The initial OpenMLS interop spike is **DONE** (§8): hark-native OpenMLS and the
 web `cbcl-mls-wasm` artifact round-tripped create→add→welcome→encrypt→decrypt at the
-pinned ciphersuite. Round 5 adds one remaining timeboxed probe under Experiment
-Governance ([[PROTO-001]]) **before** committing IMPL-013: create a group with the
-[[#REQ-016]] genesis assertion in a pinned `Unknown`/application GroupContext extension,
-publish hark and `cbcl-mls-wasm` KeyPackages whose leaf capabilities advertise that
-extension type, and confirm cross-stack Add→Welcome→read succeeds while omitting the
-capability fails closed. Until this probe passes, the durable genesis mechanism is
-source-confirmed but **feasibility-pending-verification**.
+pinned ciphersuite. The round-5 **R5-03 genesis-extension probe is also DONE**
+(`experiments/spec-013-mls-spike`, `tests/genesis_extension.rs` +
+`cross-stack/genesis_probe.mjs`, openmls 0.8.1, run 2026-06-10) — the durable genesis
+mechanism is no longer feasibility-pending; both halves are observed:
+
+- **Round-trip (positive):** with every leaf advertising `ExtensionType::Unknown(0xF013)`,
+  the genesis bytes in an `Unknown` GroupContext extension round-trip
+  create→add→welcome→read — readable by the joiner **pre-finalize** from
+  `StagedWelcome::group_context()` (the [[#REQ-016]] inspection point) and post-join,
+  byte-identical, surviving normal Commits; confirmed **cross-stack** (native ⇄ a wasm32
+  build at the same pinned openmls + wasm-bindgen carrying the capability surface the
+  shipped glue must gain).
+- **Fail-closed (negative):** the **actually-shipped** `cbcl-mls-wasm` KeyPackage
+  (default capabilities) is rejected by the committer with
+  `ProposalValidationError(InsufficientCapabilities)` — the [[#REQ-016]] capabilities
+  obligation is enforced by the primitive, fail-closed, observed against the real artifact.
+- **Method note (creator side):** `MlsGroup::new` ACCEPTS a default-capability creator
+  with a genesis extension — creation does **not** fail; the group **bricks on its first
+  path-commit** (`LeafNodeValidation(UnsupportedExtensions)`). The creator-side
+  fail-closed is therefore **delayed**: implementers MUST set the capability in the
+  group-creation config (as [[#REQ-016]] obliges), and IMPL-013 SHALL carry a negative
+  test for the omitted-capability creator.
+
+The remaining §9 round-5 interop item is the shared [[#REQ-021]] identity safety-number
+test vector (IMPL-013).
 
 ## 11. Traceability
 
