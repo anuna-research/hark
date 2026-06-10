@@ -13,11 +13,13 @@ recorded here. Decisions were taken interactively by the project owner on
 authored the v0.7 fixes — see condition K, which exists precisely because of that
 conflict).
 
-**Outcome: gate CONDITIONALLY CLEARED.** All design residuals are explicitly
-accepted (A–H below); D-1 and D-2 are ratified as project-owner calls. IMPL-013
-planning may begin. Implementation merge waits on **condition K** (the round-6
-independent-model spot-check of R5-01/R5-02/R5-03). Conditions A-t, I, J bind
-inside IMPL as stated.
+**Outcome: gate CONDITIONALLY CLEARED** — upgraded to **CLEARED for implementation
+the same day**: condition K was satisfied by the round-6 GPT-5.x spot-check
+([[SPEC-013-round6-spotcheck-findings]] — R5-01/02/03 confirmed, D-1/D-2
+independently endorsed, no re-block). All design residuals are explicitly accepted
+(A–H below); D-1 and D-2 are ratified as project-owner calls. Conditions A-t, I, J
+bind inside IMPL as stated, joined by the round-6 carries **K-1** (remove-race
+retry test) and **K-2** (creator-capability creation-time guard).
 
 ---
 
@@ -56,7 +58,9 @@ inside IMPL as stated.
 | **A-t** | No-cross-protocol-signature-collision property/regression test (wire envelope vs `SignWithLabel` vs the `idkey`/`rekey`/`remove` DS labels). | IMPL-013, before REQ-007 verification. |
 | **I** | ADR-004 durable StorageProvider: on-disk delete/fsync-fidelity test (superseded epoch secrets + consumed init keys absent from disk after merge/consume). | IMPL-013, with the provider. |
 | **J** | `cbcl_ristretto` point-validation audit (SPAKE2 dependency). | IMPL-016, before the pairing handshake is implemented. |
-| **K** | **Round-6 independent-model spot-check** of R5-01 (evidence epoch freshness), R5-02 (creator authority documentation), R5-03 (genesis capabilities obligation), and the D-1/D-2 endorsements — by a model that is neither Claude Fable nor Claude Opus (Principle 12; round 5 was cross-context but same-model-family). Prompt: [[SPEC-013-round6-spotcheck-prompt]]. | **Gate condition** — implementation merge waits on this returning clean (or its findings being folded and re-checked). |
+| **K** | **Round-6 independent-model spot-check** of R5-01 (evidence epoch freshness), R5-02 (creator authority documentation), R5-03 (genesis capabilities obligation), and the D-1/D-2 endorsements — by a model that is neither Claude Fable nor Claude Opus (Principle 12; round 5 was cross-context but same-model-family). Prompt: [[SPEC-013-round6-spotcheck-prompt]]. | **SATISFIED 2026-06-10** — run on **GPT-5.x**; all three confirmed (R5-01 with the retry-cost caveat), D-1/D-2 endorsed, explicit no-re-block ([[SPEC-013-round6-spotcheck-findings]]). Carries → K-1, K-2 below. |
+| **K-1** | Remove-race retry test: evidence losing an epoch race to a concurrent Commit is rejected; removal succeeds on retry with fresh evidence (auto re-mint of `bye` / re-signed remover order at the new epoch). | IMPL-013 (§9). |
+| **K-2** | Creator-capability guard: assert at group-creation time that the create config advertises the genesis-extension capability — fail before the first real Commit, not at it. | IMPL-013 / `cbcl-mls-wasm` (§9, REQ-016). |
 | **L** | AI Trust Boundary metadata — recorded below. | Done (this document). |
 
 ## AI Trust Boundary metadata (PROTO-001)
@@ -81,8 +85,7 @@ inside IMPL as stated.
 
 ## What this sign-off does NOT cover
 
-- The round-6 spot-check (K) — outstanding; the gate is conditional on it.
-- The IMPL-bound verifications (A-t, I, J) — scheduled, not waived.
+- The IMPL-bound verifications (A-t, I, J, K-1, K-2) — scheduled, not waived.
 - The shared REQ-021(a) cross-stack test vector and the `queued_proposals()` /
   `update_path_leaf_node()` staged-inspection surface — source-confirmed only,
   exercised at IMPL-013.

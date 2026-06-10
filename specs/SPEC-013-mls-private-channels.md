@@ -3,13 +3,13 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: draft
 tier: 1
-version: 0.8.0
+version: 0.8.1
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off; v0.8.1 folds the round-6 spot-check, GPT-5.x — gate cleared)
 last-updated: 2026-06-10
 owner-repo: hark
 affects-repos: cbcl-bus (web client + vendored cbcl-mls-wasm artifact), cbcl-chat (cbcl-mls-wasm crate)
-review-gate: CONDITIONALLY CLEARED 2026-06-10 (human sign-off recorded in docs/decisions/SPEC-013-tier1-signoff.md — all residuals A–H explicitly accepted, D-1/D-2 ratified, ADRs APPROVED conditional. **Implementation merge waits on condition K**: the round-6 independent-model spot-check of R5-01/R5-02/R5-03 + D-1/D-2 (docs/decisions/SPEC-013-round6-spotcheck-prompt.md — a non-Fable, non-Opus model, per Principle 12). IMPL-bound conditions: A-t no-collision property test, I durable-provider delete fidelity, J cbcl_ristretto audit. IMPL-013 planning may begin. History: rounds 1–2 → v0.3; ADR-006 → v0.4; OQ-004/005 → v0.5; round-3 → v0.6; round-4 → v0.7; round-5 tightenings → v0.7.1; executed R5-03 probe → v0.7.2 — see docs/decisions/SPEC-013-round5-review-findings.md)
+review-gate: CLEARED for implementation 2026-06-10 (human sign-off: docs/decisions/SPEC-013-tier1-signoff.md — all residuals A–H explicitly accepted, D-1/D-2 ratified, ADRs APPROVED. **Condition K satisfied**: round-6 independent spot-check by GPT-5.x confirmed R5-01 (closed with the retry-cost caveat, folded as K-1), R5-02, R5-03, and endorsed D-1/D-2 — docs/decisions/SPEC-013-round6-spotcheck-findings.md; no re-block. Remaining conditions live INSIDE IMPL: A-t no-collision property test, I durable-provider delete fidelity, J cbcl_ristretto audit (IMPL-016), K-1 remove-race retry test, K-2 creator-capability guard. History: rounds 1–2 → v0.3; ADR-006 → v0.4; OQ-004/005 → v0.5; round-3 → v0.6; round-4 → v0.7; round-5 → v0.7.1/v0.7.2; sign-off → v0.8.0; round-6 → v0.8.1)
 ---
 
 # SPEC-013 — hark MLS: Agents in Encrypted Private Channels
@@ -22,10 +22,12 @@ review-gate: CONDITIONALLY CLEARED 2026-06-10 (human sign-off recorded in docs/d
 > encryption** and the **[[Signed-Member Wire|signed-member authentication core]]**.
 > Per [[PROTO-001]] AI Trust Boundaries, it is a **no-go area** requiring
 > **cross-model adversarial review** and a **human security/cryptography
-> sign-off** before any implementation. **The sign-off was given 2026-06-10**
-> ([[SPEC-013-tier1-signoff]]): all `ADR-###` below are **APPROVED (conditional)**
-> — the gate in [[#8. Tier-1 Gate]] is CONDITIONALLY CLEARED; implementation
-> merge waits on the round-6 independent-model spot-check (condition K).
+> sign-off** before any implementation. **Both are complete**: the human sign-off
+> was given 2026-06-10 ([[SPEC-013-tier1-signoff]]) and the round-6
+> independent-model spot-check (GPT-5.x) returned clean
+> ([[SPEC-013-round6-spotcheck-findings]]). All `ADR-###` below are **APPROVED**;
+> the gate in [[#8. Tier-1 Gate]] is **CLEARED** — implementation may proceed,
+> carrying the IMPL-bound conditions (A-t, I, J, K-1, K-2).
 
 ## 1. Context & Intent
 
@@ -267,7 +269,9 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   that member** — not merely drop fan-out — so a removed/compromised member cannot decrypt
   subsequent traffic. The removal trigger SHALL be **authenticated evidence**, NOT unsigned hub
   presence. Evidence SHALL be a **signed removal-evidence object** bound to the removal it
-  authorises — `(room, group_id, epoch, target handle + leaf)` — under its **own
+  authorises — `(room, group_id, epoch, target handle + leaf)`, where **`leaf` is the
+  concrete MLS leaf identity** (leaf index + leaf signature key at the evidence epoch), not
+  the handle alone (round-6 K-1 clarification) — under its **own
   domain-separation label** (e.g. `cbcl-mls-remove/v1`, the [[#REQ-019]] pattern, so it cannot
   be transplanted across rooms, groups, epochs, or targets), signed by one of:
   - **(a) the subject's pinned key** — a self-signed `bye` for a voluntary leave, which the
@@ -293,7 +297,12 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   Evidence is valid only in that exact epoch: validators SHALL reject stale or future
   evidence, with no tolerance window. A re-added member is a new leaf in a later epoch, so
   any prior `bye` or remover evidence for the old leaf is invalid and cannot remove the
-  re-added member without fresh evidence.
+  re-added member without fresh evidence. **Race/retry behaviour (round-6 K-1):** evidence
+  minted at epoch N that loses a race to a concurrent Commit (validators now at N+1) is
+  correctly **rejected**; honest removal then **retries with fresh evidence** — the leaving
+  client re-mints its `bye` at the new epoch automatically, and a remover re-signs its
+  order at the new epoch. This is an accepted availability/retry cost, not a replay hole;
+  the retry path SHALL be tested (§9).
   Every Remove proposal/Commit SHALL **carry or reference** this evidence so each member can
   verify it independently; verification is REQUIRED **at merge time by every validator**
   ([[#REQ-017]] clause (d)) — NOT only at the committer's decision — otherwise a malicious
@@ -347,7 +356,9 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   round-trip with the capability, `InsufficientCapabilities` rejection of the shipped
   default-capability KeyPackage without it — and one nuance: the **creator-side** check
   fires at the first path-commit, not at group creation, so the create config MUST set
-  the capability or the group bricks on first use.
+  the capability or the group bricks on first use; implementations SHALL therefore
+  **assert the capability at group-creation time** (fail before the first real Commit —
+  round-6 K-2, §9).
   At channel `claim` the hub SHALL record a **creator handle**
   (today `cbcl-room` stores none — affected-repo change), but that record is **bookkeeping,
   not trust** — it is hub-asserted. The hub cannot fabricate MLS membership inside an
@@ -672,13 +683,14 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
 
 ## 8. Tier-1 Gate
 
-**Status: CONDITIONALLY CLEARED 2026-06-10** ([[SPEC-013-tier1-signoff]]) — the human
-sign-off accepted all documented residuals (A–H), ratified D-1/D-2, and approved the
-ADRs, **conditional on the round-6 independent-model spot-check** of R5-01/R5-02/R5-03 +
-D-1/D-2 ([[SPEC-013-round6-spotcheck-prompt]]; Principle 12 — round 5 was same-model-family
-as the fix author). IMPL-013 planning may begin; **implementation merge waits on that
-spot-check** plus the IMPL-bound conditions (A-t no-collision property test, I
-durable-provider delete fidelity, J `cbcl_ristretto` audit). Gate history follows.
+**Status: CLEARED for implementation 2026-06-10.** The human sign-off
+([[SPEC-013-tier1-signoff]]) accepted all documented residuals (A–H), ratified D-1/D-2,
+and approved the ADRs; the round-6 independent spot-check (**GPT-5.x**, Principle 12 —
+[[SPEC-013-round6-spotcheck-findings]]) confirmed R5-01/R5-02/R5-03 closed and
+independently endorsed D-1/D-2, with no re-block. Implementation proceeds carrying the
+IMPL-bound conditions: **A-t** no-collision property test, **I** durable-provider delete
+fidelity, **J** `cbcl_ristretto` audit (IMPL-016), **K-1** remove-race retry test,
+**K-2** creator-capability guard. Gate history follows.
 
 Rounds 1–2 folded into v0.3.0; v0.4.0 added the
 **Authentication Service design** ([[#ADR-006]]); v0.5.0 resolved OQ-004 + OQ-005
@@ -757,10 +769,11 @@ Gate disposition, per [[PROTO-001]]:
    detection split); D-1/D-2 ratified; durable-provider delete fidelity and
    `cbcl_ristretto` validation bound as IMPL conditions (I, J), the OQ-001 no-collision
    property test as condition A-t. (The R5-03 spike is DONE — §10.)
-2. **Principle-12 spot-check — OUTSTANDING (condition K, blocks implementation merge):**
-   a genuinely independent model (not Fable, not Opus) re-checks R5-01, R5-02, R5-03 and
-   the D-1/D-2 endorsements ([[SPEC-013-round6-spotcheck-prompt]]), because the round-5
-   reviewer was not cross-model independent.
+2. **Principle-12 spot-check — DONE 2026-06-10 (condition K satisfied):** GPT-5.x
+   independently confirmed R5-01 (closed with the retry-cost caveat → K-1), R5-02, and
+   R5-03, and endorsed D-1/D-2; explicit no-re-block
+   ([[SPEC-013-round6-spotcheck-findings]]). Carries K-1/K-2 folded into
+   [[#REQ-014]]/[[#REQ-016]]/§9.
 3. **AI Trust Boundary metadata — DONE**: recorded in [[SPEC-013-tier1-signoff]].
 
 ## 9. Verification Strategy (Phase 2 — to be detailed in IMPL-013)
@@ -782,6 +795,11 @@ Per the [[PROTO-001]] security-critical row, the test specification will select:
 - **Round-5 interop vectors**: a shared [[#REQ-021]] identity safety-number vector for hark
   and the web client. (The genesis-extension capabilities round-trip probe is DONE — §10;
   IMPL-013 re-runs it as a regression plus the omitted-capability-creator negative test.)
+- **Round-6 carries (K-1, K-2)**: the **remove-race retry path** — evidence losing an epoch
+  race to a concurrent Commit is rejected and removal succeeds on retry with fresh evidence
+  ([[#REQ-014]]); and the **creator-capability guard** — hark and the web client assert at
+  group-creation time that the create config advertises the genesis-extension capability,
+  failing **before** the first real Commit rather than at it ([[#REQ-016]]).
 
 Each `REQ` gets requirement-targeted decomposition (positive / negative-input /
 negative-output) so failures attribute to a single clause.
