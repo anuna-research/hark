@@ -3,7 +3,7 @@
 
 PREFIX ?= $(HOME)/.local
 
-.PHONY: all build test check lint clippy fmt fmt-fix run man install uninstall clean doc doc-open help
+.PHONY: all build test check lint clippy fmt fmt-fix run man install uninstall dist clean doc doc-open help
 
 all: build
 
@@ -52,8 +52,37 @@ uninstall:
 	rm -f $(PREFIX)/bin/hark
 	rm -f $(PREFIX)/share/man/man1/hark.1
 
+# Build the release binary and stage it as a distributable artifact for
+# the host platform: dist/hark-<os>-<arch> plus its .sha256 checksum.
+# Upload both to https://files.anuna.io/hark/ (see scripts/install.sh).
+dist: build
+	@set -e; \
+	os=$$(uname -s); arch=$$(uname -m); \
+	case "$$os" in \
+	  Darwin) os=darwin ;; \
+	  Linux) os=linux ;; \
+	  *) echo "dist: unsupported OS: $$os" >&2; exit 1 ;; \
+	esac; \
+	case "$$arch" in \
+	  arm64|aarch64) arch=arm64 ;; \
+	  x86_64|amd64) arch=x64 ;; \
+	  *) echo "dist: unsupported architecture: $$arch" >&2; exit 1 ;; \
+	esac; \
+	artifact="hark-$$os-$$arch"; \
+	mkdir -p dist; \
+	cp target/release/hark "dist/$$artifact"; \
+	if command -v sha256sum >/dev/null 2>&1; then \
+	  (cd dist && sha256sum "$$artifact" > "$$artifact.sha256"); \
+	else \
+	  (cd dist && shasum -a 256 "$$artifact" > "$$artifact.sha256"); \
+	fi; \
+	echo ""; \
+	echo "Staged dist/$$artifact and dist/$$artifact.sha256"; \
+	echo "Upload both to https://files.anuna.io/hark/ alongside scripts/install.sh."
+
 clean:
 	cargo clean
+	rm -rf dist
 
 doc:
 	cargo doc --no-deps
@@ -76,6 +105,7 @@ help:
 	@echo "  make man       - Generate target/hark.1 from the clap CLI"
 	@echo "  make install   - Install binary + man page under \$$PREFIX"
 	@echo "  make uninstall - Remove installed binary and man page"
+	@echo "  make dist      - Stage dist/hark-<os>-<arch> + .sha256 for the host platform"
 	@echo "  make clean     - Remove build artifacts"
 	@echo "  make doc       - Generate documentation"
 	@echo "  make doc-open  - Generate and open documentation"

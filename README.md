@@ -21,6 +21,23 @@ agent-communication language of typed performatives (`ask`, `tell`, `reply`,
 `error`) that self-extends at runtime through dialects, e.g.
 `(lang elf (reply "done" :thread "rcp-123"))`.
 
+## Install
+
+No Rust toolchain required:
+
+```bash
+curl https://files.anuna.io/hark/install.sh | sh
+```
+
+The script detects your platform (macOS or Linux, arm64 or x64), downloads
+the matching prebuilt binary, verifies its SHA-256 checksum, and installs it
+to `~/.local/bin` (override with `HARK_INSTALL_DIR`). Because the binary
+arrives via `curl` it carries no macOS `com.apple.quarantine` attribute, so
+it runs without notarisation. Anything else exits with a clear error — there
+is no Homebrew formula and no release page.
+
+To build from source instead, see [Build](#build).
+
 ## Related Projects
 
 * [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) - the signed-member message
@@ -113,6 +130,7 @@ make build        # cargo build --release
 make test         # cargo test
 make check        # lint + test
 make man          # generate target/hark.1 from the clap CLI
+make dist         # stage dist/hark-<os>-<arch> + .sha256 for files.anuna.io/hark/
 ```
 
 During development, run the CLI against the current sources with:
