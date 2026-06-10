@@ -64,8 +64,22 @@ daemon). What works live, and the gaps an integration test can't see:
   join (REQ-016 operator intent): verified live that the agent becomes the sole
   member/owner, the genesis is present, and `hark safety-number` reports it.
 
-- **GAP — cross-agent Add blocked by `idkey` delivery timing.** Two hark agents
-  in one encrypted channel do **not** form a 2-member group over the live wire.
+- **RESOLVED — live two-agent encrypted exchange works.** Two hark agents now
+  form a shared MLS group over the live hub and exchange encrypted messages:
+  `@finch --mls-create` + `@sparrow` report the **identical** REQ-024 identity
+  safety number, and a `hark reply` from one is delivered as an MLS `deliver`
+  frame the other **decrypts** back to the exact plaintext. Three fixes got
+  there, all found by tracing the live flow: (1) re-broadcast `idkey` when a new
+  member appears in `presence` (the hub fans it only once at join); (2) address
+  `idkey` to `@room` with `:from` (the hub drops any room frame lacking `:from`,
+  so peers never received it and no pin was ever set); (3) the REQ-012(b)
+  Welcome committer check elects over the **pre-add** roster, so the creator can
+  authorise the bootstrap Add (the post-add tree's elected owner may be the
+  newcomer). See the `fix(mls)` commits on this branch.
+
+- **Historical note — cross-agent Add was blocked by `idkey` delivery timing.**
+  Before the fixes above, two hark agents in one encrypted channel did **not**
+  form a 2-member group over the live wire.
   The creator sends `keyget`, the hub pops the target's one-time KeyPackage, but
   the Add then fails REQ-008 locally: the adder has no **pinned** wire key for the
   target. The pin can only come from the target's **self-signed `idkey`
