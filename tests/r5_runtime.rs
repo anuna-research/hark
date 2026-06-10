@@ -153,9 +153,14 @@ async fn outbound_happy_path_succeeds_and_appends_to_store() {
         response.text().await.unwrap_or_default()
     );
 
-    // The frame must have been forwarded to the router.
+    // The frame must have been forwarded to the router. The wire frame is a
+    // signed envelope (SPEC-012) embedding the payload verbatim.
     harness.router.wait_for_captured_frame(Duration::from_secs(1)).await;
-    assert_eq!(harness.router.captured_frame().as_deref(), Some(message));
+    let captured = harness.router.captured_frame().expect("a frame was captured");
+    assert!(
+        captured.contains(message),
+        "captured frame should embed the payload: {captured:?}"
+    );
 
     // The validated simple message must now be in the per-handle store.
     let handle =
@@ -633,6 +638,15 @@ async fn handle_connection(stream: tokio::net::TcpStream, shared: Arc<Mutex<Mock
     let Ok(mut websocket) = accept_async(stream).await else {
         return;
     };
+    // SPEC-012 signed-member connect: the hub's first frame is the conn-nonce
+    // bootstrap; the daemon waits for it before its hello.
+    let _ = websocket
+        .send(WsMessage::Text(
+            "(tell @agent \"conn-nonce\" :from @cbcl-router :nonce \"AAAAAAAAAAAAAAAAAAAAAA==\" :hub \"cbcl-router\")"
+                .to_owned()
+                .into(),
+        ))
+        .await;
     // Read hello.
     if let Some(Ok(msg)) = websocket.next().await {
         shared
@@ -688,8 +702,9 @@ async fn handle_connection(stream: tokio::net::TcpStream, shared: Arc<Mutex<Mock
                     Some(Ok(WsMessage::Binary(bytes))) => {
                         let text = String::from_utf8_lossy(&bytes).into_owned();
                         // Filter heartbeats — tests assert against work
-                        // frames only and shouldn't see the keepalive.
-                        if text != r#"(lang cbcl-router (tell @router "heartbeat"))"# {
+                        // frames only and shouldn't see the keepalive. The
+                        // frame is a signed envelope embedding the payload.
+                        if !text.contains(r#"(tell @router "heartbeat")"#) {
                             shared
                                 .lock()
                                 .expect("mock state lock")

@@ -36,13 +36,12 @@ async fn router_integration_success_sends_auth_and_hello_then_enqueues_dispatch(
     assert_eq!(created.state, "connected");
 
     router.wait_for_hello(Duration::from_secs(1)).await;
-    assert_eq!(
-        router.auth_header(),
-        Some("Bearer shr_test.secret".to_owned())
-    );
+    // SPEC-012: no bearer auth — identity is per-frame Ed25519.
+    assert_eq!(router.auth_header(), None);
     let hello = router.hello_frame().expect("hello should be captured");
-    assert!(hello.contains(":agent-id"));
+    assert!(hello.contains("(hello @router"));
     assert!(hello.contains(&created.router_agent_id));
+    assert!(hello.contains(":key \""));
     assert!(!hello.contains(":capabilities"));
     assert!(hello.contains(":dialects (\"elf\" \"arena-v1\")"));
 
@@ -84,6 +83,9 @@ async fn router_integration_maps_invalid_and_missing_router_config() {
     assert_eq!(error_code(response).await, "invalid_router_ws_url");
     local.stop().await;
 
+    // SPEC-012: a missing auth_token is no longer a config error — the token
+    // is accepted-but-ignored, so the create proceeds to the (dead) endpoint
+    // and surfaces a connection failure instead.
     let mut missing_token = AppConfig::default();
     missing_token.router.ws_url = Some("ws://127.0.0.1:9/agent/v1".to_owned());
     let local = LocalApi::start_with_config(missing_token).await;
@@ -91,8 +93,8 @@ async fn router_integration_maps_invalid_and_missing_router_config() {
         .post_agent(&["elf"])
         .await
         .expect("request should complete");
-    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert_eq!(error_code(response).await, "missing_router_auth_token");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error_code(response).await, "router_connection_failed");
     local.stop().await;
 }
 
@@ -233,9 +235,11 @@ async fn router_integration_send_writes_binary_frame_to_router() {
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     router.wait().await;
-    assert_eq!(
-        router.sent_frame(),
-        Some(r#"(lang elf (reply "done" :thread "rcp-1"))"#.to_owned())
+    // The wire frame is a signed envelope (SPEC-012) embedding the payload.
+    let sent = router.sent_frame().expect("a frame was sent");
+    assert!(
+        sent.contains(r#"(lang elf (reply "done" :thread "rcp-1"))"#),
+        "sent frame should embed the payload: {sent:?}"
     );
     local.stop().await;
 }
@@ -280,9 +284,10 @@ async fn router_integration_sends_heartbeat_on_idle_connection() {
     tokio::time::advance(Duration::from_secs(31)).await;
 
     router.wait().await;
-    assert_eq!(
-        router.sent_frame(),
-        Some(r#"(lang cbcl-router (tell @router "heartbeat"))"#.to_owned())
+    let heartbeat = router.sent_frame().expect("a heartbeat was sent");
+    assert!(
+        heartbeat.contains(r#"(lang cbcl-router (tell @router "heartbeat"))"#),
+        "heartbeat frame should embed the payload: {heartbeat:?}"
     );
     local.stop().await;
 }
@@ -305,13 +310,14 @@ async fn router_integration_sends_heartbeat_for_each_active_connection() {
     tokio::time::advance(Duration::from_secs(31)).await;
 
     router.wait().await;
-    assert_eq!(
-        router.sent_frames(),
-        vec![
-            r#"(lang cbcl-router (tell @router "heartbeat"))"#.to_owned(),
-            r#"(lang cbcl-router (tell @router "heartbeat"))"#.to_owned(),
-        ]
-    );
+    let heartbeats = router.sent_frames();
+    assert_eq!(heartbeats.len(), 2, "one heartbeat per connection");
+    for heartbeat in &heartbeats {
+        assert!(
+            heartbeat.contains(r#"(lang cbcl-router (tell @router "heartbeat"))"#),
+            "heartbeat frame should embed the payload: {heartbeat:?}"
+        );
+    }
     local.stop().await;
 }
 
@@ -522,6 +528,15 @@ async fn handle_mock_connection(
     let Ok(mut websocket) = accept_hdr_async(stream, callback).await else {
         return;
     };
+    // SPEC-012 signed-member connect: the hub's first frame is the conn-nonce
+    // bootstrap; the daemon waits for it before its hello.
+    let _ = websocket
+        .send(Message::Text(
+            "(tell @agent \"conn-nonce\" :from @cbcl-router :nonce \"AAAAAAAAAAAAAAAAAAAAAA==\" :hub \"cbcl-router\")"
+                .to_owned()
+                .into(),
+        ))
+        .await;
     if let Some(Ok(message)) = websocket.next().await {
         let hello = message_to_string(message);
         shared
