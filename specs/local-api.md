@@ -68,8 +68,11 @@ Stable error codes used by the MVP local API:
 * `missing_router_ws_url` - router WebSocket URL is not configured.
 * `invalid_router_ws_url` - router WebSocket URL is malformed or not `ws://` or
   `wss://`.
-* `missing_router_auth_token` - router bearer token is not configured.
-* `router_auth_rejected` - router rejected the WebSocket authentication.
+* `router_auth_rejected` - the WebSocket upgrade was refused with HTTP 401/403
+  (e.g. by a proxy in front of `/agent/v1`). The hub itself has no connection
+  auth — identity is per-frame Ed25519, so a bad signature/identity arrives as
+  an error frame after connect, not here. (`missing_router_auth_token` is legacy
+  and no longer emitted.)
 * `router_connection_failed` - router WebSocket connection failed for another
   network or protocol reason.
 * `missing_dialect` - agent creation request has no dialects.

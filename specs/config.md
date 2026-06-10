@@ -89,7 +89,6 @@ Example TOML:
 ```toml
 [router]
 ws_url = "wss://cbcl-lfe.anuna.io/agent/v1"
-auth_token = "shr_prod-agent.REPLACE_ME"
 
 [agent]
 agent_id_prefix = "local-agent"
@@ -103,36 +102,21 @@ overflow_policy = "reject_new_and_close"
 
 ## Router Authentication
 
-The current `cbcl-router` `/agent/v1` WebSocket path requires:
+The `/agent/v1` WebSocket path has **no bearer token** — the daemon authenticates
+per frame with an Ed25519 signature (see [Router protocol mapping](router-protocol.md)).
+There is nothing to configure: on `init`, the daemon loads (and on first use
+creates) its router identity key at:
 
 ```text
-Authorization: Bearer shr_<key_id>.<secret>
+<config-dir>/router-agent.key
 ```
 
-The client should support this shared-secret bearer token in the MVP.
+The hub trust-on-first-use enrols the corresponding public key. The key file is
+created owner-only (`0600` on Unix); back it up to keep a stable identity.
 
-Config key:
-
-```toml
-[router]
-auth_token = "shr_prod-agent.REPLACE_ME"
-```
-
-Environment override:
-
-```bash
-export CBCL_ROUTER_AUTH_TOKEN='shr_prod-agent.REPLACE_ME'
-```
-
-The daemon uses this value when `init` opens an agent WebSocket connection to
-the router:
-
-```text
-Authorization: Bearer ${CBCL_ROUTER_AUTH_TOKEN}
-```
-
-The token is sensitive. The client should avoid printing it in logs, status
-output, error messages, or JSON responses.
+A legacy `[router].auth_token` (or `CBCL_ROUTER_AUTH_TOKEN`) is still accepted in
+config for backward compatibility, but it is **ignored** — the daemon never sends
+an `Authorization` header to the router.
 
 ## Router URLs
 
@@ -264,31 +248,17 @@ Future versions may add OS keychain integration. That is not required for MVP.
 
 ## Future Auth Support
 
-The router repository contains Ed25519/JWT enrollment machinery, but the current
-`/agent/v1` path described by the code uses the shared-secret bearer mechanism.
-
-Future client versions may support:
-
-* enrollment flows
-* Ed25519 keypair storage
-* challenge/verify token acquisition
-* token refresh
-
-Those are out of MVP. The first client implementation should use the current
-shared-secret bearer token required by `/agent/v1`.
+The current `/agent/v1` auth is per-frame Ed25519 signing with trust-on-first-use
+enrolment by the hub. Future client versions may add **out-of-band enrolment** —
+registering the agent's public key with the hub ahead of connecting, rather than
+relying on TOFU — so an agent is recognised, and granted its dialect
+capabilities, from the first connect. That is out of MVP.
 
 ## Error Handling
 
-Missing router auth config should not prevent `daemon start`, `daemon run`,
-`daemon status`, or `daemon stop`. It should fail an agent `init` request before
-opening a WebSocket:
-
-```text
-error: router auth token is not configured
-hint: run `hark config init` or set CBCL_ROUTER_AUTH_TOKEN
-```
-
-Missing router URL should likewise fail before agent init opens a WebSocket.
+There is no router auth to configure, so `init` no longer fails for a missing
+auth token. Missing router URL still fails an agent `init` before it opens a
+WebSocket.
 The daemon may start without router configuration, but it cannot create router
 WebSocket connections until a URL is available:
 
@@ -305,10 +275,8 @@ error: router WebSocket URL is invalid
 hint: run `hark config path` to find config.toml
 ```
 
-Authentication failure from the router should be surfaced distinctly from
-network failure:
-
-```text
-error: router rejected WebSocket authentication
-hint: check `CBCL_ROUTER_AUTH_TOKEN`
-```
+A per-frame signature/identity rejection by the hub (e.g. an unenrolled key, or
+a key mismatch) arrives as an error frame *after* the WebSocket is established —
+not as a connection-auth failure. The daemon marks the handle unhealthy and
+surfaces it through `recv`, `send`, and `daemon status`, distinct from a network
+failure to connect.

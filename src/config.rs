@@ -10,9 +10,17 @@ use crate::constants::{
     DEFAULT_MAX_MESSAGES_PER_HANDLE, DEFAULT_OVERFLOW_POLICY,
 };
 
-pub const SAMPLE_CONFIG: &str = r#"[router]
+pub const SAMPLE_CONFIG: &str = r#"# ws_url's PATH selects the transport: /chat/v1 -> cbcl-chat, anything else -> router.
+[router]
 ws_url = "wss://cbcl-lfe.anuna.io/agent/v1"
 auth_token = "shr_prod-agent.REPLACE_ME"
+
+# Used only when ws_url points at a chat hub (path /chat/v1). The wire handle is
+# per process: `hark init --handle @aria --channel @general` (each handle is
+# enrolled separately with the hub and signed by its own key under identity_dir).
+[chat]
+channel = "@general"
+# identity_dir defaults to <config-dir>/chat-keys; one <handle>.key per agent.
 
 [agent]
 agent_id_prefix = "local-agent"
@@ -24,10 +32,21 @@ max_bytes_per_handle = 67108864
 overflow_policy = "reject_new_and_close"
 "#;
 
+/// Default chat channel when neither `--channel` nor `[chat].channel` is set.
+pub const DEFAULT_CHAT_CHANNEL: &str = "@general";
+
+/// Which upstream transport a connection uses, decided by the `ws_url` path.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Transport {
+    Router,
+    Chat,
+}
+
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
     pub router: RouterConfig,
+    pub chat: ChatConfig,
     pub agent: AgentConfig,
     pub daemon: DaemonConfig,
 }
@@ -37,6 +56,26 @@ pub struct AppConfig {
 pub struct RouterConfig {
     pub ws_url: Option<String>,
     pub auth_token: Option<String>,
+}
+
+/// Chat-transport-only knobs. The hub URL is shared with `[router]` (the
+/// `ws_url` path decides router vs chat); these are the extras the chat
+/// transport needs that the router does not: a default channel, and where
+/// per-handle signing keys live.
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Default)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// Default channel (`@name`) joined when `init` omits `--channel`.
+    pub channel: Option<String>,
+    /// Directory holding one Ed25519 seed per wire handle (`<dir>/<handle>.key`).
+    /// Each agent process gets its own handle and its own key here.
+    pub identity_dir: Option<String>,
+    /// Δ: how long to collect claims before electing an answerer, in
+    /// milliseconds (SPEC-003 NFR-001). Defaults to 400 ms.
+    pub claim_window_ms: Option<u64>,
+    /// T: per-rank liveness timeout before a fallback agent takes over, in
+    /// milliseconds (SPEC-003 REQ-007/NFR-002). Defaults to 2000 ms.
+    pub liveness_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
@@ -64,8 +103,25 @@ pub struct DaemonConfig {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ValidatedRouterConfig {
     pub ws_url: Url,
-    pub auth_token: String,
 }
+
+/// A validated chat-transport configuration: the hub URL plus the chat-only
+/// extras with defaults applied.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ValidatedChatConfig {
+    pub ws_url: Url,
+    pub channel: String,
+    pub identity_dir: PathBuf,
+    /// Δ — the claim-collection window (SPEC-003 NFR-001).
+    pub claim_window: std::time::Duration,
+    /// T — the per-rank liveness timeout (SPEC-003 REQ-007).
+    pub liveness_timeout: std::time::Duration,
+}
+
+/// Default Δ claim window (SPEC-003 NFR-001: ≤ 750 ms p95 for N ≤ 8 on LAN).
+pub const DEFAULT_CLAIM_WINDOW_MS: u64 = 400;
+/// Default T liveness timeout before a fallback agent answers.
+pub const DEFAULT_LIVENESS_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -79,14 +135,13 @@ pub enum ConfigError {
     MissingRouterWsUrl,
     #[error("invalid router WebSocket URL: {0}")]
     InvalidRouterWsUrl(String),
-    #[error("missing router authentication token")]
-    MissingRouterAuthToken,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             router: RouterConfig::default(),
+            chat: ChatConfig::default(),
             agent: AgentConfig {
                 agent_id_prefix: DEFAULT_AGENT_ID_PREFIX.to_owned(),
                 auto_install_advertised: DEFAULT_AUTO_INSTALL_ADVERTISED,
@@ -141,7 +196,6 @@ impl fmt::Debug for ValidatedRouterConfig {
         formatter
             .debug_struct("ValidatedRouterConfig")
             .field("ws_url", &self.ws_url)
-            .field("auth_token", &"<redacted>")
             .finish()
     }
 }
@@ -179,7 +233,9 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn validate_router(&self) -> Result<ValidatedRouterConfig, ConfigError> {
+    /// Parse and scheme-check the configured hub WebSocket URL. Shared by both
+    /// transports; the URL's *path* is what then selects router vs chat.
+    pub fn validate_ws_url(&self) -> Result<Url, ConfigError> {
         let ws_url = self
             .router
             .ws_url
@@ -188,25 +244,104 @@ impl AppConfig {
             .ok_or(ConfigError::MissingRouterWsUrl)?;
         let ws_url = Url::parse(ws_url)
             .map_err(|error| ConfigError::InvalidRouterWsUrl(error.to_string()))?;
-
         if !matches!(ws_url.scheme(), "ws" | "wss") {
             return Err(ConfigError::InvalidRouterWsUrl(
                 "URL scheme must be ws or wss".to_owned(),
             ));
         }
+        Ok(ws_url)
+    }
 
-        let auth_token = self
-            .router
-            .auth_token
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(ConfigError::MissingRouterAuthToken)?;
-
-        Ok(ValidatedRouterConfig {
-            ws_url,
-            auth_token: auth_token.to_owned(),
+    /// Select the transport from the configured hub URL: path `/chat/v1` is the
+    /// cbcl-chat transport, anything else is the router.
+    pub fn transport(&self) -> Result<Transport, ConfigError> {
+        let ws_url = self.validate_ws_url()?;
+        Ok(if ws_url.path() == crate::chat::CHAT_WS_PATH {
+            Transport::Chat
+        } else {
+            Transport::Router
         })
     }
+
+    pub fn validate_router(&self) -> Result<ValidatedRouterConfig, ConfigError> {
+        // The router no longer uses a bearer token — identity is established per
+        // frame by Ed25519 signature (see signed_transport). A legacy
+        // `[router].auth_token` in the config is accepted but ignored.
+        let ws_url = self.validate_ws_url()?;
+        Ok(ValidatedRouterConfig { ws_url })
+    }
+
+    /// Validate the chat transport: the shared hub URL, plus the chat-only
+    /// extras with defaults applied (channel → `@general`, identity_dir →
+    /// `<config-dir>/chat-keys`). Unlike the router, chat needs no auth token —
+    /// it authenticates per frame by Ed25519 signature.
+    pub fn validate_chat(&self) -> Result<ValidatedChatConfig, ConfigError> {
+        let ws_url = self.validate_ws_url()?;
+        let channel = self
+            .chat
+            .channel
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_CHAT_CHANNEL)
+            .to_owned();
+        validate_chat_handle("chat.channel", &channel)?;
+        let identity_dir = match self
+            .chat
+            .identity_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(dir) => PathBuf::from(dir),
+            None => default_chat_identity_dir().ok_or(ConfigError::InvalidValue {
+                field: "chat.identity_dir",
+                reason: "no default config directory is available; set chat.identity_dir"
+                    .to_owned(),
+            })?,
+        };
+        let claim_window = std::time::Duration::from_millis(
+            self.chat.claim_window_ms.unwrap_or(DEFAULT_CLAIM_WINDOW_MS),
+        );
+        let liveness_timeout = std::time::Duration::from_millis(
+            self.chat
+                .liveness_timeout_ms
+                .unwrap_or(DEFAULT_LIVENESS_TIMEOUT_MS),
+        );
+        Ok(ValidatedChatConfig {
+            ws_url,
+            channel,
+            identity_dir,
+            claim_window,
+            liveness_timeout,
+        })
+    }
+}
+
+/// A chat channel or wire handle must be an `@`-prefixed name. Light validation;
+/// the hub is the final authority.
+pub fn validate_chat_handle(field: &'static str, value: &str) -> Result<(), ConfigError> {
+    if !value.starts_with('@') || value.len() < 2 {
+        return Err(ConfigError::InvalidValue {
+            field,
+            reason: format!("must be an @-prefixed name, got {value:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Default per-handle key directory: `<config-dir>/<command>/chat-keys`.
+pub fn default_chat_identity_dir() -> Option<PathBuf> {
+    let base_dirs = BaseDirs::new()?;
+    Some(base_dirs.config_dir().join(COMMAND_NAME).join("chat-keys"))
+}
+
+/// Default router agent identity key: `<config-dir>/<command>/router-agent.key`.
+/// One stable Ed25519 key for the daemon's router connections (replaces the old
+/// `auth_token` bearer credential under SPEC-012). The hub TOFU-enrols it.
+pub fn default_router_identity_path() -> Option<PathBuf> {
+    let base_dirs = BaseDirs::new()?;
+    Some(base_dirs.config_dir().join(COMMAND_NAME).join("router-agent.key"))
 }
 
 pub fn default_config_file() -> Option<PathBuf> {
@@ -282,6 +417,12 @@ fn apply_environment_overrides(config: &mut AppConfig) -> Result<(), ConfigError
     }
     if let Some(value) = env_value("CBCL_ROUTER_AUTH_TOKEN") {
         config.router.auth_token = Some(value);
+    }
+    if let Some(value) = env_value("CBCL_CHAT_CHANNEL") {
+        config.chat.channel = Some(value);
+    }
+    if let Some(value) = env_value("CBCL_CHAT_IDENTITY_DIR") {
+        config.chat.identity_dir = Some(value);
     }
     if let Some(value) = env_value("CBCL_AGENT_ID_PREFIX") {
         config.agent.agent_id_prefix = value;
@@ -440,9 +581,105 @@ mod tests {
         DEFAULT_MAX_MESSAGES_PER_HANDLE, DEFAULT_OVERFLOW_POLICY,
     };
 
-    use super::{AppConfig, ConfigError, validate_capability_name, validate_dialect_id};
+    use super::{
+        AppConfig, ChatConfig, ConfigError, RouterConfig, Transport, validate_capability_name,
+        validate_dialect_id,
+    };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn config_with_ws(url: &str) -> AppConfig {
+        AppConfig {
+            router: RouterConfig {
+                ws_url: Some(url.to_owned()),
+                auth_token: Some("shr_token".to_owned()),
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn transport_is_chat_only_for_chat_v1_path() {
+        assert_eq!(
+            config_with_ws("wss://hub.example/chat/v1")
+                .transport()
+                .unwrap(),
+            Transport::Chat
+        );
+        assert_eq!(
+            config_with_ws("wss://hub.example/agent/v1")
+                .transport()
+                .unwrap(),
+            Transport::Router
+        );
+        // A chat-ish prefix that isn't exactly /chat/v1 stays router.
+        assert_eq!(
+            config_with_ws("wss://hub.example/chat/v2")
+                .transport()
+                .unwrap(),
+            Transport::Router
+        );
+    }
+
+    #[test]
+    fn validate_chat_applies_defaults() {
+        let chat = config_with_ws("wss://hub.example/chat/v1")
+            .validate_chat()
+            .expect("chat config should validate");
+        assert_eq!(chat.channel, super::DEFAULT_CHAT_CHANNEL);
+        assert!(chat.identity_dir.ends_with("chat-keys"));
+    }
+
+    #[test]
+    fn validate_chat_overrides_channel_and_dir() {
+        let config = AppConfig {
+            router: RouterConfig {
+                ws_url: Some("ws://localhost:8080/chat/v1".to_owned()),
+                auth_token: None,
+            },
+            chat: ChatConfig {
+                channel: Some("@research".to_owned()),
+                identity_dir: Some("/tmp/hark-keys".to_owned()),
+                claim_window_ms: Some(250),
+                liveness_timeout_ms: None,
+            },
+            ..AppConfig::default()
+        };
+        let chat = config.validate_chat().expect("validate");
+        assert_eq!(chat.channel, "@research");
+        assert_eq!(
+            chat.identity_dir,
+            std::path::PathBuf::from("/tmp/hark-keys")
+        );
+        // Δ overridden; T falls back to the default.
+        assert_eq!(chat.claim_window, std::time::Duration::from_millis(250));
+        assert_eq!(
+            chat.liveness_timeout,
+            std::time::Duration::from_millis(super::DEFAULT_LIVENESS_TIMEOUT_MS)
+        );
+        // Chat needs no auth token.
+        assert_eq!(config.transport().unwrap(), Transport::Chat);
+    }
+
+    #[test]
+    fn validate_chat_rejects_non_at_channel() {
+        let config = AppConfig {
+            chat: ChatConfig {
+                channel: Some("general".to_owned()),
+                identity_dir: None,
+                claim_window_ms: None,
+                liveness_timeout_ms: None,
+            },
+            ..config_with_ws("wss://hub.example/chat/v1")
+        };
+        assert!(matches!(
+            config.validate_chat(),
+            Err(ConfigError::InvalidValue {
+                field: "chat.channel",
+                ..
+            })
+        ));
+    }
 
     const ENV_VARS: &[&str] = &[
         "CBCL_ROUTER_WS",
@@ -676,17 +913,19 @@ mod tests {
             Err(ConfigError::InvalidRouterWsUrl(_))
         ));
 
+        // The router no longer requires a bearer token — a config with no
+        // auth_token validates (identity is per-frame Ed25519).
         config.router.ws_url = Some("wss://router.example/agent/v1".to_owned());
         config.router.auth_token = None;
-        assert!(matches!(
-            config.validate_router(),
-            Err(ConfigError::MissingRouterAuthToken)
-        ));
+        let validated = config
+            .validate_router()
+            .expect("router config should pass without an auth token");
+        assert_eq!(validated.ws_url.as_str(), "wss://router.example/agent/v1");
 
+        // a legacy auth_token is accepted but ignored.
         config.router.auth_token = Some("shr_test.secret".to_owned());
         let validated = config.validate_router().expect("router config should pass");
         assert_eq!(validated.ws_url.as_str(), "wss://router.example/agent/v1");
-        assert_eq!(validated.auth_token, "shr_test.secret");
     }
 
     #[test]
@@ -704,13 +943,15 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("shr_secret.do-not-print"));
 
+        // The validated router config does not carry the legacy token at all —
+        // there is nothing to redact, and the secret cannot leak through it.
         let validated = config
             .validate_router()
             .expect("router config should validate");
         let debug = format!("{validated:?}");
 
-        assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("shr_secret.do-not-print"));
+        assert!(!debug.contains("auth_token"));
     }
 
     fn write_config(contents: &str) -> (TempDir, std::path::PathBuf) {

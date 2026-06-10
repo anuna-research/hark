@@ -1,0 +1,33 @@
+# SPEC-013 §10 Experiment Spike — native OpenMLS wire-compat + behavioural probes.
+#
+# ISOLATED, gate-permitted: this crate is detached from hark's package (its own
+# empty [workspace]) and touches no production code. It characterises the OpenMLS
+# 0.8 *primitive* (the test oracle), NOT the gated SPEC-013 design. Its job is to
+# turn the round-3 review's "could NOT assess" list into observed evidence for the
+# human crypto sign-off, and to confirm NFR-001 byte-compat before IMPL-013.
+#
+# Versions are pinned to match cbcl-chat/crates/cbcl-mls-wasm/Cargo.toml exactly,
+# so the bytes/behaviour here are the bytes/behaviour the web artifact produces.
+[package]
+name = "spec-013-mls-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+# Detached from any parent workspace (hark is a standalone package; this must not
+# join its build). Mirrors cbcl-mls-wasm's isolation.
+[workspace]
+
+[dependencies]
+openmls = "0.8"
+# test-utils exposes MemoryStorage::{values, serialize} so a probe can observe
+# whether OpenMLS *issues* delete calls for superseded epoch secrets (R3-11) and
+# round-trip persisted state (REQ-009/ADR-004) — without hand-writing a ~50-method
+# StorageProvider spy.
+openmls_rust_crypto = { version = "0.5", features = ["test-utils"] }
+openmls_basic_credential = "0.5"
+openmls_traits = "0.5"
+tls_codec = "0.4"
+# Only the `native_peer` cross-stack bin uses JSON; the lib/tests do not.
+serde_json = "1.0"

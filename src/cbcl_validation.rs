@@ -161,6 +161,57 @@ pub fn validate_for_send_with_context(
     validate_for_send_inner(input, expected_kind, Some((registry, store)))
 }
 
+/// Validate a message an agent wants to **emit**: a proactive, agent-initiated
+/// outbound that is *not* a reply/error/progress — typically a
+/// `(lang <dialect> (<perf> …))` ask the agent originates on its own (SPEC-003
+/// REQ-011, ADR-007: the concierge compiling an intent into a channel dialect).
+///
+/// Unlike [`validate_for_send_with_context`] this does **not** force a
+/// reply/error/progress performative or require a `:thread`, and it accepts a
+/// `Dialect`/`Wrapped` envelope (which `validate_for_send` rejects). It still
+/// runs the full R1–R5 pipeline, so a malformed, shape-violating, or causally
+/// dangling message is refused before it leaves the agent. A `(meta …)` form is
+/// refused — an emit is a message, not dialect teaching.
+pub fn validate_for_emit(
+    input: &str,
+    registry: &DialectRegistry,
+    store: &mut ThreadedMessageStore,
+) -> Result<(), CbclValidationError> {
+    match run_validation_pipeline(input, Some((registry, store))) {
+        PipelineResult::Success(message) => {
+            if matches!(message, Message::Meta { .. }) {
+                return Err(CbclValidationError::Malformed(
+                    "an emit must be a message, not a (meta …) form".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        PipelineResult::ParseError(error) => Err(malformed_parse(error)),
+        PipelineResult::ValidationError(error) => Err(
+            CbclValidationError::from_pipeline_validation(
+                &error,
+                violation_performative(&error),
+                violation_thread(&error),
+            )
+            .unwrap_or_else(|| CbclValidationError::Malformed(error.to_string())),
+        ),
+        PipelineResult::Pending { message, reason } => Err(CbclValidationError::CausalViolation {
+            detail: format!("causal predecessor unknown: {reason:?}"),
+            performative: message
+                .innermost_simple()
+                .and_then(|m| m.performative())
+                .map(|p| p.name().to_owned()),
+            thread: message
+                .innermost_simple()
+                .and_then(|m| m.thread())
+                .map(String::from),
+        }),
+        PipelineResult::Buffered { .. } => Err(CbclValidationError::Malformed(
+            "unexpected buffered pipeline state during emit validation".to_owned(),
+        )),
+    }
+}
+
 fn validate_for_send_inner(
     input: &str,
     expected_kind: MessageKind,
@@ -864,6 +915,53 @@ mod tests {
             "shape_violation",
             "expected shape_violation, got: {error}"
         );
+    }
+
+    #[test]
+    fn emit_accepts_lang_and_bare_messages() {
+        let registry = DialectRegistry::new();
+        let mut store = ThreadedMessageStore::new();
+        // A proactive (lang …) ask — which validate_for_send rejects as an
+        // unsupported wrapper — is accepted for emit (unknown dialect →
+        // lightweight R1–R4 pipeline).
+        validate_for_emit(
+            r#"(lang cbcl-cli (ls @host "/etc" :from @aria :thread "t1"))"#,
+            &registry,
+            &mut store,
+        )
+        .expect("a well-formed lang emit is accepted");
+        // A bare message needs no reply shape and no :thread.
+        validate_for_emit(r#"(tell @general "hi" :from @aria)"#, &registry, &mut store)
+            .expect("a bare message emits");
+    }
+
+    #[test]
+    fn emit_rejects_meta_and_malformed() {
+        let registry = DialectRegistry::new();
+        let mut store = ThreadedMessageStore::new();
+        assert!(
+            validate_for_emit("not (((valid", &registry, &mut store).is_err(),
+            "malformed input must be refused"
+        );
+        assert!(
+            validate_for_emit("(meta (query (list)))", &registry, &mut store).is_err(),
+            "a (meta …) form is not an emittable message"
+        );
+    }
+
+    #[test]
+    fn emit_still_enforces_r5_shape() {
+        // An emit is not an R5 bypass: a known-dialect message that violates
+        // its shape is refused just as on the send path.
+        let registry = shape_constraint_registry();
+        let mut store = ThreadedMessageStore::new();
+        let error = validate_for_emit(
+            r#"(lang shape-dialect (track @worker :thread "rcp-1"))"#,
+            &registry,
+            &mut store,
+        )
+        .expect_err("missing :package must violate shape even on emit");
+        assert_eq!(error.code(), "shape_violation", "got: {error}");
     }
 
     #[test]
