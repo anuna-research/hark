@@ -188,12 +188,21 @@ pub struct CreateAgentResponse {
     pub router_agent_id: String,
     pub dialects: Vec<String>,
     pub state: String,
+    /// Non-fatal join caveats for the operator (e.g. the channel declares no
+    /// dialect menu, or chosen definitions are not yet acquirable by digest).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentsResponse {
     pub daemon: DaemonStatus,
     pub agents: Vec<AgentStatus>,
+    /// The session's active handle (REQ-003, SPEC-016): the most recently
+    /// created, still-open agent. CLI commands fall back to it when
+    /// `CBCL_AGENT_HANDLE` is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -215,6 +224,9 @@ pub struct AgentStatus {
     pub unhealthy_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unhealthy_detail: Option<String>,
+    /// The chat channel the agent joined; absent on the router transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -742,6 +754,7 @@ async fn create_router_transport_agent(
         router_agent_id: created.router_agent_id,
         dialects: created.dialects,
         state: "connected".to_owned(),
+        warnings: Vec::new(),
     }))
 }
 
@@ -798,7 +811,7 @@ async fn create_chat_transport_agent(
             None,
         )
     })?;
-    let handle = create_chat_agent(
+    let (handle, warnings) = create_chat_agent(
         state.agents.clone(),
         &chat.ws_url,
         &channel,
@@ -817,6 +830,7 @@ async fn create_chat_transport_agent(
         router_agent_id: wire_handle.to_owned(),
         dialects,
         state: "connected".to_owned(),
+        warnings,
     }))
 }
 
@@ -940,8 +954,14 @@ async fn agents(
             queued_bytes: snapshot.queued_bytes,
             unhealthy_reason: snapshot.unhealthy_reason,
             unhealthy_detail: snapshot.unhealthy_detail,
+            channel: snapshot.channel,
         })
         .collect();
+    let active_agent_handle = state
+        .agents
+        .active_handle()
+        .await
+        .map(|handle| handle.as_str().to_owned());
     Ok(Json(AgentsResponse {
         daemon: DaemonStatus {
             pid: state.record.pid,
@@ -950,6 +970,7 @@ async fn agents(
             api_version: state.record.api_version,
         },
         agents,
+        active_agent_handle,
     }))
 }
 
@@ -1781,6 +1802,16 @@ fn chat_error_to_api(error: ChatError) -> ApiError {
         ChatError::Store(message) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_dialect", message, None)
         }
+        ChatError::UndeclaredDialect { dialect, declared } => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "undeclared_dialect",
+            format!("dialect {dialect} is not declared by the channel"),
+            Some(if declared.is_empty() {
+                "the channel declares no dialects".to_owned()
+            } else {
+                format!("declared dialects: {}", declared.join(", "))
+            }),
+        ),
     }
 }
 
@@ -2026,6 +2057,7 @@ mod tests {
                     api_version: server.record.api_version,
                 },
                 agents: Vec::new(),
+                active_agent_handle: None,
             }
         );
 

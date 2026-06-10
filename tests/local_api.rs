@@ -30,6 +30,7 @@ async fn local_api_ping_and_status_work_over_loopback() {
                 api_version: server.record.api_version,
             },
             agents: Vec::new(),
+            active_agent_handle: None,
         }
     );
 

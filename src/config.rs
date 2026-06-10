@@ -386,7 +386,9 @@ pub fn validate_dialect_id(value: &str) -> Result<(), ConfigError> {
     )
 }
 
-fn load_file_backed_config(config_file: Option<PathBuf>) -> Result<AppConfig, ConfigError> {
+pub(crate) fn load_file_backed_config(
+    config_file: Option<PathBuf>,
+) -> Result<AppConfig, ConfigError> {
     let mut builder = Config::builder()
         .set_default("agent.agent_id_prefix", DEFAULT_AGENT_ID_PREFIX)?
         .set_default("daemon.bind", DEFAULT_DAEMON_BIND)?

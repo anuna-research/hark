@@ -43,7 +43,7 @@ async fn exactly_one_of_two_agents_is_elected() {
 
     let store_a = store("resp-a");
     let store_b = store("resp-b");
-    let agent_a = create_chat_agent(
+    let (agent_a, _warnings_a) = create_chat_agent(
         store_a.clone(),
         &ws,
         "@general",
@@ -56,7 +56,7 @@ async fn exactly_one_of_two_agents_is_elected() {
     )
     .await
     .expect("agent A joins");
-    let agent_b = create_chat_agent(
+    let (agent_b, _warnings_b) = create_chat_agent(
         store_b.clone(),
         &ws,
         "@general",

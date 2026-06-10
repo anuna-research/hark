@@ -54,6 +54,92 @@ pub enum ChatError {
     JoinTimeout(Duration),
     #[error("agent store rejected the connection: {0}")]
     Store(String),
+    /// REQ-008 (SPEC-016): the operator chose a dialect the channel does not
+    /// declare. Carries the declared names so the error can show the menu.
+    #[error("dialect {dialect} is not declared by the channel")]
+    UndeclaredDialect {
+        dialect: String,
+        declared: Vec<String>,
+    },
+}
+
+/// One entry of a channel's declared-dialect menu (SPEC-015 CON-001):
+/// a `(name, digest-hex)` pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredDialect {
+    pub name: String,
+    pub digest: String,
+}
+
+/// The hub's join acknowledgement (`roomcfg`), parsed. `declared: None` means
+/// the hub conveyed no `:dialects` menu (a legacy hub) — distinct from
+/// `Some([])`, a channel that declares an empty set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomCfg {
+    pub enc: bool,
+    pub declared: Option<Vec<DeclaredDialect>>,
+}
+
+impl RoomCfg {
+    fn absent() -> Self {
+        Self {
+            enc: false,
+            declared: None,
+        }
+    }
+}
+
+/// Parse a `roomcfg` frame per SPEC-015 CON-001:
+/// `(roomcfg @room :enc true|false :dialects ((<name> <digest-hex>) …))`.
+/// Returns `None` for any other frame.
+fn parse_roomcfg(text: &str) -> Option<RoomCfg> {
+    let SExpr::List(items) = cbcl_parser::parse(text).ok()? else {
+        return None;
+    };
+    match items.first()? {
+        SExpr::Atom(Atom::Symbol(symbol)) if symbol == "roomcfg" => {}
+        _ => return None,
+    }
+
+    let mut cfg = RoomCfg::absent();
+    let mut index = 1;
+    while index < items.len() {
+        let SExpr::Atom(Atom::Keyword(keyword)) = &items[index] else {
+            index += 1;
+            continue;
+        };
+        let value = items.get(index + 1);
+        match (keyword.as_str(), value) {
+            ("enc", Some(SExpr::Atom(Atom::Bool(enc)))) => cfg.enc = *enc,
+            ("enc", Some(SExpr::Atom(Atom::Symbol(word)))) => cfg.enc = word == "true",
+            ("dialects", Some(SExpr::List(entries))) => {
+                let mut declared = Vec::new();
+                for entry in entries {
+                    let SExpr::List(pair) = entry else { continue };
+                    let (Some(name), Some(digest)) =
+                        (atom_text(pair.first()), atom_text(pair.get(1)))
+                    else {
+                        continue;
+                    };
+                    declared.push(DeclaredDialect { name, digest });
+                }
+                cfg.declared = Some(declared);
+            }
+            _ => {}
+        }
+        index += 2;
+    }
+    Some(cfg)
+}
+
+/// The textual value of a string or symbol atom, if `expr` is one.
+fn atom_text(expr: Option<&SExpr>) -> Option<String> {
+    match expr {
+        Some(SExpr::Atom(Atom::Str(text))) | Some(SExpr::Atom(Atom::Symbol(text))) => {
+            Some(text.clone())
+        }
+        _ => None,
+    }
 }
 
 /// The exact payload bytes to sign and transmit. We validate that `text`
@@ -98,7 +184,7 @@ pub async fn create_chat_agent(
     claim_window: Duration,
     liveness_timeout: Duration,
     identity: Arc<ChatIdentity>,
-) -> Result<AgentHandle, ChatError> {
+) -> Result<(AgentHandle, Vec<String>), ChatError> {
     AgentStore::validate_advertisement(&dialects)
         .map_err(|error| ChatError::Store(error.to_string()))?;
     let (mut websocket, _response) = connect_async(ws_url.as_str())
@@ -128,7 +214,51 @@ pub async fn create_chat_agent(
     // this would hand back a "joined" handle the agent is not actually a member
     // of. On rejection or timeout the websocket drops here, before any store
     // entry exists — nothing to mark unhealthy or clean up.
-    await_join_ack(&mut websocket).await?;
+    let roomcfg = await_join_ack(&mut websocket).await?;
+
+    // REQ-008 (SPEC-016): the advertised set must be a subset of the channel's
+    // declared menu when one is conveyed. A hub that conveys no menu (today's
+    // cbcl-bus) soft-passes with an explicit warning — never silently.
+    let mut warnings = Vec::new();
+    match &roomcfg.declared {
+        None => warnings.push(format!(
+            "channel {channel} declares no dialect menu (legacy hub); --speak validation skipped"
+        )),
+        Some(menu) => {
+            for dialect in &dialects {
+                if !menu.iter().any(|entry| entry.name == *dialect) {
+                    return Err(ChatError::UndeclaredDialect {
+                        dialect: dialect.clone(),
+                        declared: menu.iter().map(|entry| entry.name.clone()).collect(),
+                    });
+                }
+            }
+            // REQ-005 acquisition-by-digest: blocked on the hub's
+            // fetch-by-digest endpoint (SPEC-015 REQ-005, not yet served by
+            // cbcl-bus). Until it lands, chosen dialects are advertised with
+            // base-level validation and the gap is surfaced, not hidden.
+            if !dialects.is_empty() {
+                warnings.push(format!(
+                    "definitions for {} cannot be acquired by digest yet (hub fetch pending); \
+                     advertising with base validation",
+                    dialects.join(", ")
+                ));
+            }
+        }
+    }
+
+    // REQ-006 (SPEC-016): announce ourselves so chat clients render this
+    // member as an agent (the agent treatment is *earned* by the announce
+    // performative, not inferable from the handle). Sent once, right after
+    // the join ack — a failure here is a failed join, not a silent
+    // plain-member fallback.
+    let announce = build_announce_frame(channel, agent_handle, &dialects);
+    let announce_payload = payload_bytes(&announce).map_err(ChatError::Hello)?;
+    let announce_frame = conn.sign_chat_frame(identity.as_ref(), &announce_payload);
+    websocket
+        .send(WsMessage::Binary(announce_frame.into()))
+        .await
+        .map_err(|error| ChatError::ConnectionFailed(error.to_string()))?;
 
     let handle = AgentHandle::generate();
     let (close_tx, close_rx) = oneshot::channel();
@@ -143,11 +273,20 @@ pub async fn create_chat_agent(
             Some(close_tx),
             Some(AgentSendChannel::new(send_tx)),
             Some(agent_handle.to_owned()), // the chat wire identity (@handle)
+            Some(channel.to_owned()),
         )
         .await
         .map_err(|error| ChatError::Store(error.to_string()))?;
 
-    let responder = Responder::new(agent_handle.to_owned(), channel.to_owned(), capability);
+    let responder = Responder::new(
+        agent_handle.to_owned(),
+        channel.to_owned(),
+        capability,
+        roomcfg
+            .declared
+            .as_ref()
+            .map(|menu| menu.iter().map(|entry| entry.name.clone()).collect()),
+    );
     spawn_receive_loop(ReceiveLoopArgs {
         store,
         handle: handle.clone(),
@@ -161,7 +300,20 @@ pub async fn create_chat_agent(
         conn,
     });
 
-    Ok(handle)
+    Ok((handle, warnings))
+}
+
+/// The agent's `announce` frame (SPEC-016 REQ-006): addressed to the channel
+/// (the first `@`-token is the signing audience), carrying the agent handle
+/// and its advertised dialects. Chat clients key the agent rendering off this
+/// performative.
+fn build_announce_frame(channel: &str, agent_handle: &str, dialects: &[String]) -> String {
+    let list = dialects
+        .iter()
+        .map(|dialect| format!("\"{}\"", dialect.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("(announce {channel} :agent {agent_handle} :dialects ({list}))")
 }
 
 /// Receive + parse the chat hub's conn-nonce bootstrap (its first frame:
@@ -231,7 +383,7 @@ enum ClaimTimer {
 /// one is a single `(error @room "slug")` with the socket left open. We consume
 /// only the acknowledging frame and leave any backfill/presence for the receive
 /// loop to enqueue.
-async fn await_join_ack(websocket: &mut ChatSocket) -> Result<(), ChatError> {
+async fn await_join_ack(websocket: &mut ChatSocket) -> Result<RoomCfg, ChatError> {
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
     loop {
         let message = match tokio::time::timeout_at(deadline, websocket.next()).await {
@@ -264,7 +416,12 @@ async fn await_join_ack(websocket: &mut ChatSocket) -> Result<(), ChatError> {
             _ => continue, // ping/pong/etc.
         };
         match frame_performative(&text).as_deref() {
-            Some("roomcfg") | Some("presence") => return Ok(()),
+            // A roomcfg carries the channel's config (enc + declared dialect
+            // menu, SPEC-015 CON-001); a presence-first ack conveys neither.
+            Some("roomcfg") => {
+                return Ok(parse_roomcfg(&text).unwrap_or_else(RoomCfg::absent));
+            }
+            Some("presence") => return Ok(RoomCfg::absent()),
             Some("error") => {
                 return Err(ChatError::JoinRejected(
                     error_slug(&text).unwrap_or_else(|| "unknown".to_owned()),
@@ -438,7 +595,49 @@ fn sanitize(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_part, error_slug, frame_performative, payload_bytes};
+    use super::{build_announce_frame, cap_part, error_slug, frame_performative, payload_bytes};
+
+    #[test]
+    fn parses_roomcfg_with_and_without_declared_dialects() {
+        // Legacy hub: no :dialects key → the menu is absent (None), which is
+        // different from a declared-empty menu (Some([])).
+        let cfg = super::parse_roomcfg("(roomcfg @demo :enc false)")
+            .expect("legacy roomcfg should parse");
+        assert!(!cfg.enc);
+        assert_eq!(cfg.declared, None);
+
+        let cfg = super::parse_roomcfg("(roomcfg @demo :enc true :dialects ())")
+            .expect("empty menu should parse");
+        assert!(cfg.enc);
+        assert_eq!(cfg.declared, Some(vec![]));
+
+        let cfg = super::parse_roomcfg(
+            r#"(roomcfg @demo :enc false :dialects (("cite" "abc123") ("vote" "def456")))"#,
+        )
+        .expect("menu should parse");
+        let declared = cfg.declared.expect("menu is present");
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].name, "cite");
+        assert_eq!(declared[0].digest, "abc123");
+        assert_eq!(declared[1].name, "vote");
+        assert_eq!(declared[1].digest, "def456");
+
+        // Not a roomcfg → None.
+        assert!(super::parse_roomcfg("(presence @demo :members ())").is_none());
+    }
+
+    #[test]
+    fn builds_announce_frame_with_channel_audience_and_dialects() {
+        assert_eq!(
+            build_announce_frame("@demo", "@aria", &["cite".to_owned(), "vote".to_owned()]),
+            r#"(announce @demo :agent @aria :dialects ("cite" "vote"))"#
+        );
+        // Advertising nothing is still a legible agent (HP-2 + REQ-006).
+        assert_eq!(
+            build_announce_frame("@demo", "@aria", &[]),
+            "(announce @demo :agent @aria :dialects ())"
+        );
+    }
 
     #[test]
     fn cap_part_is_empty_when_absent_or_blank() {

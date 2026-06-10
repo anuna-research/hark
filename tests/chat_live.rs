@@ -40,7 +40,7 @@ async fn signed_hello_is_accepted_by_live_hub() {
     // after the hub acknowledged the join with a roomcfg frame, which it does
     // only once it has verified the Ed25519 signature against the :key. A broken
     // signature would come back as ChatError::JoinRejected("bad-signature").
-    let handle = create_chat_agent(
+    let (handle, _warnings) = create_chat_agent(
         store.clone(),
         &ws_url,
         "@general",

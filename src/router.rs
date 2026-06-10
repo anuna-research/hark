@@ -85,6 +85,7 @@ pub async fn create_router_agent(
             Some(close_tx),
             Some(AgentSendChannel::new(send_tx)),
             None, // router derives its wire id from the local handle
+            None, // the router transport has no channel
         )
         .await
         .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;

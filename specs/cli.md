@@ -16,15 +16,21 @@ compose with ordinary Unix-style tools and agent harnesses:
 
 Local daemon routing key for an ephemeral agent instance.
 
-Commands that operate on an agent WebSocket connection require this variable
-for the MVP.
+**Optional since SPEC-016 REQ-003.** When set it always wins (multi-agent
+scripting); when unset, commands fall back to the **daemon-tracked active
+handle** — the most recently created, still-open agent. The `eval` ritual is
+gone: `hark init`/`hark join` followed by `hark recv` in the same (or any)
+shell just works. With neither an env var nor an active agent, commands fail
+with exit code `6`.
 
-Required by:
+Consulted by:
 
 * `recv`
 * `reply`
 * `error`
 * `progress`
+* `emit`
+* `dialect …`
 * `close`
 
 No daemon address or daemon-token environment variable is exported. Commands
@@ -115,6 +121,42 @@ Exit codes:
 
 * `0` - daemon stopped, was not running, or stale discovery state was cleaned
 * nonzero - daemon was running but could not be stopped cleanly
+
+### `join` (SPEC-016 REQ-002)
+
+`hark join <@channel> --as <@handle> [--speak d1,d2] [--cap <token>] [--hub <ws-url>]`
+
+The one-shot composition of `config init` + `daemon start` + `init` for a chat
+channel. From a clean machine it:
+
+1. scaffolds the config if absent, pointing `ws_url` at `--hub` or the public
+   chat hub (the `/chat/v1` path is the transport selector — the operator never
+   needs to know this, NFR-002);
+2. starts the daemon if needed (idempotent);
+3. joins `<@channel>` under `<@handle>`, advertising only the `--speak` subset
+   (omit it to advertise nothing), and emits `announce` so chat clients render
+   the member as an agent (REQ-006).
+
+`--speak` is validated against the channel's declared dialect menu when the
+hub conveys one in `roomcfg` (SPEC-015 CON-001): an undeclared dialect is a
+usage error naming the declared menu. A hub that conveys no menu produces an
+explicit warning on stderr, never a silent pass. The new agent becomes the
+session's active handle — no `eval`, no exported variable (REQ-003).
+
+Prints a single human-readable success line to stdout
+(`joined @channel as @handle · speaking: …`); warnings go to stderr.
+
+### `emit` (SPEC-016 REQ-004)
+
+`hark emit <text|cbcl>`
+
+The proactive plain-chat verb over the existing local-API `kind=emit` path.
+Plain text is wrapped into a valid CBCL `(tell @<channel> "<text>")` against
+the agent's joined chat channel; an input that already looks like a CBCL form
+(leading `(`) is validated (full R1–R5, no reply shape, `meta` refused) and
+sent as-is. The wire frame is always valid CBCL — there are no raw-text
+frames. Plain text on a router-transport agent (which has no channel) is a
+usage error suggesting a full CBCL form.
 
 ### `init`
 
@@ -431,7 +473,8 @@ on common failure modes:
 * `4` - daemon already running when invoking non-idempotent foreground
   `daemon run`
 * `5` - stale daemon state
-* `6` - missing `CBCL_AGENT_HANDLE`
+* `6` - no agent handle available (`CBCL_AGENT_HANDLE` unset **and** no
+  daemon-tracked active agent)
 * `7` - unknown, unhealthy, or busy agent handle
 * `8` - CBCL validation or command-kind validation failure, including R1–R5
   well-formedness failures on `dialect publish` and R5 runtime shape or
