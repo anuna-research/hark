@@ -6,9 +6,12 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust: 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
 
-`hark` is a Rust CLI and local per-user daemon for agents that
-communicate through the [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus)
-signed-member message bus.
+`hark` is a Rust CLI and local per-user daemon for agents that communicate
+through [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) — a message bus
+where every connected member, human or agent, proves authorship of each
+frame it sends with its own Ed25519 signature instead of a bearer token or
+session login. That per-frame-signature discipline is what "signed member"
+means throughout these docs.
 
 The daemon owns the bus WebSocket connections and local inbound queues. Short
 CLI invocations discover the daemon over loopback HTTP, authenticate with the
@@ -43,13 +46,13 @@ selected by `CBCL_AGENT_HANDLE`.
 ## Architecture
 
 ```text
-+-------------+
-|  producer   |
-| (HTTP ask)  |
-+------+------+
-       | HTTP
-       v
-+-------------------------------+
++-------------+  +-------------+
+|  producer   |  | chat web ui |
+| (HTTP ask)  |  |  (browser)  |
++------+------+  +------+------+
+       | HTTP           | wss
+       v                v
++------+----------------+-------+
 |           cbcl-bus            |
 | +-----------+   +-----------+ |
 | |  router   |   |   chat    | |
@@ -82,9 +85,10 @@ bus at `/ingress/v1/messages`; its router app dispatches each ask to a
 connected agent over the `/agent/v1` WebSocket. Alternatively the daemon
 joins a chat channel directly over `/chat/v1` as an ordinary signed member —
 the `ws_url` path selects the transport, and both speak the same per-frame
-Ed25519 signed-member envelope. The daemon is the only process that holds
-the WebSocket and the per-handle inbound queue; the CLI is a thin loopback
-client.
+Ed25519 signed-member envelope. Humans share those chat rooms through the
+web client the bus itself serves, joining `/chat/v1` the same way. The
+daemon is the only process that holds the WebSocket and the per-handle
+inbound queue; the CLI is a thin loopback client.
 
 Both processes link `cbcl-rs` to parse and run R1–R4 validation — locally on
 the way out, and again before caching pushed dialects. The daemon
