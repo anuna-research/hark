@@ -91,6 +91,12 @@ pub struct MlsSession {
     /// The wire identity (signs idkey/bye assertions — same key as the MLS
     /// leaf, different DS labels).
     wire_seed: [u8; 32],
+    /// The room roster from the last `presence` frame. Tracked so that when a
+    /// NEW handle appears we re-broadcast our own `idkey` (REQ-019) — the
+    /// hub fans an `idkey` only once at join, to then-connected members, so a
+    /// late joiner would otherwise never receive an earlier member's key and
+    /// could not pin it for the REQ-008 adder check.
+    present: std::collections::HashSet<String>,
 }
 
 impl MlsSession {
@@ -135,6 +141,7 @@ impl MlsSession {
             downgrade_refused: false,
             meta_path,
             wire_seed: wire.signing_seed(),
+            present: std::collections::HashSet::new(),
         };
 
         if let Some(meta) = meta {
@@ -266,6 +273,15 @@ impl MlsSession {
             self.handle
         ));
 
+        frames.push(self.own_idkey_frame()?);
+        Ok(frames)
+    }
+
+    /// Build this agent's self-signed `idkey` assertion frame (REQ-019),
+    /// bound to the current pin epoch. Broadcast at join and re-broadcast
+    /// whenever a new member appears in `presence`, so late joiners can pin
+    /// us for the REQ-008 adder check.
+    fn own_idkey_frame(&self) -> Result<String, MlsError> {
         let key = <[u8; 32]>::try_from(self.identity.public_key())
             .map_err(|_| MlsError::Rejected("identity key is not 32 bytes".into()))?;
         let nonce: u64 = self
@@ -275,15 +291,50 @@ impl MlsSession {
             .unwrap_or(0);
         let wire = ChatIdentity::from_seed(self.wire_seed);
         let sig = wire.sign(&idkey_signing_bytes(&self.handle, &key, &self.room, nonce));
-        frames.push(format!(
-            "(idkey {} :key \"{}\" :room {} :nonce {} :sig \"{}\")",
+        // Addressed to the ROOM (not the asserter's handle) so the hub's
+        // membership-gated fan delivers it to every member — the same
+        // contract `deliver`/`welcome` use. The asserter is in `:handle`; the
+        // signed context (handle, key, room, nonce) is unchanged.
+        Ok(format!(
+            "(idkey {} :handle {} :key \"{}\" :room {} :nonce {} :sig \"{}\")",
+            self.room,
             self.handle,
             B64.encode(key),
             self.room,
             nonce,
             B64.encode(sig)
-        ));
-        Ok(frames)
+        ))
+    }
+
+    /// A `keyget` for `target` (fetch their KeyPackage to add them).
+    fn keyget_frame(&self, target: &str) -> String {
+        format!("(keyget @hub :for {target} :from {})", self.handle)
+    }
+
+    /// If we are the elected owner, a `keyget` for each present member we
+    /// have a verified pin for but who is not yet in the group — the Add is
+    /// gated on having the pin (REQ-008), so this fires only once the
+    /// target's `idkey` has landed.
+    fn keygets_for_addable(&self) -> Vec<String> {
+        let Some(group) = self.group.as_ref() else {
+            return Vec::new();
+        };
+        if !is_owner(group, &self.identity).unwrap_or(false) {
+            return Vec::new();
+        }
+        let members: std::collections::HashSet<String> = group
+            .members()
+            .filter_map(|m| super::group::credential_handle(&m.credential).ok())
+            .collect();
+        self.present
+            .iter()
+            .filter(|h| {
+                **h != self.handle
+                    && !members.contains(*h)
+                    && self.pins.pinned(h).is_some()
+            })
+            .map(|h| self.keyget_frame(h))
+            .collect()
     }
 
     /// Operator intent (REQ-023 (b)): create the room's group — the agent is
@@ -356,11 +407,20 @@ impl MlsSession {
         }
     }
 
-    /// REQ-019: verify and pin from a fanned `idkey` assertion.
+    /// REQ-019: verify and pin from a fanned `idkey` assertion. Pinning a
+    /// newly-seen member is the event that unblocks adding them — so if we
+    /// are the elected owner and they are present, fetch their KeyPackage now
+    /// (this is what makes the add work regardless of whether the `idkey` or
+    /// the `presence` arrived first).
     fn on_idkey(&mut self, text: &str) -> SessionEvent {
-        let result = (|| -> Result<(), MlsError> {
-            let handle = head_target(text)
-                .ok_or_else(|| MlsError::Rejected("idkey missing handle".into()))?;
+        let result = (|| -> Result<String, MlsError> {
+            // The asserter is in `:handle` (the frame is addressed to the room
+            // so the hub fans it); ignore our own re-broadcast echo.
+            let handle = kw_symbol(text, ":handle")
+                .ok_or_else(|| MlsError::Rejected("idkey missing :handle".into()))?;
+            if handle == self.handle {
+                return Ok(handle);
+            }
             let key = kw_bytes32(text, ":key")
                 .ok_or_else(|| MlsError::Rejected("idkey missing :key".into()))?;
             let room = kw_symbol(text, ":room")
@@ -369,11 +429,13 @@ impl MlsSession {
             let sig = kw_b64(text, ":sig")
                 .ok_or_else(|| MlsError::Rejected("idkey missing :sig".into()))?;
             self.pins
-                .apply_idkey(&handle, &key, &room, nonce, &sig, &self.room)
-                .map(|_| ())
+                .apply_idkey(&handle, &key, &room, nonce, &sig, &self.room)?;
+            Ok(handle)
         })();
         match result {
-            Ok(()) => SessionEvent::Handled { outbound: vec![] },
+            Ok(_handle) => SessionEvent::Handled {
+                outbound: self.keygets_for_addable(),
+            },
             Err(e) => SessionEvent::Dropped {
                 reason: e.to_string(),
                 probable_fork: false,
@@ -542,25 +604,36 @@ impl MlsSession {
         }
     }
 
-    /// Presence may PROMPT an add decision (never a removal — REQ-014): when
-    /// we are the elected owner, fetch KeyPackages for present non-members.
+    /// Presence drives two things (never a removal — REQ-014):
+    /// 1. **idkey re-broadcast** — when a handle we haven't seen before
+    ///    appears, re-broadcast our own `idkey` (REQ-019). The hub fans an
+    ///    `idkey` only once at join to then-connected members, so without
+    ///    this a member that joined before us never receives our key and a
+    ///    member that joins after us is invisible to our join-time fan; the
+    ///    re-broadcast closes that delivery gap so both sides can pin.
+    /// 2. **add prompt** — if we are the elected owner, a `keyget` for each
+    ///    present member we have already pinned but not yet added. Members we
+    ///    cannot pin yet are skipped here and picked up in [`Self::on_idkey`]
+    ///    once their key lands, so the Add never races ahead of the pin.
     fn on_presence(&mut self, text: &str) -> SessionEvent {
-        let Some(group) = self.group.as_ref() else {
-            return SessionEvent::Handled { outbound: vec![] };
-        };
-        let am_owner = is_owner(group, &self.identity).unwrap_or_default();
-        if !am_owner {
+        if !self.enc_pinned {
             return SessionEvent::Handled { outbound: vec![] };
         }
-        let members: std::collections::HashSet<String> = group
-            .members()
-            .filter_map(|m| super::group::credential_handle(&m.credential).ok())
-            .collect();
-        let outbound = presence_handles(text)
-            .into_iter()
-            .filter(|h| !members.contains(h) && h != &self.handle)
-            .map(|h| format!("(keyget @hub :for {h} :from {})", self.handle))
-            .collect();
+        let roster = presence_handles(text);
+        let saw_new = roster
+            .iter()
+            .any(|h| h != &self.handle && !self.present.contains(h));
+        for h in &roster {
+            self.present.insert(h.clone());
+        }
+
+        let mut outbound = Vec::new();
+        if saw_new {
+            if let Ok(frame) = self.own_idkey_frame() {
+                outbound.push(frame);
+            }
+        }
+        outbound.extend(self.keygets_for_addable());
         SessionEvent::Handled { outbound }
     }
 
@@ -710,15 +783,6 @@ fn head_symbol(text: &str) -> Option<String> {
     }
 }
 
-/// The first @-symbol after the performative (e.g. the asserted handle of
-/// an idkey, the room of a deliver).
-fn head_target(text: &str) -> Option<String> {
-    parse_list(text)?.iter().skip(1).find_map(|item| match item {
-        SExpr::Atom(Atom::Symbol(s)) if s.starts_with('@') => Some(s.clone()),
-        _ => None,
-    })
-}
-
 /// The value following keyword `key`, as a raw SExpr.
 fn kw_value(text: &str, key: &str) -> Option<SExpr> {
     let items = parse_list(text)?;
@@ -862,11 +926,13 @@ mod tests {
         assert!(frames[0].contains(":onetime ("));
         assert!(cbcl_parser::parse(&frames[0]).is_ok(), "keypub parses");
 
-        // The idkey frame round-trips through a peer's pin store.
-        assert!(frames[1].starts_with("(idkey @aria"));
+        // The idkey frame is addressed to the room (so the hub fans it) and
+        // round-trips through a peer's pin store.
+        assert!(frames[1].starts_with("(idkey @research"));
+        assert!(frames[1].contains(":handle @aria"));
         let (peer_dir, _) = setup("joinframes-peer", 85, "@peer");
         let mut peer = PinStore::open(&peer_dir.join("peer.pins")).unwrap();
-        let handle = head_target(&frames[1]).unwrap();
+        let handle = kw_symbol(&frames[1], ":handle").unwrap();
         let key = kw_bytes32(&frames[1], ":key").unwrap();
         let room = kw_symbol(&frames[1], ":room").unwrap();
         let nonce = kw_u64(&frames[1], ":nonce").unwrap_or(0);
@@ -910,13 +976,21 @@ mod tests {
         // Alice creates the room's group (operator intent).
         alice.create_group_as_creator().unwrap();
 
-        // Presence prompts the owner to fetch bob's KeyPackage.
+        // Presence re-broadcasts alice's idkey (bob is newly seen) AND, since
+        // alice already pinned bob, prompts the owner to fetch bob's KeyPackage.
         let SessionEvent::Handled { outbound } =
             alice.handle_frame("(presence @research :members (@alice @bob))")
         else {
             panic!("presence handled")
         };
-        assert_eq!(outbound, vec!["(keyget @hub :for @bob :from @alice)".to_string()]);
+        assert!(
+            outbound.iter().any(|f| f == "(keyget @hub :for @bob :from @alice)"),
+            "owner fetches the pinned, present non-member's KeyPackage: {outbound:?}"
+        );
+        assert!(
+            outbound.iter().any(|f| f.contains(":handle @alice")),
+            "a newly-seen member triggers an idkey re-broadcast: {outbound:?}"
+        );
 
         // The hub answers with bob's published package (from his keypub).
         let bob_kp_b64 = {
@@ -990,6 +1064,106 @@ mod tests {
         // The offline REQ-024 surface reads the same state.
         let (nums, _) = offline_safety_numbers(&a_dir, "alice", "@research").unwrap();
         assert_eq!(nums.epoch, alice2.safety_numbers().unwrap().epoch);
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+    }
+
+    /// Late-joiner ordering (the live playtest bug): the creator/owner joins
+    /// AFTER the other member, so it never received that member's join-time
+    /// `idkey` fan and cannot pin them. Presence must re-broadcast idkey so
+    /// the peer re-announces, the owner pins them, and the Add then succeeds —
+    /// without this the group can never grow past the creator over the wire.
+    #[test]
+    fn owner_joining_after_peer_still_adds_via_idkey_rebroadcast() {
+        let (a_dir, a_wire) = setup("late", 94, "alice");
+        let (b_dir, b_wire) = setup("late", 95, "bob");
+        let mut alice =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
+        let mut bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
+
+        // Bob joins FIRST and broadcasts his idkey — but alice is not yet
+        // connected, so she never sees it (the hub fans it only to present
+        // members). Bob's join frames go nowhere alice can hear.
+        let _b_join = bob.join_frames().unwrap();
+        assert!(alice.pins.pinned("@bob").is_none(), "alice missed bob's join idkey");
+
+        // Alice joins, creates the group, and broadcasts her own idkey.
+        alice.create_group_as_creator().unwrap();
+        let a_join = alice.join_frames().unwrap();
+        // Bob hears alice's idkey and pins her.
+        assert!(matches!(
+            bob.handle_frame(&a_join[1]),
+            SessionEvent::Handled { .. }
+        ));
+
+        // The hub now broadcasts presence to both. Alice sees bob (new) and
+        // re-broadcasts her idkey; she still can't add him (no pin yet).
+        let SessionEvent::Handled { outbound: a_pres } =
+            alice.handle_frame("(presence @research :members (@alice @bob))")
+        else {
+            panic!("presence")
+        };
+        assert!(
+            a_pres.iter().any(|f| f.contains(":handle @alice")),
+            "alice re-broadcasts idkey on seeing bob"
+        );
+        assert!(
+            !a_pres.iter().any(|f| f.starts_with("(keyget")),
+            "alice cannot keyget bob yet — no pin"
+        );
+
+        // Bob sees presence too; bob (new owner-perspective aside) re-broadcasts
+        // his idkey, which is the frame alice was missing.
+        let SessionEvent::Handled { outbound: b_pres } =
+            bob.handle_frame("(presence @research :members (@alice @bob))")
+        else {
+            panic!("presence")
+        };
+        let bob_idkey = b_pres
+            .iter()
+            .find(|f| f.contains(":handle @bob"))
+            .expect("bob re-broadcasts his idkey on seeing alice");
+
+        // Alice receives bob's re-broadcast idkey → pins him → and because she
+        // is the owner and bob is present, immediately emits the keyget.
+        let SessionEvent::Handled { outbound: after_pin } = alice.handle_frame(bob_idkey) else {
+            panic!("idkey handled")
+        };
+        assert!(alice.pins.pinned("@bob").is_some(), "alice now pins bob");
+        assert!(
+            after_pin.iter().any(|f| f == "(keyget @hub :for @bob :from @alice)"),
+            "pinning bob unblocks the keyget: {after_pin:?}"
+        );
+
+        // Hub answers the keyget with bob's published one-time package.
+        let onetime = kw_value(&_b_join[0], ":onetime").unwrap();
+        let bob_kp_b64 = match onetime {
+            SExpr::List(items) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("onetime entry"),
+            },
+            _ => panic!("onetime list"),
+        };
+        let SessionEvent::Handled { outbound: add_out } =
+            alice.handle_frame(&format!("(keypkg @hub :for @bob :kp \"{bob_kp_b64}\")"))
+        else {
+            panic!("keypkg handled")
+        };
+        assert_eq!(add_out.len(), 2, "commit + welcome — the Add succeeded");
+
+        // Bob joins via the welcome; both now agree on a 2-member group.
+        let _ = bob.handle_frame(&add_out[0]);
+        assert!(matches!(
+            bob.handle_frame(&add_out[1]),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(bob.joined());
+        assert_eq!(
+            alice.safety_numbers().unwrap().identity,
+            bob.safety_numbers().unwrap().identity,
+            "both stacks agree on the membership safety number"
+        );
 
         let _ = fs::remove_dir_all(&a_dir);
         let _ = fs::remove_dir_all(&b_dir);
