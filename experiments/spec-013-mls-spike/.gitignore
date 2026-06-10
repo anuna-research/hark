@@ -2,6 +2,10 @@
 # Generated wasm artifact (rebuild with cross-stack/build-wasm.sh). Not committed —
 # it's a multi-MB binary derived from cbcl-mls-wasm at openmls 0.8.1.
 /cross-stack/wasm-node/
+# Generated R5-03 probe artifact (rebuild with cross-stack/build-genesis-wasm.sh).
+/cross-stack/genesis-wasm-node/
+/cross-stack/genesis-wasm/target/
+# genesis-wasm/Cargo.lock IS committed (same evidence rule as the root lock).
 node_modules/
 # Cargo.lock IS committed — this is an evidence-producing spike; the lock pins the
 # exact OpenMLS (0.8.1) that the recorded findings were observed against.

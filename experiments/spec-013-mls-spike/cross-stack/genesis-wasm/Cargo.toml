@@ -1,0 +1,33 @@
+# R5-03 genesis-extension wasm probe — SPIKE-LOCAL, not the shipped artifact.
+#
+# The REAL cbcl-mls-wasm cannot advertise the genesis-extension capability today —
+# that gap IS the R5-03 finding (a required affected-repo change, SPEC-013
+# REQ-016). This crate is the same pinned openmls 0.8 + wasm-bindgen 0.2.114 on
+# wasm32, mirroring the shipped glue's Provider/Identity/Group shapes, plus the
+# capability + genesis-read surface the real crate must gain. It exists ONLY so
+# the cross-stack positive leg can run pre-IMPL; it implements no primitive and
+# is not production code.
+[package]
+name = "genesis-wasm-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "=0.2.114"
+openmls = "0.8"
+openmls_rust_crypto = "0.5"
+openmls_basic_credential = "0.5"
+openmls_traits = "0.5"
+tls_codec = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+openmls = { version = "0.8", features = ["js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }

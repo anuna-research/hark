@@ -1,6 +1,7 @@
 # SPEC-013 §10 Experiment Spike — OpenMLS 0.8 oracle probes
 
-**Status:** complete — incl. the storage-pruning and cross-stack `.wasm` follow-ups.
+**Status:** complete — incl. the storage-pruning and cross-stack `.wasm` follow-ups,
+and the round-5 **R5-03 genesis-extension probe** (see below).
 **Gate-permitted:** isolated crate, detached from hark's build, no production code touched. This characterises the OpenMLS **primitive**
 (the test oracle) — it does **not** implement the gated SPEC-013 design.
 
@@ -57,6 +58,25 @@ node cross-stack/cross_stack.mjs
 - Result: **PASS** — the two stacks interoperate **both directions** at the pinned
   ciphersuite. This is the genuine cross-stack NFR-001 confirmation (native ⇄ the shipped
   `.wasm`, not native↔native). `src/bin/native_peer.rs` is the native side.
+
+## R5-03 genesis-extension probe (round 5) — REQ-016 durable delivery + the capabilities obligation
+
+Round 5 confirmed by **source reading** that the REQ-016 genesis-in-GroupContext mechanism
+works on openmls 0.8.1 but imposes an unstated leaf-capabilities obligation (R5-03); this
+probe converts that to **observed behaviour**. Native probes (`tests/genesis_extension.rs`,
+`cargo test --test genesis_extension -- --nocapture`) + a cross-stack leg
+(`cross-stack/build-genesis-wasm.sh` then `node cross-stack/genesis_probe.mjs`).
+
+| Probe | Observed | Consequence for the spec |
+|---|---|---|
+| `r5_03_genesis_roundtrip_with_capabilities` | With every leaf advertising `ExtensionType::Unknown(0xF013)`, a group created with genesis bytes in an `Unknown` GroupContext extension round-trips create→add→welcome→read: the joiner reads the bytes **pre-finalize** (`StagedWelcome::group_context()`) and post-join (`MlsGroup::extensions()`), byte-identical; the genesis survives a normal Commit unchanged; the group carries traffic. | **REQ-016's durable-delivery mechanism is implementable as specified.** The pre-finalize read is the inspection point a joiner needs before trusting the group. |
+| `r5_03_default_capability_joiner_fails_closed` | A default-capability KeyPackage (the shape the shipped `cbcl-mls-wasm` publishes today) is **rejected** at the committer: `CreateCommitError(ProposalValidationError(InsufficientCapabilities))` (valn0502). Membership unchanged. | The capabilities obligation REQ-016 states is **enforced by the primitive, fail-closed**: a stack that omits the capability cannot silently join a genesis-bearing group. |
+| `r5_03_default_capability_creator_observed` | **Method note:** `MlsGroup::new` ACCEPTS a default-capability creator with a genesis GC extension — creation does NOT fail; the group then **bricks on its first path-commit**: `CreateCommitError(LeafNodeValidation(UnsupportedExtensions))`. | The creator-side failure is **delayed**, not at creation: implementers MUST set `capabilities(...)` in the create config (as REQ-016 obliges), or the first add/commit fails. Worth an IMPL-013 negative test. |
+| `genesis_probe.mjs` leg 1 (REAL artifact) | Native rejected the **actually-shipped** `cbcl-mls-wasm` KeyPackage (`InsufficientCapabilities`) against a genesis-bearing group. | The required affected-repo change in `cbcl-chat` is load-bearing and its absence fails closed — observed against the real `.wasm`, not a stand-in. |
+| `genesis_probe.mjs` leg 2 (capability probe build) | A spike-local wasm32 build (`cross-stack/genesis-wasm/`, same pinned openmls 0.8.1 + wasm-bindgen 0.2.114, mirroring the shipped glue + the capability/genesis surface it must gain) was accepted, **joined the Welcome, read the genesis byte-identically**, and exchanged traffic wasm→native. | The positive cross-stack half holds on the actual wasm32 target. Honest scope: the shipped artifact **cannot** run this leg until the REQ-016 affected-repo change lands — that gap is the finding, not a probe shortcut. |
+
+**Net:** SPEC-013 v0.7.1's "feasibility-pending-verification" on the genesis mechanism is
+**cleared** — both halves observed (round-trip with capabilities; fail-closed without).
 
 ## What this spike still does NOT establish (carry to sign-off)
 

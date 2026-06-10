@@ -18,6 +18,24 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 pub const CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
+/// The application extension type the R5-03 probe pins for the REQ-016 genesis
+/// assertion. Any GREASE-free private-use value works; what matters is that every
+/// stack pins the SAME id and advertises it in leaf capabilities.
+pub const GENESIS_EXT_TYPE: u16 = 0xF013;
+
+/// Leaf capabilities advertising the genesis extension type (everything else
+/// default). This is the cross-repo obligation REQ-016 states: every member's
+/// leaf must carry it, or openmls 0.8.1 fails the Add/Welcome validation.
+pub fn genesis_capabilities() -> Capabilities {
+    Capabilities::new(
+        None,
+        None,
+        Some(&[ExtensionType::Unknown(GENESIS_EXT_TYPE)]),
+        None,
+        None,
+    )
+}
+
 /// A single member: an OpenMLS provider (RustCrypto + in-memory storage), a
 /// signature keypair, and a BasicCredential over a handle string. Mirrors
 /// `Provider` + `Identity` in the wasm binding.
@@ -69,6 +87,71 @@ impl Party {
         MlsGroup::new(&self.provider, &self.signer, &cfg, self.credential.clone())
             .expect("create group")
     }
+
+    /// R5-03 probe: create a group carrying `genesis` bytes in a pinned
+    /// `Unknown(GENESIS_EXT_TYPE)` GroupContext extension. `creator_capable`
+    /// controls whether the creator's own leaf advertises the extension type —
+    /// `false` probes where the missing-capability failure surfaces.
+    pub fn create_group_with_genesis(
+        &self,
+        genesis: &[u8],
+        creator_capable: bool,
+    ) -> Result<MlsGroup, String> {
+        let ext = Extension::Unknown(GENESIS_EXT_TYPE, UnknownExtension(genesis.to_vec()));
+        let exts = Extensions::single(ext).map_err(|e| format!("extensions: {e:?}"))?;
+        let mut builder = MlsGroupCreateConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .ciphersuite(CIPHERSUITE)
+            .with_group_context_extensions(exts);
+        if creator_capable {
+            builder = builder.capabilities(genesis_capabilities());
+        }
+        MlsGroup::new(&self.provider, &self.signer, &builder.build(), self.credential.clone())
+            .map_err(|e| format!("create group: {e:?}"))
+    }
+
+    /// A KeyPackage whose leaf capabilities advertise the genesis extension type —
+    /// what REQ-016 obliges every hark/web KeyPackage to publish.
+    pub fn key_package_with_genesis_capability(&self) -> Vec<u8> {
+        self.build_key_package(
+            KeyPackage::builder().leaf_node_capabilities(genesis_capabilities()),
+        )
+    }
+}
+
+/// R5-03 probe: join from Welcome bytes, reading the `Unknown(GENESIS_EXT_TYPE)`
+/// GroupContext extension at BOTH inspection points — pre-finalize from the
+/// `StagedWelcome` (what REQ-016 needs a joiner to verify before trusting the
+/// group) and post-join from the live group. Returns (group, pre_join_genesis,
+/// post_join_genesis).
+pub fn join_reading_genesis(
+    joiner: &Party,
+    welcome_bytes: &[u8],
+) -> Result<(MlsGroup, Option<Vec<u8>>, Option<Vec<u8>>), String> {
+    let msg = MlsMessageIn::tls_deserialize_exact(welcome_bytes)
+        .map_err(|e| format!("deserialize welcome: {e:?}"))?;
+    let welcome = match msg.extract() {
+        MlsMessageBodyIn::Welcome(w) => w,
+        _ => return Err("expected a Welcome".into()),
+    };
+    let cfg = MlsGroupJoinConfig::builder()
+        .use_ratchet_tree_extension(true)
+        .build();
+    let staged = StagedWelcome::new_from_welcome(&joiner.provider, &cfg, welcome, None)
+        .map_err(|e| format!("staged welcome: {e:?}"))?;
+    let pre = staged
+        .group_context()
+        .extensions()
+        .unknown(GENESIS_EXT_TYPE)
+        .map(|u| u.0.clone());
+    let group = staged
+        .into_group(&joiner.provider)
+        .map_err(|e| format!("into group: {e:?}"))?;
+    let post = group
+        .extensions()
+        .unknown(GENESIS_EXT_TYPE)
+        .map(|u| u.0.clone());
+    Ok((group, pre, post))
 }
 
 /// Validate + deserialize a published KeyPackage (the adder's view). Returns the
