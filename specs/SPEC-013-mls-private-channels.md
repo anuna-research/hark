@@ -3,13 +3,13 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: draft
 tier: 1
-version: 0.7.0
+version: 0.7.1
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings)
 last-updated: 2026-06-10
 owner-repo: hark
 affects-repos: cbcl-bus (web client + vendored cbcl-mls-wasm artifact), cbcl-chat (cbcl-mls-wasm crate)
-review-gate: not-approved — BLOCKED (rounds 1–2 folded into v0.3; v0.4 adds the Authentication Service design — ADR-006; v0.5 resolves OQ-004 + OQ-005 client-side — REQ-013/REQ-022; v0.6 folds round-3 cross-model findings; **v0.7 folds the round-4 confirmation review** — 1 Critical: the mode pin's hub-winnable first observation (REQ-023 rewritten — pin derives from the admission path, mode-TOFU removed); 3 High: removal evidence bound to Remove validation (REQ-014/REQ-017(d)), genesis honest-TOFU + durable GroupContext delivery (REQ-016), stable identity safety number split from the epoch state hash (REQ-021/REQ-024); plus the rotation ceremony + proposal allowlist (REQ-011/REQ-017(e)) and the bare-payload signer retired in the live tree 2026-06-10 (OQ-001). Round-4 confirmed R3-01/R3-02 closed. A **round-5 confirmation** of the v0.7 closures + human crypto sign-off remain to gate implementation — see docs/decisions/SPEC-013-round4-review-findings.md)
+review-gate: not-approved — BLOCKED (rounds 1–2 folded into v0.3; v0.4 adds the Authentication Service design — ADR-006; v0.5 resolves OQ-004 + OQ-005 client-side — REQ-013/REQ-022; v0.6 folds round-3 cross-model findings; **v0.7 folds the round-4 confirmation review**; **v0.7.1 folds the round-5 spec tightenings** — removal-evidence epoch freshness, creator eviction authority residual, genesis-extension capability requirements + spike, canonical safety-number encoding, and low-risk residual clarifications. Round-5 was cross-context but not cross-model; human crypto sign-off and the Principle-12 spot-check remain before implementation — see docs/decisions/SPEC-013-round5-review-findings.md)
 ---
 
 # SPEC-013 — hark MLS: Agents in Encrypted Private Channels
@@ -82,6 +82,12 @@ record**, not as requirements:
   binding the safety number to `epoch` made it **rotate on every Commit**, nullifying out-of-band
   comparison (R4-04, [[#REQ-021]]); the flagged key-rotation exception was undefined and non-leaf
   proposal types unhandled (R4-05, [[#REQ-011]]/[[#REQ-017]]).
+- **(round 5)** the v0.7 closures held as design intent, but four predicates were still too
+  implicit for implementation: removal evidence needed an exact live-epoch freshness check
+  ([[#REQ-014]]/[[#REQ-017]]), the creator fallback needed to document its unilateral eviction
+  authority ([[#REQ-014]]/[[#REQ-016]]), the durable genesis GroupContext extension needed
+  cross-stack OpenMLS capabilities and a probe ([[#REQ-016]]/[[#REQ-017]]/[[#10-experiment-spike]]),
+  and the identity safety number needed byte-exact canonical encoding ([[#REQ-021]]/[[#REQ-024]]).
 
 ## 2. Scope
 
@@ -219,9 +225,15 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   (R4-05). A member that **lost** K cannot rotate — recovery is **remove + re-add**
   ([[#REQ-014]] authorized removal, then a fresh [[#REQ-008]]-validated Add of the new key),
   which is deliberately membership-visible: it flips the [[#REQ-021]] identity safety number
-  rather than slipping a new key under a stable one. The residual first-contact gap is
-  [[#OQ-002]]. Trace: `[[#TEST-011]]`. *(Closes BUG-003; defines the rotation path R4-05
-  found dangling.)*
+  rather than slipping a new key under a stable one. This recovery path is only as available
+  as an authorized remover: the subject, the agent's `added_by` adder
+  ([[SPEC-016-agent-onboarding-dx#REQ-012]]), or the creator fallback in [[#REQ-014]].
+  *Compromised-key residual:* if current key K is compromised, the attacker can
+  cross-sign a formally valid rotation to attacker-controlled K'; this is inherent to
+  current-key compromise, and the mitigation is visibility, not prevention — the rotation
+  changes the [[#REQ-021]] identity safety number and must be re-compared. The residual
+  first-contact gap is [[#OQ-002]]. Trace: `[[#TEST-011]]`. *(Closes BUG-003; defines the
+  rotation path R4-05 found dangling; residuals tightened per R5-05.)*
 - **REQ-012 — App-bound Welcome validation (full-tree, pin-checked).** Before joining a
   group from a [[Welcome]], the agent SHALL verify it is bound to (a) **this** app
   room/channel, (b) an **authorised committer** (the elected owner for the current roster —
@@ -259,13 +271,28 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   domain-separation label** (e.g. `cbcl-mls-remove/v1`, the [[#REQ-019]] pattern, so it cannot
   be transplanted across rooms, groups, epochs, or targets), signed by one of:
   - **(a) the subject's pinned key** — a self-signed `bye` for a voluntary leave, which the
-    leaving client SHALL **fan to the room as evidence** (today's `bye` only drives local leave
-    + hub presence — `cbcl-chat-session-ws.lfe` — an affected-repo wire change); or
+    leaving client SHALL **fan to the room as evidence**. Because `bye` is a reserved hub
+    performative today, this is not just "add a new verb": implementation SHALL change the
+    reserved-verb interception so the verified payload and signature are preserved and fanned
+    room-wide as peer-verifiable evidence (today's `bye` only drives local leave + unsigned
+    hub presence — `cbcl-chat-session-ws.lfe` — an affected-repo wire change); or
   - **(b) an authorized remover's pinned key** — the agent's `added_by` adder
     ([[SPEC-016-agent-onboarding-dx#REQ-012]]) or, as the **liveness fallback** for a crashed
     member that can never sign a `bye`, the **room creator** (the [[#REQ-016]] genesis
-    principal). *(Liveness residual, documented: if the creator is itself gone, an unresponsive
-    member persists in the group until it is — availability-class, PROPOSED for sign-off.)*
+    principal). The creator fallback is **not mechanically restricted to crashed or
+    unresponsive members**: the creator can evict any member. This is an accepted
+    single-party membership-shrink authority only because the evidence is signed by the
+    creator's pinned key, attributable to that creator, and membership-visible via the
+    [[#REQ-021]] identity safety number; it does not let the creator add attacker keys or
+    break confidentiality by itself. *(Residuals, documented: if the creator is itself gone,
+    an unresponsive member persists in the group until an authorized remover is available —
+    availability-class; a malicious creator can unilaterally evict live members —
+    authority/integrity-class. Both are PROPOSED for sign-off.)*
+  The evidence epoch is the **current MLS group epoch before applying the Remove Commit**.
+  Evidence is valid only in that exact epoch: validators SHALL reject stale or future
+  evidence, with no tolerance window. A re-added member is a new leaf in a later epoch, so
+  any prior `bye` or remover evidence for the old leaf is invalid and cannot remove the
+  re-added member without fresh evidence.
   Every Remove proposal/Commit SHALL **carry or reference** this evidence so each member can
   verify it independently; verification is REQUIRED **at merge time by every validator**
   ([[#REQ-017]] clause (d)) — NOT only at the committer's decision — otherwise a malicious
@@ -286,8 +313,10 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   over the **MLS leaves**, and admitting a new member requires (a) a current MLS member
   (the room creator bootstraps — see below), (b) the addee's key validated
   ([[#REQ-008]]/[[#REQ-011]]/[[#REQ-017]]), and (c) a valid cap. The hub cannot **grow**
-  MLS membership it does not hold; it CAN **shrink** it only via the unsigned-presence path
-  closed by [[#REQ-014]]. **Bootstrap root of trust (honest about its limit).** The "room
+  MLS membership it does not hold; the hub alone cannot **shrink** MLS membership either,
+  because every Remove requires [[#REQ-014]] evidence. The design does, however, grant the
+  room creator a signed, attributable, membership-visible unilateral eviction authority as
+  documented in [[#REQ-014]]. **Bootstrap root of trust (honest about its limit).** The "room
   creator" SHALL be a concrete principal: the creator SHALL emit a **creator-signed
   group-genesis assertion** (the [[#REQ-019]] self-signed pattern:
   `(genesis @room :creator @h :group <group-id> :key K …)` signed by K). Its authority SHALL
@@ -306,7 +335,15 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   an application extension** (every [[Welcome]] then conveys it inside the MLS-authenticated
   object; it is immutable thereafter — [[#REQ-017]] clause (e)); room fan-out alone is
   insufficient (encrypted rooms have **no history/backfill** — `cbcl-chat-room.lfe` — and the
-  hub can drop a fanned frame). At channel `claim` the hub SHALL record a **creator handle**
+  hub can drop a fanned frame). **OpenMLS capabilities obligation:** the genesis extension
+  SHALL have a pinned application extension type, and every hark and web-client
+  (`cbcl-mls-wasm`) KeyPackage / leaf node SHALL advertise that type in its OpenMLS
+  `Capabilities`; group-creation configuration SHALL include the extension. A stack that
+  omits the capability must fail closed during Add/Welcome validation rather than silently
+  joining a group whose genesis extension it cannot process. This is a load-bearing
+  cross-repo requirement for both `hark` and `cbcl-mls-wasm`, and [[#10-experiment-spike]]
+  requires an explicit round-trip probe before IMPL-013 treats the mechanism as verified.
+  At channel `claim` the hub SHALL record a **creator handle**
   (today `cbcl-room` stores none — affected-repo change), but that record is **bookkeeping,
   not trust** — it is hub-asserted. The hub cannot fabricate MLS membership inside an
   established group, so it cannot create a divergent valid group **undetected** once pins +
@@ -348,15 +385,20 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   defence-in-depth**. Further: (d) **Remove evidence at merge** — a Remove proposal/Commit
   SHALL be merged only after verifying the [[#REQ-014]] removal-evidence object it carries or
   references (signature by the subject's or an authorized remover's pinned key; binding to
-  this room, group, epoch, and target); a Remove lacking valid evidence SHALL be rejected **by
-  every validator**, not only weighed by the committer (R4-02). And (e) **fail-closed proposal
-  allowlist** — ONLY Add, Update, and Remove proposals plus the committer's UpdatePath leaf,
-  each validated as above, are accepted; **every other proposal or external-join object** —
-  ReInit, PreSharedKey, GroupContextExtensions, ExternalInit/external Commits, and any future
-  proposal type — SHALL be **rejected** unless a spec revision defines explicit app-level
-  validation for it; in particular a GroupContextExtensions proposal that would alter the
-  [[#REQ-016]] genesis extension SHALL be rejected (the genesis is immutable). The current
-  wasm glue merges/stores protocol messages with **no** app checks
+  this room, group, target handle + current leaf, and the validator's **current epoch before
+  merge**); stale or future-epoch evidence SHALL be rejected, including any evidence from
+  before the target was removed and later re-added. A Remove lacking valid fresh evidence
+  SHALL be rejected **by every validator**, not only weighed by the committer (R4-02/R5-01).
+  And (e) **fail-closed proposal allowlist** — ONLY Add, Update, and Remove proposals plus the
+  committer's UpdatePath leaf, each validated as above, are accepted; **every other proposal or
+  external-join object** — ReInit, PreSharedKey, GroupContextExtensions, ExternalInit/external
+  Commits, and any future proposal type — SHALL be **rejected** unless a spec revision defines
+  explicit app-level validation for it; in particular a GroupContextExtensions proposal that
+  would alter the [[#REQ-016]] genesis extension SHALL be rejected (the genesis is immutable).
+  Validators SHALL also reject Adds/Welcomes/Updates whose leaf capabilities do not advertise
+  the pinned [[#REQ-016]] genesis-extension type, because openmls 0.8.1 treats that unknown
+  extension as a member capability requirement. The current wasm glue merges/stores protocol
+  messages with **no** app checks
   (`cbcl-mls-wasm/src/lib.rs`) — a defect this REQ corrects (R4-05). Commits SHALL originate
   from an **authorised committer** ([[#REQ-016]]); unauthorised or unvalidated proposals SHALL
   NOT be stored or merged. Trace: `[[#TEST-017]]`. *(Closes BUG-008; closes R3-07 — reopened
@@ -405,10 +447,23 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
     tree-level equivocation that preserves the membership set — invisible to (a) by
     construction — is caught **here**, paired with the [[#REQ-006]] signal (forked groups
     cannot decrypt each other's traffic).
-  A keys-only fingerprint remains insufficient (R3-13): (a) carries the group binding and the
-  handle↔key bindings; the tree-state property R3-13 demanded lives in (b). **Comparison
-  workflow:** compare (a) once at first contact and again whenever the client flags a
-  membership change or rotation; consult (b) only when investigating a fork signal. A mismatch
+  **Canonical encoding for (a):** the digest input SHALL be exactly:
+  `u32be(len("cbcl-mls-identity-safety/v1")) || "cbcl-mls-identity-safety/v1" ||
+  u32be(len(group_id_bytes)) || group_id_bytes || u32be(member_count) || members...`.
+  `group_id_bytes` are the MLS GroupId opaque bytes with no MLS TLS length prefix. Each member
+  entry is `u32be(len(handle_utf8)) || handle_utf8 || u32be(32) || ed25519_pubkey_bytes`,
+  where `handle_utf8` is the canonical CBCL handle string including `@`, encoded as UTF-8, and
+  `ed25519_pubkey_bytes` is the 32-byte raw verification key that [[#REQ-007]] also uses as
+  the leaf signature key. Members are sorted lexicographically by `handle_utf8` bytes, with
+  `ed25519_pubkey_bytes` as the tie-breaker. The identity safety-number bytes are
+  `SHA-256` of that frame; the human-facing representation SHALL be 64 lowercase hex
+  characters displayed as eight groups of eight separated by spaces (comparisons ignore
+  spaces and ASCII case). Implementations SHALL include a cross-stack test vector before
+  treating [[#REQ-024]] as satisfied. A keys-only fingerprint remains insufficient (R3-13):
+  (a) carries the group binding and the handle↔key bindings; the tree-state property R3-13
+  demanded lives in (b). **Comparison workflow:** compare (a) once at first contact and again
+  whenever the client flags a membership change or rotation; consult (b) only when
+  investigating a fork signal. A mismatch
   in either indicates hub equivocation / MITM / fork (the confirmation [[#REQ-006]] and
   [[#REQ-012]]'s all-first-contact path defer to). This is the first-contact mitigation
   alongside the invite anchor ([[#OQ-002]], [[#ADR-006]]). The agent surface is [[#REQ-024]].
@@ -431,7 +486,10 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   pinned encrypted SHALL be treated as a **downgrade attack**: the client SHALL **refuse to
   send** (fail closed) and surface the conflict — it SHALL NEVER fall back to emitting channel
   content as plaintext. A join into a channel believed private but whose mode the client cannot
-  pin from (a)/(b) SHALL also **fail closed** (no plaintext send). `roomcfg :enc true` on an
+  pin from (a)/(b) SHALL also **fail closed** (no plaintext send). This creates an accepted
+  availability cost: a legitimate returning human member on a fresh device or cleared storage
+  who no longer has an invite/cap must be re-invited or re-paired to re-derive the pin; the
+  client SHALL NOT guess plaintext to preserve convenience. `roomcfg :enc true` on an
   unpinned channel MAY trigger MLS bootstrap (encrypting is never the downgrade direction) but
   SHALL NOT serve as evidence of cleartext in any later conflict. The web client SHALL persist
   pins (local storage), noting persistence is best-effort — re-presenting the invite re-derives
@@ -455,7 +513,10 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
 - **NFR-001 — Wire-byte compatibility.** MLS objects SHALL serialise to bytes
   accepted by the web client's [[OpenMLS]] at the pinned ciphersuite
   `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` and [[RFC 9420]] (`Mls10`),
-  verified by a live cross-client roundtrip ([[#TEST-010]]).
+  verified by a live cross-client roundtrip ([[#TEST-010]]). App-level cryptographic
+  comparison surfaces that cross the hark/web boundary — especially the [[#REQ-021]]
+  identity safety number — SHALL also be byte-compatible under their pinned canonical
+  encodings, with shared test vectors.
 - **NFR-002 — No plaintext leak.** In an encrypted channel, no message *content*
   SHALL traverse the wire unencrypted, verified by frame inspection.
 - **NFR-003 — Guarantees preserved.** The [[#REQ-007|binding]] change SHALL NOT
@@ -571,11 +632,16 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   admin-rooted; key transparency is the documented strong-future. **Accepted residual** (for
   human sign-off): first-contact TOFU is winnable by an active hub until safety numbers are
   compared out-of-band — humans may never compare; agents structurally depend on [[#REQ-024]].
-  A **round-4 confirmation** must weigh whether that residual is acceptable for the threat
-  model now that the agent-AS over-claim is removed.
+  The [[#REQ-021]] identity number now has a pinned canonical encoding so this comparison can be
+  byte-identical across hark and the web client; the residual is user/process adherence, not an
+  encoding ambiguity.
 - **OQ-003 — Roster/committer authenticity — RESOLVED (PROPOSED, round-3).** Authority
   derives from the verifiable [[MLS]] ratchet tree, not hub presence ([[#REQ-016]]); the
-  concrete election mechanism + any web-client change are confirmed at round-3.
+  concrete election mechanism + any web-client change are confirmed at round-3. Round 5 adds
+  an explicit accepted residual for [[#REQ-014]]/[[#REQ-016]]: the room creator can
+  unilaterally evict any member, not only crashed members. That authority is key-attributable
+  and membership-visible via [[#REQ-021]], but it is still a single-party membership-shrink
+  power the human signer must accept.
 - **OQ-004 — KeyPackage replay defence — RESOLVED (PROPOSED, round-3).** Enforcement moves
   **client-side** (the directory is the untrusted hub): **delete-on-use** of the one-time
   init private key from memory + storage, a **consumed-`KeyPackageRef` ledger**, and
@@ -650,24 +716,34 @@ gap opened by the R3-13 fix. **v0.7.0 folds their dispositions:**
 - **R4-06 (Low) → [[#OQ-001]]** — the bare-payload signer **retired in the live tree
   2026-06-10**.
 
-What remains to gate implementation: a **round-5 confirmation** that v0.7.0's closures hold
-(focused re-review, fresh context — Principle 12) + a **human crypto sign-off**. Per
-[[PROTO-001]], before implementation:
+The **round-5 confirmation review ran** (findings:
+docs/decisions/SPEC-013-round5-review-findings.md). It found no surviving Critical and no
+surviving High confidentiality/authenticity hole, but it also carried a Principle-12 caveat:
+the reviewer was the same model family that folded v0.7, so independence is cross-context,
+not cross-model. **v0.7.1 folds the required pre-IMPL tightenings:**
 
-1. **Round-5 confirmation** of v0.7.0 — verify REQ-011/014/016/017/021/023/024 actually close
-   R4-01…R4-05 and that no new gap opened; weigh the newly documented residuals (the
-   creator-as-removal-authority liveness fallback; the hub-served-JS limit on web-client
-   pinning; the identity-number/state-hash detection split). The §10 spike evidence is an
-   input, not a substitute — it confirms the *primitive's* behaviour, not the spec's
-   app-level closures.
-2. **Human security/cryptography sign-off** resolving OQ-001…OQ-005 (the project
-   owner may give this, accepting the cross-model review as basis, as was done for
-   `cbcl-bus` `SPEC-012`). The OpenMLS 0.8 retention/lifetime/Update semantics the round-3
-   review flagged are now spike-confirmed; the signer must still confirm the **durable
-   provider's on-disk delete fidelity** (ADR-004) and the **`cbcl_ristretto` point-validation**
-   (SPEC-016 REQ-007) the spike did not cover.
-3. **AI Trust Boundary metadata** recorded for the synthesis trajectory (model,
-   prompts, drafts, adversarial findings).
+- **R5-01 → [[#REQ-014]]/[[#REQ-017]](d)** — removal evidence is fresh only for the exact
+  current pre-merge epoch; stale evidence cannot remove a re-added member.
+- **R5-02 → [[#REQ-014]]/[[#REQ-016]]/[[#OQ-003]]** — creator-as-removal-authority is documented
+  as unilateral eviction authority, not merely liveness recovery.
+- **R5-03 → [[#REQ-016]]/[[#REQ-017]]/[[#10-experiment-spike]]** — the genesis GroupContext
+  extension requires cross-stack OpenMLS capabilities and a pre-IMPL round-trip probe.
+- **R5-04 → [[#REQ-021]]/[[#REQ-024]]/[[#NFR-001]]** — the identity safety-number canonical
+  encoding, sort order, hash, and display representation are pinned.
+- **R5-05/R5-06/R5-07** — residual/scoping clarifications for compromised-key rotation,
+  `bye`'s reserved-verb implementation, and no-cap returning-member availability.
+
+What remains to gate implementation, per [[PROTO-001]]:
+
+1. **Human security/cryptography sign-off** resolving OQ-001…OQ-005 and explicitly accepting
+   the residuals now documented: first-contact TOFU, last-resort forward-secrecy loss, hub
+   fan-out/evidence-suppression availability, durable-provider on-disk delete fidelity,
+   `cbcl_ristretto` point validation, creator unilateral eviction, hub-served-JS limits,
+   the identity-number/state-hash detection split, and the R5-03 feasibility-pending spike.
+2. **Principle-12 spot-check** by a genuinely independent model or human cryptographer for at
+   least R5-01, R5-02, and R5-03, because the round-5 reviewer was not cross-model independent.
+3. **AI Trust Boundary metadata** recorded for the synthesis trajectory (model, prompts,
+   drafts, adversarial findings).
 
 ## 9. Verification Strategy (Phase 2 — to be detailed in IMPL-013)
 
@@ -685,18 +761,24 @@ Per the [[PROTO-001]] security-critical row, the test specification will select:
 - **Formal contracts**: pre/postconditions on add-member (reject-on-mismatch).
 - **Adversarial testing** + **live interop test**: a `hark` agent and a web client
   in one private channel exchanging encrypted messages ([[#TEST-010]]).
+- **Round-5 interop vectors**: a shared [[#REQ-021]] identity safety-number vector for hark
+  and the web client, plus a genesis-extension capabilities round-trip probe before IMPL-013
+  treats [[#REQ-016]] durable delivery as empirically verified.
 
 Each `REQ` gets requirement-targeted decomposition (positive / negative-input /
 negative-output) so failures attribute to a single clause.
 
-## 10. Experiment Spike (recommended, pre-IMPL)
+## 10. Experiment Spike (pre-IMPL)
 
-One genuine integration unknown warrants a timeboxed spike under Experiment
-Governance ([[PROTO-001]]) **before** committing IMPL-013: confirm that hark's
-native [[OpenMLS]] (at the pinned version) produces **wire-compatible** bytes with
-the web `cbcl-mls-wasm` artifact — a minimal create→add→welcome→encrypt→decrypt
-exchange between the two stacks. Isolated (no production writes); findings fold
-into [[#NFR-001]] and [[#ADR-003]].
+The initial OpenMLS interop spike is **DONE** (§8): hark-native OpenMLS and the
+web `cbcl-mls-wasm` artifact round-tripped create→add→welcome→encrypt→decrypt at the
+pinned ciphersuite. Round 5 adds one remaining timeboxed probe under Experiment
+Governance ([[PROTO-001]]) **before** committing IMPL-013: create a group with the
+[[#REQ-016]] genesis assertion in a pinned `Unknown`/application GroupContext extension,
+publish hark and `cbcl-mls-wasm` KeyPackages whose leaf capabilities advertise that
+extension type, and confirm cross-stack Add→Welcome→read succeeds while omitting the
+capability fails closed. Until this probe passes, the durable genesis mechanism is
+source-confirmed but **feasibility-pending-verification**.
 
 ## 11. Traceability
 

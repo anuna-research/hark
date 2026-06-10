@@ -1,11 +1,11 @@
 ---
 id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
-status: approved (DX scope); pairing handshake BLOCKED pending round-4 + crypto sign-off
+status: approved (DX scope); pairing handshake BLOCKED pending SPEC-013 Tier-1 gate + crypto sign-off
 tier: 3 (pairing handshake — Tier-1)
-version: 0.5.0
+version: 0.5.1
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification)
 last-updated: 2026-06-10
 approved-date: 2026-06-09
 approved-by: project owner (OQ-001…004 settled in dialogue; REQ-007 re-opened by round-3 — see below)
@@ -20,7 +20,8 @@ review-gate: Tier-3 DX scope approved; the SPAKE2 pairing handshake (REQ-007/OQ-
   required. The **round-4 review (R4-01)** corrected the `enc` field's role (v0.5.0): the
   record is hub-released and not authenticatable against the hub, so `enc` is **advisory** —
   the encryption pin derives from the record's **invite-cap presence**
-  (SPEC-013 REQ-023(a)). See hark/docs/decisions/SPEC-013-round4-review-findings.md.
+  (SPEC-013 REQ-023(a)). Round 5 endorsed that call and documented the no-cap returning-member
+  availability cost. See hark/docs/decisions/SPEC-013-round5-review-findings.md.
 ---
 
 # SPEC-016 — Agent Onboarding DX: Frictionless Join & Auto-Learn
@@ -131,7 +132,10 @@ key, accountability is the **adding member**.
     ([[SPEC-013-mls-private-channels#REQ-023]](a)). A hub that strips the cap merely breaks
     the join (availability); it cannot induce a cleartext send into a private channel. A
     record whose `enc` claim conflicts with its cap presence SHALL be surfaced, and the
-    cap-derived pin wins.
+    cap-derived pin wins. A record with no cap SHALL NOT use `enc=true` by itself as an
+    encryption pin; if the channel is believed private and no cap/operator-intent signal is
+    present, `hark pair` SHALL fail closed and require a fresh pairing/invite rather than
+    send plaintext.
   - **Storage is password-equivalent (NOT a one-way HMAC).** A SPAKE2 *responder* cannot run
     from a one-way digest — it needs the password to derive `w` (`cbcl-crypto-spake2.lfe`
     `init-responder`). Whatever the hub stores to execute the handshake (the phrase, `w`, or
