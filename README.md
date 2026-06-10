@@ -8,10 +8,8 @@
 
 `hark` is a Rust CLI and local per-user daemon for agents that communicate
 through [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) — a message bus
-where every connected member, human or agent, proves authorship of each
-frame it sends with its own Ed25519 signature instead of a bearer token or
-session login. That per-frame-signature discipline is what "signed member"
-means throughout these docs.
+where every member, human or agent, signs each frame with its own Ed25519
+key instead of using a bearer token (a "signed member").
 
 The daemon owns the bus WebSocket connections and local inbound queues. Short
 CLI invocations discover the daemon over loopback HTTP, authenticate with the
@@ -31,35 +29,20 @@ selected by `CBCL_AGENT_HANDLE`.
 ## What is CBCL?
 
 CBCL (a recursive acronym: *CBCL-Based Communication Language*) is the
-S-expression agent-communication language everything on the bus speaks. A
-message is a parenthesised form whose head is a **performative** — a typed
-speech act like `ask`, `tell`, `reply`, or `error` — correlated into
-conversations by a `:thread` key:
+S-expression language everything on the bus speaks. Each message is a
+**performative** — a typed speech act like `ask`, `tell`, `reply`, `error` —
+threaded into conversations by `:thread`:
 
 ```text
 (lang elf (reply "done" :thread "rcp-123"))
 ```
 
-Three properties of CBCL shape how hark works:
-
-* **Self-extension through dialects.** The language grows at runtime:
-  a dialect definition `(define <name> ...)` is itself a CBCL message, so
-  agents publish, query, and subscribe to new vocabularies over the same
-  wire they chat on (see [Dialect distribution](#dialect-distribution)).
-  The outer `(lang <name> ...)` wrapper names the dialect a message is
-  written in.
-* **Bounded, verifiable parsing.** The grammar is deliberately constrained
-  so messages parse deterministically and dialect definitions can be
-  verified mechanically before they are accepted.
-* **Layered validation (R1–R5).** Every message runs a pipeline: R1–R4
-  are structural and grammar checks, R5 is the behavioural layer — does
-  the message match its dialect's declared shape, and do its causal
-  predecessors exist in the thread? hark runs R1–R4 on the way out and in,
-  and the daemon adds R5 at the `/send` and `recv` boundaries.
-
-The reference implementation and formal write-up live in
-[`cbcl`](https://codeberg.org/anuna/cbcl); the Rust implementation hark
-links is [`cbcl-rs`](https://codeberg.org/anuna/cbcl-rs).
+The `(lang <name> ...)` wrapper names a **dialect**: CBCL self-extends at
+runtime, dialect definitions travelling as ordinary messages
+(see [Dialect distribution](#dialect-distribution)). Every message is
+validated in layers — R1–R4 structural/grammar, R5 behavioural (dialect
+shape + causal predecessors). Reference implementation:
+[`cbcl`](https://codeberg.org/anuna/cbcl).
 
 ## Related Projects
 
