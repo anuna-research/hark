@@ -798,6 +798,33 @@ async fn create_chat_transport_agent(
             None,
         )
     })?;
+    // SPEC-013 REQ-023: presenting a cap/invite IS joining a private (=>
+    // encrypted) channel — the mode is pinned encrypted BEFORE the first
+    // frame is sent. The session also resumes prior MLS state (REQ-009);
+    // a public channel with no prior state gets no session.
+    let cap_present = request
+        .cap
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let file_stem = chat_key_filename(wire_handle);
+    let mls = crate::mls::session::MlsSession::open_if_relevant(
+        &chat.identity_dir,
+        &file_stem,
+        &channel,
+        wire_handle,
+        &identity,
+        cap_present,
+    )
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "mls_state_unavailable",
+            format!("could not open the MLS session state: {error}"),
+            None,
+        )
+    })?;
     let handle = create_chat_agent(
         state.agents.clone(),
         &chat.ws_url,
@@ -808,6 +835,7 @@ async fn create_chat_transport_agent(
         chat.claim_window,
         chat.liveness_timeout,
         std::sync::Arc::new(identity),
+        mls,
     )
     .await
     .map_err(chat_error_to_api)?;
@@ -822,7 +850,7 @@ async fn create_chat_transport_agent(
 
 /// Map a wire handle to a key filename: strip the leading `@` and keep only
 /// filename-safe characters. Falls back to `agent` if nothing remains.
-fn chat_key_filename(handle: &str) -> String {
+pub(crate) fn chat_key_filename(handle: &str) -> String {
     let name: String = handle
         .trim_start_matches('@')
         .chars()
@@ -1781,6 +1809,15 @@ fn chat_error_to_api(error: ChatError) -> ApiError {
         ChatError::Store(message) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_dialect", message, None)
         }
+        ChatError::DowngradeRefused(message) => ApiError::new(
+            StatusCode::CONFLICT,
+            "encryption_downgrade_refused",
+            message,
+            Some(
+                "the hub claims this pinned-encrypted channel is cleartext; refusing to join                  (SPEC-013 REQ-023). Verify the hub and channel out of band."
+                    .to_owned(),
+            ),
+        ),
     }
 }
 

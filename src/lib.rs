@@ -10,6 +10,7 @@ pub mod dialect_cache;
 pub mod errors;
 pub mod identity;
 pub mod local_api;
+pub mod mls;
 pub mod router;
 pub mod selector;
 pub mod signed_frame;

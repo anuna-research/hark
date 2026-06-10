@@ -53,6 +53,7 @@ async fn exactly_one_of_two_agents_is_elected() {
         window,
         liveness,
         Arc::new(ChatIdentity::from_seed([11u8; 32])),
+        None,
     )
     .await
     .expect("agent A joins");
@@ -66,6 +67,7 @@ async fn exactly_one_of_two_agents_is_elected() {
         window,
         liveness,
         Arc::new(ChatIdentity::from_seed([12u8; 32])),
+        None,
     )
     .await
     .expect("agent B joins");
