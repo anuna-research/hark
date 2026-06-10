@@ -1,0 +1,316 @@
+;;;; IMPL-016 — SPEC-016 Agent Onboarding DX: plan of record.
+;;;; Owner repo: hark. Hub-side tasks live in cbcl-bus and are tracked here
+;;;; as external dependencies so readiness reasoning stays honest.
+
+(meta plan
+  (id "IMPL-016")
+  (title "Agent Onboarding DX — Frictionless Join & Auto-Learn")
+  (version "1.0.0")
+  (status "active")
+  (created "2026-06-10")
+  (author "agent:claude")
+  (spec "SPEC-016")
+  (description "Implement SPEC-016: hark emit/join/session-handle/announce/speak-validation/response-scoping/install (Tier-3, executable now); SPAKE2 pairing (Tier-1, gated on condition J ristretto audit + cbcl-bus hub work)."))
+
+;; ---------------------------------------------------------------- agents
+
+(given agent-claude-available)
+
+;; ---------------------------------------------------------------- facts
+
+;; Tier-1 gate state (SPEC-016 header, SPEC-013-tier1-signoff.md):
+;; the gate is cleared, but condition J binds IMPL-016 — the cbcl_ristretto
+;; point-validation audit must complete BEFORE the pairing handshake is coded.
+(given tier1-gate-cleared)
+(given condition-j-outstanding)
+
+;; Hub reality observed 2026-06-10 (cbcl-bus checkout):
+;; roomcfg carries only :enc — no SPEC-015 REQ-004 dialect menu yet;
+;; no pairing endpoint; web client DOES render the announce performative.
+(given discovered-hub-roomcfg-lacks-dialect-menu)
+(given discovered-hub-has-no-pairing-endpoint)
+(given discovered-web-client-renders-announce)
+
+;; ---------------------------------------------------------------- tasks
+
+(given task-emit)
+(given task-session-handle)
+(given task-join)
+(given task-announce)
+(given task-speak-validation)
+(given task-response-scoping)
+(given task-install)
+(given task-ristretto-audit)
+(given task-hub-pairing)
+(given task-pair-client)
+(given task-provenance)
+(given task-removal)
+
+(meta task-emit
+  (description "REQ-004/ADR-004: `hark emit <text|cbcl>` CLI verb over the existing kind=emit local-API path. Plain text wraps into a valid `(tell @channel \"<text>\")` (auto-threaded, escaped); a full CBCL form passes validate_for_emit as-is. cli.rs + local_api client.")
+  (acceptance "TEST-004: `hark emit \"hi\"` sends `(tell @<channel> \"hi\")` via kind=emit; full CBCL accepted unchanged; invalid CBCL rejected with cbcl_validation_failed; unit + integration tests green.")
+  (req "REQ-004"))
+
+(meta task-session-handle
+  (description "REQ-003/ADR-002: the daemon tracks the active agent handle per user session; recv/reply/error/progress/emit/dialect/close resolve the handle from the daemon when CBCL_AGENT_HANDLE is unset (env var still wins for multi-agent scripting). Drop the eval ritual.")
+  (acceptance "TEST-003: init → recv works in a fresh shell with no exported env var; explicit CBCL_AGENT_HANDLE overrides; daemon status shows the active handle; tests green.")
+  (req "REQ-003"))
+
+(meta task-join
+  (description "REQ-002/ADR-001: `hark join <@channel> --as <@handle> [--speak d1,d2] [--cap …]` composes config-scaffold (if absent) + daemon-start (if needed) + init in one command. No TOML edit, no eval, no /chat/v1 knowledge (NFR-002). Sets the daemon-tracked active handle.")
+  (acceptance "TEST-002: from a clean HOME, `hark join @demo --as @aria` scaffolds config, starts the daemon, joins, prints a human success line within 400ms of hub ack (NFR-003); omitting --speak advertises nothing; tests green.")
+  (req "REQ-002"))
+
+(meta task-announce
+  (description "REQ-006: on a chat-hub join, hark emits the `announce` performative (`(announce :agent @handle :dialects (…))`) so the web client renders it as an agent (teal + avatar). Client-side only — the web app already handles announce (app.js renderer).")
+  (acceptance "TEST-006: join to a mock hub produces exactly one announce frame after roomcfg ack, carrying the handle + advertised dialects; live test renders the agent treatment.")
+  (req "REQ-006"))
+
+(meta task-speak-validation
+  (description "REQ-008 + REQ-005 (hark side): parse the channel's declared `(name, digest)` menu from roomcfg when present; reject any --speak dialect not declared; acquire chosen-but-unknown definitions by digest; advertise only the chosen subset. When the hub conveys no menu (current cbcl-bus), warn that the channel declares nothing and treat the declared set as absent (validation soft-passes with a warning, never silently).")
+  (acceptance "TEST-005/TEST-008: declared menu present → undeclared --speak rejected, chosen-unknown acquired by digest with digest verification; menu absent → explicit warning; never learns the whole menu; tests green against mock roomcfg frames.")
+  (req "REQ-005 REQ-008"))
+
+(meta task-response-scoping
+  (description "REQ-009: in a channel the chat responder answers asks only in dialects BOTH declared by the channel AND in the agent's repertoire; empty declared set → empty response scope. Keyed off the parsed roomcfg menu.")
+  (acceptance "TEST-009: ask in declared∩repertoire answered; ask in repertoire-but-undeclared ignored; empty declared set answers nothing; tests green.")
+  (req "REQ-009"))
+
+(meta task-install
+  (description "REQ-001/ADR-006: platform-detecting scripts/install.sh (darwin-arm64/darwin-x64/linux-x64/linux-arm64) fetching a release binary from https://files.anuna.io/hark/, plus a `make dist` target producing the per-platform artifacts. Publishing to files.anuna.io is an operator step documented in the script header.")
+  (acceptance "TEST-001: shellcheck-clean install.sh; platform detection unit-tested (sh function table); `make dist` builds a release binary; README install section updated.")
+  (req "REQ-001"))
+
+(meta task-ristretto-audit
+  (description "Condition J (Tier-1, binding): point-validation audit of cbcl_ristretto (cbcl-bus c_src/cbcl_ristretto.c) — identity/small-order/non-canonical encoding rejection at every point-decode used by cbcl-crypto-spake2. Produces docs/decisions/SPEC-013-condition-J-ristretto-audit.md; requires human crypto sign-off to close.")
+  (acceptance "Audit document enumerating every decode path with verdicts + tests; human sign-off recorded. Until then the pairing handshake MUST NOT be implemented.")
+  (req "REQ-007")
+  (tier "1"))
+
+(meta task-hub-pairing
+  (description "EXTERNAL (cbcl-bus): web 'add agent' mints the pairing record {name, channel, enc, invite-cap, adder, dialects, exp} + 4-word BIP39 phrase; hub runs the SPAKE2 responder with pairing-specific transcript constants (idB cbcl-chat-pair:hub_id, own HKDF salt/info, 4-word encoding); single-use + TTL + N=3 failed-MAC deletion + rate limiting; record released bound to K.")
+  (acceptance "Hub endpoint live with the R3-03/R3-04 controls; cbcl-bus tests green. Tracked here; executed in the cbcl-bus repo.")
+  (req "REQ-007"))
+
+(meta task-pair-client
+  (description "REQ-007/REQ-011 (hark side, Tier-1): `hark pair \"<phrase>\"` — BIP39 phrase decode, SPAKE2 initiator (RFC 9382, pairing transcript constants), verify the K-bound record, derive the encryption pin from invite-cap PRESENCE (enc field advisory, R4-01; no cap + believed-private → fail closed), join under the adder-set name (--as overrides), install dialects by digest.")
+  (acceptance "TEST-007/TEST-011: property + adversarial tests (wrong phrase fails, tampered record fails MAC, cap-stripped record fails join but never sends plaintext, enc/cap conflict surfaced with cap winning); joins under the record name; Tier-1 review trail attached.")
+  (req "REQ-007 REQ-011")
+  (tier "1"))
+
+(meta task-provenance
+  (description "EXTERNAL (cbcl-bus): REQ-010 — membership records added_by (pairing minter / inviting member); roster displays 'aria · added by @mira'.")
+  (acceptance "TEST-010: roster shows added-by; provenance persisted per channel.")
+  (req "REQ-010"))
+
+(meta task-removal
+  (description "EXTERNAL (cbcl-bus): REQ-012/ADR-007 — agent de-listable only by its added_by member; orphaned agents persist (reclamation deferred).")
+  (acceptance "TEST-012: removal by adder succeeds; removal by non-adder rejected; orphan persists.")
+  (req "REQ-012"))
+
+;; ---------------------------------------------------------- readiness
+
+(normally r-ready-emit task-emit ready-emit)
+(normally r-ready-session-handle task-session-handle ready-session-handle)
+(normally r-ready-install task-install ready-install)
+(normally r-ready-ristretto-audit task-ristretto-audit ready-ristretto-audit)
+
+(normally r-ready-join
+  (and task-join completed-session-handle)
+  ready-join)
+(meta r-ready-join
+  (description "join sets/uses the daemon-tracked active handle, so the no-eval mechanism must exist first")
+  (justification "ADR-001 composes over ADR-002; REQ-002 forbids the eval ritual"))
+
+(normally r-ready-announce
+  (and task-announce completed-join)
+  ready-announce)
+(normally r-ready-speak-validation
+  (and task-speak-validation completed-join)
+  ready-speak-validation)
+(normally r-ready-response-scoping
+  (and task-response-scoping completed-speak-validation)
+  ready-response-scoping)
+(meta r-ready-response-scoping
+  (description "scoping consumes the parsed declared-dialect set produced by speak-validation")
+  (justification "REQ-009 intersects the channel's declared set with the repertoire"))
+
+(normally r-ready-hub-pairing
+  (and task-hub-pairing completed-ristretto-audit)
+  ready-hub-pairing)
+(normally r-ready-pair-client
+  (and task-pair-client completed-ristretto-audit completed-hub-pairing)
+  ready-pair-client)
+(meta r-ready-pair-client
+  (description "condition J blocks the handshake; the hub responder + record minting must exist to pair against")
+  (justification "SPEC-013 tier-1 sign-off condition J binds IMPL-016's handshake implementation"))
+
+(normally r-ready-provenance
+  (and task-provenance completed-hub-pairing)
+  ready-provenance)
+(normally r-ready-removal
+  (and task-removal completed-provenance)
+  ready-removal)
+
+;; ---------------------------------------------------------- assignment
+
+(normally r-assign-emit (and ready-emit agent-claude-available) assign-to-emit-claude)
+(normally r-assign-session-handle (and ready-session-handle agent-claude-available) assign-to-session-handle-claude)
+(normally r-assign-join (and ready-join agent-claude-available) assign-to-join-claude)
+(normally r-assign-announce (and ready-announce agent-claude-available) assign-to-announce-claude)
+(normally r-assign-speak-validation (and ready-speak-validation agent-claude-available) assign-to-speak-validation-claude)
+(normally r-assign-response-scoping (and ready-response-scoping agent-claude-available) assign-to-response-scoping-claude)
+(normally r-assign-install (and ready-install agent-claude-available) assign-to-install-claude)
+(normally r-assign-ristretto-audit (and ready-ristretto-audit agent-claude-available) assign-to-ristretto-audit-claude)
+
+(claims agent:claude
+  :at "2026-06-10T13:13:08Z"
+  (given claim-v1-emit)
+  (normally r-cl-state-v1-emit claim-v1-emit state-claimed-v1-emit)
+  (normally r-cl-chain-v1-emit state-claimed-v1-emit claimed-emit)
+)
+
+(claims agent:claude
+  :at "2026-06-10T13:13:08Z"
+  (given claim-v1-install)
+  (normally r-cl-state-v1-install claim-v1-install state-claimed-v1-install)
+  (normally r-cl-chain-v1-install state-claimed-v1-install claimed-install)
+)
+
+(claims agent:claude
+  :at "2026-06-10T13:13:08Z"
+  (given claim-v1-ristretto-audit)
+  (normally r-cl-state-v1-ristretto-audit claim-v1-ristretto-audit state-claimed-v1-ristretto-audit)
+  (normally r-cl-chain-v1-ristretto-audit state-claimed-v1-ristretto-audit claimed-ristretto-audit)
+)
+
+;; Propagation rules: failures in 'ristretto-audit' block downstream tasks
+(normally r-propagate-hub-pairing-from-ristretto-audit-failed failed-ristretto-audit upstream-blocked-hub-pairing)
+(normally r-propagate-hub-pairing-from-ristretto-audit-permanently-failed permanently-failed-ristretto-audit upstream-blocked-hub-pairing)
+(normally r-propagate-hub-pairing-from-ristretto-audit-stale-v1 stale-v1-ristretto-audit upstream-blocked-hub-pairing)
+(normally r-propagate-hub-pairing-from-ristretto-audit-timeout-v1 timeout-v1-ristretto-audit upstream-blocked-hub-pairing)
+(normally r-propagate-hub-pairing-from-ristretto-audit-blocked upstream-blocked-ristretto-audit upstream-blocked-hub-pairing)
+(normally r-propagate-pair-client-from-ristretto-audit-failed failed-ristretto-audit upstream-blocked-pair-client)
+(normally r-propagate-pair-client-from-ristretto-audit-permanently-failed permanently-failed-ristretto-audit upstream-blocked-pair-client)
+(normally r-propagate-pair-client-from-ristretto-audit-stale-v1 stale-v1-ristretto-audit upstream-blocked-pair-client)
+(normally r-propagate-pair-client-from-ristretto-audit-timeout-v1 timeout-v1-ristretto-audit upstream-blocked-pair-client)
+(normally r-propagate-pair-client-from-ristretto-audit-blocked upstream-blocked-ristretto-audit upstream-blocked-pair-client)
+
+;; Transitive propagation: upstream-blocked cascades through dependency chain
+(normally r-propagate-pair-client-from-hub-pairing-blocked upstream-blocked-hub-pairing upstream-blocked-pair-client)
+(normally r-propagate-provenance-from-hub-pairing-blocked upstream-blocked-hub-pairing upstream-blocked-provenance)
+(normally r-propagate-removal-from-provenance-blocked upstream-blocked-provenance upstream-blocked-removal)
+
+(claims agent:claude
+  :at "2026-06-10T13:32:48Z"
+  (given completed-emit))
+
+(claims agent:claude
+  :at "2026-06-10T13:32:48Z"
+  (given completed-install))
+
+(claims agent:claude
+  :at "2026-06-10T13:32:48Z"
+  (given discovered-preexisting-mock-router-suites-broken-by-spec012-now-fixed))
+
+(claims agent:claude
+  :at "2026-06-10T13:32:48Z"
+  (given discovered-ristretto-audit-no-blocking-findings))
+
+(claims agent:claude
+  :at "2026-06-10T13:32:48Z"
+  (given block-v1-ristretto-audit)
+  (normally r-bl-state-v1-ristretto-audit block-v1-ristretto-audit state-blocked-v1-ristretto-audit)
+  (normally r-bl-chain-v1-ristretto-audit state-blocked-v1-ristretto-audit blocked-ristretto-audit)
+)
+
+(claims agent:claude
+  :at "2026-06-10T13:32:48Z"
+  (given claim-v1-session-handle)
+  (normally r-cl-state-v1-session-handle claim-v1-session-handle state-claimed-v1-session-handle)
+  (normally r-cl-chain-v1-session-handle state-claimed-v1-session-handle claimed-session-handle)
+)
+
+;; Propagation rules: failures in 'session-handle' block downstream tasks
+(normally r-propagate-join-from-session-handle-failed failed-session-handle upstream-blocked-join)
+(normally r-propagate-join-from-session-handle-permanently-failed permanently-failed-session-handle upstream-blocked-join)
+(normally r-propagate-join-from-session-handle-stale-v1 stale-v1-session-handle upstream-blocked-join)
+(normally r-propagate-join-from-session-handle-timeout-v1 timeout-v1-session-handle upstream-blocked-join)
+(normally r-propagate-join-from-session-handle-blocked upstream-blocked-session-handle upstream-blocked-join)
+
+;; Transitive propagation: upstream-blocked cascades through dependency chain
+(normally r-propagate-announce-from-join-blocked upstream-blocked-join upstream-blocked-announce)
+(normally r-propagate-speak-validation-from-join-blocked upstream-blocked-join upstream-blocked-speak-validation)
+(normally r-propagate-response-scoping-from-speak-validation-blocked upstream-blocked-speak-validation upstream-blocked-response-scoping)
+
+(claims agent:claude
+  :at "2026-06-10T13:41:05Z"
+  (given completed-session-handle))
+
+(claims agent:claude
+  :at "2026-06-10T13:41:05Z"
+  (given claim-v1-join)
+  (normally r-cl-state-v1-join claim-v1-join state-claimed-v1-join)
+  (normally r-cl-chain-v1-join state-claimed-v1-join claimed-join)
+)
+
+;; Propagation rules: failures in 'join' block downstream tasks
+(normally r-propagate-announce-from-join-failed failed-join upstream-blocked-announce)
+(normally r-propagate-announce-from-join-permanently-failed permanently-failed-join upstream-blocked-announce)
+(normally r-propagate-announce-from-join-stale-v1 stale-v1-join upstream-blocked-announce)
+(normally r-propagate-announce-from-join-timeout-v1 timeout-v1-join upstream-blocked-announce)
+(normally r-propagate-speak-validation-from-join-failed failed-join upstream-blocked-speak-validation)
+(normally r-propagate-speak-validation-from-join-permanently-failed permanently-failed-join upstream-blocked-speak-validation)
+(normally r-propagate-speak-validation-from-join-stale-v1 stale-v1-join upstream-blocked-speak-validation)
+(normally r-propagate-speak-validation-from-join-timeout-v1 timeout-v1-join upstream-blocked-speak-validation)
+
+(claims agent:claude
+  :at "2026-06-10T13:49:00Z"
+  (given completed-join))
+
+(claims agent:claude
+  :at "2026-06-10T13:49:00Z"
+  (given claim-v1-announce)
+  (normally r-cl-state-v1-announce claim-v1-announce state-claimed-v1-announce)
+  (normally r-cl-chain-v1-announce state-claimed-v1-announce claimed-announce)
+)
+
+(claims agent:claude
+  :at "2026-06-10T13:49:00Z"
+  (given claim-v1-speak-validation)
+  (normally r-cl-state-v1-speak-validation claim-v1-speak-validation state-claimed-v1-speak-validation)
+  (normally r-cl-chain-v1-speak-validation state-claimed-v1-speak-validation claimed-speak-validation)
+)
+
+;; Propagation rules: failures in 'speak-validation' block downstream tasks
+(normally r-propagate-response-scoping-from-speak-validation-failed failed-speak-validation upstream-blocked-response-scoping)
+(normally r-propagate-response-scoping-from-speak-validation-permanently-failed permanently-failed-speak-validation upstream-blocked-response-scoping)
+(normally r-propagate-response-scoping-from-speak-validation-stale-v1 stale-v1-speak-validation upstream-blocked-response-scoping)
+(normally r-propagate-response-scoping-from-speak-validation-timeout-v1 timeout-v1-speak-validation upstream-blocked-response-scoping)
+
+(claims agent:claude
+  :at "2026-06-10T13:51:22Z"
+  (given completed-announce))
+
+(claims agent:claude
+  :at "2026-06-10T14:00:05Z"
+  (given decided-menu-absent-warns-and-advertises))
+
+(claims agent:claude
+  :at "2026-06-10T14:00:05Z"
+  (given discovered-hub-lacks-dialect-fetch-by-digest))
+
+(claims agent:claude
+  :at "2026-06-10T14:00:05Z"
+  (given completed-speak-validation))
+
+(claims agent:claude
+  :at "2026-06-10T14:00:05Z"
+  (given claim-v1-response-scoping)
+  (normally r-cl-state-v1-response-scoping claim-v1-response-scoping state-claimed-v1-response-scoping)
+  (normally r-cl-chain-v1-response-scoping state-claimed-v1-response-scoping claimed-response-scoping)
+)
+
+(claims agent:claude
+  :at "2026-06-10T14:03:11Z"
+  (given completed-response-scoping))
