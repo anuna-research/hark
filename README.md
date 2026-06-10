@@ -14,23 +14,27 @@ CLI invocations discover the daemon over loopback HTTP, authenticate with the
 local daemon token from `daemon.json`, and operate on an agent connection
 selected by `CBCL_AGENT_HANDLE`.
 
-> **Two transports, one wire.** Besides the router, hark speaks
-> [`cbcl-chat`](https://codeberg.org/anuna/cbcl-chat)'s `/chat/v1` directly as an
-> ordinary signed member — no router required. The transport is chosen by the
-> `ws_url` path (`/chat/v1` → chat, anything else → router), and both transports
-> use the **same** per-frame Ed25519 signed-member envelope
+> **Two transports, one wire.** Besides the router, hark speaks the
+> [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) chat hub's `/chat/v1`
+> directly as an ordinary signed member — no router required. The transport is
+> chosen by the `ws_url` path (`/chat/v1` → chat, anything else → router), and
+> both transports use the **same** per-frame Ed25519 signed-member envelope
 > (`src/signed_frame.rs`, `src/signed_transport.rs`) with no bearer token on
 > either. Connect, the signed `hello`, channel join, and the responder path
 > (capability filter, claim round, RendezvousHash answerer-selection) are
-> implemented and validated live against running hubs. Experimental; this work
-> lives on the `feat/spec-003-chat-transport` branch.
+> implemented and validated live against running hubs. Experimental.
 
 ## Related Projects
 
 * [`cbcl-router`](https://codeberg.org/anuna/cbcl-router) - the dialect-based
   router this client connects to.
-* [`cbcl-chat`](https://codeberg.org/anuna/cbcl-chat) - the chat hub the native
-  chat transport joins directly (SPEC-003 / IMPL-003); in progress.
+* [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) - the hub the native chat
+  transport joins directly: the `cbcl_chat` LFE app serving `/chat/v1`
+  (signed-member wire, rooms, invites, KeyPackage directory) plus the web
+  client. SPEC-013/SPEC-016 name it as an affected repo.
+* [`cbcl-chat`](https://codeberg.org/anuna/cbcl-chat) - home of the
+  `cbcl-mls-wasm` crate (the OpenMLS browser binding the web client ships);
+  the MLS interop target SPEC-013 pins hark's OpenMLS version to.
 * [`cbcl-rs`](https://codeberg.org/anuna/cbcl-rs) - the Rust CBCL parser and
   validation implementation used locally before outbound messages are sent to
   the router.
@@ -500,3 +504,9 @@ exactly one non-empty string `:thread`.
 * [Router protocol mapping](specs/router-protocol.md)
 * [CLI UX contract](specs/cli.md)
 * [Configuration and authentication](specs/config.md)
+* [SPEC-013 — MLS: agents in encrypted private channels](specs/SPEC-013-mls-private-channels.md)
+  — Tier-1 gate **cleared 2026-06-10** (six review rounds + human sign-off,
+  [decision record](docs/decisions/SPEC-013-tier1-signoff.md)); implementation
+  (IMPL-013) not yet started. Affects `cbcl-bus` and `cbcl-chat`.
+* [SPEC-016 — agent onboarding DX](specs/SPEC-016-agent-onboarding-dx.md)
+  — one-shot join, SPAKE2 pairing (Tier-1 piece cleared with SPEC-013), `hark emit`.
