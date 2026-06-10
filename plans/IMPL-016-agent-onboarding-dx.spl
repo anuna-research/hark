@@ -314,3 +314,25 @@
 (claims agent:claude
   :at "2026-06-10T14:03:11Z"
   (given completed-response-scoping))
+
+(claims agent:claude
+  :at "2026-06-10T21:34:00Z"
+  (given unblock-v2-ristretto-audit)
+  (normally r-ubl-state-v2-ristretto-audit unblock-v2-ristretto-audit state-unblocked-v2-ristretto-audit)
+  (normally r-ubl-cancel-v1-ristretto-audit unblock-v2-ristretto-audit (not state-blocked-v1-ristretto-audit))
+  (prefer r-ubl-cancel-v1-ristretto-audit r-bl-state-v1-ristretto-audit)
+  (normally r-ubl-unblocked-v2-ristretto-audit unblock-v2-ristretto-audit (not blocked-ristretto-audit))
+  (prefer r-ubl-unblocked-v2-ristretto-audit r-bl-chain-v1-ristretto-audit)
+)
+
+(claims agent:claude
+  :at "2026-06-10T21:34:00Z"
+  (given condition-j-signed-off-2026-06-11))
+
+(claims agent:claude
+  :at "2026-06-10T21:34:00Z"
+  (given decided-j-a-and-j-b-ride-into-pair-implementation))
+
+(claims agent:claude
+  :at "2026-06-10T21:34:00Z"
+  (given completed-ristretto-audit))

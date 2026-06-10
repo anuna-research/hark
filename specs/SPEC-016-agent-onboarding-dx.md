@@ -1,11 +1,11 @@
 ---
 id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
-status: approved (DX scope); pairing handshake CLEARED 2026-06-10 with SPEC-013 (J binds IMPL-016 — see review-gate)
+status: approved (DX scope); pairing handshake CLEARED 2026-06-10 with SPEC-013; condition J SATISFIED 2026-06-11 (J-a/J-b ride — see review-gate)
 tier: 3 (pairing handshake — Tier-1)
-version: 0.6.1
+version: 0.6.2
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance; v0.6.2 records the condition-J satisfaction, J-a/J-b riding)
 last-updated: 2026-06-10
 approved-date: 2026-06-09
 approved-by: project owner (OQ-001…004 settled in dialogue; REQ-007 re-opened by round-3 — see below)
@@ -24,9 +24,14 @@ review-gate: Tier-3 DX scope approved; the SPAKE2 pairing handshake (REQ-007/OQ-
   availability cost. **The Tier-1 gate is CLEARED 2026-06-10**: human sign-off
   (hark/docs/decisions/SPEC-013-tier1-signoff.md, D-1 ratified) + the round-6 independent
   spot-check (GPT-5.x, D-1 independently endorsed —
-  hark/docs/decisions/SPEC-013-round6-spotcheck-findings.md). One condition rides into
-  implementation: the **`cbcl_ristretto` point-validation audit (condition J) blocks
-  IMPL-016's handshake implementation** specifically.
+  hark/docs/decisions/SPEC-013-round6-spotcheck-findings.md). The **`cbcl_ristretto`
+  point-validation audit (condition J) is SATISFIED 2026-06-11**
+  (hark/docs/decisions/SPEC-013-condition-J-ristretto-audit.md: no blocking finding;
+  owner-ratified after a live probe re-run). Two conditions ride into the handshake
+  implementation: **J-a** (fix the `ct-equal?` strict-`and` MAC-length crash so the
+  failed-attempt counter cannot be evaded) and **J-b** (the audit's §6 negative
+  tests: K-=-identity abort, wrong-length MAC, M/N known-answer) — both bind
+  **before `hark pair` ships**.
 ---
 
 # SPEC-016 — Agent Onboarding DX: Frictionless Join & Auto-Learn

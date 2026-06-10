@@ -4,15 +4,24 @@
 **Auditor:** Claude Fable 5 (agent) — condition J of [[SPEC-013-tier1-signoff]]
 (IMPL-016, "`cbcl_ristretto` point-validation audit (SPAKE2 dependency), before the
 pairing handshake is implemented").
-**Status:** **PENDING HUMAN CRYPTO SIGN-OFF.**
+**Status:** **SIGNED OFF 2026-06-11** — project owner, after a guided walkthrough in
+which the load-bearing citations were re-read from source and the four decisive
+probes (P2/P5/P6c/P4 equivalents) were re-run live against the compiled NIF.
 
-> This document does **not** close condition J by itself. It is an agent-produced
-> evidence package: a decode-path inventory, a set of empirically-confirmed probes,
-> and a findings list. Condition J remains **OPEN** until a human reviewer with
-> crypto authority reads it, checks the cited `file:line` evidence, and records an
-> explicit sign-off. Per the Tier-1 gate, J binds inside IMPL-016 *before* the
-> pairing handshake is implemented; this audit is the input to that decision, not
-> the decision.
+> **Sign-off record (2026-06-11).** Condition J is **CLOSED** on this evidence:
+> the point-validation core holds (non-canonical/invalid encodings rejected in
+> `ristretto255_frombytes`; K forced non-identity by `crypto_scalarmult_ristretto255`'s
+> zero-output check). Two conditions **ride into IMPL-016 and bind before
+> `hark pair` ships** (the K-1/K-2 pattern):
+>
+> - **J-a** — fix J-3: make `ct-equal?` short-circuit (`if`/`andalso`) so a
+>   wrong-length peer MAC returns `{error, mac_mismatch}` and bumps the
+>   failed-attempt counter instead of crashing the handler. The N=3 failed-MAC
+>   deletion is a load-bearing REQ-007 control; the counter path must be airtight.
+> - **J-b** — land the §6 negative tests in cbcl-bus, at minimum #4 (K = identity
+>   aborts) and #5 (wrong-length MAC: no crash, counter bumped), plus the M/N
+>   known-answer test (#6), so a libsodium swap cannot silently regress the
+>   delegated validation chain.
 
 ---
 
