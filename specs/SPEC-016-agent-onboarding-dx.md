@@ -3,9 +3,9 @@ id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
 status: approved (DX scope); pairing handshake BLOCKED pending round-4 + crypto sign-off
 tier: 3 (pairing handshake — Tier-1)
-version: 0.4.0
+version: 0.5.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings, Claude Fable 5)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5)
 last-updated: 2026-06-10
 approved-date: 2026-06-09
 approved-by: project owner (OQ-001…004 settled in dialogue; REQ-007 re-opened by round-3 — see below)
@@ -17,7 +17,10 @@ review-gate: Tier-3 DX scope approved; the SPAKE2 pairing handshake (REQ-007/OQ-
   SPEC-013 **round-3 review (R3-01..R3-05)** corrected REQ-007 + ADR-003 (v0.4.0): SPAKE2
   anchors capability + name, NOT peer identity; the hub holds a password-equivalent verifier;
   pairing-specific transcript constants + failed-attempt bound + an `enc`-mode field are now
-  required. See hark/docs/decisions/SPEC-013-round3-review-findings.md.
+  required. The **round-4 review (R4-01)** corrected the `enc` field's role (v0.5.0): the
+  record is hub-released and not authenticatable against the hub, so `enc` is **advisory** —
+  the encryption pin derives from the record's **invite-cap presence**
+  (SPEC-013 REQ-023(a)). See hark/docs/decisions/SPEC-013-round4-review-findings.md.
 ---
 
 # SPEC-016 — Agent Onboarding DX: Frictionless Join & Auto-Learn
@@ -117,8 +120,18 @@ key, accountability is the **adding member**.
   "<phrase>"` SHALL run **SPAKE2** (RFC 9382, reusing the `cbcl-crypto-spake2` **primitive**);
   on success the hub releases the record **bound to the PAKE-derived session key K** (encrypted
   and/or MAC'd under K, not merely "sent after success"), and hark joins the channel **under
-  that name** with the **invite-as-cap** ([[SPEC-013-mls-private-channels#HP-1]]), pins the
-  channel `enc` mode from the record, and installs the dialects by digest.
+  that name** with the **invite-as-cap** ([[SPEC-013-mls-private-channels#HP-1]]) and installs
+  the dialects by digest.
+  - **The `enc` field is advisory, NOT the encryption-pin source (R4-01).** The record is
+    hub-stored and hub-released, and (per the scope note below) its contents cannot be
+    authenticated *against* the hub — so a hub-alterable `enc` bit must not decide whether the
+    agent sends plaintext. The pin SHALL derive from the record's **`cbcl-chat-invite` cap
+    presence**: a cap admits to a **private** channel, and private ⇒ encrypted, so hark SHALL
+    pin `enc=true` **before its first frame** whenever the record carries a cap
+    ([[SPEC-013-mls-private-channels#REQ-023]](a)). A hub that strips the cap merely breaks
+    the join (availability); it cannot induce a cleartext send into a private channel. A
+    record whose `enc` claim conflicts with its cap presence SHALL be surfaced, and the
+    cap-derived pin wins.
   - **Storage is password-equivalent (NOT a one-way HMAC).** A SPAKE2 *responder* cannot run
     from a one-way digest — it needs the password to derive `w` (`cbcl-crypto-spake2.lfe`
     `init-responder`). Whatever the hub stores to execute the handshake (the phrase, `w`, or
@@ -184,10 +197,13 @@ key, accountability is the **adding member**.
   pairing authenticates the *operator/agent to the hub* and releases a cap the hub itself
   issues, so a **malicious hub gains nothing it did not already have** — but it also means the
   hub holds password-equivalent material and the record contents cannot be authenticated
-  *against* the hub by phrase-derived keys. Agent peer-identity first-contact therefore rests
-  on hub-mediated TOFU + the [[SPEC-013-mls-private-channels#REQ-024]] safety number, **not**
-  on this phrase. *Consequence:* this handshake is **Tier-1 / no-go**, and the design SHALL NOT
-  claim it anchors agent first-contact *identity*.
+  *against* the hub by phrase-derived keys — which is why the `enc` field is **advisory** and
+  the encryption pin derives from the **invite-cap presence**, a signal the hub can withhold
+  but not invert ([[#REQ-007]], [[SPEC-013-mls-private-channels#REQ-023]]; R4-01). Agent
+  peer-identity first-contact therefore rests on hub-mediated TOFU + the
+  [[SPEC-013-mls-private-channels#REQ-024]] safety number, **not** on this phrase.
+  *Consequence:* this handshake is **Tier-1 / no-go**, and the design SHALL NOT claim it
+  anchors agent first-contact *identity*.
 - **ADR-004 — `emit` for plain chat; all frames valid CBCL.** Expose the existing
   API-only `emit` kind as `hark emit`; it produces a valid `(tell …)` and the chat client
   unwraps it. No raw-text frames; `reply`/`progress` keep the ask/answer model (OQ-002).
