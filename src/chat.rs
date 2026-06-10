@@ -102,6 +102,7 @@ pub async fn create_chat_agent(
     liveness_timeout: Duration,
     identity: Arc<ChatIdentity>,
     mut mls: Option<MlsSession>,
+    mls_create: bool,
 ) -> Result<AgentHandle, ChatError> {
     AgentStore::validate_advertisement(&dialects)
         .map_err(|error| ChatError::Store(error.to_string()))?;
@@ -143,6 +144,14 @@ pub async fn create_chat_agent(
             .on_roomcfg(&ack)
             .map_err(|e| ChatError::DowngradeRefused(e.to_string()))?;
         if session.encrypted() {
+            // REQ-016 operator intent: bootstrap the MLS group as the room
+            // creator before publishing, so this agent is the sole member /
+            // elected owner and will add present members on presence.
+            if mls_create {
+                session
+                    .create_group_as_creator()
+                    .map_err(|e| ChatError::Hello(format!("mls create group: {e}")))?;
+            }
             let frames = session
                 .join_frames()
                 .map_err(|e| ChatError::Hello(format!("mls join frames: {e}")))?;

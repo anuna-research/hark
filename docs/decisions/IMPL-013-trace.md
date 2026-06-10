@@ -45,3 +45,39 @@ audit) is IMPL-016; the affected-repo wire changes (`bye` fan-out with preserved
 signature, creator-handle bookkeeping at claim, `cbcl-mls-wasm` identity binding
 + genesis capability, web election from MLS leaves) are the `task-affected`
 follow-on in `plans/impl-013-mls.spl`.
+
+## Live playtest findings (2026-06-10, against the cbcl-bus hub on `:8080`)
+
+Driven end to end against a running hub (web client via Playwright; hark via the
+daemon). What works live, and the gaps an integration test can't see:
+
+- **Web create-private + persist + creator + mode-pin** — works after fixing a
+  Mnesia 4→5 schema-migration bug the playtest surfaced (cbcl-bus
+  `fix(hub): make the cbcl-room creator migration actually fire`). The channel
+  comes up `private, end-to-end encrypted`, persists with the creator recorded.
+- **hark transport + REQ-023 fail-closed** — a hark agent joins an encrypted
+  channel by cap, pins the mode encrypted, and **refuses to send** when it is not
+  yet an MLS group member (`will not fall back to plaintext — REQ-023`). No
+  plaintext leak. (Rough edge: the refused send marks the agent handle unhealthy;
+  the security behaviour is correct, the handle lifecycle is not ideal.)
+- **`hark init --mls-create`** — bootstraps the MLS group as the room creator on
+  join (REQ-016 operator intent): verified live that the agent becomes the sole
+  member/owner, the genesis is present, and `hark safety-number` reports it.
+
+- **GAP — cross-agent Add blocked by `idkey` delivery timing.** Two hark agents
+  in one encrypted channel do **not** form a 2-member group over the live wire.
+  The creator sends `keyget`, the hub pops the target's one-time KeyPackage, but
+  the Add then fails REQ-008 locally: the adder has no **pinned** wire key for the
+  target. The pin can only come from the target's **self-signed `idkey`
+  assertion** (REQ-019) — which the hub fans **once at join, to then-connected
+  members only**, and never replays to a peer that connects later (unlike the
+  genesis, which rides durably in the GroupContext). Confirmed on disk: each
+  creator's pin store contained only its own handle. The session-level
+  `full_session_flow_over_frames` test passes precisely because it feeds the
+  `idkey` deterministically before the Add. **Fix direction (design, not a
+  one-liner):** make a member's `idkey` available to late joiners — re-broadcast
+  on observing a new member in `presence`, carry the most-recent `idkey` as a
+  queryable directory entry alongside the KeyPackage, or have the adder obtain
+  and verify the target's `idkey` before adding. This is a SPEC-013 wiring
+  refinement (REQ-019/REQ-011 distribution), independent of the `--mls-create`
+  trigger added here.

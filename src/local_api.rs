@@ -180,6 +180,11 @@ pub struct CreateAgentRequest {
     /// (the hub's `:cap`). Omit for public channels. Ignored by the router.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<String>,
+    /// Chat transport only: bootstrap the channel's MLS group as the room
+    /// creator after joining (SPEC-013 REQ-016 operator intent). Only acts on
+    /// a pinned-encrypted channel. Ignored by the router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mls_create: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -836,6 +841,7 @@ async fn create_chat_transport_agent(
         chat.liveness_timeout,
         std::sync::Arc::new(identity),
         mls,
+        request.mls_create.unwrap_or(false),
     )
     .await
     .map_err(chat_error_to_api)?;

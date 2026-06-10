@@ -160,6 +160,11 @@ pub struct InitArgs {
         help = "Chat hub only: capability token or invite for a private channel"
     )]
     pub cap: Option<String>,
+    #[arg(
+        long = "mls-create",
+        help = "Chat hub only: after joining an encrypted private channel, bootstrap its MLS group as the room creator (SPEC-013 REQ-016 operator intent). The agent then adds present members as the elected owner."
+    )]
+    pub mls_create: bool,
     #[arg(long = "json", help = "Print JSON instead of shell exports")]
     pub json: bool,
 }
@@ -338,6 +343,7 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
             channel: args.channel,
             handle: args.handle,
             cap: args.cap,
+            mls_create: if args.mls_create { Some(true) } else { None },
         })
         .await
         .map_err(map_local_api_request_error)?;
