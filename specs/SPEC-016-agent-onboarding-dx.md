@@ -1,11 +1,11 @@
 ---
 id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
-status: approved (DX scope); pairing handshake CLEARED 2026-06-10 with SPEC-013; condition J SATISFIED 2026-06-11 (J-a/J-b ride — see review-gate)
+status: IMPLEMENTED 2026-06-11 (IMPL-016 — all REQs; pairing handshake cross-stack-verified; J-a/J-b done)
 tier: 3 (pairing handshake — Tier-1)
-version: 0.6.2
+version: 0.6.3
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance; v0.6.2 records the condition-J satisfaction, J-a/J-b riding)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance; v0.6.2 records the condition-J satisfaction, J-a/J-b riding; v0.6.3 records full IMPL-016 implementation)
 last-updated: 2026-06-10
 approved-date: 2026-06-09
 approved-by: project owner (OQ-001…004 settled in dialogue; REQ-007 re-opened by round-3 — see below)
@@ -240,6 +240,36 @@ Settled in dialogue (project owner, 2026-06-09):
 | OQ-002 | A plain-chat verb **`hark emit`** exposing the existing `kind=emit`; all wire frames are **valid CBCL** (`tell`), the chat unwraps for display ([[#REQ-004]]). |
 | OQ-003 | **`files.anuna.io/hark/install.sh`** curl install over a single binary ([[#REQ-001]], ADR-006). |
 | OQ-004 | An agent is removable **only by its `added_by` member** ([[#REQ-012]]). |
+
+## 7a. Implementation status (IMPL-016, 2026-06-11)
+
+All twelve requirements implemented across `hark` (Rust) + `cbcl-bus`
+(LFE/Erlang); plan of record `plans/IMPL-016-agent-onboarding-dx.spl`.
+
+- **Tier-3 DX (hark):** REQ-001 install.sh + `make dist`; REQ-002 `hark join`;
+  REQ-003 daemon-tracked active handle (no `eval`); REQ-004 `hark emit`;
+  REQ-005/008 declared-menu `--speak` validation; REQ-006 `announce`; REQ-009
+  response scoping.
+- **Pairing (Tier-1, REQ-007/011):** the SPAKE2 handshake is implemented on
+  both sides and **cross-stack byte-verified** by a shared known-answer fixture
+  (`tests/fixtures/pairing-vectors.json`): the LFE hub responder
+  (`cbcl-chat-pairing`, over the relocated shared `cbcl_bus` crypto) and the
+  Rust initiator (`hark pair`, curve25519-dalek) reproduce identical
+  msg_a/msg_b/K/MACs/AEAD-record. Store enforces single-use + TTL + the N=3
+  failed-attempt bound; the record is released bound to K; the encryption pin
+  derives from invite-cap presence (R4-01). `/pair/v1` WS endpoint + the web
+  "add agent" mint flow (`addagent` → `paircode` code).
+- **Provenance/removal (REQ-010/012):** `cbcl-chat-provenance` records the
+  adder; the agent's `announce` carries `:added-by` so every roster shows it;
+  `removeagent` is authorized only against the recorded adder.
+- **Condition J:** signed off; J-a (`ct-equal?` fix) and J-b (negative tests)
+  implemented.
+
+**Documented follow-ons (dependent on other work, surfaced not faked):** the
+REQ-005 acquisition-by-digest leg waits on the hub's SPEC-015 `roomcfg` dialect
+menu + fetch-by-digest endpoint (today a menu-absent warning); REQ-012 live
+roster eviction of an *active* agent connection rides with the room-eviction
+path (authority + provenance removal are done).
 
 ## 8. Verification Strategy (Phase 2 — IMPL-016)
 

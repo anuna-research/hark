@@ -386,3 +386,46 @@
 (claims agent:claude
   :at "2026-06-10T22:36:53Z"
   (given decided-pairing-code-is-wormhole-style-public-id-plus-secret-phrase))
+
+(claims agent:claude
+  :at "2026-06-10T23:13:24Z"
+  (given completed-hub-pairing))
+
+(claims agent:claude
+  :at "2026-06-10T23:13:24Z"
+  (given claim-v1-pair-client)
+  (normally r-cl-state-v1-pair-client claim-v1-pair-client state-claimed-v1-pair-client)
+  (normally r-cl-chain-v1-pair-client state-claimed-v1-pair-client claimed-pair-client)
+)
+
+(claims agent:claude
+  :at "2026-06-10T23:13:24Z"
+  (given completed-pair-client))
+
+(claims agent:claude
+  :at "2026-06-10T23:13:24Z"
+  (given claim-v1-provenance)
+  (normally r-cl-state-v1-provenance claim-v1-provenance state-claimed-v1-provenance)
+  (normally r-cl-chain-v1-provenance state-claimed-v1-provenance claimed-provenance)
+)
+
+;; Propagation rules: failures in 'provenance' block downstream tasks
+(normally r-propagate-removal-from-provenance-failed failed-provenance upstream-blocked-removal)
+(normally r-propagate-removal-from-provenance-permanently-failed permanently-failed-provenance upstream-blocked-removal)
+(normally r-propagate-removal-from-provenance-stale-v1 stale-v1-provenance upstream-blocked-removal)
+(normally r-propagate-removal-from-provenance-timeout-v1 timeout-v1-provenance upstream-blocked-removal)
+
+(claims agent:claude
+  :at "2026-06-10T23:13:24Z"
+  (given completed-provenance))
+
+(claims agent:claude
+  :at "2026-06-10T23:13:24Z"
+  (given claim-v1-removal)
+  (normally r-cl-state-v1-removal claim-v1-removal state-claimed-v1-removal)
+  (normally r-cl-chain-v1-removal state-claimed-v1-removal claimed-removal)
+)
+
+(claims agent:claude
+  :at "2026-06-10T23:13:24Z"
+  (given completed-removal))
