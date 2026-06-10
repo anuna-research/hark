@@ -293,10 +293,13 @@ impl MlsSession {
         let sig = wire.sign(&idkey_signing_bytes(&self.handle, &key, &self.room, nonce));
         // Addressed to the ROOM (not the asserter's handle) so the hub's
         // membership-gated fan delivers it to every member — the same
-        // contract `deliver`/`welcome` use. The asserter is in `:handle`; the
-        // signed context (handle, key, room, nonce) is unchanged.
+        // contract `deliver`/`welcome` use, including the `:from` the hub
+        // requires to attribute a room frame (without it the hub rejects the
+        // frame `missing-from` and never fans it). The asserter IS the
+        // sender, so `:from` carries the handle; the signed context (handle,
+        // key, room, nonce) is unchanged.
         Ok(format!(
-            "(idkey {} :handle {} :key \"{}\" :room {} :nonce {} :sig \"{}\")",
+            "(idkey {} :from {} :key \"{}\" :room {} :nonce {} :sig \"{}\")",
             self.room,
             self.handle,
             B64.encode(key),
@@ -414,10 +417,10 @@ impl MlsSession {
     /// the `presence` arrived first).
     fn on_idkey(&mut self, text: &str) -> SessionEvent {
         let result = (|| -> Result<String, MlsError> {
-            // The asserter is in `:handle` (the frame is addressed to the room
-            // so the hub fans it); ignore our own re-broadcast echo.
-            let handle = kw_symbol(text, ":handle")
-                .ok_or_else(|| MlsError::Rejected("idkey missing :handle".into()))?;
+            // The asserter is the sender (`:from`); the frame is addressed to
+            // the room so the hub fans it. Ignore our own re-broadcast echo.
+            let handle = kw_symbol(text, ":from")
+                .ok_or_else(|| MlsError::Rejected("idkey missing :from".into()))?;
             if handle == self.handle {
                 return Ok(handle);
             }
@@ -929,10 +932,10 @@ mod tests {
         // The idkey frame is addressed to the room (so the hub fans it) and
         // round-trips through a peer's pin store.
         assert!(frames[1].starts_with("(idkey @research"));
-        assert!(frames[1].contains(":handle @aria"));
+        assert!(frames[1].contains(":from @aria"));
         let (peer_dir, _) = setup("joinframes-peer", 85, "@peer");
         let mut peer = PinStore::open(&peer_dir.join("peer.pins")).unwrap();
-        let handle = kw_symbol(&frames[1], ":handle").unwrap();
+        let handle = kw_symbol(&frames[1], ":from").unwrap();
         let key = kw_bytes32(&frames[1], ":key").unwrap();
         let room = kw_symbol(&frames[1], ":room").unwrap();
         let nonce = kw_u64(&frames[1], ":nonce").unwrap_or(0);
@@ -988,7 +991,7 @@ mod tests {
             "owner fetches the pinned, present non-member's KeyPackage: {outbound:?}"
         );
         assert!(
-            outbound.iter().any(|f| f.contains(":handle @alice")),
+            outbound.iter().any(|f| f.contains(":from @alice")),
             "a newly-seen member triggers an idkey re-broadcast: {outbound:?}"
         );
 
@@ -1105,7 +1108,7 @@ mod tests {
             panic!("presence")
         };
         assert!(
-            a_pres.iter().any(|f| f.contains(":handle @alice")),
+            a_pres.iter().any(|f| f.contains(":from @alice")),
             "alice re-broadcasts idkey on seeing bob"
         );
         assert!(
@@ -1122,7 +1125,7 @@ mod tests {
         };
         let bob_idkey = b_pres
             .iter()
-            .find(|f| f.contains(":handle @bob"))
+            .find(|f| f.contains(":from @bob"))
             .expect("bob re-broadcasts his idkey on seeing alice");
 
         // Alice receives bob's re-broadcast idkey → pins him → and because she

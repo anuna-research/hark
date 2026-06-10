@@ -406,7 +406,7 @@ pub struct JoinOutcome {
 /// a successful join persists (which deletes the consumed key from disk).
 pub fn join_from_welcome(
     provider: &DurableProvider,
-    _identity: &MlsIdentity,
+    identity: &MlsIdentity,
     welcome_bytes: &[u8],
     room: &str,
     pins: &mut PinStore,
@@ -451,7 +451,7 @@ pub fn join_from_welcome(
         }
     };
 
-    match validate_staged_welcome(&staged, room, pins) {
+    match validate_staged_welcome(&staged, room, pins, &identity.handle) {
         Ok(()) => {}
         Err(e) => {
             provider.rollback_to_disk()?;
@@ -536,6 +536,7 @@ fn validate_staged_welcome(
     staged: &StagedWelcome,
     _room: &str,
     pins: &PinStore,
+    joiner_handle: &str,
 ) -> Result<(), MlsError> {
     // (d) Full-tree leaf-vs-pin: every leaf whose handle is pinned must
     // carry exactly the pinned key; an unpinned key for a pinned handle is a
@@ -556,21 +557,33 @@ fn validate_staged_welcome(
     }
 
     // (b) Authorised committer: the Welcome's sender must be the elected
-    // owner of the tree it delivers. NOT sufficient alone (circular over a
-    // fabricated tree — REQ-012 documents this); (d) is the predicate with
-    // teeth, plus the genesis check the caller performs.
+    // owner of the membership BEFORE this Add — i.e. the delivered tree minus
+    // the joiner being added by this commit. This is what makes REQ-016
+    // bootstrap work: when the room creator (sole member) adds the first
+    // member, the post-Add tree's elected owner may be the newcomer, but the
+    // committer's authority comes from owning the *pre-Add* group (just the
+    // creator). For a steady-state add the pre-Add set is every prior member,
+    // so the current elected owner is the only authorised committer. NOT
+    // sufficient alone (circular over a fabricated tree — REQ-012 documents
+    // this); (d) is the predicate with teeth, plus the caller's genesis check.
+    // (Assumes one joiner per Welcome, which is hark's add flow.)
     let sender = staged
         .welcome_sender()
         .map_err(MlsError::stack("welcome sender"))?;
     let sender_handle = credential_handle(sender.credential())?;
     let sender_key = sender.signature_key().as_slice().to_vec();
-    match elect_owner(&bindings) {
+    let pre_add: Vec<(String, Vec<u8>)> = bindings
+        .iter()
+        .filter(|(handle, _)| handle != joiner_handle)
+        .cloned()
+        .collect();
+    match elect_owner(&pre_add) {
         Some((owner_handle, owner_key))
             if owner_handle == sender_handle && owner_key == sender_key => {}
         Some((owner_handle, _)) => {
             return Err(MlsError::Rejected(format!(
-                "welcome committed by {sender_handle}, but the elected owner for this tree is \
-                 {owner_handle} (REQ-012b)"
+                "welcome committed by {sender_handle}, but the elected owner of the pre-add \
+                 roster is {owner_handle} (REQ-012b)"
             )));
         }
         None => return Err(MlsError::Rejected("welcome tree has no members".into())),
