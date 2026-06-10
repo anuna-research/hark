@@ -45,6 +45,10 @@ pub enum Command {
         about = "One-shot join: scaffold config if absent, start the daemon if needed, and join a chat channel"
     )]
     Join(JoinArgs),
+    #[command(
+        about = "Pair an agent into a channel via a memorable code: `hark pair \"<id>-word-word-word-word\"`"
+    )]
+    Pair(PairArgs),
     #[command(about = "Create an agent WebSocket and print the local handle")]
     Init(InitArgs),
     #[command(about = "Receive one CBCL message for the current agent handle")]
@@ -158,6 +162,24 @@ pub struct JoinArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct PairArgs {
+    #[arg(
+        help = "The pairing code from the web app: `<pairing-id>-word-word-word-word`"
+    )]
+    pub code: String,
+    #[arg(
+        long = "as",
+        help = "Override the adder-set channel handle (@name); defaults to the record's name"
+    )]
+    pub as_handle: Option<String>,
+    #[arg(
+        long = "hub",
+        help = "Chat hub WebSocket URL; defaults to the configured hub or the public hub"
+    )]
+    pub hub: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct InitArgs {
     /// Capability ≡ dialect: agents advertise the dialects they can
     /// perform. At least one is required.
@@ -233,6 +255,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
             DaemonCommand::Stop => daemon_stop().await,
         },
         Command::Join(args) => join_command(args).await,
+        Command::Pair(args) => pair_command(args).await,
         Command::Init(args) => init_command(args).await,
         Command::Recv(args) => recv_command(args).await,
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args).await,
@@ -397,6 +420,115 @@ async fn join_command(args: JoinArgs) -> AppResult<()> {
         args.channel, args.as_handle
     );
     Ok(())
+}
+
+/// REQ-007/REQ-011 (SPEC-016): `hark pair "<code>"` — run the SPAKE2 pairing
+/// handshake with the hub, then join the channel under the adder-set name with
+/// the released invite cap. The four phrase words are the PAKE secret and never
+/// leave this process. Composes config-scaffold + daemon-start like `join`.
+async fn pair_command(args: PairArgs) -> AppResult<()> {
+    let code = crate::pairing::parse_code(&args.code)
+        .map_err(|error| AppError::Usage(error.to_string()))?;
+
+    // 1. Config: scaffold a chat config when absent; verify it's a chat hub.
+    let path = resolve_config_file()?;
+    if !path.exists() {
+        let hub = args
+            .hub
+            .as_deref()
+            .unwrap_or(crate::constants::DEFAULT_CHAT_HUB_URL);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to create config directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        write_new_config_file(&path, &build_chat_config_toml(hub))?;
+        eprintln!("scaffolded config at {}", path.display());
+    }
+    let config = crate::config::AppConfig::load()
+        .map_err(|error| AppError::Usage(format!("failed to load config: {error}")))?;
+    let hub_ws = args
+        .hub
+        .as_deref()
+        .or(config.router.ws_url.as_deref())
+        .ok_or_else(|| AppError::Usage("no chat hub configured; pass --hub <ws-url>".to_owned()))?;
+    let pair_url = crate::pairing::client::pair_url_from(hub_ws)
+        .map_err(|error| AppError::Usage(error.to_string()))?;
+
+    // 2. Run the pairing handshake → the hub-released record (bound to K).
+    let record = crate::pairing::client::run_pairing(&pair_url, &code)
+        .await
+        .map_err(map_pair_error)?;
+
+    // 3. Encryption pin (R4-01): the cap's PRESENCE — not the advisory `enc`
+    //    bit a hub could flip — decides private⇒encrypted. Surface a conflict.
+    let cap = if record.has_cap() {
+        if !record.enc {
+            eprintln!(
+                "warning: record carries an invite cap (private channel) but enc=false; \
+                 the cap-derived pin wins (treating the channel as encrypted)"
+            );
+        }
+        Some(String::from_utf8_lossy(&record.cap).into_owned())
+    } else {
+        if record.enc {
+            return Err(AppError::Usage(
+                "record claims enc=true but carries no invite cap; refusing to send into a \
+                 believed-private channel without a cap — request a fresh pairing"
+                    .to_owned(),
+            ));
+        }
+        None
+    };
+
+    // 4. Daemon + join under the adder-set name (--as overrides, REQ-011).
+    daemon_start().await?;
+    let client = discover_live_client().await?;
+    let handle = args.as_handle.clone().unwrap_or_else(|| record.agent_name.clone());
+    let dialects: Vec<String> = record.dialects.iter().map(|d| d.name.clone()).collect();
+    let response = client
+        .create_agent(&CreateAgentRequest {
+            dialects: dialects.clone(),
+            auto_install_advertised: None,
+            channel: Some(record.channel.clone()),
+            handle: Some(handle.clone()),
+            cap,
+        })
+        .await
+        .map_err(map_local_api_request_error)?;
+
+    for warning in &response.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let speaking = if response.dialects.is_empty() {
+        "nothing".to_owned()
+    } else {
+        response.dialects.join(", ")
+    };
+    println!(
+        "paired into {} as {} (added by {}) · speaking: {speaking}",
+        record.channel, handle, record.adder
+    );
+    Ok(())
+}
+
+fn map_pair_error(error: crate::pairing::client::PairClientError) -> AppError {
+    use crate::pairing::client::PairClientError;
+    match error {
+        PairClientError::BadHubUrl(_) | PairClientError::Pair(_) => {
+            AppError::Usage(error.to_string())
+        }
+        PairClientError::HubError { .. } => AppError::Usage(error.to_string()),
+        PairClientError::ConnectionFailed(_) | PairClientError::ClosedEarly => {
+            AppError::RouterConnection
+        }
+        PairClientError::UnexpectedFrame { .. } | PairClientError::MalformedFrame(_) => {
+            AppError::Internal(error.to_string())
+        }
+    }
 }
 
 /// The config `hark join` scaffolds: the chat hub URL is the only required
@@ -1261,6 +1393,26 @@ mod tests {
             panic!("expected join command");
         };
         assert!(args.speak.is_empty());
+    }
+
+    #[test]
+    fn parses_pair_arguments() {
+        let cli = Cli::parse_from(["hark", "pair", "42-account-clinic-text-wheel"]);
+        let Command::Pair(args) = cli.command else {
+            panic!("expected pair command");
+        };
+        assert_eq!(args.code, "42-account-clinic-text-wheel");
+        assert_eq!(args.as_handle, None);
+        assert_eq!(args.hub, None);
+
+        let cli = Cli::parse_from([
+            "hark", "pair", "code", "--as", "@bot", "--hub", "wss://h/chat/v1",
+        ]);
+        let Command::Pair(args) = cli.command else {
+            panic!("expected pair command");
+        };
+        assert_eq!(args.as_handle.as_deref(), Some("@bot"));
+        assert_eq!(args.hub.as_deref(), Some("wss://h/chat/v1"));
     }
 
     #[test]

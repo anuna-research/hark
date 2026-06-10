@@ -12,6 +12,7 @@
 //! the shared known-answer vectors (`tests/pairing_vectors.rs`).
 
 pub mod bip39;
+pub mod client;
 pub mod record;
 pub mod spake2;
 
