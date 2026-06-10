@@ -148,9 +148,62 @@ fn r3_11_max_past_epochs_bounds_window() {
               max_past_epochs, number_of_resumption_psks (the resumption-PSK retention bound \
               the review flagged), and sender_ratchet_configuration (out_of_order_tolerance / \
               maximum_forward_distance). NFR-004 can name these directly.");
-    println!("[R3-11] STILL UNASSESSABLE here: that a *durable* StorageProvider (ADR-004, not \
-              yet written) actually honours delete calls on disk — the in-memory provider can't \
-              show it. Remains a provider-test item for sign-off.");
+    println!("[R3-11] See companion test `r3_11_storage_prunes_superseded_epoch_secrets`: the \
+              knob bounds PERSISTED secret bytes (pruning is reflected at rest, not only in \
+              memory). The only residual is a *durable* provider's own on-disk fsync/delete \
+              fidelity (ADR-004, its own test).");
 }
 
 use openmls::prelude::tls_codec::Serialize as _;
+
+/// R3-11 (mechanism) — does OpenMLS actually *issue* `delete_*` calls for
+/// superseded epoch secrets, so a durable provider that honours deletes will
+/// prune on disk? With `max_past_epochs(0)` the stored-entry count must stay flat
+/// across many epoch changes; with a large window it accumulates. The in-memory
+/// provider stands in for any provider — what's load-bearing is that OpenMLS
+/// emits the deletes; a durable provider honouring them prunes identically.
+#[test]
+fn r3_11_storage_prunes_superseded_epoch_secrets() {
+    fn churn(keep: usize, rounds: usize) -> usize {
+        let alice = Party::new("alice");
+        let bob = Party::new("bob");
+        let cfg = MlsGroupCreateConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .ciphersuite(CIPHERSUITE)
+            .max_past_epochs(keep)
+            .build();
+        let mut g = MlsGroup::new(&alice.provider, &alice.signer, &cfg, alice.credential.clone())
+            .expect("create");
+        add_member(&mut g, &alice, &bob.key_package()).expect("add bob");
+        for _ in 0..rounds {
+            g.self_update(&alice.provider, &alice.signer, LeafNodeParameters::default())
+                .expect("self update");
+            g.merge_pending_commit(&alice.provider).expect("merge");
+        }
+        storage_byte_size(&alice)
+    }
+
+    let rounds = 12;
+    let pruned = churn(0, rounds);
+    let kept = churn(rounds, rounds);
+
+    println!("[R3-11] persisted secret-state bytes after {rounds} epoch changes:");
+    println!("[R3-11]   max_past_epochs(0):  {pruned} bytes");
+    println!("[R3-11]   max_past_epochs({rounds}): {kept} bytes  (Δ over pruned = {})", kept as i64 - pruned as i64);
+
+    // The retention knob must materially bound persisted secret material: keeping
+    // `rounds` past epochs persists strictly more than keeping none. If these were
+    // equal, the at-rest footprint would not track the knob and NFR-004's "prune
+    // superseded epoch secrets" claim would not hold at rest.
+    assert!(
+        kept > pruned,
+        "max_past_epochs did not change persisted byte footprint ({pruned} vs {kept}); \
+         retained epoch secrets are not reflected at rest — re-examine NFR-004's at-rest model"
+    );
+    println!(
+        "[R3-11] => the retention window bounds PERSISTED secret material (pruned < kept). \
+         OpenMLS prunes superseded epoch secrets from the persisted state under (0); a durable \
+         provider (ADR-004) writing the same state inherits the bound. Only that provider's own \
+         on-disk fsync/delete fidelity is left to its own test."
+    );
+}

@@ -21,7 +21,13 @@ license = "Apache-2.0"
 
 [dependencies]
 openmls = "0.8"
-openmls_rust_crypto = "0.5"
+# test-utils exposes MemoryStorage::{values, serialize} so a probe can observe
+# whether OpenMLS *issues* delete calls for superseded epoch secrets (R3-11) and
+# round-trip persisted state (REQ-009/ADR-004) — without hand-writing a ~50-method
+# StorageProvider spy.
+openmls_rust_crypto = { version = "0.5", features = ["test-utils"] }
 openmls_basic_credential = "0.5"
 openmls_traits = "0.5"
 tls_codec = "0.4"
+# Only the `native_peer` cross-stack bin uses JSON; the lib/tests do not.
+serde_json = "1.0"

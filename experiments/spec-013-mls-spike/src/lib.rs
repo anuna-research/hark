@@ -210,6 +210,31 @@ pub fn process(
     }
 }
 
+/// Number of key/value entries in this party's MLS storage. Available because the
+/// spike enables `openmls_rust_crypto/test-utils` (exposes `MemoryStorage::values`).
+/// Used to observe whether OpenMLS prunes superseded epoch secrets — i.e. whether
+/// it *issues* the `delete_*` calls a durable provider (ADR-004) must honour.
+pub fn storage_entry_count(party: &Party) -> usize {
+    party.provider.storage().values.read().unwrap().len()
+}
+
+/// Total bytes of persisted value blobs in this party's MLS storage. OpenMLS keeps
+/// a group's retained past-epoch secrets *inside* the serialized group-state blob
+/// (not as separate KV entries), so byte size — not entry count — is what tracks
+/// retained secret material at rest. This is the quantity NFR-004's compromise
+/// model is about.
+pub fn storage_byte_size(party: &Party) -> usize {
+    party
+        .provider
+        .storage()
+        .values
+        .read()
+        .unwrap()
+        .values()
+        .map(|v| v.len())
+        .sum()
+}
+
 /// The BasicCredential identity bytes of the leaf at `index`, if any — used to
 /// read what handle a member's leaf currently *claims* (the R3-07 question).
 pub fn leaf_identity(group: &MlsGroup, index: LeafNodeIndex) -> Option<Vec<u8>> {

@@ -1,3 +1,7 @@
 /target
+# Generated wasm artifact (rebuild with cross-stack/build-wasm.sh). Not committed —
+# it's a multi-MB binary derived from cbcl-mls-wasm at openmls 0.8.1.
+/cross-stack/wasm-node/
+node_modules/
 # Cargo.lock IS committed — this is an evidence-producing spike; the lock pins the
 # exact OpenMLS (0.8.1) that the recorded findings were observed against.
