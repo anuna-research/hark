@@ -3,9 +3,9 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: draft
 tier: 1
-version: 0.6.0
+version: 0.6.1
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings, Claude Fable 5)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence, Claude Fable 5)
 last-updated: 2026-06-10
 owner-repo: hark
 affects-repos: cbcl-bus (web client + vendored cbcl-mls-wasm artifact), cbcl-chat (cbcl-mls-wasm crate)
@@ -266,8 +266,10 @@ missing/stale persisted state → re-join, logged.
   A **last-resort** KeyPackage MAY be used only when the one-time pool is exhausted; its
   reuse is **bounded by a mechanism, not only prose**: the last-resort leaf SHALL carry a
   short MLS **`lifetime`**, and [[#REQ-008]]/[[#REQ-017]] SHALL **reject an expired
-  KeyPackage** (confirm OpenMLS's leaf-lifetime validation is enabled at the pinned version,
-  or enforce it explicitly). The forward-secrecy residual SHALL be recorded at its **true
+  KeyPackage**. The §10 spike confirmed `KeyPackageIn::validate()` already rejects an expired
+  KeyPackage on openmls 0.8.1 (`InvalidLifetime`; `experiments/spec-013-mls-spike`,
+  `r3_10_expired_keypackage_rejected`) — so setting a short `lifetime` suffices; expiry is
+  enforced by the primitive at add time. The forward-secrecy residual SHALL be recorded at its **true
   scope**: a hub that **drains** the one-time pool can force last-resort use, and because a
   Welcome carries the joiner's **epoch secrets**, a captured Welcome plus a *later* init-key
   compromise exposes the **group's message confidentiality for that epoch and forward until
@@ -285,9 +287,13 @@ missing/stale persisted state → re-join, logged.
   explicit **flagged key-rotation** path of [[#REQ-011]] (never a silent rebind). This closes
   the Update-path bypass: MLS does NOT enforce credential continuity across Update (RFC 9420
   §7.3/§12.1.2), so without (c) a member could publish an Update rebinding their leaf to read
-  `@alice`, after which [[#REQ-018]]'s sender check passes for a forged `:from @alice`. Commits
-  SHALL originate from an **authorised committer** ([[#REQ-016]]); unauthorised or unvalidated
-  proposals SHALL NOT be stored or merged. Trace: `[[#TEST-017]]`. *(Closes BUG-008; closes R3-07 — reopened `:from` forgery via the Update path.)*
+  `@alice`, after which [[#REQ-018]]'s sender check passes for a forged `:from @alice`. **The
+  §10 spike confirmed this empirically against openmls 0.8.1**: a self-Update rebinding a leaf
+  credential from `bob` to `alice` was accepted by both the committer and the peer
+  (`experiments/spec-013-mls-spike`, `r3_07_self_update_credential_rebind`) — so clause (c) is
+  **load-bearing, not defence-in-depth**. Commits SHALL originate from an **authorised
+  committer** ([[#REQ-016]]); unauthorised or unvalidated proposals SHALL NOT be stored or
+  merged. Trace: `[[#TEST-017]]`. *(Closes BUG-008; closes R3-07 — reopened `:from` forgery via the Update path.)*
 - **REQ-018 — Sender-authenticated `:from`.** The agent SHALL obtain the **authenticated
   MLS sender leaf** for each decrypted application message and SHALL **reject** (not render)
   a message whose inner CBCL `:from` does not match that sender's **pinned handle**
@@ -368,7 +374,13 @@ missing/stale persisted state → re-join, logged.
   provider**, the provider SHALL actually honour deletes; a provider that no-ops deletes
   silently retains every superseded secret with no API symptom. A TEST SHALL assert that,
   after a Commit merge / Welcome consume, superseded epoch secrets and consumed init keys
-  are **absent from disk** ([[#OQ-005]]). *(Concretised per R3-11.)*
+  are **absent from disk** ([[#OQ-005]]). The §10 spike established the upstream half: all
+  three knobs exist on `MlsGroupJoinConfigBuilder` (openmls 0.8.1), and OpenMLS prunes
+  superseded epoch secrets from the **persisted state** — persisted secret-state was ~8.4 KB
+  under `max_past_epochs(0)` vs ~36 KB under `(12)` after 12 epoch changes
+  (`experiments/spec-013-mls-spike`, `r3_11_storage_prunes_superseded_epoch_secrets`). The
+  **residual** the durable provider's own test must close: that ADR-004's on-disk provider
+  actually honours those delete calls (fsync fidelity). *(Concretised per R3-11; upstream half confirmed by the §10 spike.)*
 
 ## 6. Architecture Decisions (PROPOSED — pending Tier-1 sign-off)
 
@@ -463,14 +475,20 @@ missing/stale persisted state → re-join, logged.
   [[#REQ-017]]). Prefer one-time + **replenish** ([[#REQ-022]]); a bounded, documented
   **last-resort** carries an explicit, accepted residual (a draining hub can force
   last-resort → a later init-key compromise weakens forward secrecy for those Welcomes).
-  Round-3 confirms the ref-visibility mechanism + the residual's acceptability.
+  The §10 spike confirmed `validate()` rejects an expired KeyPackage (`InvalidLifetime`), so
+  the last-resort `lifetime` bound ([[#REQ-022]]) is enforced by the primitive. **Round-4
+  confirms** the ref-visibility mechanism (transcript-visible `KeyPackageRef`) + the
+  residual's acceptability.
 - **OQ-005 — Persisted-state retention — RESOLVED (PROPOSED, round-3).** Same
   retention-minimisation principle as [[#NFR-004]]: the agent SHALL retain only the secret
   material OpenMLS needs for the **current** epoch (plus a bounded out-of-order decryption
   window), **prune superseded epoch secrets** promptly to preserve forward secrecy, and
   treat a storage-format **version bump as a re-join** (no silent migration of stale secret
-  state). This bounds the [[#NFR-004]] past-message window to the retained window. Round-3
-  confirms the concrete OpenMLS retention knobs.
+  state). This bounds the [[#NFR-004]] past-message window to the retained window. The §10
+  spike **confirmed the concrete knobs** (`max_past_epochs`, `number_of_resumption_psks`,
+  `sender_ratchet_configuration` on `MlsGroupJoinConfigBuilder`) and that pruning is reflected
+  in **persisted** secret-state (~8.4 KB at `(0)` vs ~36 KB at `(12)`). **Round-4 / the durable
+  provider's own test** confirms only the on-disk delete fidelity of ADR-004's provider.
 
 ## 8. Tier-1 Gate
 
@@ -491,18 +509,31 @@ found **two Critical + four High** findings; **v0.6.0 folds their dispositions**
 - Tightening: R3-09 → [[#REQ-013]], R3-10 → [[#REQ-022]], R3-11 → [[#NFR-004]], R3-12 →
   [[#REQ-006]], R3-13 → [[#REQ-021]]/[[#REQ-024]], R3-14 → [[#REQ-019]]/[[#OQ-001]].
 
+**§10 experiment spike — DONE** (`experiments/spec-013-mls-spike`, openmls 0.8.1 pinned to
+`cbcl-mls-wasm`). It converted three of the round-3 "could-not-assess" items into evidence
+and confirmed NFR-001 cross-stack: **R3-07** — OpenMLS *accepts* a credential-rebinding
+self-Update (REQ-017 clause (c) is load-bearing); **R3-10** — `validate()` rejects an expired
+KeyPackage (REQ-022 lifetime bound enforced); **R3-11** — `max_past_epochs` bounds *persisted*
+secret-state, all named knobs exist (NFR-004); **NFR-001** — native OpenMLS ⇄ the compiled
+`cbcl-mls-wasm` interoperate both directions at the pinned ciphersuite. Residuals it could not
+close: the durable provider's on-disk delete fidelity, and `cbcl_ristretto` point validation.
+
 What remains to gate implementation: a **round-4 confirmation** that v0.6.0's closures hold
-(focused re-review, fresh context — Principle 12) + a **human crypto sign-off**. Per
+(focused re-review, fresh context — Principle 12; brief at
+docs/decisions/SPEC-013-round4-review-brief.md) + a **human crypto sign-off**. Per
 [[PROTO-001]], before implementation:
 
 1. **Round-4 confirmation** of v0.6.0 — verify REQ-012/014/016/017/023 and the re-scoped
    ADR-006 actually close R3-01…R3-08 and that no new gap opened, and that the accepted
    residuals (first-contact TOFU; last-resort forward-secrecy; hub fan-out availability) are
-   adequately bounded.
+   adequately bounded. The §10 spike evidence is an input, not a substitute — it confirms the
+   *primitive's* behaviour, not the spec's app-level closures.
 2. **Human security/cryptography sign-off** resolving OQ-001…OQ-005 (the project
    owner may give this, accepting the cross-model review as basis, as was done for
-   `cbcl-bus` `SPEC-012`), explicitly confirming the OpenMLS 0.8 retention/lifetime/Update
-   semantics and the `cbcl_ristretto` point-validation the review could not assess.
+   `cbcl-bus` `SPEC-012`). The OpenMLS 0.8 retention/lifetime/Update semantics the round-3
+   review flagged are now spike-confirmed; the signer must still confirm the **durable
+   provider's on-disk delete fidelity** (ADR-004) and the **`cbcl_ristretto` point-validation**
+   (SPEC-016 REQ-007) the spike did not cover.
 3. **AI Trust Boundary metadata** recorded for the synthesis trajectory (model,
    prompts, drafts, adversarial findings).
 

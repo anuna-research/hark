@@ -347,5 +347,26 @@ All findings folded into **SPEC-013 v0.6.0** and **SPEC-016 v0.4.0**:
 
 The gate **remains BLOCKED**: folding the dispositions is not the same as clearing them. A
 **round-4 confirmation** (fresh context) + human crypto sign-off are still required, per
-SPEC-013 §8. The "could NOT assess" items above (OpenMLS 0.8 retention/lifetime/Update
-semantics; `cbcl_ristretto` point validation) are unchanged and must be confirmed by a human.
+SPEC-013 §8.
+
+### §10 experiment spike — resolves three of the "could NOT assess" items (2026-06-10)
+
+`experiments/spec-013-mls-spike` (openmls 0.8.1, pinned to `cbcl-mls-wasm`) verified, against
+the actual pinned minor source, the OpenMLS behaviours this review had only asserted:
+
+- **OpenMLS 0.8 Update-path credential check (R3-07)** — *empirically: NONE*. A self-Update
+  rebinding a leaf credential `bob`→`alice` is accepted by committer and peer. **Confirms
+  R3-07 and that REQ-017 clause (c) is load-bearing**, not defence-in-depth.
+- **Leaf-`lifetime` validation (R3-10)** — *enforced*. `KeyPackageIn::validate()` rejects an
+  expired KeyPackage (`InvalidLifetime`, `key_package_in.rs:196-197`). REQ-022's lifetime
+  bound works on the primitive.
+- **Retention knobs + pruning (R3-11)** — `max_past_epochs`, `number_of_resumption_psks`,
+  `sender_ratchet_configuration` all exist on `MlsGroupJoinConfigBuilder`; pruning is
+  reflected in **persisted** secret-state (~8.4 KB at `(0)` vs ~36 KB at `(12)`).
+- **NFR-001 cross-stack** — native OpenMLS ⇄ the compiled `cbcl-mls-wasm` interoperate both
+  directions at the pinned ciphersuite (`cross-stack/`).
+
+**Still NOT assessed (carry to human sign-off):** the **durable provider's on-disk delete
+fidelity** (ADR-004 not yet written — narrowed from the broad R3-11 doubt to just fsync);
+`cbcl_ristretto` point validation; the web client's full pin/rendering path; the live Fly
+deployment artifact; SPAKE2↔WS record-release binding (no spec'd frames yet).
