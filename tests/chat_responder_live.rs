@@ -17,11 +17,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use hark::chat::create_chat_agent;
-use hark::chat_frame::encode_frame;
+use hark::chat_frame::decode_payload;
 use hark::daemon::{AgentStore, AgentStoreConfig};
 use hark::identity::ChatIdentity;
+use hark::signed_transport::{SignedConn, parse_conn_bootstrap};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use url::Url;
 
@@ -69,20 +70,24 @@ async fn exactly_one_of_two_agents_is_elected() {
     .await
     .expect("agent B joins");
 
-    // A raw asker: join, then publish one cite ask carrying a thread id.
+    // A raw asker: bootstrap the signed-member wire (SPEC-012), join, then
+    // publish one cite ask carrying a thread id. Frames are signed over the
+    // domain-separated envelope via SignedConn — the production path; there is
+    // no bare-payload signer (SPEC-013 OQ-001 / R4-06).
     let asker = ChatIdentity::from_seed([99u8; 32]);
     let (mut sock, _) = connect_async(ws.as_str()).await.expect("asker connects");
+    let mut conn = recv_bootstrap(&mut sock).await;
     let hello = format!(
         "(hello @general :from @asker99 :key \"{}\")",
         asker.public_key_b64()
     );
-    send_signed(&mut sock, &asker, &hello).await;
+    send_signed(&mut sock, &mut conn, &asker, &hello).await;
     // Let the hub enrol + ack the asker before the ask.
     tokio::time::sleep(Duration::from_millis(300)).await;
     // A lang-wrapped ask in the agents' learned dialect (SPEC-005): only the
     // `(lang …)` form triggers the responder; bare cite/poll are ignored.
     let ask = "(lang summarize (ask @general \"what is X?\" :from @asker99 :thread \"ask-xyz\"))";
-    send_signed(&mut sock, &asker, ask).await;
+    send_signed(&mut sock, &mut conn, &asker, ask).await;
 
     // After the Δ window both agents have ranked; exactly one holds the ask in
     // its recv queue. Poll each once with a window comfortably past Δ but well
@@ -113,14 +118,31 @@ async fn exactly_one_of_two_agents_is_elected() {
     );
 }
 
-async fn send_signed(
-    sock: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    identity: &ChatIdentity,
-    text: &str,
-) {
-    let frame = encode_frame(text.as_bytes(), identity);
+type LiveSocket = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// Read the hub's first frame — the `(tell @client "conn-nonce" …)` bootstrap —
+/// and prime a `SignedConn` from it, as `create_chat_agent` does internally.
+async fn recv_bootstrap(sock: &mut LiveSocket) -> SignedConn {
+    let msg = tokio::time::timeout(Duration::from_secs(5), sock.next())
+        .await
+        .expect("bootstrap within 5s")
+        .expect("socket open")
+        .expect("bootstrap frame");
+    let text = match &msg {
+        WsMessage::Binary(bytes) => {
+            String::from_utf8_lossy(decode_payload(bytes).expect("well-formed frame")).into_owned()
+        }
+        WsMessage::Text(text) => text.to_string(),
+        other => panic!("unexpected first frame (expected conn-nonce bootstrap): {other:?}"),
+    };
+    let boot = parse_conn_bootstrap(&text).expect("first frame is the conn-nonce bootstrap");
+    SignedConn::from_bootstrap(&boot)
+}
+
+async fn send_signed(sock: &mut LiveSocket, conn: &mut SignedConn, identity: &ChatIdentity, text: &str) {
+    let frame = conn.sign_chat_frame(identity, text.as_bytes());
     sock.send(WsMessage::Binary(frame.into()))
         .await
         .expect("send frame");

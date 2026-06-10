@@ -1,14 +1,19 @@
-//! cbcl-chat signed-frame codec (SPEC-001 CON-006, IMPL-003 §5).
+//! cbcl-chat frame decoding + the signing seam (SPEC-001 CON-006, IMPL-003 §5).
 //!
-//! A `/chat/v1` frame is `u32 big-endian payload length ‖ payload ‖ 64-byte
-//! Ed25519 signature`, byte-identical to the browser client
-//! (`apps/cbcl_chat/priv/web/app.js`, `sendCBCL`/`onFrame`).
+//! A `/chat/v1` hub→client frame is `u32 big-endian payload length ‖ payload ‖
+//! 64-byte Ed25519 signature`, byte-identical to what the browser client reads
+//! (`apps/cbcl_chat/priv/web/app.js`, `onFrame`). This module decodes that
+//! framing and defines the [`FrameSigner`] seam the identity key plugs into.
 //!
-//! The framing is plain bytes and lives here, ungated. The *signature* is the
-//! only crypto, and it is isolated behind [`FrameSigner`] so the gated
-//! `ed25519-dalek` implementation (IMPL-003 Phase 2) plugs in at one seam. The
-//! agent does **not** verify inbound signatures: the hub verifies every signer
-//! and reconciles it with `:from` before fan-out (cbcl-chat-session-ws
+//! There is deliberately **no bare-payload encoder here**. Outbound frames are
+//! produced only by `signed_transport::SignedConn`, which signs the
+//! domain-separated `signed_frame::envelope` — never raw payload bytes. The old
+//! `encode_frame(payload, signer)` API was a raw-bytes signing oracle on the
+//! identity key and was retired per SPEC-013 OQ-001 / R4-06; do not reintroduce
+//! one.
+//!
+//! The agent does **not** verify inbound signatures: the hub verifies every
+//! signer and reconciles it with `:from` before fan-out (cbcl-chat-session-ws
 //! `verify-sender`), so a delivered frame's payload is already custody-checked,
 //! exactly as the browser treats it.
 
@@ -17,22 +22,13 @@ pub const SIG_LEN: usize = 64;
 /// Length of the big-endian `u32` payload-length prefix.
 pub const LEN_PREFIX: usize = 4;
 
-/// Produces the 64-byte signature over a canonical CBCL payload. Phase 1 ships
-/// [`NullSigner`]; the real `ed25519-dalek` signer lands in Phase 2 (the
-/// crypto-gate boundary). Keeping it a trait means the transport, claim round,
-/// and selector all compile and test with no crypto present.
+/// Produces a 64-byte Ed25519 signature over the given bytes. Implemented by
+/// [`crate::identity::ChatIdentity`]; invoked only by
+/// `signed_transport::SignedConn`, which always passes the domain-separated
+/// envelope (`signed_frame::envelope`), never bare payload bytes (SPEC-013
+/// OQ-001).
 pub trait FrameSigner: Send + Sync {
     fn sign(&self, payload: &[u8]) -> [u8; SIG_LEN];
-}
-
-/// Encode a signed frame: `len(4, big-endian) ‖ payload ‖ sig(64)`.
-pub fn encode_frame(payload: &[u8], signer: &dyn FrameSigner) -> Vec<u8> {
-    let sig = signer.sign(payload);
-    let mut frame = Vec::with_capacity(LEN_PREFIX + payload.len() + SIG_LEN);
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(payload);
-    frame.extend_from_slice(&sig);
-    frame
 }
 
 /// Extract the payload bytes from a hub-delivered frame, or `None` if the frame
@@ -54,52 +50,34 @@ pub fn decode_payload(frame: &[u8]) -> Option<&[u8]> {
     Some(&frame[LEN_PREFIX..LEN_PREFIX + len])
 }
 
-/// A stub signer for Phase 1 — emits an all-zero signature. The real hub will
-/// reject this with `bad-signature`; it exists only so the transport seam
-/// compiles and is testable before the Ed25519 codec (Phase 2) lands.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NullSigner;
-
-impl FrameSigner for NullSigner {
-    fn sign(&self, _payload: &[u8]) -> [u8; SIG_LEN] {
-        [0u8; SIG_LEN]
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{FrameSigner, LEN_PREFIX, NullSigner, SIG_LEN, decode_payload, encode_frame};
+    use super::{LEN_PREFIX, SIG_LEN, decode_payload};
 
-    /// A signer that fills the signature with a constant, to check placement.
-    struct ConstSigner(u8);
-    impl FrameSigner for ConstSigner {
-        fn sign(&self, _payload: &[u8]) -> [u8; SIG_LEN] {
-            [self.0; SIG_LEN]
-        }
+    /// Build a hub-shaped frame by hand: `len(4, big-endian) ‖ payload ‖ sig(64)`.
+    /// Test-local on purpose — production has no bare-payload encoder (R4-06).
+    fn frame(payload: &[u8], sig_byte: u8) -> Vec<u8> {
+        let mut f = Vec::with_capacity(LEN_PREFIX + payload.len() + SIG_LEN);
+        f.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        f.extend_from_slice(payload);
+        f.extend_from_slice(&[sig_byte; SIG_LEN]);
+        f
     }
 
     #[test]
     fn round_trips_payload() {
         let payload = b"(tell @research \"hi\" :from @aria)";
-        let frame = encode_frame(payload, &NullSigner);
-        assert_eq!(decode_payload(&frame), Some(&payload[..]));
+        assert_eq!(decode_payload(&frame(payload, 0)), Some(&payload[..]));
     }
 
     #[test]
     fn layout_matches_browser_format() {
         // 4-byte big-endian length, then payload, then 64-byte sig.
-        let payload = b"hi";
-        let frame = encode_frame(payload, &ConstSigner(0xAB));
-        assert_eq!(frame.len(), LEN_PREFIX + payload.len() + SIG_LEN);
-        assert_eq!(&frame[0..4], &[0, 0, 0, 2]); // len = 2, big-endian
-        assert_eq!(&frame[4..6], b"hi");
-        assert!(frame[6..].iter().all(|&b| b == 0xAB)); // 64-byte sig region
-    }
-
-    #[test]
-    fn null_signer_is_all_zero() {
-        let frame = encode_frame(b"x", &NullSigner);
-        assert!(frame[LEN_PREFIX + 1..].iter().all(|&b| b == 0));
+        let f = frame(b"hi", 0xAB);
+        assert_eq!(f.len(), LEN_PREFIX + 2 + SIG_LEN);
+        assert_eq!(&f[0..4], &[0, 0, 0, 2]); // len = 2, big-endian
+        assert_eq!(&f[4..6], b"hi");
+        assert!(f[6..].iter().all(|&b| b == 0xAB)); // 64-byte sig region
     }
 
     #[test]
@@ -113,27 +91,26 @@ mod tests {
     #[test]
     fn rejects_frame_missing_signature() {
         // len=2 ‖ "hi" but no trailing 64-byte signature: malformed.
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&2u32.to_be_bytes());
-        frame.extend_from_slice(b"hi");
-        assert_eq!(decode_payload(&frame), None);
+        let mut f = Vec::new();
+        f.extend_from_slice(&2u32.to_be_bytes());
+        f.extend_from_slice(b"hi");
+        assert_eq!(decode_payload(&f), None);
         // Payload + partial signature is also rejected (not exactly SIG_LEN).
-        frame.extend_from_slice(&[0u8; SIG_LEN - 1]);
-        assert_eq!(decode_payload(&frame), None);
+        f.extend_from_slice(&[0u8; SIG_LEN - 1]);
+        assert_eq!(decode_payload(&f), None);
     }
 
     #[test]
     fn rejects_overlong_frame() {
         // A correctly framed payload with extra trailing bytes is rejected
         // rather than silently truncated to the declared length.
-        let mut frame = encode_frame(b"hi", &NullSigner);
-        frame.push(0xFF);
-        assert_eq!(decode_payload(&frame), None);
+        let mut f = frame(b"hi", 0);
+        f.push(0xFF);
+        assert_eq!(decode_payload(&f), None);
     }
 
     #[test]
     fn empty_payload_is_valid() {
-        let frame = encode_frame(b"", &NullSigner);
-        assert_eq!(decode_payload(&frame), Some(&b""[..]));
+        assert_eq!(decode_payload(&frame(b"", 0)), Some(&b""[..]));
     }
 }
