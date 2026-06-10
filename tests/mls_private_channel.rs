@@ -51,14 +51,18 @@ fn two_agents_full_encrypted_channel_lifecycle() {
         SessionEvent::Handled { .. }
     ));
 
-    // Alice creates; presence prompts the keyget; the hub answers keypkg.
+    // Alice creates; presence re-broadcasts her idkey (bob newly seen) AND,
+    // since alice already pinned bob, prompts the keyget the hub answers.
     alice.create_group_as_creator().unwrap();
     let SessionEvent::Handled { outbound } =
         alice.handle_frame("(presence @research :members (@alice @bob))")
     else {
         panic!("presence");
     };
-    assert_eq!(outbound.len(), 1, "one keyget for @bob");
+    assert!(
+        outbound.iter().any(|f| f == "(keyget @hub :for @bob :from @alice)"),
+        "presence prompts a keyget for the pinned, present non-member: {outbound:?}"
+    );
 
     // Bob's one-time package from his keypub (first :onetime entry).
     let onetime_start = b_join[0].find(":onetime (").unwrap() + ":onetime (".len();

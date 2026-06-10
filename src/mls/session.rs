@@ -17,6 +17,7 @@
 //! cap is re-presented.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -52,6 +53,13 @@ struct SessionMeta {
     enc_pinned: bool,
     group_id_b64: Option<String>,
     genesis: Option<GenesisAssertion>,
+    /// True when the group was joined as first-contact TOFU and the operator
+    /// has NOT yet confirmed the REQ-021 safety number out-of-band. Persisted
+    /// so a daemon restart does NOT silently promote an unconfirmed (possibly
+    /// hub-fabricated) group to authoritative — the safety-number control
+    /// must survive HP-3 (REQ-016/ADR-006).
+    #[serde(default)]
+    tofu_pending: bool,
 }
 
 /// What an inbound frame turned out to be.
@@ -159,9 +167,16 @@ impl MlsSession {
                     .ok()
                     .flatten();
                     if session.group.is_some() && session.genesis.is_some() {
-                        // Trust was graded at join; a pinned creator key can
-                        // only have improved since (rotations re-pin).
-                        session.trust = Some(GenesisTrust::Authoritative);
+                        // Restore the trust grade faithfully: a group joined as
+                        // unconfirmed TOFU stays TOFU-pending across restart so
+                        // the safety-number comparison is still required; only a
+                        // group that was authoritative at join (pinned creator
+                        // key) reloads authoritative.
+                        session.trust = Some(if meta.tofu_pending {
+                            GenesisTrust::TofuRequiresSafetyNumber
+                        } else {
+                            GenesisTrust::Authoritative
+                        });
                     }
                 }
             }
@@ -207,12 +222,22 @@ impl MlsSession {
                 .as_ref()
                 .map(|g| B64.encode(g.group_id().as_slice())),
             genesis: self.genesis.clone(),
+            tofu_pending: matches!(self.trust, Some(GenesisTrust::TofuRequiresSafetyNumber)),
         };
         let bytes = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
         if let Some(parent) = self.meta_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&self.meta_path, bytes)?;
+        // Atomic write (temp + fsync + rename), matching the provider/pins/
+        // ledger writers — a crash mid-write must not truncate the resume
+        // state and silently force a re-join (REQ-009).
+        let tmp = self.meta_path.with_extension("mlsmeta.tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &self.meta_path)?;
         Ok(())
     }
 

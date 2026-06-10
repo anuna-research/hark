@@ -358,6 +358,20 @@ pub fn add_member(
                 .into(),
         ));
     }
+    // Refuse to add a handle that is already a member. The KeyPackage
+    // directory is the untrusted hub; an unsolicited or replayed `keypkg` for
+    // an existing member (with a fresh one-time ref the ledger hasn't seen)
+    // would otherwise commit a second leaf for the same handle — corrupting
+    // the deterministic election, double-counting the REQ-021 safety number
+    // (a false fork vs. web peers), and seating a duplicate decryptor.
+    if member_bindings(group)?
+        .iter()
+        .any(|(handle, _)| handle == target_handle)
+    {
+        return Err(MlsError::Rejected(format!(
+            "{target_handle} is already a member; refusing a duplicate-leaf Add"
+        )));
+    }
     let kp = validate_key_package_bytes(provider, kp_bytes)?;
     verify_add_target(&kp, target_handle, pins)?;
 
@@ -432,9 +446,12 @@ pub fn join_from_welcome(
     };
 
     // REQ-013: a replayed Welcome addressed to an already-consumed package
-    // is inert — rejected before any key material is touched.
-    for ref_b64 in welcome_refs(&welcome) {
-        if ledger.is_consumed(&ref_b64) {
+    // is inert — rejected before any key material is touched. Capture the refs
+    // now (the `welcome` is moved into staging below) so the durable
+    // consumed-ledger can be written on a *successful* join.
+    let welcome_refs = welcome_refs(&welcome);
+    for ref_b64 in &welcome_refs {
+        if ledger.is_consumed(ref_b64) {
             return Err(MlsError::Rejected(format!(
                 "welcome reuses consumed KeyPackageRef {ref_b64} (replay)"
             )));
@@ -504,7 +521,6 @@ pub fn join_from_welcome(
         }
     }
 
-    let refs: Vec<String> = welcome_refs_of_staged(&staged);
     let group = match staged.into_group(provider) {
         Ok(group) => group,
         Err(e) => {
@@ -513,11 +529,12 @@ pub fn join_from_welcome(
         }
     };
 
-    // Success: record consumed refs durably, pin first-contact members TOFU,
-    // persist (this is REQ-013 step 4 — the init key leaves disk here).
-    for ref_b64 in refs {
+    // Success: record the consumed KeyPackageRef(s) durably (REQ-013 step 4 —
+    // the durable single-use ledger), pin first-contact members TOFU, then
+    // persist (the consumed init key leaves disk here).
+    for ref_b64 in &welcome_refs {
         // mark_consumed errors only on duplicates, which we pre-checked.
-        let _ = ledger.mark_consumed(&ref_b64);
+        let _ = ledger.mark_consumed(ref_b64);
     }
     for (handle, key) in tofu_pins {
         pins.observe_verified(&handle, &key)?;
@@ -589,14 +606,6 @@ fn validate_staged_welcome(
         None => return Err(MlsError::Rejected("welcome tree has no members".into())),
     }
     Ok(())
-}
-
-/// The refs a staged welcome consumed (recorded in the ledger on success).
-fn welcome_refs_of_staged(_staged: &StagedWelcome) -> Vec<String> {
-    // The matching ref was already captured pre-staging via `welcome_refs`;
-    // openmls does not re-expose it post-staging. The session records the
-    // pre-staging refs; this hook exists so the call-site reads clearly.
-    Vec::new()
 }
 
 #[cfg(test)]
@@ -756,6 +765,50 @@ mod tests {
         assert_eq!(joined.genesis, genesis);
         assert_eq!(joined.group.members().count(), 2);
         assert!(joined.first_contact_handles.is_empty());
+
+        // REQ-013: a successful join records the consumed KeyPackageRef in the
+        // DURABLE ledger (regression: this loop was previously dead, leaving
+        // the single-use ledger permanently empty). Reopen it to prove it
+        // persisted, and that a replayed Welcome to that ref is now rejected.
+        let ledger = super::super::keypackages::ConsumedLedger::open(
+            &bob.dir.join("agent.kpledger"),
+        )
+        .unwrap();
+        assert!(
+            bob.dir.join("agent.kpledger").exists(),
+            "join must persist the consumed-ref ledger"
+        );
+        let replay = join_from_welcome(
+            &bob.provider,
+            &bob.identity,
+            &outcome.welcome_bytes,
+            "@research",
+            &mut bob.pins,
+            &mut { ledger },
+            None,
+        );
+        assert!(replay.is_err(), "a replayed Welcome to a consumed ref is rejected (REQ-013)");
+
+        // Integrity guard: the owner refuses to add @bob a second time (an
+        // unsolicited/replayed keypkg for an existing member must not seat a
+        // duplicate leaf).
+        let kp2 = super::super::keypackages::build_one_time(&bob.provider, &bob.identity, 1)
+            .unwrap()
+            .remove(0);
+        let dup = add_member(
+            &alice.provider,
+            &alice.identity,
+            &mut group,
+            &kp2.bytes,
+            "@bob",
+            &alice.pins,
+            &alice.ledger,
+        );
+        assert!(
+            matches!(&dup, Err(MlsError::Rejected(m)) if m.contains("already a member")),
+            "duplicate-leaf Add must be rejected, got {}",
+            dup.map(|_| "Ok").unwrap_or("other Err")
+        );
 
         let _ = fs::remove_dir_all(&alice.dir);
         let _ = fs::remove_dir_all(&bob.dir);
