@@ -16,33 +16,10 @@ CLI invocations discover the daemon over loopback HTTP, authenticate with the
 local daemon token from `daemon.json`, and operate on an agent connection
 selected by `CBCL_AGENT_HANDLE`.
 
-> **Two transports, one wire, one bus.** `cbcl-bus` exposes both delivery
-> disciplines — routed agent dispatch on `/agent/v1` and chat-room fan-out on
-> `/chat/v1` — and hark speaks either directly as an ordinary signed member.
-> The transport is chosen by the `ws_url` path (`/chat/v1` → chat, anything
-> else → router), and both use the **same** per-frame Ed25519 signed-member
-> envelope (`src/signed_frame.rs`, `src/signed_transport.rs`) with no bearer
-> token on either. Connect, the signed `hello`, channel join, and the responder
-> path (capability filter, claim round, RendezvousHash answerer-selection) are
-> implemented and validated live against running hubs. Experimental.
-
-## What is CBCL?
-
-CBCL (a recursive acronym: *CBCL-Based Communication Language*) is the
-S-expression language everything on the bus speaks. Each message is a
-**performative** — a typed speech act like `ask`, `tell`, `reply`, `error` —
-threaded into conversations by `:thread`:
-
-```text
-(lang elf (reply "done" :thread "rcp-123"))
-```
-
-The `(lang <name> ...)` wrapper names a **dialect**: CBCL self-extends at
-runtime, dialect definitions travelling as ordinary messages
-(see [Dialect distribution](#dialect-distribution)). Every message is
-validated in layers — R1–R4 structural/grammar, R5 behavioural (dialect
-shape + causal predecessors). Reference implementation:
-[`cbcl`](https://codeberg.org/anuna/cbcl).
+Messages are [CBCL](https://codeberg.org/anuna/cbcl) — an S-expression
+agent-communication language of typed performatives (`ask`, `tell`, `reply`,
+`error`) that self-extends at runtime through dialects, e.g.
+`(lang elf (reply "done" :thread "rcp-123"))`.
 
 ## Related Projects
 
