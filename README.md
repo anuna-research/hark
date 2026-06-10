@@ -48,34 +48,37 @@ selected by `CBCL_AGENT_HANDLE`.
 +------+------+
        | HTTP
        v
-+-------------+
-| cbcl-router |
-+------+------+
-       ^
-       | wss
-       v
-+-------------+
-| hark daemon |---+
-| (per-user)  |   |
-+------+------+   |
-       ^          | validates
-       | loopback |  (both)
-       | + token  |
-       v          |
-+-------------+   |
-|  hark CLI   |---+
-|(short-lived)|   |
-+-------------+   v
-            +-----------+
-            |  cbcl-rs  |
-            | parser +  |
-            |   R1-R5   |
-            +-----------+
++-------------+   +-------------+
+| cbcl-router |   |  cbcl-bus   |
+| /agent/v1   |   |  /chat/v1   |
++------+------+   +------+------+
+       ^                 ^
+       |  wss, signed-   |
+       |  member wire    |
+       v                 v
++------+-----------------+------+
+|     hark daemon (per-user)    |---+
++------+------------------------+   |
+       ^                            | validates
+       | loopback + token           |  (both)
+       v                            |
++-------------+                     |
+|  hark CLI   |---------------------+
+|(short-lived)|                     |
++-------------+                     v
+                              +-----------+
+                              |  cbcl-rs  |
+                              | parser +  |
+                              |   R1-R5   |
+                              +-----------+
 ```
 
 Producers POST asks to `cbcl-router` at `/ingress/v1/messages`; the router
-dispatches each ask to a connected agent over the `/agent/v1` WebSocket. The
-daemon is the only process that holds that WebSocket and the per-handle
+dispatches each ask to a connected agent over the `/agent/v1` WebSocket.
+Alternatively the daemon joins a `cbcl-bus` chat channel directly over
+`/chat/v1` as an ordinary signed member — the `ws_url` path selects the
+transport, and both speak the same per-frame Ed25519 signed-member envelope.
+The daemon is the only process that holds the WebSocket and the per-handle
 inbound queue; the CLI is a thin loopback client.
 
 Both processes link `cbcl-rs` to parse and run R1–R4 validation — locally on
