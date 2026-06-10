@@ -162,6 +162,11 @@
 (normally r-assign-response-scoping (and ready-response-scoping agent-claude-available) assign-to-response-scoping-claude)
 (normally r-assign-install (and ready-install agent-claude-available) assign-to-install-claude)
 (normally r-assign-ristretto-audit (and ready-ristretto-audit agent-claude-available) assign-to-ristretto-audit-claude)
+;; Tier-1 + hub tasks: assignable now that condition J is satisfied.
+(normally r-assign-hub-pairing (and ready-hub-pairing agent-claude-available) assign-to-hub-pairing-claude)
+(normally r-assign-pair-client (and ready-pair-client agent-claude-available) assign-to-pair-client-claude)
+(normally r-assign-provenance (and ready-provenance agent-claude-available) assign-to-provenance-claude)
+(normally r-assign-removal (and ready-removal agent-claude-available) assign-to-removal-claude)
 
 (claims agent:claude
   :at "2026-06-10T13:13:08Z"
@@ -336,3 +341,48 @@
 (claims agent:claude
   :at "2026-06-10T21:34:00Z"
   (given completed-ristretto-audit))
+
+(claims agent:claude
+  :at "2026-06-10T21:37:32Z"
+  (given claim-v1-hub-pairing)
+  (normally r-cl-state-v1-hub-pairing claim-v1-hub-pairing state-claimed-v1-hub-pairing)
+  (normally r-cl-chain-v1-hub-pairing state-claimed-v1-hub-pairing claimed-hub-pairing)
+)
+
+;; Propagation rules: failures in 'hub-pairing' block downstream tasks
+(normally r-propagate-pair-client-from-hub-pairing-failed failed-hub-pairing upstream-blocked-pair-client)
+(normally r-propagate-pair-client-from-hub-pairing-permanently-failed permanently-failed-hub-pairing upstream-blocked-pair-client)
+(normally r-propagate-pair-client-from-hub-pairing-stale-v1 stale-v1-hub-pairing upstream-blocked-pair-client)
+(normally r-propagate-pair-client-from-hub-pairing-timeout-v1 timeout-v1-hub-pairing upstream-blocked-pair-client)
+(normally r-propagate-provenance-from-hub-pairing-failed failed-hub-pairing upstream-blocked-provenance)
+(normally r-propagate-provenance-from-hub-pairing-permanently-failed permanently-failed-hub-pairing upstream-blocked-provenance)
+(normally r-propagate-provenance-from-hub-pairing-stale-v1 stale-v1-hub-pairing upstream-blocked-provenance)
+(normally r-propagate-provenance-from-hub-pairing-timeout-v1 timeout-v1-hub-pairing upstream-blocked-provenance)
+
+(claims agent:claude
+  :at "2026-06-10T21:53:27Z"
+  (given discovered-pairing-crypto-foundation-done-spake2-context-bip39-4word-j-a-j-b))
+
+(claims agent:claude
+  :at "2026-06-10T21:53:27Z"
+  (given decided-pairing-placement-needs-owner-input-router-vs-chat-vs-shared))
+
+(claims agent:claude
+  :at "2026-06-10T22:20:15Z"
+  (given discovered-crypto-relocated-to-cbcl-bus-420-tests-green))
+
+(claims agent:claude
+  :at "2026-06-10T22:20:15Z"
+  (given decided-pairing-lives-in-cbcl-chat-using-shared-bus-crypto))
+
+(claims agent:claude
+  :at "2026-06-10T22:31:03Z"
+  (given discovered-hub-pairing-core-complete-store-driver-vectors-432-tests))
+
+(claims agent:claude
+  :at "2026-06-10T22:36:53Z"
+  (given discovered-pair-client-crypto-byte-matches-hub-cross-stack-vectors-green))
+
+(claims agent:claude
+  :at "2026-06-10T22:36:53Z"
+  (given decided-pairing-code-is-wormhole-style-public-id-plus-secret-phrase))
