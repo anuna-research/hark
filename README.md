@@ -7,37 +7,38 @@
 [![Rust: 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
 
 `hark` is a Rust CLI and local per-user daemon for agents that
-communicate through `cbcl-router`.
+communicate through the [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus)
+signed-member message bus.
 
-The daemon owns router WebSocket connections and local inbound queues. Short
+The daemon owns the bus WebSocket connections and local inbound queues. Short
 CLI invocations discover the daemon over loopback HTTP, authenticate with the
 local daemon token from `daemon.json`, and operate on an agent connection
 selected by `CBCL_AGENT_HANDLE`.
 
-> **Two transports, one wire.** Besides the router, hark speaks the
-> [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) chat hub's `/chat/v1`
-> directly as an ordinary signed member — no router required. The transport is
-> chosen by the `ws_url` path (`/chat/v1` → chat, anything else → router), and
-> both transports use the **same** per-frame Ed25519 signed-member envelope
-> (`src/signed_frame.rs`, `src/signed_transport.rs`) with no bearer token on
-> either. Connect, the signed `hello`, channel join, and the responder path
-> (capability filter, claim round, RendezvousHash answerer-selection) are
+> **Two transports, one wire, one bus.** `cbcl-bus` exposes both delivery
+> disciplines — routed agent dispatch on `/agent/v1` and chat-room fan-out on
+> `/chat/v1` — and hark speaks either directly as an ordinary signed member.
+> The transport is chosen by the `ws_url` path (`/chat/v1` → chat, anything
+> else → router), and both use the **same** per-frame Ed25519 signed-member
+> envelope (`src/signed_frame.rs`, `src/signed_transport.rs`) with no bearer
+> token on either. Connect, the signed `hello`, channel join, and the responder
+> path (capability filter, claim round, RendezvousHash answerer-selection) are
 > implemented and validated live against running hubs. Experimental.
 
 ## Related Projects
 
-* [`cbcl-router`](https://codeberg.org/anuna/cbcl-router) - the dialect-based
-  router this client connects to.
-* [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) - the hub the native chat
-  transport joins directly: the `cbcl_chat` LFE app serving `/chat/v1`
-  (signed-member wire, rooms, invites, KeyPackage directory) plus the web
-  client. SPEC-013/SPEC-016 name it as an affected repo.
-* [`cbcl-chat`](https://codeberg.org/anuna/cbcl-chat) - home of the
-  `cbcl-mls-wasm` crate (the OpenMLS browser binding the web client ships);
-  the MLS interop target SPEC-013 pins hark's OpenMLS version to.
+* [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) - the signed-member message
+  bus this client connects to: one LFE/OTP umbrella with a shared auth core and
+  both transports — `apps/cbcl_router` (routed dispatch, `/agent/v1`) and
+  `apps/cbcl_chat` (chat fan-out, `/chat/v1`, rooms/invites/KeyPackage
+  directory) — plus the web client. SPEC-013/SPEC-016 name it as an affected
+  repo. Supersedes the former standalone `cbcl-router` and `cbcl-chat` hubs.
+* [`cbcl-chat`](https://codeberg.org/anuna/cbcl-chat) - superseded as a hub
+  (now `apps/cbcl_chat` in the bus), but still home of the `cbcl-mls-wasm`
+  crate — the OpenMLS browser binding SPEC-013 pins hark's OpenMLS version to.
 * [`cbcl-rs`](https://codeberg.org/anuna/cbcl-rs) - the Rust CBCL parser and
   validation implementation used locally before outbound messages are sent to
-  the router.
+  the bus.
 
 ## Architecture
 
@@ -48,15 +49,18 @@ selected by `CBCL_AGENT_HANDLE`.
 +------+------+
        | HTTP
        v
-+-------------+   +-------------+
-| cbcl-router |   |  cbcl-bus   |
-| /agent/v1   |   |  /chat/v1   |
-+------+------+   +------+------+
-       ^                 ^
-       |  wss, signed-   |
-       |  member wire    |
-       v                 v
-+------+-----------------+------+
++-------------------------------+
+|           cbcl-bus            |
+| +-----------+   +-----------+ |
+| |  router   |   |   chat    | |
+| | /agent/v1 |   | /chat/v1  | |
+| +-----+-----+   +-----+-----+ |
++-------+---------------+-------+
+        ^               ^
+        |  wss, signed- |
+        |  member wire  |
+        v               v
++-------+---------------+-------+
 |     hark daemon (per-user)    |---+
 +------+------------------------+   |
        ^                            | validates
@@ -73,13 +77,14 @@ selected by `CBCL_AGENT_HANDLE`.
                               +-----------+
 ```
 
-Producers POST asks to `cbcl-router` at `/ingress/v1/messages`; the router
-dispatches each ask to a connected agent over the `/agent/v1` WebSocket.
-Alternatively the daemon joins a `cbcl-bus` chat channel directly over
-`/chat/v1` as an ordinary signed member — the `ws_url` path selects the
-transport, and both speak the same per-frame Ed25519 signed-member envelope.
-The daemon is the only process that holds the WebSocket and the per-handle
-inbound queue; the CLI is a thin loopback client.
+Both transports are one `cbcl-bus` deployment. Producers POST asks to the
+bus at `/ingress/v1/messages`; its router app dispatches each ask to a
+connected agent over the `/agent/v1` WebSocket. Alternatively the daemon
+joins a chat channel directly over `/chat/v1` as an ordinary signed member —
+the `ws_url` path selects the transport, and both speak the same per-frame
+Ed25519 signed-member envelope. The daemon is the only process that holds
+the WebSocket and the per-handle inbound queue; the CLI is a thin loopback
+client.
 
 Both processes link `cbcl-rs` to parse and run R1–R4 validation — locally on
 the way out, and again before caching pushed dialects. The daemon
