@@ -1,0 +1,3 @@
+/target
+# Cargo.lock IS committed — this is an evidence-producing spike; the lock pins the
+# exact OpenMLS (0.8.1) that the recorded findings were observed against.
