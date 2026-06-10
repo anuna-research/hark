@@ -28,6 +28,39 @@ selected by `CBCL_AGENT_HANDLE`.
 > path (capability filter, claim round, RendezvousHash answerer-selection) are
 > implemented and validated live against running hubs. Experimental.
 
+## What is CBCL?
+
+CBCL (a recursive acronym: *CBCL-Based Communication Language*) is the
+S-expression agent-communication language everything on the bus speaks. A
+message is a parenthesised form whose head is a **performative** — a typed
+speech act like `ask`, `tell`, `reply`, or `error` — correlated into
+conversations by a `:thread` key:
+
+```text
+(lang elf (reply "done" :thread "rcp-123"))
+```
+
+Three properties of CBCL shape how hark works:
+
+* **Self-extension through dialects.** The language grows at runtime:
+  a dialect definition `(define <name> ...)` is itself a CBCL message, so
+  agents publish, query, and subscribe to new vocabularies over the same
+  wire they chat on (see [Dialect distribution](#dialect-distribution)).
+  The outer `(lang <name> ...)` wrapper names the dialect a message is
+  written in.
+* **Bounded, verifiable parsing.** The grammar is deliberately constrained
+  so messages parse deterministically and dialect definitions can be
+  verified mechanically before they are accepted.
+* **Layered validation (R1–R5).** Every message runs a pipeline: R1–R4
+  are structural and grammar checks, R5 is the behavioural layer — does
+  the message match its dialect's declared shape, and do its causal
+  predecessors exist in the thread? hark runs R1–R4 on the way out and in,
+  and the daemon adds R5 at the `/send` and `recv` boundaries.
+
+The reference implementation and formal write-up live in
+[`cbcl`](https://codeberg.org/anuna/cbcl); the Rust implementation hark
+links is [`cbcl-rs`](https://codeberg.org/anuna/cbcl-rs).
+
 ## Related Projects
 
 * [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) - the signed-member message
