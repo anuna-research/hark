@@ -180,6 +180,11 @@ pub struct CreateAgentRequest {
     /// (the hub's `:cap`). Omit for public channels. Ignored by the router.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<String>,
+    /// Chat transport only: the member who added this agent (SPEC-016 REQ-010),
+    /// carried on the agent's `announce` so the roster shows the provenance.
+    /// Set by `hark pair` from the released record; `None` for a plain join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -818,6 +823,7 @@ async fn create_chat_transport_agent(
         wire_handle,
         request.dialects,
         request.cap.clone(),
+        request.added_by.clone(),
         chat.claim_window,
         chat.liveness_timeout,
         std::sync::Arc::new(identity),

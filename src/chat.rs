@@ -181,6 +181,7 @@ pub async fn create_chat_agent(
     agent_handle: &str,
     dialects: Vec<String>,
     cap: Option<String>,
+    added_by: Option<String>,
     claim_window: Duration,
     liveness_timeout: Duration,
     identity: Arc<ChatIdentity>,
@@ -252,7 +253,7 @@ pub async fn create_chat_agent(
     // performative, not inferable from the handle). Sent once, right after
     // the join ack — a failure here is a failed join, not a silent
     // plain-member fallback.
-    let announce = build_announce_frame(channel, agent_handle, &dialects);
+    let announce = build_announce_frame(channel, agent_handle, &dialects, added_by.as_deref());
     let announce_payload = payload_bytes(&announce).map_err(ChatError::Hello)?;
     let announce_frame = conn.sign_chat_frame(identity.as_ref(), &announce_payload);
     websocket
@@ -305,15 +306,24 @@ pub async fn create_chat_agent(
 
 /// The agent's `announce` frame (SPEC-016 REQ-006): addressed to the channel
 /// (the first `@`-token is the signing audience), carrying the agent handle
-/// and its advertised dialects. Chat clients key the agent rendering off this
-/// performative.
-fn build_announce_frame(channel: &str, agent_handle: &str, dialects: &[String]) -> String {
+/// and its advertised dialects. When the agent was paired in, it also carries
+/// `:added-by` so every client can show the provenance (REQ-010). Chat clients
+/// key the agent rendering off this performative.
+fn build_announce_frame(
+    channel: &str,
+    agent_handle: &str,
+    dialects: &[String],
+    added_by: Option<&str>,
+) -> String {
     let list = dialects
         .iter()
         .map(|dialect| format!("\"{}\"", dialect.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>()
         .join(" ");
-    format!("(announce {channel} :agent {agent_handle} :dialects ({list}))")
+    let added = added_by
+        .map(|adder| format!(" :added-by {adder}"))
+        .unwrap_or_default();
+    format!("(announce {channel} :agent {agent_handle} :dialects ({list}){added})")
 }
 
 /// Receive + parse the chat hub's conn-nonce bootstrap (its first frame:
@@ -629,13 +639,18 @@ mod tests {
     #[test]
     fn builds_announce_frame_with_channel_audience_and_dialects() {
         assert_eq!(
-            build_announce_frame("@demo", "@aria", &["cite".to_owned(), "vote".to_owned()]),
+            build_announce_frame("@demo", "@aria", &["cite".to_owned(), "vote".to_owned()], None),
             r#"(announce @demo :agent @aria :dialects ("cite" "vote"))"#
         );
         // Advertising nothing is still a legible agent (HP-2 + REQ-006).
         assert_eq!(
-            build_announce_frame("@demo", "@aria", &[]),
+            build_announce_frame("@demo", "@aria", &[], None),
             "(announce @demo :agent @aria :dialects ())"
+        );
+        // A paired agent carries its adder (REQ-010).
+        assert_eq!(
+            build_announce_frame("@demo", "@aria", &["cite".to_owned()], Some("@mira")),
+            r#"(announce @demo :agent @aria :dialects ("cite") :added-by @mira)"#
         );
     }
 

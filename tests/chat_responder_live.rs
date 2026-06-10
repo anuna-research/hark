@@ -50,6 +50,7 @@ async fn exactly_one_of_two_agents_is_elected() {
         "@resp-a",
         vec!["summarize".to_owned()],
         None,
+        None, // added_by
         window,
         liveness,
         Arc::new(ChatIdentity::from_seed([11u8; 32])),
@@ -63,6 +64,7 @@ async fn exactly_one_of_two_agents_is_elected() {
         "@resp-b",
         vec!["summarize".to_owned()],
         None,
+        None, // added_by
         window,
         liveness,
         Arc::new(ChatIdentity::from_seed([12u8; 32])),

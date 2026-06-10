@@ -403,6 +403,7 @@ async fn join_command(args: JoinArgs) -> AppResult<()> {
             channel: Some(args.channel.clone()),
             handle: Some(args.as_handle.clone()),
             cap: args.cap,
+            added_by: None,
         })
         .await
         .map_err(map_local_api_request_error)?;
@@ -496,6 +497,7 @@ async fn pair_command(args: PairArgs) -> AppResult<()> {
             channel: Some(record.channel.clone()),
             handle: Some(handle.clone()),
             cap,
+            added_by: Some(record.adder.clone()),
         })
         .await
         .map_err(map_local_api_request_error)?;
@@ -562,6 +564,7 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
             channel: args.channel,
             handle: args.handle,
             cap: args.cap,
+            added_by: None,
         })
         .await
         .map_err(map_local_api_request_error)?;
