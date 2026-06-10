@@ -1,19 +1,23 @@
 ---
 id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
-status: approved
+status: approved (DX scope); pairing handshake BLOCKED pending round-4 + crypto sign-off
 tier: 3 (pairing handshake — Tier-1)
-version: 0.3.0
+version: 0.4.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8)
-last-updated: 2026-06-09
+author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings, Claude Fable 5)
+last-updated: 2026-06-10
 approved-date: 2026-06-09
-approved-by: project owner (OQ-001…004 settled in dialogue)
+approved-by: project owner (OQ-001…004 settled in dialogue; REQ-007 re-opened by round-3 — see below)
 owner-repo: hark
 affects-repos: cbcl-bus (web mints the pairing record; SPEC-015 declaration)
 depends-on: SPEC-015 (channel dialects), the announce fix, cbcl-crypto-spake2 + cbcl-chat-invite (reused)
-review-gate: Tier-3 DX scope approved; the SPAKE2 pairing handshake (OQ-001) carries a
-  Tier-1 gate — cross-model review + crypto sign-off before that piece is implemented
+review-gate: Tier-3 DX scope approved; the SPAKE2 pairing handshake (REQ-007/OQ-001) carries a
+  Tier-1 gate — cross-model review + crypto sign-off before that piece is implemented. The
+  SPEC-013 **round-3 review (R3-01..R3-05)** corrected REQ-007 + ADR-003 (v0.4.0): SPAKE2
+  anchors capability + name, NOT peer identity; the hub holds a password-equivalent verifier;
+  pairing-specific transcript constants + failed-attempt bound + an `enc`-mode field are now
+  required. See hark/docs/decisions/SPEC-013-round3-review-findings.md.
 ---
 
 # SPEC-016 — Agent Onboarding DX: Frictionless Join & Auto-Learn
@@ -70,8 +74,9 @@ nothing.)
 **HP-3 — in-app pairing.** In the web app the operator **names** the agent and picks its
 dialects → the hub mints a pairing record + a **3–4 word BIP39 phrase**
 (*"rocket anchor velvet"*). `hark pair "rocket anchor velvet"` runs **SPAKE2** with the
-hub; on success the hub releases the record — `{name, dialects, a cbcl-chat-invite cap}`
-— and hark joins under that name with the invite, no `--as`/`--speak`.
+hub; on success the hub releases the record (bound to the PAKE key) —
+`{name, dialects, enc-mode, a cbcl-chat-invite cap}` — and hark joins under that name with
+the invite, pinning the channel's encryption mode, no `--as`/`--speak`.
 **HP-4 — plain chat.** `hark emit "looking into it"` sends a **valid CBCL** `(tell
 @research "looking into it")` (the existing `emit` kind); the chat client unwraps the
 `tell` to render the prose. No hand-written CBCL, no raw-text frames.
@@ -105,15 +110,37 @@ key, accountability is the **adding member**.
   ([[SPEC-015-channel-dialects#REQ-005]]). Trace: `[[#TEST-005]]`.
 - **REQ-006 — Legibility.** On joining, the agent SHALL emit `announce` so it is
   rendered as an agent. Trace: `[[#TEST-006]]`.
-- **REQ-007 — SPAKE2 pairing carrying name + dialects (Tier-1).** The web "add agent"
-  SHALL mint a hub pairing record `{agent-name, channel, a cbcl-chat-invite cap, adder,
-  chosen (name, digest) dialects, exp}` and a **memorable BIP39 phrase** stored only as
-  an HMAC. `hark pair "<phrase>"` SHALL run **SPAKE2** (RFC 9382, reusing
-  `cbcl-crypto-spake2` + `bip39-english.txt`, mirroring `auth_shell` enrolment); on
-  success the hub releases the record over the authenticated session, and hark joins the
-  channel **under that name** with the **invite-as-cap** ([[SPEC-013-mls-private-channels#HP-1]])
-  and installs the dialects by digest. Single-use, short TTL. **This handshake is Tier-1
-  / no-go** (auth-core) — gated on cross-model review + crypto sign-off. Trace: `[[#TEST-007]]`.
+- **REQ-007 — SPAKE2 pairing carrying name + dialects + enc-mode (Tier-1).** The web "add
+  agent" SHALL mint a hub pairing record `{agent-name, channel, **enc** (the channel's pinned
+  encryption mode — [[SPEC-013-mls-private-channels#REQ-023]]), a cbcl-chat-invite cap, adder,
+  chosen (name, digest) dialects, exp}` and a **memorable BIP39 phrase**. `hark pair
+  "<phrase>"` SHALL run **SPAKE2** (RFC 9382, reusing the `cbcl-crypto-spake2` **primitive**);
+  on success the hub releases the record **bound to the PAKE-derived session key K** (encrypted
+  and/or MAC'd under K, not merely "sent after success"), and hark joins the channel **under
+  that name** with the **invite-as-cap** ([[SPEC-013-mls-private-channels#HP-1]]), pins the
+  channel `enc` mode from the record, and installs the dialects by digest.
+  - **Storage is password-equivalent (NOT a one-way HMAC).** A SPAKE2 *responder* cannot run
+    from a one-way digest — it needs the password to derive `w` (`cbcl-crypto-spake2.lfe`
+    `init-responder`). Whatever the hub stores to execute the handshake (the phrase, `w`, or
+    an HMAC-as-password-input) is **password-equivalent**; SPAKE2 is not an augmented PAKE, so
+    a hub-DB reader can complete the pairing as either side. The spec SHALL state this plainly
+    (do not claim "stored only as an HMAC"). The exposure is bounded by **single-use + short
+    TTL + a failed-attempt bound** (delete the record after **N=3 failed MAC verifications**)
+    + hub-side rate limiting — a 3–4-word BIP39 phrase is only ~33–44 bits, so the online-guess
+    budget must be mechanized, not asserted "one guess per run" (R3-04).
+  - **Pairing-specific transcript binding.** The reused module hard-codes router-enrolment
+    identities/labels (`idB = "cbcl-router:" ++ deployment_id`, salt `"CBCL-enrollment-v1"`,
+    MAC labels `cbcl-agent-confirm`/`cbcl-router-confirm`, a 3-word/5-byte password encoding).
+    Pairing SHALL pin **its own** identity strings (e.g. `idB = "cbcl-chat-pair:" ++ hub_id`,
+    a defined `idA`), its own HKDF salt/info, and an encoding covering **4 words** — so a
+    pairing transcript is domain-distinct from an enrolment transcript and the promised
+    "rocket anchor velvet" 4-word phrase actually fits (R3-03).
+  - **Scope.** This handshake authenticates **capability + name delivery to the intended
+    agent** against third parties; it is **NOT** the agent Authentication Service and carries
+    **no peer-identity material** — agent first-contact identity is hub-mediated TOFU + the
+    [[SPEC-013-mls-private-channels#REQ-024]] safety number ([[SPEC-013-mls-private-channels#ADR-006]]).
+  **This handshake is Tier-1 / no-go** (auth-core) — gated on cross-model review + crypto
+  sign-off. Trace: `[[#TEST-007]]`. *(Corrected per SPEC-013 round-3 R3-01..R3-05.)*
 - **REQ-008 — Validated selection.** The operator SHALL choose the subset the agent
   speaks (`--speak …` or the pairing record); hark SHALL validate it against the
   channel's declared set and reject/warn on any undeclared dialect. Trace: `[[#TEST-008]]`.
@@ -146,13 +173,21 @@ key, accountability is the **adding member**.
 - **ADR-001 — `join` wraps config+daemon+init.** A composed command over the existing
   `config`/`daemon`/`init` primitives.
 - **ADR-002 — Daemon tracks the active handle.** Drops the `eval` ritual ([[#REQ-003]]).
-- **ADR-003 — SPAKE2-over-BIP39 pairing wrapping a chat invite (OQ-001).** A short
-  *memorable* phrase is low-entropy, which is exactly where a PAKE earns its keep (your
-  own [[SPEC-012-tier1-gate-decisions|enrolment logic]]): SPAKE2 resists offline attack
-  and bounds an attacker to one online guess/run. The phrase delivers a **`cbcl-chat-invite`
-  cap** + `{name, dialects}` — room admission reuses the existing invite-as-cap path; no
-  parallel admission. Reuses `cbcl-crypto-spake2` (the primitive, not the router enrolment
-  flow). *Consequence:* this handshake is **Tier-1 / no-go**.
+- **ADR-003 — SPAKE2-over-BIP39 pairing wrapping a chat invite (OQ-001; re-scoped per R3-01/R3-02).**
+  A short *memorable* phrase is low-entropy, which is exactly where a PAKE earns its keep (your
+  own [[SPEC-012-tier1-gate-decisions|enrolment logic]]): SPAKE2 resists **offline** attack and
+  bounds an attacker to online guesses (bounded by [[#REQ-007]]'s failed-attempt limit). The
+  phrase delivers a **`cbcl-chat-invite` cap** + `{name, dialects, enc}` — room admission reuses
+  the existing invite-as-cap path; no parallel admission. Reuses the `cbcl-crypto-spake2`
+  **primitive** (with pairing-specific transcript constants — [[#REQ-007]]), not the router
+  enrolment flow. **What this is NOT:** it is **not** the agent Authentication Service. The
+  pairing authenticates the *operator/agent to the hub* and releases a cap the hub itself
+  issues, so a **malicious hub gains nothing it did not already have** — but it also means the
+  hub holds password-equivalent material and the record contents cannot be authenticated
+  *against* the hub by phrase-derived keys. Agent peer-identity first-contact therefore rests
+  on hub-mediated TOFU + the [[SPEC-013-mls-private-channels#REQ-024]] safety number, **not**
+  on this phrase. *Consequence:* this handshake is **Tier-1 / no-go**, and the design SHALL NOT
+  claim it anchors agent first-contact *identity*.
 - **ADR-004 — `emit` for plain chat; all frames valid CBCL.** Expose the existing
   API-only `emit` kind as `hark emit`; it produces a valid `(tell …)` and the chat client
   unwraps it. No raw-text frames; `reply`/`progress` keep the ask/answer model (OQ-002).
@@ -171,7 +206,7 @@ Settled in dialogue (project owner, 2026-06-09):
 
 | # | Resolution |
 | --- | --- |
-| OQ-001 | Pairing = **SPAKE2 over a memorable BIP39 phrase** ([[#REQ-007]]), releasing a record that wraps a **`cbcl-chat-invite` cap** + `{name, dialects}`. Reuses `cbcl-crypto-spake2` + `cbcl-chat-invite`. **Tier-1 handshake.** |
+| OQ-001 | Pairing = **SPAKE2 over a memorable BIP39 phrase** ([[#REQ-007]]), releasing a record (bound to the PAKE key K) that wraps a **`cbcl-chat-invite` cap** + `{name, dialects, enc}`. Reuses the `cbcl-crypto-spake2` **primitive** (pairing-specific transcript constants) + `cbcl-chat-invite`. **Tier-1 handshake.** **Round-3 correction (R3-01/R3-02):** anchors *capability + name*, NOT agent peer-identity; hub stores a **password-equivalent** verifier (not a one-way HMAC), bounded by single-use + TTL + a failed-attempt limit. |
 | OQ-002 | A plain-chat verb **`hark emit`** exposing the existing `kind=emit`; all wire frames are **valid CBCL** (`tell`), the chat unwraps for display ([[#REQ-004]]). |
 | OQ-003 | **`files.anuna.io/hark/install.sh`** curl install over a single binary ([[#REQ-001]], ADR-006). |
 | OQ-004 | An agent is removable **only by its `added_by` member** ([[#REQ-012]]). |

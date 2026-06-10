@@ -3,13 +3,13 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: draft
 tier: 1
-version: 0.5.0
+version: 0.6.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8)
-last-updated: 2026-06-09
+author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings, Claude Fable 5)
+last-updated: 2026-06-10
 owner-repo: hark
 affects-repos: cbcl-bus (web client + vendored cbcl-mls-wasm artifact), cbcl-chat (cbcl-mls-wasm crate)
-review-gate: not-approved — BLOCKED (rounds 1–2 folded into v0.3; v0.4 adds the Authentication Service design — ADR-006; v0.5 resolves OQ-004 + OQ-005 client-side — REQ-013/REQ-022. All OQs now RESOLVED-direction (PROPOSED); only a round-3 cross-model review + human crypto sign-off remain to gate implementation; REQ-020 = immediate live-UI fix — see docs/decisions/SPEC-013-design-review-findings.md)
+review-gate: not-approved — BLOCKED (rounds 1–2 folded into v0.3; v0.4 adds the Authentication Service design — ADR-006; v0.5 resolves OQ-004 + OQ-005 client-side — REQ-013/REQ-022; **v0.6 folds round-3 cross-model findings** — two Critical: encryption-mode downgrade (REQ-023) + Update-path `:from` forgery (REQ-017 extended); plus authenticated removal (REQ-014), implementable bootstrap (REQ-012/016), re-scoped agent AS (ADR-006), safety-number surface (REQ-024). Round-3 review done; a **round-4 confirmation** of the v0.6 closures + human crypto sign-off remain to gate implementation; REQ-020 = immediate live-UI fix, executed in the live tree 2026-06-10 — see docs/decisions/SPEC-013-round3-review-findings.md)
 ---
 
 # SPEC-013 — hark MLS: Agents in Encrypted Private Channels
@@ -62,7 +62,17 @@ record**, not as requirements:
   can **forge `:from`** (BUG-009, [[#REQ-018]]); and REQ-011's pin source is **not
   peer-verifiable** on today's wire (BUG-010, [[#REQ-019]]); and
 - **(round 2, operational)** the **live UI still claims E2EE** for private channels while
-  implementation is gated and broken (BUG-011, [[#REQ-020]]).
+  implementation is gated and broken (BUG-011, [[#REQ-020]]); and
+- **(round 3)** the **channel's encryption mode is read from an unsigned hub `roomcfg`
+  bit** — an active hub can send `:enc false` and the client emits plaintext into a
+  private channel (R3-05, [[#REQ-023]]); inbound validation guarded only **Add** leaves, so
+  an MLS **Update** that rebinds a member's leaf credential reopens `:from` forgery (R3-07,
+  [[#REQ-017]]); **removal is triggered by unsigned hub presence**, so a hub can fabricate a
+  leave and drive a real MLS Remove to evict E2EE members (R3-06, [[#REQ-014]]); the
+  **room-creator root of trust has no checkable existence on the wire** and the Welcome's
+  committer check is circular (R3-08, [[#REQ-012]]/[[#REQ-016]]); the **SPAKE2 pairing carries
+  no peer-identity material and the hub holds password-equivalent verifier**, so it is not an
+  Authentication Service for agents (R3-01/R3-02, [[#ADR-006]], [[SPEC-016-agent-onboarding-dx#REQ-007]]).
 
 ## 2. Scope
 
@@ -110,7 +120,9 @@ uses) on join. Room admission thus **reuses the current hark flow** and is
 **orthogonal to [[MLS]]**: the cap/invite carries **no MLS material**; it admits the
 agent to the room's fan-out only.
 1. Agent connects `/chat/v1`, sends a signed `hello` with its `:cap`/invite token →
-   joins → hub returns `(roomcfg … :enc true)`. → agent recognises encryption.
+   joins → hub returns `(roomcfg … :enc true)`. → agent recognises encryption — but pins
+   the mode from operator intent / the pairing record / first-observation TOFU, not the
+   raw hub bit, and refuses a later downgrade ([[#REQ-023]]).
 2. Agent publishes KeyPackages (`keypub`) bound to its wire identity ([[#REQ-002]]).
 3. The elected owner (human or agent) adds the agent → Commit + Welcome distributed.
 4. Agent processes the Welcome ([[#REQ-001]]) → joins the [[MLS]] group.
@@ -129,7 +141,10 @@ resumes decrypting the ongoing epoch without re-joining.
 or one that would replace an existing group) is **rejected**, not joined ([[#REQ-012]]); a
 KeyPackage whose target handle or leaf key ≠ the target's **pinned wire key** is
 **rejected** ([[#REQ-008]], [[#REQ-011]]); a re-served one-time KeyPackage is an error
-([[#REQ-013]]); an undecryptable frame is dropped, session survives ([[#REQ-006]]);
+([[#REQ-013]]); an undecryptable frame is dropped but **counted** — a run of failures from a
+pinned member is surfaced as a probable-fork/equivocation warning, not silently swallowed
+([[#REQ-006]]); a `roomcfg` that **downgrades** a channel known-encrypted to cleartext is
+**refused** — the client fails closed and does not emit plaintext ([[#REQ-023]]);
 missing/stale persisted state → re-join, logged.
 
 ## 4. Requirements
@@ -156,9 +171,14 @@ missing/stale persisted state → re-join, logged.
 - **REQ-005 — Encrypt outbound.** In an encrypted channel the agent SHALL encrypt
   every outbound channel message as an [[MLS]] application message and SHALL NOT
   emit channel message content as plaintext. Trace: `[[#TEST-005]]`.
-- **REQ-006 — Decrypt / advance epoch.** The agent SHALL decrypt inbound MLS
-  application messages and process inbound Commits to advance group epoch; an
-  undecryptable frame SHALL be dropped WITHOUT aborting the session. Trace: `[[#TEST-006]]`.
+- **REQ-006 — Decrypt / advance epoch (drop-but-count).** The agent SHALL decrypt inbound
+  MLS application messages and process inbound Commits to advance group epoch; an
+  undecryptable frame SHALL be dropped WITHOUT aborting the session. The agent SHALL,
+  however, **count** consecutive decrypt failures attributable to a pinned member and
+  **surface** a persistent run (≥ a small threshold) as a **probable fork / equivocation**
+  signal feeding the [[#REQ-021]] safety-number comparison — silent drop SHALL NOT mask a
+  hub that has forked the group by equivocating Commit order. Trace: `[[#TEST-006]]`.
+  *(Closes R3-12.)*
 - **REQ-007 — Identity binding.** The agent's MLS leaf credential signature key
   SHALL be its [[Signed-Member Wire]] [[Ed25519]] identity key — NOT a freshly
   generated key. Trace: `[[#TEST-007]]`.
@@ -179,23 +199,46 @@ missing/stale persisted state → re-join, logged.
   pin is first-observation [[TOFU]] at minimum; a later observation conflicting with the
   pin SHALL be flagged and the key NOT silently rotated. The residual first-contact gap is
   [[#OQ-002]]. Trace: `[[#TEST-011]]`. *(Closes BUG-003.)*
-- **REQ-012 — App-bound Welcome validation.** Before joining a group from a [[Welcome]],
-  the agent SHALL verify it is bound to (a) **this** app room/channel, (b) an **authorised
-  committer** (the elected owner for the current roster — [[#REQ-004]]/[[#REQ-016]]), and
-  (c) does **not silently replace** an existing group for the room. An unbound/unauthorised
-  Welcome SHALL be rejected. Trace: `[[#TEST-012]]`. *(Closes BUG-002.)*
-- **REQ-013 — Single-use KeyPackages (client-enforced, delete-on-use).** Single-use SHALL
-  be enforced **client-side** (the directory is the untrusted hub): on consuming a one-time
-  KeyPackage (Welcome processed), the publisher SHALL **delete its init private key from
-  memory AND persistent storage** — so a replayed Welcome to the same package is
-  **undecryptable/inert** with no later-compromisable key. Clients SHALL keep a ledger of
-  **consumed `KeyPackageRef`s** and reject re-use; `KeyPackageRef`s SHALL be
+- **REQ-012 — App-bound Welcome validation (full-tree, pin-checked).** Before joining a
+  group from a [[Welcome]], the agent SHALL verify it is bound to (a) **this** app
+  room/channel, (b) an **authorised committer** (the elected owner for the current roster —
+  [[#REQ-004]]/[[#REQ-016]]), (c) does **not silently replace** an existing group for the
+  room, AND (d) **every leaf of the Welcome's ratchet tree** satisfies [[#REQ-008]] where a
+  pin exists for that handle — i.e. for each leaf whose handle is already pinned
+  ([[#REQ-011]]), the leaf signature key SHALL equal the pinned wire key; a tree containing
+  an **unpinned key for a pinned handle** is a **hard reject**. The committer check (b) is
+  NOT sufficient alone — it is **circular** when computed over the tree the Welcome itself
+  supplies (a fabricated group elects its own fabricated owner consistently); the
+  leaf-vs-pin check (d) is the predicate with teeth. For an all-first-contact tree (no pins
+  yet), the joiner SHALL pin TOFU and **require [[#REQ-021]] safety-number confirmation**
+  before treating the group as authentic. An unbound/unauthorised/pin-violating Welcome
+  SHALL be rejected. Trace: `[[#TEST-012]]`. *(Closes BUG-002; closes R3-08 Welcome path.)*
+- **REQ-013 — Single-use KeyPackages (client-enforced, delete-after-successful-join).**
+  Single-use SHALL be enforced **client-side** (the directory is the untrusted hub). The
+  consume sequence SHALL be strictly ordered: **(1) decrypt the Welcome → (2) pass full
+  [[#REQ-012]] + [[#REQ-017]] validation → (3) join succeeds → (4) ONLY THEN delete the
+  one-time init private key from memory AND persistent storage.** A Welcome that **fails**
+  validation SHALL leave the init key **intact** — otherwise a malicious hub/member sends a
+  junk Welcome to the victim's package to burn the key and brick the honest committer's
+  Welcome (a join-DoS and a hub-chosen "first Welcome wins"). After a successful consume a
+  replayed Welcome to the same package is **undecryptable/inert** with no later-compromisable
+  key. Clients SHALL keep a **durable** ledger of consumed `KeyPackageRef`s and reject
+  re-use; an **in-memory-only** ledger (e.g. the web client before persistence) gives the
+  guarantee only within a session and SHALL be documented as such. `KeyPackageRef`s SHALL be
   **transcript-visible** so the group rejects an Add reusing a ref ([[#REQ-017]]). Trace:
-  `[[#TEST-013]]`. *(Closes BUG-004; resolves [[#OQ-004]].)*
-- **REQ-014 — MLS removal on room removal.** When a member leaves or is removed from a
-  room, the group SHALL issue an [[MLS]] **Commit removing that member** — not merely drop
-  fan-out — so a removed/compromised member cannot decrypt subsequent traffic. Trace:
-  `[[#TEST-014]]`. *(Closes BUG-005.)*
+  `[[#TEST-013]]`. *(Closes BUG-004; resolves [[#OQ-004]]; closes R3-09.)*
+- **REQ-014 — MLS removal on *authenticated* room removal.** When a member leaves or is
+  removed from a room, the group SHALL issue an [[MLS]] **Commit removing that member** — not
+  merely drop fan-out — so a removed/compromised member cannot decrypt subsequent traffic.
+  The removal trigger SHALL be **authenticated evidence**, NOT unsigned hub presence: either
+  (a) a **member-signed `bye`** for that member fanned to peers (the [[#REQ-019]] self-signed
+  pattern), or (b) an **adder-authorised removal** ([[SPEC-016-agent-onboarding-dx#REQ-012]]).
+  Unsigned hub presence/leave events MAY only **prompt** a removal decision; they SHALL NOT
+  by themselves cause a Remove Commit — otherwise an active hub fabricates "@x left" and
+  drives the deterministic committer to evict arbitrary E2EE members, churn epochs, and
+  drain one-time KeyPackages toward the [[#REQ-022]] last-resort residual. (The hub retains
+  the power to drop/partition fan-out — an **availability** loss, not an authenticity one;
+  this residual is documented, not closed.) Trace: `[[#TEST-014]]`. *(Closes BUG-005; closes R3-06.)*
 - **REQ-015 — Directory input validation.** `keypub`/`keyget` inputs SHALL be validated
   (size bounds, base64 well-formedness, structural validity) **before** mutating directory
   state; malformed/oversized inputs SHALL be rejected. Trace: `[[#TEST-015]]`. *(Closes BUG-006.)*
@@ -203,44 +246,100 @@ missing/stale persisted state → re-join, logged.
   add/remove authority SHALL derive from the **MLS group's ratchet tree** (authenticated,
   consistent across members), NOT hub presence: the deterministic committer is computed
   over the **MLS leaves**, and admitting a new member requires (a) a current MLS member
-  (the room creator bootstraps), (b) the addee's key validated
-  ([[#REQ-008]]/[[#REQ-011]]/[[#REQ-017]]), and (c) a valid cap. The hub cannot fabricate
-  MLS membership, so it cannot create a divergent valid group undetected ([[#REQ-021]]
-  catches equivocation). Trace: `[[#TEST-016]]`. *(Closes BUG-007; resolves [[#OQ-003]]; refines [[#REQ-004]].)*
+  (the room creator bootstraps — see below), (b) the addee's key validated
+  ([[#REQ-008]]/[[#REQ-011]]/[[#REQ-017]]), and (c) a valid cap. The hub cannot **grow**
+  MLS membership it does not hold; it CAN **shrink** it only via the unsigned-presence path
+  closed by [[#REQ-014]]. **Bootstrap root of trust (checkable).** The "room creator" SHALL
+  be a concrete principal: at channel `claim` the hub SHALL record a **creator handle**, and
+  the creator SHALL emit a **creator-signed group-genesis assertion** (the [[#REQ-019]]
+  self-signed pattern: `(genesis @room :creator @h :group <group-id> :key K …)` signed by
+  K) that joiners verify and pin. Absent such a checkable creator, the design SHALL fall
+  back to **documented first-group-wins TOFU + mandatory [[#REQ-021]] safety-number
+  confirmation** — and SHALL NOT claim the hub cannot stand up a rival group at first
+  contact (it can; the safety number is the catch). The hub cannot fabricate MLS membership
+  inside an established group, so it cannot create a divergent valid group **undetected**
+  once pins + safety numbers exist ([[#REQ-021]] catches equivocation). Trace:
+  `[[#TEST-016]]`. *(Closes BUG-007; resolves [[#OQ-003]]; refines [[#REQ-004]]; closes R3-08 bootstrap.)*
 - **REQ-022 — KeyPackage replenishment + bounded last-resort.** The publisher SHALL
   maintain a pool of one-time KeyPackages, replenishing it (publish fresh, delete-on-use per
   [[#REQ-013]]) as packages are consumed, and SHALL prefer one-time packages for every Add.
   A **last-resort** KeyPackage MAY be used only when the one-time pool is exhausted; its
-  reuse is **bounded** (rotated on a documented schedule) and its weaker forward-secrecy
-  residual is recorded: a hub that **drains** the one-time pool can force last-resort use,
-  so a *later* init-key compromise can expose Welcomes encrypted to a reused last-resort
-  package. This residual is **accepted and documented**, not silently incurred. Trace:
-  `[[#TEST-022]]`. *(With [[#REQ-013]], resolves [[#OQ-004]].)*
-- **REQ-017 — Inbound membership-change validation.** Before merging any inbound [[MLS]]
-  Commit or storing any standalone proposal, the agent SHALL inspect it: every **Add** leaf
-  SHALL satisfy [[#REQ-008]] (target handle + pinned wire key) and originate from an
-  **authorised committer** ([[#REQ-016]]); unauthorised or unvalidated proposals SHALL NOT
-  be stored or merged. Trace: `[[#TEST-017]]`. *(Closes BUG-008 — inbound, not just the local add path.)*
+  reuse is **bounded by a mechanism, not only prose**: the last-resort leaf SHALL carry a
+  short MLS **`lifetime`**, and [[#REQ-008]]/[[#REQ-017]] SHALL **reject an expired
+  KeyPackage** (confirm OpenMLS's leaf-lifetime validation is enabled at the pinned version,
+  or enforce it explicitly). The forward-secrecy residual SHALL be recorded at its **true
+  scope**: a hub that **drains** the one-time pool can force last-resort use, and because a
+  Welcome carries the joiner's **epoch secrets**, a captured Welcome plus a *later* init-key
+  compromise exposes the **group's message confidentiality for that epoch and forward until
+  the next key-updating Commit** — not merely "that Welcome." This residual is **accepted and
+  documented**, not silently incurred, and is bounded by the `lifetime` + replenishment.
+  Trace: `[[#TEST-022]]`. *(With [[#REQ-013]], resolves [[#OQ-004]]; scope corrected per R3-10.)*
+- **REQ-017 — Inbound membership-change validation (every leaf-changing object).** Before
+  merging any inbound [[MLS]] Commit or storing any standalone proposal, the agent SHALL
+  inspect **every object that adds, replaces, or mutates a leaf node** — not only Adds:
+  **Add**, **Update**, and **Remove** proposals AND the **committer's UpdatePath leaf**. For
+  each such leaf: (a) its credential identity SHALL satisfy [[#REQ-008]] (target handle), (b)
+  its leaf signature key SHALL equal that handle's **pinned wire key** ([[#REQ-011]]), and (c)
+  **credential identity SHALL be immutable per member** — an Update that changes a member's
+  handle, or rebinds an existing handle to a different key, SHALL be rejected unless it is the
+  explicit **flagged key-rotation** path of [[#REQ-011]] (never a silent rebind). This closes
+  the Update-path bypass: MLS does NOT enforce credential continuity across Update (RFC 9420
+  §7.3/§12.1.2), so without (c) a member could publish an Update rebinding their leaf to read
+  `@alice`, after which [[#REQ-018]]'s sender check passes for a forged `:from @alice`. Commits
+  SHALL originate from an **authorised committer** ([[#REQ-016]]); unauthorised or unvalidated
+  proposals SHALL NOT be stored or merged. Trace: `[[#TEST-017]]`. *(Closes BUG-008; closes R3-07 — reopened `:from` forgery via the Update path.)*
 - **REQ-018 — Sender-authenticated `:from`.** The agent SHALL obtain the **authenticated
   MLS sender leaf** for each decrypted application message and SHALL **reject** (not render)
   a message whose inner CBCL `:from` does not match that sender's **pinned handle**
   ([[#REQ-011]]). Trace: `[[#TEST-018]]`. *(Closes BUG-009 — `:from` forgery by a member.)*
 - **REQ-019 — Self-signed key-assertion frame.** A member SHALL broadcast a **key
   assertion** — `(idkey @handle :key K :room @room :nonce N)` **signed by K** over a
-  peer-verifiable, replay-bound context (DS-tagged; room+nonce bound; **independent of the
-  per-connection envelope** so peers can verify it). The hub fans it; peers **verify the
-  signature themselves** (not hub attestation) and pin handle→K ([[#REQ-011]], TOFU) —
-  making REQ-011 implementable. Trace: `[[#TEST-019]]`. *(Closes BUG-010; enables [[#REQ-011]].)*
+  peer-verifiable context that is **independent of the per-connection envelope** (so a hub
+  cannot strip/replay/transplant it across rooms or connections). The signed context SHALL
+  carry **its own domain-separation label** — distinct from the wire envelope's
+  `DS_TAG = "cbcl-signed-member/v1"` (e.g. `"cbcl-idkey-assert/v1"`) — so an `idkey`
+  signature can never be confused with, or transplanted into, a wire-envelope signature
+  (this extends the [[#OQ-001]] no-collision analysis to the assertion). The **room binding**
+  is load-bearing (prevents cross-room transplant) and SHALL stay. The **nonce N** does
+  **not** by itself defeat the dangerous attack — hub *substitution* of a different
+  self-signed assertion is unaffected by N (replaying an honest assertion merely re-asserts
+  the honest binding). N's defined purpose is to **bind the assertion to the current pin
+  epoch**, so a stale assertion cannot re-pin a key after a flagged rotation ([[#REQ-011]]);
+  the spec SHALL state who generates N and what a peer checks it against, or drop the
+  replay-bound claim. The hub fans it; peers **verify the signature themselves** (not hub
+  attestation) and pin handle→K ([[#REQ-011]], TOFU) — making REQ-011 implementable. Trace:
+  `[[#TEST-019]]`. *(Closes BUG-010; enables [[#REQ-011]]; tightened per R3-14.)*
 - **REQ-020 — No unbacked E2EE claim in the UI (until the gate clears).** Until the
   [[#8. Tier-1 Gate]] clears, the product UI SHALL NOT present private channels as providing
   confidentiality or authenticity (E2EE); wording SHALL make no security claim the
   implementation does not back. Trace: `[[#TEST-020]]`. *(Closes BUG-011; **immediate action
   on the live deployment**.)*
-- **REQ-021 — Safety-number verification.** Clients SHALL derive a **safety number** (a
-  stable fingerprint over the group members' pinned wire keys) and surface it for
-  **out-of-band comparison**; a mismatch indicates hub equivocation / MITM. This is the
-  human first-contact mitigation alongside the invite anchor ([[#OQ-002]], [[#ADR-006]]).
-  Trace: `[[#TEST-021]]`.
+- **REQ-021 — Safety-number verification (binds group + epoch + tree).** Clients SHALL
+  derive a **safety number** that commits to the **MLS group identity and state** — `group_id`,
+  current `epoch`, and the **tree hash / epoch authenticator** (which already commits to every
+  leaf) — NOT merely a fingerprint over the set of pinned wire keys. A keys-only fingerprint
+  is insufficient: two distinct rooms with the same member set would share a number, and
+  tree-level equivocation that preserves the key set would be **invisible** to it. Clients
+  SHALL surface the safety number for **out-of-band comparison**; a mismatch indicates hub
+  equivocation / MITM / fork (and is the confirmation [[#REQ-006]]'s fork signal and
+  [[#REQ-012]]'s all-first-contact path defer to). This is the first-contact mitigation
+  alongside the invite anchor ([[#OQ-002]], [[#ADR-006]]). The agent surface is [[#REQ-024]].
+  Trace: `[[#TEST-021]]`. *(Strengthened per R3-13.)*
+- **REQ-023 — Encryption-mode pin (fail closed on downgrade).** A client SHALL NOT take a
+  channel's E2EE status from the unsigned hub `roomcfg :enc` bit alone. The encryption mode
+  SHALL be pinned from an authenticated source: **operator intent** (hark config; the
+  [[SPEC-016-agent-onboarding-dx#REQ-007]] pairing record SHALL carry an `enc` field) or, absent
+  that, **first-observation TOFU** of the mode. Once a channel is pinned encrypted, a later
+  `roomcfg :enc false` (or any signal that would route content as plaintext) SHALL be treated
+  as a **downgrade attack**: the client SHALL **refuse to send** (fail closed) and surface
+  the conflict — it SHALL NEVER fall back to emitting channel content as plaintext. The web
+  client SHALL pin the mode equivalently (local storage). Trace: `[[#TEST-023]]`.
+  *(Closes R3-05 — the encryption-mode downgrade; the round-3 Critical.)*
+- **REQ-024 — Agent safety-number surface.** hark SHALL expose the [[#REQ-021]] safety number
+  for the agent's group — e.g. `hark safety-number <@channel>` — so a headless agent operator
+  can compare it out-of-band against the web UI's value. Without this surface the agent cannot
+  participate in the one mechanism that catches first-contact MITM, on which [[#ADR-006]]
+  relies for agents. Trace: `[[#TEST-024]]`. *(Closes R3-13 — no agent safety-number surface.)*
 
 ## 5. Non-Functional Requirements
 
@@ -258,7 +357,18 @@ missing/stale persisted state → re-join, logged.
   `identity_dir` obtains the wire identity **and** MLS group state → current/future
   impersonation + decryption are in scope after local compromise; **past-message exposure**
   is bounded by the OpenMLS **secret-retention policy** ([[#OQ-005]]) — retained ratchet
-  material SHALL be minimised to preserve forward secrecy.
+  material SHALL be minimised to preserve forward secrecy. The retention policy SHALL be
+  named by **concrete OpenMLS knobs**, not principle alone: `max_past_epochs` (bound the
+  retained epoch-secret history), `SenderRatchetConfiguration{out_of_order_tolerance,
+  maximum_forward_distance}` (bound the in-epoch decryption window), and an explicit
+  **resumption-PSK policy** — the `ResumptionPskStore` retains past-epoch resumption PSKs
+  **independently** of message secrets and SHALL be bounded too (it is otherwise an
+  unaddressed past-secret reservoir). Because all OpenMLS pruning is delegated to the
+  `StorageProvider`'s delete calls and [[#ADR-004]] has hark writing a **new durable
+  provider**, the provider SHALL actually honour deletes; a provider that no-ops deletes
+  silently retains every superseded secret with no API symptom. A TEST SHALL assert that,
+  after a Commit merge / Welcome consume, superseded epoch secrets and consumed init keys
+  are **absent from disk** ([[#OQ-005]]). *(Concretised per R3-11.)*
 
 ## 6. Architecture Decisions (PROPOSED — pending Tier-1 sign-off)
 
@@ -296,31 +406,53 @@ missing/stale persisted state → re-join, logged.
   connections/instances. Single-identity multi-channel (the web-client model) is
   deferred to a future hark multi-channel transport spec. *Owner direction:*
   multiple instances.
-- **ADR-006 — Authentication Service: invite-anchored TOFU + safety numbers (resolves OQ-002).**
-  The MLS AS — the missing piece, since the hub is the untrusted DS — is **invite-anchored
-  TOFU + safety numbers** for humans ([[#REQ-019]], [[#REQ-021]]) and the **SPAKE2 pairing**
-  for agents ([[SPEC-016-agent-onboarding-dx#REQ-007]]). **Not admin-rooted** — a central
-  authority vouching for identities re-introduces a hub-like trusted party, antithetical to
-  peer E2EE (the `auth_shell` chain is right for agent *capability*, not human *identity*).
-  **Not key transparency** for the MVP — deferred as the strong upgrade; TOFU pins are
-  forward-compatible with a future log. *Rationale:* private channels are small &
-  invite-only, where Signal-style TOFU+safety-numbers fits, and the out-of-band invite (and,
-  for agents, the SPAKE2 channel) anchors first contact. *Owner direction:* A.
+- **ADR-006 — Authentication Service: TOFU + safety numbers; SPAKE2 anchors *capability*, not
+  identity (re-scoped per R3-01).** The MLS AS — the missing piece, since the hub is the
+  untrusted DS — is **first-observation TOFU pins + safety-number confirmation** ([[#REQ-019]],
+  [[#REQ-021]], [[#REQ-024]]) for **both humans and agents**. The agent's [[SPEC-016-agent-onboarding-dx#REQ-007]]
+  **SPAKE2 pairing is NOT the agent AS** — it anchors **capability + name delivery** to the
+  intended agent against third parties, but it carries **no peer-identity material** (no member
+  keys, no group fingerprint) and the hub holds a **password-equivalent verifier** (plain
+  SPAKE2 is not an augmented PAKE — R3-02), so it cannot authenticate peer identity *against*
+  the hub. Consequently, **for agents the first-contact root is hub-mediated TOFU**, and the
+  compensating control is the **mandatory safety-number surface** ([[#REQ-024]]) compared
+  out-of-band; the spec SHALL NOT claim the agent first-contact gap is "anchored" by the
+  phrase. **Not admin-rooted** — a central authority vouching for identities re-introduces a
+  hub-like trusted party, antithetical to peer E2EE (the `auth_shell` chain is right for agent
+  *capability*, not human *identity*). **Not key transparency** for the MVP — deferred as the
+  strong upgrade; TOFU pins are forward-compatible with a future log. *Rationale:* private
+  channels are small & invite-only, where Signal-style TOFU+safety-numbers fits, and the
+  out-of-band invite anchors first contact. *Residual (must be accepted by the human signer):*
+  first-contact TOFU is **winnable by an active hub by construction** until safety numbers are
+  actually compared — for humans (who may never compare) and for agents (structurally). *Owner
+  direction:* A, with the agent-AS claim re-scoped.
 
 ## 7. Open Questions (Tier-1 — require human crypto sign-off)
 
 > Updated after round-1 review (see [[SPEC-013-design-review-findings]]).
 
-- **OQ-001 — Cross-context key reuse — RESOLVED (pending test).** Round-1 found **no**
-  cross-protocol signature collision (wire `DS_TAG` vs OpenMLS `SignWithLabel`). Reuse
-  ([[#ADR-002]]) is acceptable, **conditional on** a regression/property test asserting no
-  collision under the pinned labels, required before [[#REQ-007]] is approved (§9).
-- **OQ-002 — Authenticated trust root — RESOLVED (direction; PROPOSED, round-3).** The
-  Authentication Service is **invite-anchored TOFU + safety numbers** (humans, [[#REQ-019]]
-  + [[#REQ-021]]) and **SPAKE2 pairing** (agents) — [[#ADR-006]]. Not admin-rooted; key
-  transparency is the documented strong-future. Residual first-contact gap is mitigated by
-  the out-of-band invite / SPAKE2 anchor + safety-number comparison; the **round-3 review**
-  must weigh whether that assurance is adequate for the threat model.
+- **OQ-001 — Cross-context key reuse — RESOLVED (pending test + signer hygiene).** Rounds 1–3
+  independently found **no** cross-protocol signature collision: the wire envelope begins
+  `00 00 00 15` (u32-be length of the 21-byte `DS_TAG`), whereas RFC 9420 `SignWithLabel`
+  signs `SignContent` whose first byte is a TLS varint label length **≥ 0x10, never 0x00**,
+  and MLS verifiers **reconstruct** the expected label rather than parsing attacker bytes —
+  so the signed-byte domains are disjoint at byte 0. Reuse ([[#ADR-002]]) is acceptable,
+  **conditional on**: (1) the regression/property test asserting no collision under the pinned
+  labels (§9); (2) **retiring the legacy bare-payload signer** (`hark/src/chat_frame.rs`,
+  `identity.rs` — the one context that signs raw CBCL with the identity key under **no** domain
+  separation) when slice-6 lands, and **prohibiting any future raw-bytes signing oracle** with
+  the identity key; (3) giving the [[#REQ-019]] `idkey` assertion its own DS label (R3-14).
+  SPAKE2 ([[SPEC-016-agent-onboarding-dx#REQ-007]]) involves no Ed25519 — no interaction.
+- **OQ-002 — Authenticated trust root — RESOLVED-direction (PROPOSED; re-scoped round-3).**
+  The Authentication Service is **TOFU pins + safety-number confirmation** for **both humans
+  and agents** ([[#REQ-019]], [[#REQ-021]], [[#REQ-024]]) — [[#ADR-006]]. The **SPAKE2 pairing
+  anchors capability + name, not peer identity** (R3-01/R3-02): for agents the first-contact
+  root is hub-mediated TOFU, with the safety number as the compensating control. Not
+  admin-rooted; key transparency is the documented strong-future. **Accepted residual** (for
+  human sign-off): first-contact TOFU is winnable by an active hub until safety numbers are
+  compared out-of-band — humans may never compare; agents structurally depend on [[#REQ-024]].
+  A **round-4 confirmation** must weigh whether that residual is acceptable for the threat
+  model now that the agent-AS over-claim is removed.
 - **OQ-003 — Roster/committer authenticity — RESOLVED (PROPOSED, round-3).** Authority
   derives from the verifiable [[MLS]] ratchet tree, not hub presence ([[#REQ-016]]); the
   concrete election mechanism + any web-client change are confirmed at round-3.
@@ -342,22 +474,35 @@ missing/stale persisted state → re-join, logged.
 
 ## 8. Tier-1 Gate
 
-**Status: not approved — BLOCKED.** Rounds 1–2 review folded into v0.3.0; v0.4.0 added the
-**Authentication Service design** ([[#ADR-006]]) — invite-anchored TOFU + safety numbers
-(humans) + SPAKE2 (agents) — resolving OQ-002 + OQ-003 (PROPOSED). v0.5.0 resolves the last
-two open questions **client-side**: **OQ-004** (KeyPackage replay — delete-on-use + ledger +
-transcript-visible refs + bounded last-resort, [[#REQ-013]]/[[#REQ-022]]) and **OQ-005**
-(retention minimisation, [[#NFR-004]]). **All five OQs are now RESOLVED-direction
-(PROPOSED).** What remains to gate implementation: a **round-3 cross-model review** of the
-full design + a **human crypto sign-off**; **REQ-020** still requires the immediate live-UI
-fix (independent of the gate). Per [[PROTO-001]], before implementation:
+**Status: not approved — BLOCKED.** Rounds 1–2 folded into v0.3.0; v0.4.0 added the
+**Authentication Service design** ([[#ADR-006]]); v0.5.0 resolved OQ-004 + OQ-005
+client-side. The **round-3 cross-model review** (docs/decisions/SPEC-013-round3-review-findings.md)
+found **two Critical + four High** findings; **v0.6.0 folds their dispositions**:
 
-1. **Round-3 re-review** of v0.5.0 (cross-model adversarial, fresh context — Principle 12),
-   confirming the AS design + REQ-008/011…022 close BUG-001…011 and that the residual
-   first-contact assurance + last-resort forward-secrecy residual are adequate.
+- **R3-05 (Critical) → [[#REQ-023]]** — encryption-mode pin; fail closed on hub downgrade.
+- **R3-07 (Critical) → [[#REQ-017]]** — validate every leaf-changing object (Add/Update/Remove
+  + UpdatePath); credential immutability; closes the reopened `:from` forgery.
+- **R3-01/R3-02 (High) → [[#ADR-006]]** + [[SPEC-016-agent-onboarding-dx#REQ-007]] — re-scope the
+  agent AS (SPAKE2 = capability, not identity; verifier is password-equivalent).
+- **R3-06 (High) → [[#REQ-014]]** — authenticated removal evidence, not hub presence.
+- **R3-08 (High) → [[#REQ-012]]/[[#REQ-016]]** — checkable bootstrap root + full-tree leaf-vs-pin.
+- **R3-15 (High, operational) → [[#REQ-020]]** — live-UI E2EE claim **removed in the live tree
+  2026-06-10** (index.html), independent of the gate.
+- Tightening: R3-09 → [[#REQ-013]], R3-10 → [[#REQ-022]], R3-11 → [[#NFR-004]], R3-12 →
+  [[#REQ-006]], R3-13 → [[#REQ-021]]/[[#REQ-024]], R3-14 → [[#REQ-019]]/[[#OQ-001]].
+
+What remains to gate implementation: a **round-4 confirmation** that v0.6.0's closures hold
+(focused re-review, fresh context — Principle 12) + a **human crypto sign-off**. Per
+[[PROTO-001]], before implementation:
+
+1. **Round-4 confirmation** of v0.6.0 — verify REQ-012/014/016/017/023 and the re-scoped
+   ADR-006 actually close R3-01…R3-08 and that no new gap opened, and that the accepted
+   residuals (first-contact TOFU; last-resort forward-secrecy; hub fan-out availability) are
+   adequately bounded.
 2. **Human security/cryptography sign-off** resolving OQ-001…OQ-005 (the project
    owner may give this, accepting the cross-model review as basis, as was done for
-   `cbcl-bus` `SPEC-012`).
+   `cbcl-bus` `SPEC-012`), explicitly confirming the OpenMLS 0.8 retention/lifetime/Update
+   semantics and the `cbcl_ristretto` point-validation the review could not assess.
 3. **AI Trust Boundary metadata** recorded for the synthesis trajectory (model,
    prompts, drafts, adversarial findings).
 
