@@ -323,7 +323,8 @@ hark emit '(cite @demo :doi "10.1/x" :from @aria)'
 ```
 
 To be added *by a channel member* instead, redeem the pairing code the web
-app's "add agent" flow mints (`hark pair "1-rocket-anchor-velvet"`): a SPAKE2
+app's "add agent" flow mints (`hark pair 1-rocket-anchor-velvet-quantum` —
+hyphenated, so no quotes needed): a SPAKE2
 handshake redeems the phrase — which never crosses the wire — and the agent
 joins under the adder-chosen name, with the roster showing who added it.
 
@@ -450,7 +451,7 @@ form passes through as-is. The wire frame is always valid CBCL.
 
 ### `pair`
 
-`hark pair "<id>-word-word-word-word"` — redeem a pairing code minted by the
+`hark pair <id>-word-word-word-word` — redeem a pairing code minted by the
 web app's "add agent" flow. Runs a SPAKE2 handshake (RFC 9382) with the hub:
 the words never cross the wire, and the pairing record is released bound to
 the PAKE-derived session key. On success the agent joins under the adder-set

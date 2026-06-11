@@ -42,7 +42,7 @@ public, sent in the clear to claim the rendezvous, and **independent of the
 secret**, so it leaks nothing about the phrase. We adopt exactly this:
 
 - **Nameplate = the smallest integer not currently pending**, allocated at mint
-  and bundled into the handed-off code (`1-rocket-anchor-velvet`). It only has
+  and bundled into the handed-off code (`1-rocket-anchor-velvet-quantum`). It only has
   to be unique across the pairings outstanding *right now* (normally one).
   Freed on consume/expiry/delete and reused. Public + predictable + independent
   of the phrase → zero leakage. (`cbcl-chat-pairing-store:alloc-nameplate`.)
@@ -72,7 +72,7 @@ transcript is the nameplate, binding the handshake to the specific record.
 
 ## Properties
 
-- Pure-phrase secret, memorable code (`1-rocket-anchor-velvet`), unlimited
+- Pure-phrase secret, memorable code (`1-rocket-anchor-velvet-quantum`), unlimited
   concurrency, no phrase-derived value on the wire, no single-pending limit.
 - Online-guess budget mechanized two ways: per-record N=3 deletion + per-source
   rate limit. Single-use + short TTL bound the exposure window.

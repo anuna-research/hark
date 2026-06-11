@@ -269,7 +269,7 @@ deferred to SPEC-015**, not claimed (see the follow-ons below); plan of record
   derives from invite-cap presence (R4-01). `/pair/v1` WS endpoint + the web
   "add agent" mint flow (`addagent` → `paircode` code). The code is a
   Magic-Wormhole nameplate (smallest free integer) + the 4-word phrase
-  (`1-rocket-anchor-velvet`); the phrase never crosses the wire, and the small
+  (`1-rocket-anchor-velvet-quantum`); the phrase never crosses the wire, and the small
   nameplate is paired with a per-source `/pair/v1` rate limiter that *throttles*
   blind enumeration (it bounds the burn rate per source; it cannot stop a
   distributed attacker — the residual risk is availability, never secrecy) —

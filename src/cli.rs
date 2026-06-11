@@ -44,7 +44,7 @@ pub enum Command {
     )]
     Join(JoinArgs),
     #[command(
-        about = "Pair an agent into a channel via a memorable code: `hark pair \"<id>-word-word-word-word\"`"
+        about = "Pair an agent into a channel via a memorable code: `hark pair <id>-word-word-word-word`"
     )]
     Pair(PairArgs),
     #[command(about = "Create an agent WebSocket and print the local handle")]
