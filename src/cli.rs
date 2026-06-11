@@ -738,14 +738,15 @@ async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
     let message = if emit_input_is_cbcl_form(input) {
         input.to_owned()
     } else {
-        let channel = agent_chat_channel(&client, &handle).await?.ok_or_else(|| {
+        let (channel, wire_handle) = agent_chat_channel(&client, &handle).await?;
+        let channel = channel.ok_or_else(|| {
             AppError::Usage(
                 "plain-text emit needs a chat-hub agent with a channel; \
                  on the router transport pass a full CBCL form instead"
                     .to_owned(),
             )
         })?;
-        build_emit_message(input, &channel)
+        build_emit_message(input, &channel, &wire_handle)
     };
 
     // Mirror reply/error/progress: validate locally before bothering the
@@ -772,11 +773,12 @@ async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
     Ok(())
 }
 
-/// The joined chat channel for `handle`, or `None` on the router transport.
+/// The joined chat channel (`None` on the router transport) and the wire
+/// handle (`@name`) for `handle`.
 async fn agent_chat_channel(
     client: &LocalApiClient,
     handle: &AgentHandle,
-) -> AppResult<Option<String>> {
+) -> AppResult<(Option<String>, String)> {
     let agents = client
         .agents()
         .await
@@ -786,7 +788,7 @@ async fn agent_chat_channel(
         .into_iter()
         .find(|agent| agent.agent_handle == handle.as_str())
         .ok_or(AppError::AgentHandleUnavailable)?;
-    Ok(agent.channel)
+    Ok((agent.channel, agent.router_agent_id))
 }
 
 /// `true` when the emit input is already a CBCL form rather than plain text.
@@ -794,8 +796,15 @@ fn emit_input_is_cbcl_form(input: &str) -> bool {
     input.trim_start().starts_with('(')
 }
 
-fn build_emit_message(text: &str, channel: &str) -> String {
-    format!("(tell {channel} \"{}\")", escape_cbcl_string(text))
+// `:from` identifies the signed-member sender — the hub's dispatch resolves
+// the sender handle from it on EVERY frame and rejects a frame without one
+// (`missing-from`, cbcl-chat-session-ws:dispatch). Same contract the announce
+// frame carries; found live — mock hubs don't enforce it.
+fn build_emit_message(text: &str, channel: &str, from: &str) -> String {
+    format!(
+        "(tell {channel} \"{}\" :from {from})",
+        escape_cbcl_string(text)
+    )
 }
 
 async fn send_validated_message(kind: SendMessageKind, message: String) -> AppResult<()> {
@@ -1554,13 +1563,15 @@ mod tests {
 
     #[test]
     fn wraps_plain_text_emit_into_tell() {
+        // `:from` is required by the hub's per-frame sender resolution
+        // (`missing-from` rejection) — a tell without it is silently useless.
         assert_eq!(
-            build_emit_message("looking into it", "@research"),
-            r#"(tell @research "looking into it")"#
+            build_emit_message("looking into it", "@research", "@aria"),
+            r#"(tell @research "looking into it" :from @aria)"#
         );
         assert_eq!(
-            build_emit_message("say \"hi\"\nnow", "@general"),
-            r#"(tell @general "say \"hi\"\nnow")"#
+            build_emit_message("say \"hi\"\nnow", "@general", "@bot"),
+            r#"(tell @general "say \"hi\"\nnow" :from @bot)"#
         );
     }
 

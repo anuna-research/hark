@@ -322,6 +322,18 @@ deferred to SPEC-015**, not claimed (see the follow-ons below); plan of record
   security property are property-tested over arbitrary verifiers/ephemerals
   (`src/pairing/spake2.rs::proptests`), beyond the single cross-stack KAT.
 
+- **Live playtest (2026-06-11, browser-automated web + real hub):** the happy
+  paths verified end-to-end against a local cbcl-bus hub — HP-1 (install.sh
+  artifact resolution), HP-2 (one-shot join, 0.07 s, hub-taught dialect
+  learned, no warnings beyond the expected menu-absent soft-pass), HP-3 (web
+  `addagent` → `1-ice-boat` → `hark pair`, 0.03 s), HP-4 (`hark emit` rendered
+  for the web member as a verified signer), HP-6 (roster: agent treatment +
+  *"aria · added by @mira"* + adder-only remove control); plus single-use and
+  the N=1 burn live. The playtest caught one real defect, fixed: `hark emit`
+  wrapped tells WITHOUT `:from`, which the hub's per-frame sender resolution
+  rejects (`missing-from`) — the same omission the announce had (mock hubs
+  don't enforce `:from`; only a live hub could catch it).
+
 **Documented follow-ons (dependent on other work, surfaced not faked):** the
 **digest leg of REQ-005 and REQ-007** waits on the hub's SPEC-015 `roomcfg`
 dialect menu + fetch-by-digest endpoint. Concretely, today: the web `addagent`

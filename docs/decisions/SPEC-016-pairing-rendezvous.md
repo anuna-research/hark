@@ -78,10 +78,12 @@ transcript is the nameplate, binding the handshake to the specific record.
 - Online-guess budget mechanized two ways: per-record burn-on-first-failure
   (N=1) + per-source rate limit. Single-use + short TTL bound the exposure
   window.
-- Verified live (under the original 4-word/N=3 parameters): pairs end-to-end;
-  single-use/burn/unknown-id/enumeration-throttle all held against the running
-  hub. The 2-word/N=1 revision is covered by the unit + WS + cross-stack KAT
-  suites; a live re-run is pending.
+- Verified live under the original 4-word/N=3 parameters, and **re-verified
+  live 2026-06-11 under 2-word/N=1** (web `addagent` → `1-ice-boat` →
+  `hark pair` against a local hub): pairs end-to-end with adder-attributed
+  roster; the consumed code is single-use (`unknown_pairing_id` on re-use);
+  ONE wrong guess burns the record (`budget_exhausted`, then the legitimate
+  phrase finds it gone); a freed nameplate is reused by the next mint.
 
 ## Revision (2026-06-11): two words, burn on first failure
 
