@@ -1,0 +1,332 @@
+;; IMPL-013 — hark MLS: Agents in Encrypted Private Channels
+;; Plan for executing specs/SPEC-013-mls-private-channels.md (gate CLEARED 2026-06-10).
+;; Carries IMPL-bound conditions: A-t (no-collision property test), I (durable-provider
+;; delete fidelity), K-1 (remove-race retry test), K-2 (creator-capability guard).
+;; (J — cbcl_ristretto audit — is IMPL-016, out of this plan.)
+
+(meta plan
+  (id "IMPL-013")
+  (title "hark MLS private channels")
+  (version "1.0.0")
+  (status "active")
+  (created "2026-06-10")
+  (author "agent:claude")
+  (spec "SPEC-013")
+  (description "Implement the hark-side MLS capability: identity-bound leaf credentials, durable group state, pinned-key membership validation, authenticated removal, safety numbers, and fail-closed encryption-mode pinning; then the affected-repo wire changes."))
+
+;; ---------------------------------------------------------------- agents
+(given agent-claude-available)
+
+;; ---------------------------------------------------------------- tasks
+(given task-deps)
+(given task-storage)
+(given task-pins)
+(given task-keypkgs)
+(given task-group)
+(given task-validation)
+(given task-removal)
+(given task-safety)
+(given task-wiring)
+(given task-integration)
+(given task-affected)
+
+(meta task-deps
+  (description "Add openmls 0.8/openmls_rust_crypto/openmls_basic_credential/openmls_traits/tls_codec deps; create src/mls/ skeleton: pinned ciphersuite MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519, GENESIS_EXT_TYPE 0xF013, SignatureKeyPair built from the wire Ed25519 seed (REQ-007/ADR-002/ADR-003) so the MLS leaf signer IS the wire identity key.")
+  (acceptance "cargo check passes; unit test proves the leaf credential signature key equals ChatIdentity's public key (TEST-007)."))
+
+(meta task-storage
+  (description "Durable OpenMLS StorageProvider writing under identity_dir (ADR-004, REQ-009, NFR-004): file-backed, 0600, honours deletes on disk; join/create configs set max_past_epochs(0), bounded resumption PSKs, sender-ratchet window.")
+  (acceptance "Condition I test: after Commit merge / Welcome consume, superseded epoch secrets and consumed init keys are absent from disk; state reloads across a simulated restart (TEST-009)."))
+
+(meta task-pins
+  (description "Pin store (REQ-011): handle->wire-key pins from verified per-frame signatures only; idkey assertion frame with DS label cbcl-idkey-assert/v1 (REQ-019); cross-signed rekey ceremony cbcl-idkey-rotate/v1 (REQ-011); removal-evidence label cbcl-mls-remove/v1 reserved. Pins persisted durably.")
+  (acceptance "Condition A-t: property test asserts no cross-protocol signature collision between the wire envelope, each app DS label, and MLS SignWithLabel domains (TEST-011, TEST-019; OQ-001)."))
+
+(meta task-keypkgs
+  (description "KeyPackage lifecycle: build last-resort (short MLS lifetime) + one-time packages carrying the REQ-007 credential and genesis capability; publish via keypub; client-enforced single-use with durable consumed-KeyPackageRef ledger and delete-after-successful-join ordering (REQ-002, REQ-013, REQ-022); validate keypkg/keyget inputs client-side (REQ-015).")
+  (acceptance "Tests: init key survives a failed Welcome, is deleted from memory+disk only after successful join; expired last-resort rejected via KeyPackageIn::validate (TEST-002, TEST-013, TEST-022)."))
+
+(meta task-group
+  (description "Group lifecycle: create group with genesis GroupContext extension + capability asserted at creation (REQ-016, K-2 guard); deterministic owner election over MLS leaves (REQ-004/REQ-016); adder verification target+pinned-key (REQ-008); full-tree pin-checked app-bound Welcome validation incl. pre-finalize genesis read (REQ-001, REQ-012).")
+  (acceptance "Tests: K-2 creation without capability fails before first commit; Welcome with unpinned key for pinned handle hard-rejects; wrong-room/wrong-committer/replacing Welcome rejected; election deterministic across permutations (TEST-001, TEST-003, TEST-004, TEST-008, TEST-012, TEST-016)."))
+
+(meta task-validation
+  (description "Inbound membership-change validation (REQ-017 a-e): every leaf-changing object (Add/Update/Remove proposals + committer UpdatePath leaf) checked for handle + pinned key + credential immutability; fail-closed proposal allowlist; genesis immutability; capability advertisement required. Sender-authenticated :from (REQ-018). Decrypt with drop-but-count fork signal (REQ-006). Encrypt outbound (REQ-005).")
+  (acceptance "Tests: credential-rebinding self-Update rejected (the R3-07 oracle); forged :from rejected; ReInit/PSK/GCE/external-join rejected; decrypt-failure run surfaces fork signal (TEST-005, TEST-006, TEST-017, TEST-018)."))
+
+(meta task-removal
+  (description "Authenticated removal (REQ-014): signed removal-evidence object bound to (room, group_id, epoch, target handle + leaf index + leaf key) under cbcl-mls-remove/v1; minted by subject bye or authorized remover (added_by / creator fallback); carried with every Remove; verified at merge by every validator with exact live-epoch freshness; unsigned hub presence never triggers a Remove.")
+  (acceptance "Condition K-1 test: evidence minted at epoch N loses a race to a concurrent Commit, is rejected at N+1, and removal succeeds on retry with fresh evidence; stale evidence cannot remove a re-added member (TEST-014)."))
+
+(meta task-safety
+  (description "Safety numbers (REQ-021): identity safety number with the pinned canonical encoding (cbcl-mls-identity-safety/v1 frame, SHA-256, 8x8 lowercase hex) + epoch state hash diagnostic; cross-stack test vector; hark safety-number CLI surface via local API (REQ-024).")
+  (acceptance "Byte-exact test vector committed; number stable across pure ratchet Commits, flips on membership change; CLI prints both values (TEST-021, TEST-024)."))
+
+(meta task-wiring
+  (description "Session wiring: encryption-mode pin from admission path/operator intent, fail closed on downgrade or unpinnable private mode (REQ-023); on pinned-encrypted join publish KeyPackages, handle keypkg/welcome/deliver frames, route outbound through MLS encrypt and inbound through MLS decrypt before the responder; no plaintext content on the wire (NFR-002).")
+  (acceptance "Tests: roomcfg :enc false on pinned channel refuses send; outbound in encrypted channel is a deliver :enc mls frame whose payload openmls decrypts; inbound deliver decrypts then dispatches to responder (TEST-005, TEST-020 n/a hark, TEST-023)."))
+
+(meta task-integration
+  (description "Whole-suite verification: cargo test green including live-shaped integration tests of two hark agents in one encrypted channel (create/add/welcome/encrypt/decrypt/remove); REQ->TEST trace table recorded in docs.")
+  (acceptance "cargo test passes; trace table maps every in-scope REQ to at least one test; cargo clippy clean."))
+
+(meta task-affected
+  (description "Affected-repo changes tracked by SPEC-013: cbcl-chat hub fans verified bye payload+signature room-wide as removal evidence and records creator handle at claim; cbcl-mls-wasm binds the leaf signer to the wire identity key and advertises the genesis capability; web election from MLS leaves.")
+  (acceptance "Hub bye fan-out preserves signature; cbcl-mls-wasm Identity accepts an external Ed25519 key and advertises 0xF013; changes compile in their repos."))
+
+;; ---------------------------------------------------------------- readiness
+(normally r-ready-deps task-deps ready-deps)
+(normally r-ready-storage (and task-storage completed-deps) ready-storage)
+(normally r-ready-pins (and task-pins completed-deps) ready-pins)
+(normally r-ready-keypkgs (and task-keypkgs completed-storage) ready-keypkgs)
+(normally r-ready-group (and task-group completed-pins completed-keypkgs) ready-group)
+(normally r-ready-validation (and task-validation completed-group) ready-validation)
+(normally r-ready-removal (and task-removal completed-validation) ready-removal)
+(normally r-ready-safety (and task-safety completed-group) ready-safety)
+(normally r-ready-wiring (and task-wiring completed-removal completed-safety) ready-wiring)
+(normally r-ready-integration (and task-integration completed-wiring) ready-integration)
+(normally r-ready-affected (and task-affected completed-integration) ready-affected)
+
+(meta r-ready-deps (description "No dependencies — start here.") (justification "Everything builds on the mls module skeleton + identity-bound signer."))
+(meta r-ready-storage (description "Needs the mls module skeleton.") (justification "Provider implements openmls_traits against the pinned versions."))
+(meta r-ready-pins (description "Needs the mls module skeleton.") (justification "DS labels + pin store are independent of storage."))
+(meta r-ready-keypkgs (description "Needs durable storage.") (justification "REQ-013 ledger and init-key deletion are storage-backed."))
+(meta r-ready-group (description "Needs pins + keypackages.") (justification "Welcome validation checks leaves against pins; adds consume KeyPackages."))
+(meta r-ready-validation (description "Needs group lifecycle.") (justification "REQ-017 validates objects against live group state."))
+(meta r-ready-removal (description "Needs inbound validation.") (justification "REQ-014 evidence is verified inside the REQ-017 merge path."))
+(meta r-ready-safety (description "Needs group lifecycle.") (justification "Safety number reads group_id + membership bindings."))
+(meta r-ready-wiring (description "Needs everything crypto-complete.") (justification "Session wiring composes all module pieces into chat.rs."))
+(meta r-ready-integration (description "Needs full wiring.") (justification "End-to-end verification of the assembled capability."))
+(meta r-ready-affected (description "hark side proven first.") (justification "hark is the test oracle for the cross-repo wire changes."))
+
+;; ---------------------------------------------------------------- assignment
+(normally r-assign-deps (and ready-deps agent-claude-available) assign-to-deps-claude)
+(normally r-assign-storage (and ready-storage agent-claude-available) assign-to-storage-claude)
+(normally r-assign-pins (and ready-pins agent-claude-available) assign-to-pins-claude)
+(normally r-assign-keypkgs (and ready-keypkgs agent-claude-available) assign-to-keypkgs-claude)
+(normally r-assign-group (and ready-group agent-claude-available) assign-to-group-claude)
+(normally r-assign-validation (and ready-validation agent-claude-available) assign-to-validation-claude)
+(normally r-assign-removal (and ready-removal agent-claude-available) assign-to-removal-claude)
+(normally r-assign-safety (and ready-safety agent-claude-available) assign-to-safety-claude)
+(normally r-assign-wiring (and ready-wiring agent-claude-available) assign-to-wiring-claude)
+(normally r-assign-integration (and ready-integration agent-claude-available) assign-to-integration-claude)
+(normally r-assign-affected (and ready-affected agent-claude-available) assign-to-affected-claude)
+
+(claims agent:claude
+  :at "2026-06-10T05:33:49Z"
+  (given claim-v1-deps)
+  (normally r-cl-state-v1-deps claim-v1-deps state-claimed-v1-deps)
+  (normally r-cl-chain-v1-deps state-claimed-v1-deps claimed-deps)
+)
+
+;; Propagation rules: failures in 'deps' block downstream tasks
+(normally r-propagate-pins-from-deps-failed failed-deps upstream-blocked-pins)
+(normally r-propagate-pins-from-deps-permanently-failed permanently-failed-deps upstream-blocked-pins)
+(normally r-propagate-pins-from-deps-stale-v1 stale-v1-deps upstream-blocked-pins)
+(normally r-propagate-pins-from-deps-timeout-v1 timeout-v1-deps upstream-blocked-pins)
+(normally r-propagate-pins-from-deps-blocked upstream-blocked-deps upstream-blocked-pins)
+(normally r-propagate-storage-from-deps-failed failed-deps upstream-blocked-storage)
+(normally r-propagate-storage-from-deps-permanently-failed permanently-failed-deps upstream-blocked-storage)
+(normally r-propagate-storage-from-deps-stale-v1 stale-v1-deps upstream-blocked-storage)
+(normally r-propagate-storage-from-deps-timeout-v1 timeout-v1-deps upstream-blocked-storage)
+(normally r-propagate-storage-from-deps-blocked upstream-blocked-deps upstream-blocked-storage)
+
+;; Transitive propagation: upstream-blocked cascades through dependency chain
+(normally r-propagate-group-from-pins-blocked upstream-blocked-pins upstream-blocked-group)
+(normally r-propagate-keypkgs-from-storage-blocked upstream-blocked-storage upstream-blocked-keypkgs)
+(normally r-propagate-safety-from-group-blocked upstream-blocked-group upstream-blocked-safety)
+(normally r-propagate-validation-from-group-blocked upstream-blocked-group upstream-blocked-validation)
+(normally r-propagate-group-from-keypkgs-blocked upstream-blocked-keypkgs upstream-blocked-group)
+(normally r-propagate-wiring-from-safety-blocked upstream-blocked-safety upstream-blocked-wiring)
+(normally r-propagate-removal-from-validation-blocked upstream-blocked-validation upstream-blocked-removal)
+(normally r-propagate-integration-from-wiring-blocked upstream-blocked-wiring upstream-blocked-integration)
+(normally r-propagate-wiring-from-removal-blocked upstream-blocked-removal upstream-blocked-wiring)
+(normally r-propagate-affected-from-integration-blocked upstream-blocked-integration upstream-blocked-affected)
+
+(claims agent:claude
+  :at "2026-06-10T05:37:12Z"
+  (given completed-deps))
+
+(claims agent:claude
+  :at "2026-06-10T05:37:12Z"
+  (given claim-v1-storage)
+  (normally r-cl-state-v1-storage claim-v1-storage state-claimed-v1-storage)
+  (normally r-cl-chain-v1-storage state-claimed-v1-storage claimed-storage)
+)
+
+;; Propagation rules: failures in 'storage' block downstream tasks
+(normally r-propagate-keypkgs-from-storage-failed failed-storage upstream-blocked-keypkgs)
+(normally r-propagate-keypkgs-from-storage-permanently-failed permanently-failed-storage upstream-blocked-keypkgs)
+(normally r-propagate-keypkgs-from-storage-stale-v1 stale-v1-storage upstream-blocked-keypkgs)
+(normally r-propagate-keypkgs-from-storage-timeout-v1 timeout-v1-storage upstream-blocked-keypkgs)
+
+(claims agent:claude
+  :at "2026-06-10T05:40:18Z"
+  (given storage-epoch-secret-absence-deferred-to-integration))
+
+(claims agent:claude
+  :at "2026-06-10T05:40:18Z"
+  (given completed-storage))
+
+(claims agent:claude
+  :at "2026-06-10T05:40:18Z"
+  (given claim-v1-pins)
+  (normally r-cl-state-v1-pins claim-v1-pins state-claimed-v1-pins)
+  (normally r-cl-chain-v1-pins state-claimed-v1-pins claimed-pins)
+)
+
+;; Propagation rules: failures in 'pins' block downstream tasks
+(normally r-propagate-group-from-pins-failed failed-pins upstream-blocked-group)
+(normally r-propagate-group-from-pins-permanently-failed permanently-failed-pins upstream-blocked-group)
+(normally r-propagate-group-from-pins-stale-v1 stale-v1-pins upstream-blocked-group)
+(normally r-propagate-group-from-pins-timeout-v1 timeout-v1-pins upstream-blocked-group)
+
+(claims agent:claude
+  :at "2026-06-10T05:45:50Z"
+  (given completed-pins))
+
+(claims agent:claude
+  :at "2026-06-10T05:45:50Z"
+  (given claim-v1-keypkgs)
+  (normally r-cl-state-v1-keypkgs claim-v1-keypkgs state-claimed-v1-keypkgs)
+  (normally r-cl-chain-v1-keypkgs state-claimed-v1-keypkgs claimed-keypkgs)
+)
+
+;; Propagation rules: failures in 'keypkgs' block downstream tasks
+(normally r-propagate-group-from-keypkgs-failed failed-keypkgs upstream-blocked-group)
+(normally r-propagate-group-from-keypkgs-permanently-failed permanently-failed-keypkgs upstream-blocked-group)
+(normally r-propagate-group-from-keypkgs-stale-v1 stale-v1-keypkgs upstream-blocked-group)
+(normally r-propagate-group-from-keypkgs-timeout-v1 timeout-v1-keypkgs upstream-blocked-group)
+
+(claims agent:claude
+  :at "2026-06-10T05:47:40Z"
+  (given completed-keypkgs))
+
+(claims agent:claude
+  :at "2026-06-10T05:47:40Z"
+  (given claim-v1-group)
+  (normally r-cl-state-v1-group claim-v1-group state-claimed-v1-group)
+  (normally r-cl-chain-v1-group state-claimed-v1-group claimed-group)
+)
+
+;; Propagation rules: failures in 'group' block downstream tasks
+(normally r-propagate-safety-from-group-failed failed-group upstream-blocked-safety)
+(normally r-propagate-safety-from-group-permanently-failed permanently-failed-group upstream-blocked-safety)
+(normally r-propagate-safety-from-group-stale-v1 stale-v1-group upstream-blocked-safety)
+(normally r-propagate-safety-from-group-timeout-v1 timeout-v1-group upstream-blocked-safety)
+(normally r-propagate-validation-from-group-failed failed-group upstream-blocked-validation)
+(normally r-propagate-validation-from-group-permanently-failed permanently-failed-group upstream-blocked-validation)
+(normally r-propagate-validation-from-group-stale-v1 stale-v1-group upstream-blocked-validation)
+(normally r-propagate-validation-from-group-timeout-v1 timeout-v1-group upstream-blocked-validation)
+
+(claims agent:claude
+  :at "2026-06-10T05:54:12Z"
+  (given completed-group))
+
+(claims agent:claude
+  :at "2026-06-10T05:54:12Z"
+  (given claim-v1-validation)
+  (normally r-cl-state-v1-validation claim-v1-validation state-claimed-v1-validation)
+  (normally r-cl-chain-v1-validation state-claimed-v1-validation claimed-validation)
+)
+
+;; Propagation rules: failures in 'validation' block downstream tasks
+(normally r-propagate-removal-from-validation-failed failed-validation upstream-blocked-removal)
+(normally r-propagate-removal-from-validation-permanently-failed permanently-failed-validation upstream-blocked-removal)
+(normally r-propagate-removal-from-validation-stale-v1 stale-v1-validation upstream-blocked-removal)
+(normally r-propagate-removal-from-validation-timeout-v1 timeout-v1-validation upstream-blocked-removal)
+
+(claims agent:claude
+  :at "2026-06-10T05:59:04Z"
+  (given completed-validation))
+
+(claims agent:claude
+  :at "2026-06-10T05:59:04Z"
+  (given claim-v1-removal)
+  (normally r-cl-state-v1-removal claim-v1-removal state-claimed-v1-removal)
+  (normally r-cl-chain-v1-removal state-claimed-v1-removal claimed-removal)
+)
+
+;; Propagation rules: failures in 'removal' block downstream tasks
+(normally r-propagate-wiring-from-removal-failed failed-removal upstream-blocked-wiring)
+(normally r-propagate-wiring-from-removal-permanently-failed permanently-failed-removal upstream-blocked-wiring)
+(normally r-propagate-wiring-from-removal-stale-v1 stale-v1-removal upstream-blocked-wiring)
+(normally r-propagate-wiring-from-removal-timeout-v1 timeout-v1-removal upstream-blocked-wiring)
+
+(claims agent:claude
+  :at "2026-06-10T06:00:47Z"
+  (given completed-removal))
+
+(claims agent:claude
+  :at "2026-06-10T06:00:47Z"
+  (given claim-v1-safety)
+  (normally r-cl-state-v1-safety claim-v1-safety state-claimed-v1-safety)
+  (normally r-cl-chain-v1-safety state-claimed-v1-safety claimed-safety)
+)
+
+;; Propagation rules: failures in 'safety' block downstream tasks
+(normally r-propagate-wiring-from-safety-failed failed-safety upstream-blocked-wiring)
+(normally r-propagate-wiring-from-safety-permanently-failed permanently-failed-safety upstream-blocked-wiring)
+(normally r-propagate-wiring-from-safety-stale-v1 stale-v1-safety upstream-blocked-wiring)
+(normally r-propagate-wiring-from-safety-timeout-v1 timeout-v1-safety upstream-blocked-wiring)
+
+(claims agent:claude
+  :at "2026-06-10T06:02:28Z"
+  (given safety-cli-surface-moved-to-wiring))
+
+(claims agent:claude
+  :at "2026-06-10T06:02:28Z"
+  (given completed-safety))
+
+(claims agent:claude
+  :at "2026-06-10T06:02:28Z"
+  (given claim-v1-wiring)
+  (normally r-cl-state-v1-wiring claim-v1-wiring state-claimed-v1-wiring)
+  (normally r-cl-chain-v1-wiring state-claimed-v1-wiring claimed-wiring)
+)
+
+;; Propagation rules: failures in 'wiring' block downstream tasks
+(normally r-propagate-integration-from-wiring-failed failed-wiring upstream-blocked-integration)
+(normally r-propagate-integration-from-wiring-permanently-failed permanently-failed-wiring upstream-blocked-integration)
+(normally r-propagate-integration-from-wiring-stale-v1 stale-v1-wiring upstream-blocked-integration)
+(normally r-propagate-integration-from-wiring-timeout-v1 timeout-v1-wiring upstream-blocked-integration)
+
+(claims agent:claude
+  :at "2026-06-10T06:12:57Z"
+  (given completed-wiring))
+
+(claims agent:claude
+  :at "2026-06-10T06:12:57Z"
+  (given claim-v1-integration)
+  (normally r-cl-state-v1-integration claim-v1-integration state-claimed-v1-integration)
+  (normally r-cl-chain-v1-integration state-claimed-v1-integration claimed-integration)
+)
+
+;; Propagation rules: failures in 'integration' block downstream tasks
+(normally r-propagate-affected-from-integration-failed failed-integration upstream-blocked-affected)
+(normally r-propagate-affected-from-integration-permanently-failed permanently-failed-integration upstream-blocked-affected)
+(normally r-propagate-affected-from-integration-stale-v1 stale-v1-integration upstream-blocked-affected)
+(normally r-propagate-affected-from-integration-timeout-v1 timeout-v1-integration upstream-blocked-affected)
+
+(claims agent:claude
+  :at "2026-06-10T06:17:47Z"
+  (given preexisting-live-test-failures-unrelated))
+
+(claims agent:claude
+  :at "2026-06-10T06:17:47Z"
+  (given completed-integration))
+
+(claims agent:claude
+  :at "2026-06-10T06:17:47Z"
+  (given claim-v1-affected)
+  (normally r-cl-state-v1-affected claim-v1-affected state-claimed-v1-affected)
+  (normally r-cl-chain-v1-affected state-claimed-v1-affected claimed-affected)
+)
+
+(claims agent:claude
+  :at "2026-06-10T06:35:24Z"
+  (given web-wirekey-binding-needs-identity-regen-seam))
+
+(claims agent:claude
+  :at "2026-06-10T06:35:24Z"
+  (given completed-affected))

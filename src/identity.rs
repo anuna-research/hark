@@ -88,6 +88,18 @@ impl ChatIdentity {
     pub fn public_key_b64(&self) -> String {
         B64.encode(self.signing.verifying_key().to_bytes())
     }
+
+    /// The raw 32-byte Ed25519 public key — the same key SPEC-013 REQ-007 uses
+    /// as the MLS leaf signature key.
+    pub fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.signing.verifying_key().to_bytes()
+    }
+
+    /// The 32-byte seed, exposed only inside the crate so the MLS module can
+    /// build the leaf signer from the *same* identity key (SPEC-013 ADR-002).
+    pub(crate) fn signing_seed(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
 }
 
 impl FrameSigner for ChatIdentity {

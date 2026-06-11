@@ -11,6 +11,7 @@ pub mod errors;
 pub mod hub_dialect;
 pub mod identity;
 pub mod local_api;
+pub mod mls;
 pub mod pairing;
 pub mod router;
 pub mod selector;
