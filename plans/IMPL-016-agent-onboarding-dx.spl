@@ -437,3 +437,7 @@
 (claims agent:claude
   :at "2026-06-11T05:41:35Z"
   (given decided-digest-install-deferred-to-spec-015-spec-v0-6-5-records-it))
+
+(claims agent:claude
+  :at "2026-06-11T06:30:00Z"
+  (given decided-2-word-phrase-plus-n1-burn-wormhole-parity-spec-v0-7-0))

@@ -3,9 +3,9 @@ id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
 status: IMPLEMENTED 2026-06-11 (IMPL-016 — all REQs EXCEPT the digest-install leg of REQ-005/REQ-007, deferred to SPEC-015 — see §7a; pairing handshake cross-stack-verified; J-a/J-b done)
 tier: 3 (pairing handshake — Tier-1)
-version: 0.6.5
+version: 0.7.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance; v0.6.2 records the condition-J satisfaction, J-a/J-b riding; v0.6.3 records full IMPL-016 implementation; v0.6.4 folds the rendezvous design + REQ-012 live eviction; v0.6.5 folds the round-7 review — digest-leg deferral made explicit, NFR claims scoped to what is measured, release pin)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance; v0.6.2 records the condition-J satisfaction, J-a/J-b riding; v0.6.3 records full IMPL-016 implementation; v0.6.4 folds the rendezvous design + REQ-012 live eviction; v0.6.5 folds the round-7 review — digest-leg deferral made explicit, NFR claims scoped to what is measured, release pin; v0.7.0 owner decision: 2-word phrase + N=1 burn-on-first-failure, wormhole-style)
 last-updated: 2026-06-11
 approved-date: 2026-06-09
 approved-by: project owner (OQ-001…004 settled in dialogue; REQ-007 re-opened by round-3 — see below)
@@ -86,8 +86,8 @@ if absent, starts the daemon if needed, joins, and learns just `cite` — **no T
 no `eval`**. (`--speak` is the validated subset of [[#REQ-008]]; omit it to advertise
 nothing.)
 **HP-3 — in-app pairing.** In the web app the operator **names** the agent and picks its
-dialects → the hub mints a pairing record + a **3–4 word BIP39 phrase**
-(*"rocket anchor velvet"*). `hark pair "rocket anchor velvet"` runs **SPAKE2** with the
+dialects → the hub mints a pairing record + a **2-word BIP39 phrase**
+(*"rocket anchor"*). `hark pair 1-rocket-anchor` runs **SPAKE2** with the
 hub; on success the hub releases the record (bound to the PAKE key) —
 `{name, dialects, enc-mode, a cbcl-chat-invite cap}` — and hark joins under that name with
 the invite, pinning the channel's encryption mode, no `--as`/`--speak`.
@@ -153,16 +153,22 @@ key, accountability is the **adding member**.
     an HMAC-as-password-input) is **password-equivalent**; SPAKE2 is not an augmented PAKE, so
     a hub-DB reader can complete the pairing as either side. The spec SHALL state this plainly
     (do not claim "stored only as an HMAC"). The exposure is bounded by **single-use + short
-    TTL + a failed-attempt bound** (delete the record after **N=3 failed MAC verifications**)
-    + hub-side rate limiting — a 3–4-word BIP39 phrase is only ~33–44 bits, so the online-guess
-    budget must be mechanized, not asserted "one guess per run" (R3-04).
+    TTL + a failed-attempt bound** (delete the record on the **FIRST failed MAC
+    verification** — N=1, Magic-Wormhole's burn-the-code rule) + hub-side rate limiting —
+    a 2-word BIP39 phrase is only ~22 bits, so the online-guess budget must be mechanized,
+    not asserted "one guess per run" (R3-04). With the N=1 burn it IS one guess per mint,
+    enforced: success odds 2^-22 per record, a mistyped code burns the pairing (loudly —
+    the adder re-mints), and entropy adds nothing against a hub-DB reader anyway (the
+    verifier is password-equivalent), so the shorter, more memorable phrase costs nothing
+    the burn doesn't already cover.
   - **Pairing-specific transcript binding.** The reused module hard-codes router-enrolment
     identities/labels (`idB = "cbcl-router:" ++ deployment_id`, salt `"CBCL-enrollment-v1"`,
     MAC labels `cbcl-agent-confirm`/`cbcl-router-confirm`, a 3-word/5-byte password encoding).
     Pairing SHALL pin **its own** identity strings (e.g. `idB = "cbcl-chat-pair:" ++ hub_id`,
-    a defined `idA`), its own HKDF salt/info, and an encoding covering **4 words** — so a
-    pairing transcript is domain-distinct from an enrolment transcript and the promised
-    "rocket anchor velvet" 4-word phrase actually fits (R3-03).
+    a defined `idA`), its own HKDF salt/info, and an encoding covering the pairing
+    phrase's **2 words** (`<<i1:11, i2:11, 0:2>>`) — so a pairing transcript is
+    domain-distinct from an enrolment transcript and the promised "rocket anchor"
+    phrase actually fits (R3-03).
   - **Scope.** This handshake authenticates **capability + name delivery to the intended
     agent** against third parties; it is **NOT** the agent Authentication Service and carries
     **no peer-identity material** — agent first-contact identity is hub-mediated TOFU + the
@@ -264,12 +270,12 @@ deferred to SPEC-015**, not claimed (see the follow-ons below); plan of record
   (`tests/fixtures/pairing-vectors.json`): the LFE hub responder
   (`cbcl-chat-pairing`, over the relocated shared `cbcl_bus` crypto) and the
   Rust initiator (`hark pair`, curve25519-dalek) reproduce identical
-  msg_a/msg_b/K/MACs/AEAD-record. Store enforces single-use + TTL + the N=3
-  failed-attempt bound; the record is released bound to K; the encryption pin
+  msg_a/msg_b/K/MACs/AEAD-record. Store enforces single-use + TTL + the N=1
+  burn-on-first-failed-MAC bound (wormhole-style); the record is released bound to K; the encryption pin
   derives from invite-cap presence (R4-01). `/pair/v1` WS endpoint + the web
   "add agent" mint flow (`addagent` → `paircode` code). The code is a
-  Magic-Wormhole nameplate (smallest free integer) + the 4-word phrase
-  (`1-rocket-anchor-velvet-quantum`); the phrase never crosses the wire, and the small
+  Magic-Wormhole nameplate (smallest free integer) + the 2-word phrase
+  (`1-rocket-anchor`); the phrase never crosses the wire, and the small
   nameplate is paired with a per-source `/pair/v1` rate limiter that *throttles*
   blind enumeration (it bounds the burn rate per source; it cannot stop a
   distributed attacker — the residual risk is availability, never secrecy) —

@@ -861,7 +861,7 @@ mod tests {
         let frames = [
             announce.as_str(),
             r#"(addagent @general :name @aria :dialects ("cite") :from @mira)"#,
-            r#"(paircode @general :name @aria :id "1" :code "1-rocket-anchor-velvet-quantum")"#,
+            r#"(paircode @general :name @aria :id "1" :code "1-rocket-anchor")"#,
             r#"(removeagent @general :name @aria :from @mira)"#,
             "(agent-removed @general :name @aria)",
         ];

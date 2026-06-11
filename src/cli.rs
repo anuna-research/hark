@@ -44,7 +44,7 @@ pub enum Command {
     )]
     Join(JoinArgs),
     #[command(
-        about = "Pair an agent into a channel via a memorable code: `hark pair <id>-word-word-word-word`"
+        about = "Pair an agent into a channel via a memorable code: `hark pair <id>-word-word`"
     )]
     Pair(PairArgs),
     #[command(about = "Create an agent WebSocket and print the local handle")]
@@ -179,7 +179,7 @@ pub struct JoinArgs {
 
 #[derive(Debug, Args)]
 pub struct PairArgs {
-    #[arg(help = "The pairing code from the web app: `<pairing-id>-word-word-word-word`")]
+    #[arg(help = "The pairing code from the web app: `<pairing-id>-word-word`")]
     pub code: String,
     #[arg(
         long = "as",

@@ -144,12 +144,7 @@ async fn pair_client_surfaces_hub_error() {
 
     let code = PairingCode {
         pairing_id: "deadbeef".to_string(),
-        words: vec![
-            "account".into(),
-            "clinic".into(),
-            "text".into(),
-            "wheel".into(),
-        ],
+        words: vec!["account".into(), "clinic".into()],
     };
     let url = url::Url::parse(&format!("ws://{addr}/pair/v1")).unwrap();
     let err = client::run_pairing(&url, &code).await.unwrap_err();

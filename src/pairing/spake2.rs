@@ -303,7 +303,7 @@ mod proptests {
 
         /// A wrong phrase NEVER yields a mutual accept: the agent's mac_a is not
         /// what the responder expects, and the agent rejects the responder's
-        /// mac_b. (No false accept — the security property under the N=3 bound.)
+        /// mac_b. (No false accept — the security property under the N=1 burn.)
         #[test]
         fn wrong_phrase_never_accepts(
             wib_a in arb_bytes(6),

@@ -22,10 +22,10 @@ derived from the phrase crosses the wire. Specifically:
   offline attack SPAKE2 was chosen to prevent (ADR-003). *Rejected.*
   - (Caveat raised in review: under a strict TOFU + single-use + short-TTL
     reading this is *defensible* — a passive observer sees only TLS, and an
-    active MITM would have to crack 44 bits inside the TTL. But it couples the
+    active MITM would have to crack the phrase inside the TTL. But it couples the
     routing value to the secret, eroding SPAKE2's "secure on a broken channel"
     property, so we did not take it.)
-- **Try every pending record** breaks the N=3 accounting: a failed MAC is
+- **Try every pending record** breaks the failed-MAC accounting: a failed MAC is
   *ambiguous* (wrong-record vs wrong-phrase), so the hub would burn the wrong
   record's budget and an attacker could DoS every pending pairing's budget at
   once. *Rejected.*
@@ -48,17 +48,18 @@ secret**, so it leaks nothing about the phrase. We adopt exactly this:
   of the phrase → zero leakage. (`cbcl-chat-pairing-store:alloc-nameplate`.)
 - **Both halves are required.** A small *enumerable* nameplate means an
   unobserved attacker could connect to `/pair/v1`, hammer `1,2,3…` with junk
-  phrases, and blindly delete every pending pairing via the N=3 bound. Wormhole
+  phrases, and blindly delete every pending pairing via the failed-MAC burn. Wormhole
   pairs the small nameplate with **server-side rate limiting**; so do we:
   `cbcl-chat-pair-ratelimit` (per-source sliding window) gates `/pair/v1` before
-  any pairing work and burns budget on each failed attempt. The per-record N=3
-  stops guessing one record; the limiter **throttles** enumeration across many —
-  it does not stop it. At the defaults (10 failures/min per source, then a 5-min
-  cooldown) one source can still burn up to ~3 pending records a minute before
-  lockout, and distributed sources scale that linearly. The residual risk is
-  bounded and is **availability, never secrecy**: a burned pairing deletes a
-  pending record (single-use, 10-min TTL, normally one outstanding) and the
-  adder re-mints; no failure budget leaks anything about the phrase.
+  any pairing work and burns budget on each failed attempt. The per-record
+  burn-on-first-failure (N=1) stops guessing one record; the limiter
+  **throttles** enumeration across many — it does not stop it. At the defaults
+  (10 failures/min per source, then a 5-min cooldown) one source can burn up
+  to ~10 pending records a minute before lockout (every failed attempt now
+  burns its record), and distributed sources scale that linearly. The residual
+  risk is bounded and is **availability, never secrecy**: a burned pairing
+  deletes a pending record (single-use, 10-min TTL, normally one outstanding)
+  and the adder re-mints; no failure budget leaks anything about the phrase.
 
 The 32-hex id originally shipped was *also* secure (unguessable ⇒
 un-enumerable) — it was just unmemorable, and it had been quietly doing the
@@ -66,15 +67,30 @@ rate-limiter's job. Shrinking the nameplate is what made the limiter load-bearin
 
 ## What the agent sends
 
-`pair_init` carries the **nameplate** (public locator) + `msg_a`. The four words
+`pair_init` carries the **nameplate** (public locator) + `msg_a`. The two words
 never leave the agent — they derive the PAKE password `w`. `idA` in the
 transcript is the nameplate, binding the handshake to the specific record.
 
 ## Properties
 
-- Pure-phrase secret, memorable code (`1-rocket-anchor-velvet-quantum`), unlimited
+- Pure-phrase secret, memorable code (`1-rocket-anchor`), unlimited
   concurrency, no phrase-derived value on the wire, no single-pending limit.
-- Online-guess budget mechanized two ways: per-record N=3 deletion + per-source
-  rate limit. Single-use + short TTL bound the exposure window.
-- Verified live: pairs end-to-end; single-use/N=3/unknown-id/enumeration-throttle
-  all hold against the running hub.
+- Online-guess budget mechanized two ways: per-record burn-on-first-failure
+  (N=1) + per-source rate limit. Single-use + short TTL bound the exposure
+  window.
+- Verified live (under the original 4-word/N=3 parameters): pairs end-to-end;
+  single-use/burn/unknown-id/enumeration-throttle all held against the running
+  hub. The 2-word/N=1 revision is covered by the unit + WS + cross-stack KAT
+  suites; a live re-run is pending.
+
+## Revision (2026-06-11): two words, burn on first failure
+
+Owner decision, matching Magic-Wormhole's posture exactly: the phrase drops
+from four BIP39 words (44 bits) to **two** (22 bits), and the failed-MAC
+budget drops from N=3 to **N=1** — one wrong guess burns the record and frees
+the nameplate. SPAKE2 still makes offline attack impossible, so the only
+attack is the single online guess: success odds 2^-22 per minted record
+(wormhole ships 16 bits under the same rule). A typo now costs a re-mint —
+the failure is loud, the adder is one click from a fresh code. Entropy above
+this buys nothing real: the binding exposure is the password-equivalent
+verifier in the hub DB, which no phrase length defends.

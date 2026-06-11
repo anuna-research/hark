@@ -120,7 +120,7 @@ fn wrong_phrase_fails_hub_mac() {
     // A wrong phrase → a different wib → a different K → MAC_A won't match the
     // hub's, and the hub's MAC_B won't verify on the agent side either.
     let wrong_wib = hark::pairing::bip39::phrase_to_wib(
-        &["abandon", "abandon", "abandon", "abandon"]
+        &["abandon", "abandon"]
             .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),

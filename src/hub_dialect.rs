@@ -172,7 +172,7 @@ mod tests {
             r#"(announce @general :from @aria :agent @aria :dialects ("cite") :added-by @mira)"#,
             r#"(announce @general :from @bot :agent @bot :dialects ())"#, // no adder
             r#"(addagent @general :name @aria :dialects ("cite") :from @mira)"#,
-            r#"(paircode @general :name @aria :id "1" :code "1-rocket-anchor-velvet-quantum")"#,
+            r#"(paircode @general :name @aria :id "1" :code "1-rocket-anchor")"#,
             r#"(removeagent @general :name @aria :from @mira)"#,
             "(agent-removed @general :name @aria)",
             // SPEC-001 rooms (folded-in pre-existing control plane)

@@ -77,7 +77,7 @@ fn b64d(s: &str, field: &str) -> Result<Vec<u8>, PairClientError> {
 }
 
 /// Run the full pairing handshake against `pair_url` for `code`, returning the
-/// hub-released record. The four BIP39 words are the PAKE secret and never
+/// hub-released record. The two BIP39 words are the PAKE secret and never
 /// leave this process; only the public `pairing_id` is sent.
 pub async fn run_pairing(
     pair_url: &Url,

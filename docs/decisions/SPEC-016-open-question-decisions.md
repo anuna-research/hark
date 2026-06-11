@@ -10,7 +10,7 @@ gate (cross-model review + crypto sign-off) before that piece is implemented.
 > (REQ-007, v0.5+) is authoritative: the hub's stored verifier is
 > **password-equivalent, NOT "only an HMAC"** (a SPAKE2 responder cannot run from a
 > one-way digest — round 3); the online-guess budget is **mechanized** (single-use +
-> TTL + N=3 failed-MAC deletion + per-source rate limiting), not an asserted "one
+> TTL + burn-on-first-failed-MAC (N=1, v0.7.0; originally N=3) + per-source rate limiting), not an asserted "one
 > guess per run" (R3-04); and **install-by-digest is deferred to SPEC-015** (records
 > carry `(name, digest)` but the hub mints empty digests today — spec §7a).
 

@@ -29,7 +29,7 @@ const RECORD_NONCE: [u8; 12] = [0u8; 12];
 
 #[derive(Debug, thiserror::Error)]
 pub enum PairError {
-    #[error("pairing code must be `<pairing-id>-word-word-word-word`")]
+    #[error("pairing code must be `<pairing-id>-word-word`")]
     MalformedCode,
     #[error(transparent)]
     Phrase(#[from] bip39::PhraseError),
@@ -48,22 +48,21 @@ pub struct PairingCode {
     pub words: Vec<String>,
 }
 
-/// Parse `<pairing-id>-rocket-anchor-velvet-quantum`. The leading token is the
-/// public record locator; the trailing four are the BIP39 secret. Hyphens or
-/// whitespace separate tokens, so a pasted `42 rocket anchor velvet quantum`
-/// works too.
+/// Parse `<pairing-id>-rocket-anchor`. The leading token is the public
+/// record locator; the trailing two are the BIP39 secret. Hyphens or
+/// whitespace separate tokens, so a pasted `42 rocket anchor` works too.
 pub fn parse_code(code: &str) -> Result<PairingCode, PairError> {
     let tokens: Vec<String> = code
         .split(|c: char| c == '-' || c.is_whitespace())
         .filter(|t| !t.is_empty())
         .map(|t| t.to_string())
         .collect();
-    if tokens.len() != 5 {
+    if tokens.len() != 3 {
         return Err(PairError::MalformedCode);
     }
     Ok(PairingCode {
         pairing_id: tokens[0].clone(),
-        words: tokens[1..5].to_vec(),
+        words: tokens[1..3].to_vec(),
     })
 }
 
@@ -91,17 +90,21 @@ mod tests {
 
     #[test]
     fn parses_wormhole_style_code() {
-        let c = parse_code("00112233-account-clinic-text-wheel").unwrap();
+        let c = parse_code("00112233-account-clinic").unwrap();
         assert_eq!(c.pairing_id, "00112233");
-        assert_eq!(c.words, ["account", "clinic", "text", "wheel"]);
+        assert_eq!(c.words, ["account", "clinic"]);
 
         // whitespace-separated paste also works
-        let c = parse_code("42 account clinic text wheel").unwrap();
+        let c = parse_code("42 account clinic").unwrap();
         assert_eq!(c.pairing_id, "42");
-        assert_eq!(c.words.len(), 4);
+        assert_eq!(c.words.len(), 2);
 
         assert!(matches!(
-            parse_code("too-few-words"),
+            parse_code("toofew"),
+            Err(PairError::MalformedCode)
+        ));
+        assert!(matches!(
+            parse_code("1-too-many-words-here"),
             Err(PairError::MalformedCode)
         ));
     }
