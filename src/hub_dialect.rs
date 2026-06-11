@@ -52,12 +52,26 @@ mod tests {
     fn hub_dialect_makes_control_frames_valid_cbcl() {
         let registry = hub_registry();
         let frames = [
+            // SPEC-016 pairing + legibility
             r#"(announce @general :from @aria :agent @aria :dialects ("cite") :added-by @mira)"#,
             r#"(announce @general :from @bot :agent @bot :dialects ())"#, // no adder
             r#"(addagent @general :name @aria :dialects ("cite") :from @mira)"#,
             r#"(paircode @general :name @aria :id "1" :code "1-rocket-anchor-velvet")"#,
             r#"(removeagent @general :name @aria :from @mira)"#,
             "(agent-removed @general :name @aria)",
+            // SPEC-001 rooms (folded-in pre-existing control plane)
+            "(presence @general :members (@a @b))",
+            "(roomcfg @general :enc false)",
+            r#"(invite @general :ttl 86400000 :uses 5 :from @mira)"#,
+            r#"(invited @general :token "deadbeef" :ttl 86400000 :uses 5)"#,
+            r#"(channels @hub :public (@general @research) :from @mira :key "k")"#,
+            r#"(history @general :before "rcp-1" :limit 50 :from @mira)"#,
+            // SPEC-002 MLS
+            r#"(keypub @hub :last "b64" :onetime ("a" "b") :from @mira)"#,
+            "(keyget @hub :for @bob :from @mira)",
+            r#"(keypkg @hub :for @bob :kp "b64")"#,
+            r#"(welcome @general :for @bob :ct "b64" :from @mira)"#,
+            r#"(deliver @general :enc mls :epoch 3 :ct "b64" :from @mira)"#,
         ];
         for frame in frames {
             let mut store = ThreadedMessageStore::new();
