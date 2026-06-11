@@ -658,6 +658,30 @@ mod tests {
         );
     }
 
+    /// Every chat-wire frame the agent emits must be well-formed CBCL — the
+    /// chat send path checks exactly this (`payload_bytes` runs
+    /// `cbcl_parser::parse`), and the hub rejects anything that isn't. The
+    /// announce is the frame hark produces; the operator/hub pairing frames are
+    /// pinned here too so the shared grammar (incl. the `agent-removed`
+    /// performative and `:added-by` keyword) can't drift across the stack.
+    #[test]
+    fn pairing_chat_frames_are_valid_cbcl() {
+        let announce = build_announce_frame("@demo", "@aria", &["cite".to_owned()], Some("@mira"));
+        let frames = [
+            announce.as_str(),
+            r#"(addagent @general :name @aria :dialects ("cite") :from @mira)"#,
+            r#"(paircode @general :name @aria :id "1" :code "1-rocket-anchor-velvet")"#,
+            r#"(removeagent @general :name @aria :from @mira)"#,
+            "(agent-removed @general :name @aria)",
+        ];
+        for frame in frames {
+            assert!(
+                cbcl_parser::parse(frame).is_ok(),
+                "not valid CBCL: {frame}"
+            );
+        }
+    }
+
     #[test]
     fn cap_part_is_empty_when_absent_or_blank() {
         assert_eq!(cap_part(None), "");
