@@ -658,14 +658,21 @@ mod tests {
         );
     }
 
-    /// Every chat-wire frame the agent emits must be well-formed CBCL — the
-    /// chat send path checks exactly this (`payload_bytes` runs
-    /// `cbcl_parser::parse`), and the hub rejects anything that isn't. The
-    /// announce is the frame hark produces; the operator/hub pairing frames are
-    /// pinned here too so the shared grammar (incl. the `agent-removed`
-    /// performative and `:added-by` keyword) can't drift across the stack.
+    /// Every chat-wire frame must be a well-formed CBCL *s-expression* — that
+    /// is the bar the chat send path enforces (`payload_bytes` runs
+    /// `cbcl_parser::parse`), and the hub's lenient parser likewise accepts it.
+    ///
+    /// NOTE: this is R1 (s-expression well-formedness), NOT full CBCL *message*
+    /// validity. `addagent`/`paircode`/`removeagent`/`agent-removed`/`announce`
+    /// are bare *custom* performatives, so the strict CBCL evaluator rejects
+    /// them as `UnknownPerformative` (only the 8 core performatives or a
+    /// dialect performative inside `(lang …)` resolve). They are cbcl-chat
+    /// *protocol* verbs — recognized by name by the hub, like the pre-existing
+    /// `presence`/`roomcfg`/`invite`/`channels` — not strict CBCL messages.
+    /// This test pins their syntax + the shared grammar (the hyphenated
+    /// `agent-removed` performative and `:added-by` keyword) across the stack.
     #[test]
-    fn pairing_chat_frames_are_valid_cbcl() {
+    fn pairing_chat_frames_parse_as_wellformed_sexprs() {
         let announce = build_announce_frame("@demo", "@aria", &["cite".to_owned()], Some("@mira"));
         let frames = [
             announce.as_str(),
@@ -677,7 +684,7 @@ mod tests {
         for frame in frames {
             assert!(
                 cbcl_parser::parse(frame).is_ok(),
-                "not valid CBCL: {frame}"
+                "not a well-formed CBCL s-expression: {frame}"
             );
         }
     }
