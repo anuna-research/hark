@@ -254,6 +254,19 @@ pub async fn create_chat_agent(
     // the join ack — a failure here is a failed join, not a silent
     // plain-member fallback.
     let announce = build_announce_frame(channel, agent_handle, &dialects, added_by.as_deref());
+    // Enforce the announce is valid CBCL against the hub dialect (the control
+    // plane is a real dialect, not bare unknown performatives) — not merely a
+    // well-formed s-expression. Catches a malformed announce locally before it
+    // ever reaches the wire.
+    {
+        let mut store = cbcl_core::store::ThreadedMessageStore::new();
+        crate::cbcl_validation::validate_for_emit(
+            &announce,
+            crate::hub_dialect::hub_registry_cached(),
+            &mut store,
+        )
+        .map_err(|error| ChatError::Hello(format!("announce is not valid CBCL: {error}")))?;
+    }
     let announce_payload = payload_bytes(&announce).map_err(ChatError::Hello)?;
     let announce_frame = conn.sign_chat_frame(identity.as_ref(), &announce_payload);
     websocket

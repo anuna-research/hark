@@ -8,6 +8,7 @@ pub mod constants;
 pub mod daemon;
 pub mod dialect_cache;
 pub mod errors;
+pub mod hub_dialect;
 pub mod identity;
 pub mod local_api;
 pub mod pairing;
