@@ -3,13 +3,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use futures_util::{SinkExt, StreamExt};
 use hark::{
     config::AppConfig,
     constants::LOCAL_API_VERSION,
     daemon::{AgentStore, AgentStoreConfig, DiscoveryRecord},
     local_api::{CreateAgentResponse, ErrorResponse, RecvResponse, serve_local_api_with_agents},
 };
-use futures_util::{SinkExt, StreamExt};
 use time::OffsetDateTime;
 use tokio::{net::TcpListener, task::JoinHandle, time::Duration};
 use tokio_tungstenite::{
@@ -617,10 +617,7 @@ impl LocalApi {
         api
     }
 
-    async fn post_agent(
-        &self,
-        dialects: &[&str],
-    ) -> Result<reqwest::Response, reqwest::Error> {
+    async fn post_agent(&self, dialects: &[&str]) -> Result<reqwest::Response, reqwest::Error> {
         reqwest::Client::new()
             .post(self.url("/v1/agents"))
             .header("authorization", format!("Bearer {}", self.record.token))
@@ -634,10 +631,7 @@ impl LocalApi {
             .await
     }
 
-    async fn create_agent(
-        &self,
-        dialects: &[&str],
-    ) -> Option<CreateAgentResponse> {
+    async fn create_agent(&self, dialects: &[&str]) -> Option<CreateAgentResponse> {
         let response = self
             .post_agent(dialects)
             .await

@@ -14,8 +14,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 mod support;
 use support::{TestEnv, assert_success, output_debug};
 
-const BOOTSTRAP: &str =
-    "(tell @client \"conn-nonce\" :from @cbcl-chat :nonce \"AAAAAAAAAAAAAAAAAAAAAA==\" :hub \"cbcl-chat\")";
+const BOOTSTRAP: &str = "(tell @client \"conn-nonce\" :from @cbcl-chat :nonce \"AAAAAAAAAAAAAAAAAAAAAA==\" :hub \"cbcl-chat\")";
 
 #[test]
 fn cli_join_scaffolds_config_starts_daemon_and_joins() {
@@ -37,8 +36,7 @@ fn cli_join_scaffolds_config_starts_daemon_and_joins() {
     );
 
     // The config was scaffolded with the chat hub URL — no hand-editing.
-    let config =
-        std::fs::read_to_string(env.config_file()).expect("config should be scaffolded");
+    let config = std::fs::read_to_string(env.config_file()).expect("config should be scaffolded");
     assert!(config.contains("/chat/v1"), "config:\n{config}");
 
     // The hub saw a hello for the requested channel + handle.
@@ -203,7 +201,14 @@ fn cli_join_announces_itself_as_an_agent() {
 
     let join = env
         .command([
-            "join", "@demo", "--as", "@aria", "--speak", "cite", "--hub", &hub.ws_url(),
+            "join",
+            "@demo",
+            "--as",
+            "@aria",
+            "--speak",
+            "cite",
+            "--hub",
+            &hub.ws_url(),
         ])
         .output()
         .expect("join runs");
@@ -256,7 +261,14 @@ fn cli_join_validates_speak_against_declared_menu() {
 
     let join = env
         .command([
-            "join", "@demo", "--as", "@aria", "--speak", "vote", "--hub", &hub.ws_url(),
+            "join",
+            "@demo",
+            "--as",
+            "@aria",
+            "--speak",
+            "vote",
+            "--hub",
+            &hub.ws_url(),
         ])
         .output()
         .expect("join runs");
@@ -279,17 +291,20 @@ fn cli_join_accepts_declared_speak_subset() {
     // HP-5: only the chosen subset, never the whole menu.
     let join = env
         .command([
-            "join", "@demo", "--as", "@aria", "--speak", "cite", "--hub", &hub.ws_url(),
+            "join",
+            "@demo",
+            "--as",
+            "@aria",
+            "--speak",
+            "cite",
+            "--hub",
+            &hub.ws_url(),
         ])
         .output()
         .expect("join runs");
     assert_success(&join);
     let stdout = String::from_utf8_lossy(&join.stdout);
-    assert!(
-        stdout.contains("speaking: cite"),
-        "{}",
-        output_debug(&join)
-    );
+    assert!(stdout.contains("speaking: cite"), "{}", output_debug(&join));
     assert!(!stdout.contains("vote"), "never the whole menu: {stdout}");
 
     assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
@@ -306,7 +321,14 @@ fn cli_join_warns_when_channel_declares_no_menu() {
 
     let join = env
         .command([
-            "join", "@demo", "--as", "@aria", "--speak", "cite", "--hub", &hub.ws_url(),
+            "join",
+            "@demo",
+            "--as",
+            "@aria",
+            "--speak",
+            "cite",
+            "--hub",
+            &hub.ws_url(),
         ])
         .output()
         .expect("join runs");
@@ -402,11 +424,8 @@ impl MockChatHub {
                 let _ = websocket.send(Message::Text(meta.into())).await;
             }
             // Acknowledge the join (timestamp it for the Doherty measurement).
-            *ack_writer.lock().expect("ack should lock") =
-                Some(std::time::Instant::now());
-            let _ = websocket
-                .send(Message::Text(roomcfg.into()))
-                .await;
+            *ack_writer.lock().expect("ack should lock") = Some(std::time::Instant::now());
+            let _ = websocket.send(Message::Text(roomcfg.into())).await;
             // Record every post-ack frame and keep the socket open so the
             // agent stays healthy.
             loop {

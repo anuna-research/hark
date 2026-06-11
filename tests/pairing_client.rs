@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
-use hark::pairing::{client, PairingCode};
+use hark::pairing::{PairingCode, client};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -24,7 +24,7 @@ fn load() -> Value {
 }
 
 fn b64(hex: &str) -> String {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     let bytes: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -144,7 +144,12 @@ async fn pair_client_surfaces_hub_error() {
 
     let code = PairingCode {
         pairing_id: "deadbeef".to_string(),
-        words: vec!["account".into(), "clinic".into(), "text".into(), "wheel".into()],
+        words: vec![
+            "account".into(),
+            "clinic".into(),
+            "text".into(),
+            "wheel".into(),
+        ],
     };
     let url = url::Url::parse(&format!("ws://{addr}/pair/v1")).unwrap();
     let err = client::run_pairing(&url, &code).await.unwrap_err();

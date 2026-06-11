@@ -45,7 +45,9 @@ fn agent_initiator_reproduces_hub_vectors() {
         .map(|w| w.as_str().unwrap().to_string())
         .collect();
     assert_eq!(
-        hark::pairing::bip39::phrase_to_wib(&words).unwrap().to_vec(),
+        hark::pairing::bip39::phrase_to_wib(&words)
+            .unwrap()
+            .to_vec(),
         wib,
         "phrase must decode to the stored verifier"
     );
@@ -69,7 +71,11 @@ fn agent_initiator_reproduces_hub_vectors() {
     // Feed the hub's msg_B; MAC_A must match.
     let msg_b = unhex(out["msg_b_hex"].as_str().unwrap());
     let mac_a = agent.step1(&msg_b).expect("valid msg_b");
-    assert_eq!(hex(&mac_a), out["mac_a_hex"].as_str().unwrap(), "mac_a mismatch");
+    assert_eq!(
+        hex(&mac_a),
+        out["mac_a_hex"].as_str().unwrap(),
+        "mac_a mismatch"
+    );
 
     // Session key matches.
     assert_eq!(
@@ -89,7 +95,10 @@ fn agent_initiator_reproduces_hub_vectors() {
     assert_eq!(rec.agent_name, "@aria");
     assert_eq!(rec.channel, "@research");
     assert!(rec.enc);
-    assert!(rec.has_cap(), "private-channel record carries an invite cap");
+    assert!(
+        rec.has_cap(),
+        "private-channel record carries an invite cap"
+    );
     assert_eq!(rec.adder, "@mira");
     assert_eq!(rec.dialects.len(), 1);
     assert_eq!(rec.dialects[0].name, "cite");

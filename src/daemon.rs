@@ -24,9 +24,7 @@ use cbcl_core::{
 };
 
 use crate::{
-    config::validate_dialect_id,
-    constants::LOCAL_API_VERSION,
-    dialect_cache::DialectCache,
+    config::validate_dialect_id, constants::LOCAL_API_VERSION, dialect_cache::DialectCache,
     local_api::PingResponse,
 };
 
@@ -560,7 +558,10 @@ impl AgentStore {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut inner = self.inner.lock().await;
-            let entry = inner.agents.get_mut(handle).ok_or(AgentError::UnknownHandle)?;
+            let entry = inner
+                .agents
+                .get_mut(handle)
+                .ok_or(AgentError::UnknownHandle)?;
             entry.ensure_healthy()?;
             if entry.pending_meta_reply.is_some() {
                 return Err(AgentError::MetaSendBusy);
@@ -592,9 +593,7 @@ impl AgentStore {
                 // the full timeout.
                 Err(AgentError::Unhealthy {
                     reason: "meta_reply_channel_closed".to_owned(),
-                    detail: Some(
-                        "router connection closed before meta reply arrived".to_owned(),
-                    ),
+                    detail: Some("router connection closed before meta reply arrived".to_owned()),
                 })
             }
             Err(_elapsed) => {
@@ -824,10 +823,7 @@ impl AgentStore {
     /// order matching their store-append order. Never taken by the
     /// router receive loop — taking it there would re-introduce the
     /// inbound-vs-outbound deadlock this sequencer was added to avoid.
-    pub async fn send_sequencer(
-        &self,
-        handle: &AgentHandle,
-    ) -> Result<Arc<Mutex<()>>, AgentError> {
+    pub async fn send_sequencer(&self, handle: &AgentHandle) -> Result<Arc<Mutex<()>>, AgentError> {
         let inner = self.inner.lock().await;
         let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
         Ok(Arc::clone(&entry.send_sequencer))
@@ -897,10 +893,7 @@ impl MetaReplyDelivery {
     }
 }
 
-fn expectation_matches(
-    expectation: &MetaReplyExpectation,
-    delivery: &MetaReplyDelivery,
-) -> bool {
+fn expectation_matches(expectation: &MetaReplyExpectation, delivery: &MetaReplyDelivery) -> bool {
     match (expectation, delivery) {
         (_, MetaReplyDelivery::Reply(_)) => true,
         (MetaReplyExpectation::Reply, _) => false,
@@ -1907,7 +1900,10 @@ mod tests {
         let handle = handle();
 
         let snapshot = store
-            .insert_connected(handle.clone(), vec!["elf".to_owned(), "arena-v1".to_owned()])
+            .insert_connected(
+                handle.clone(),
+                vec!["elf".to_owned(), "arena-v1".to_owned()],
+            )
             .await
             .expect("agent should insert");
 

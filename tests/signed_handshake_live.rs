@@ -28,15 +28,25 @@ fn frame_text(msg: WsMessage) -> Option<String> {
     }
 }
 
-async fn next_text(ws: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin)) -> Option<String> {
-    let m = tokio::time::timeout(Duration::from_secs(3), ws.next()).await.ok()??.ok()?;
+async fn next_text(
+    ws: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Option<String> {
+    let m = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .ok()??
+        .ok()?;
     frame_text(m)
 }
 
 /// Chat hub->client frames are bare-framed (len ‖ payload ‖ sig) — decode the
 /// payload (the router sends raw text, so `next_text` suffices there).
-async fn next_chat_text(ws: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin)) -> Option<String> {
-    let m = tokio::time::timeout(Duration::from_secs(3), ws.next()).await.ok()??.ok()?;
+async fn next_chat_text(
+    ws: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Option<String> {
+    let m = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .ok()??
+        .ok()?;
     match m {
         WsMessage::Binary(b) => {
             let p = hark::chat_frame::decode_payload(&b)?;
@@ -65,7 +75,11 @@ async fn signed_hello_and_query_accepted_by_live_router() {
     let key = Key(SigningKey::from_bytes(&[3u8; 32]));
     let pub_b64 = {
         use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-        B64.encode(SigningKey::from_bytes(&[3u8; 32]).verifying_key().to_bytes())
+        B64.encode(
+            SigningKey::from_bytes(&[3u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
     };
     let mut conn = SignedConn::from_bootstrap(&boot);
 
@@ -73,21 +87,27 @@ async fn signed_hello_and_query_accepted_by_live_router() {
     //    with a `(... (error @router "bad-signature"))` frame.
     let hello = build_router_hello("hark-live-test", &pub_b64, &["demo".to_string()]);
     let hello_frame = conn.sign_router_frame(&key, hello.as_bytes());
-    ws.send(WsMessage::Binary(hello_frame.into())).await.expect("send hello");
+    ws.send(WsMessage::Binary(hello_frame.into()))
+        .await
+        .expect("send hello");
 
     // 4. a signed meta-query — the router replies with the dialect list. Getting
     //    a non-error reply proves the signed hello was accepted AND a subsequent
     //    signed frame verified + was routed end-to-end.
     let query = b"(meta (query (list)))";
     let query_frame = conn.sign_router_frame(&key, query);
-    ws.send(WsMessage::Binary(query_frame.into())).await.expect("send query");
+    ws.send(WsMessage::Binary(query_frame.into()))
+        .await
+        .expect("send query");
 
     // 5. drain a few frames; assert we never see a bad-signature error and that
     //    the connection is accepted (a reply / dialect list, or at least no
     //    auth error before the read window closes).
     let mut saw_reply = false;
     for _ in 0..4 {
-        let Some(t) = next_text(&mut ws).await else { break };
+        let Some(t) = next_text(&mut ws).await else {
+            break;
+        };
         assert!(
             !t.contains("bad-signature") && !t.contains("malformed"),
             "hub rejected a signed frame: {t}"
@@ -96,7 +116,10 @@ async fn signed_hello_and_query_accepted_by_live_router() {
             saw_reply = true;
         }
     }
-    assert!(saw_reply, "expected a reply to the signed meta-query from the live hub");
+    assert!(
+        saw_reply,
+        "expected a reply to the signed meta-query from the live hub"
+    );
 }
 
 /// Chat path (6d): connect to `/chat/v1`, receive the `@client` conn-nonce
@@ -119,19 +142,26 @@ async fn signed_chat_hello_accepted_by_live_hub() {
     let key = Key(SigningKey::from_bytes(&[4u8; 32]));
     let pub_b64 = {
         use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-        B64.encode(SigningKey::from_bytes(&[4u8; 32]).verifying_key().to_bytes())
+        B64.encode(
+            SigningKey::from_bytes(&[4u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
     };
     let mut conn = SignedConn::from_bootstrap(&boot);
 
     // create + join a fresh public channel (chat audience keeps the @ sigil).
-    let hello =
-        format!("(hello @harktest :from @hark-chat :key \"{pub_b64}\" :create \"public\")");
+    let hello = format!("(hello @harktest :from @hark-chat :key \"{pub_b64}\" :create \"public\")");
     let frame = conn.sign_chat_frame(&key, hello.as_bytes());
-    ws.send(WsMessage::Binary(frame.into())).await.expect("send hello");
+    ws.send(WsMessage::Binary(frame.into()))
+        .await
+        .expect("send hello");
 
     let mut joined = false;
     for _ in 0..4 {
-        let Some(t) = next_chat_text(&mut ws).await else { break };
+        let Some(t) = next_chat_text(&mut ws).await else {
+            break;
+        };
         assert!(
             !t.contains("bad-signature") && !t.contains("malformed"),
             "chat hub rejected the signed hello: {t}"
@@ -140,5 +170,8 @@ async fn signed_chat_hello_accepted_by_live_hub() {
             joined = true;
         }
     }
-    assert!(joined, "expected a join ack (roomcfg/presence) from the live chat hub");
+    assert!(
+        joined,
+        "expected a join ack (roomcfg/presence) from the live chat hub"
+    );
 }

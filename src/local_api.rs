@@ -27,8 +27,8 @@ use crate::{
     config::{AppConfig, ConfigError, Transport, validate_chat_handle},
     constants::{COMMAND_NAME, LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
     daemon::{
-        AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord,
-        MetaReplyDelivery, MetaReplyExpectation, authenticated_headers,
+        AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord, MetaReplyDelivery,
+        MetaReplyExpectation, authenticated_headers,
     },
     identity::ChatIdentity,
     router::{RouterError, create_router_agent},
@@ -105,7 +105,6 @@ pub struct SendResponse {
     pub ok: bool,
     pub agent_handle: String,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MetaSubscribeRequest {
@@ -453,10 +452,7 @@ impl LocalApiClient {
     ) -> Result<MetaAckResponse, LocalApiRequestError> {
         let response = self
             .http
-            .post(self.url(&format!(
-                "/v1/agents/{}/meta/subscribe",
-                handle.as_str()
-            )))
+            .post(self.url(&format!("/v1/agents/{}/meta/subscribe", handle.as_str())))
             .header(AUTHORIZATION, self.auth_header.clone())
             .json(request)
             .send()
@@ -471,10 +467,7 @@ impl LocalApiClient {
     ) -> Result<MetaAckResponse, LocalApiRequestError> {
         let response = self
             .http
-            .post(self.url(&format!(
-                "/v1/agents/{}/meta/unsubscribe",
-                handle.as_str()
-            )))
+            .post(self.url(&format!("/v1/agents/{}/meta/unsubscribe", handle.as_str())))
             .header(AUTHORIZATION, self.auth_header.clone())
             .send()
             .await
@@ -489,10 +482,7 @@ impl LocalApiClient {
     ) -> Result<MetaPublishResponse, LocalApiRequestError> {
         let response = self
             .http
-            .post(self.url(&format!(
-                "/v1/agents/{}/meta/publish",
-                handle.as_str()
-            )))
+            .post(self.url(&format!("/v1/agents/{}/meta/publish", handle.as_str())))
             .header(AUTHORIZATION, self.auth_header.clone())
             .json(request)
             .send()
@@ -675,10 +665,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/agents", get(agents).post(create_agent))
         .route("/v1/agents/{handle}/recv", get(recv))
         .route("/v1/agents/{handle}/send", post(send))
-        .route(
-            "/v1/agents/{handle}/meta/subscribe",
-            post(meta_subscribe),
-        )
+        .route("/v1/agents/{handle}/meta/subscribe", post(meta_subscribe))
         .route(
             "/v1/agents/{handle}/meta/unsubscribe",
             post(meta_unsubscribe),
@@ -890,7 +877,11 @@ async fn auto_install_advertised_dialects(
             )
             .await;
         match outcome {
-            Ok(MetaReplyDelivery::PushInstalled { name: installed, digest, .. }) => {
+            Ok(MetaReplyDelivery::PushInstalled {
+                name: installed,
+                digest,
+                ..
+            }) => {
                 tracing::info!(
                     target: "hark::auto_install",
                     handle = handle.as_str(),
@@ -1201,7 +1192,12 @@ async fn meta_publish(
     let frame = crate::router::build_meta_teach_frame(define);
     let delivery = state
         .agents
-        .send_meta_and_await(&handle, frame, MetaReplyExpectation::Reply, META_REPLY_TIMEOUT)
+        .send_meta_and_await(
+            &handle,
+            frame,
+            MetaReplyExpectation::Reply,
+            META_REPLY_TIMEOUT,
+        )
         .await
         .map_err(agent_error_to_api)?;
     let reply = match delivery {
@@ -1217,30 +1213,30 @@ async fn meta_publish(
             ));
         }
     };
-    let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
-        StatusCode::BAD_GATEWAY,
-        "meta_reply_malformed",
-        format!("router reply could not be parsed: {reason}"),
-        Some(reply.clone()),
-    ))?;
-    let digest = parsed
-        .get("digest")
-        .cloned()
-        .ok_or_else(|| ApiError::new(
+    let parsed = parse_meta_reply_params(&reply).map_err(|reason| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "meta_reply_malformed",
+            format!("router reply could not be parsed: {reason}"),
+            Some(reply.clone()),
+        )
+    })?;
+    let digest = parsed.get("digest").cloned().ok_or_else(|| {
+        ApiError::new(
             StatusCode::BAD_GATEWAY,
             "meta_reply_missing_digest",
             "router reply did not include a digest",
             Some(reply.clone()),
-        ))?;
-    let name = parsed
-        .get("name")
-        .cloned()
-        .ok_or_else(|| ApiError::new(
+        )
+    })?;
+    let name = parsed.get("name").cloned().ok_or_else(|| {
+        ApiError::new(
             StatusCode::BAD_GATEWAY,
             "meta_reply_missing_name",
             "router reply did not include a name",
             Some(reply.clone()),
-        ))?;
+        )
+    })?;
 
     // Install into the publishing handle's local dialect cache so the
     // outbound R5 pipeline (Phase B) can see the freshly-published
@@ -1348,7 +1344,12 @@ async fn meta_list(
     let frame = crate::router::build_meta_query_list_frame();
     let delivery = state
         .agents
-        .send_meta_and_await(&handle, frame, MetaReplyExpectation::Reply, META_REPLY_TIMEOUT)
+        .send_meta_and_await(
+            &handle,
+            frame,
+            MetaReplyExpectation::Reply,
+            META_REPLY_TIMEOUT,
+        )
         .await
         .map_err(agent_error_to_api)?;
     let reply = match delivery {
@@ -1362,12 +1363,14 @@ async fn meta_list(
             ));
         }
     };
-    let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
-        StatusCode::BAD_GATEWAY,
-        "meta_reply_malformed",
-        format!("router list reply could not be parsed: {reason}"),
-        Some(reply.clone()),
-    ))?;
+    let parsed = parse_meta_reply_params(&reply).map_err(|reason| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "meta_reply_malformed",
+            format!("router list reply could not be parsed: {reason}"),
+            Some(reply.clone()),
+        )
+    })?;
     let names = parsed
         .get("names")
         .map(|joined| {
@@ -1473,7 +1476,9 @@ fn validate_define_for_publish(define: &str) -> Result<(), ApiError> {
 /// args (the recipient, the status content). Strings are unescaped for
 /// `\\` and `\"`. Best-effort: returns `Err(_)` if the frame doesn't
 /// look like a single top-level list at all.
-fn parse_meta_reply_params(text: &str) -> Result<std::collections::HashMap<String, String>, String> {
+fn parse_meta_reply_params(
+    text: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
     let bytes = text.as_bytes();
     let mut params = std::collections::HashMap::new();
     let mut i = 0;
@@ -1893,7 +1898,6 @@ fn cbcl_validation_error_to_api(error: CbclValidationError) -> ApiError {
     }
 }
 
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ApiError {
     status: StatusCode,
@@ -1925,11 +1929,7 @@ impl ApiError {
     /// error body surfaces what the spec advertises for
     /// `shape_violation` and `causal_violation`. Either side may be
     /// `None` when the pipeline couldn't extract it.
-    fn with_blame(
-        mut self,
-        performative: Option<String>,
-        thread: Option<String>,
-    ) -> Self {
+    fn with_blame(mut self, performative: Option<String>, thread: Option<String>) -> Self {
         self.performative = performative;
         self.thread = thread;
         self

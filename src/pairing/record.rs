@@ -60,7 +60,15 @@ impl PairingRecord {
         if !r.is_empty() {
             return Err(RecordError::Malformed);
         }
-        Ok(Self { agent_name, channel, enc, cap, adder, dialects, exp })
+        Ok(Self {
+            agent_name,
+            channel,
+            enc,
+            cap,
+            adder,
+            dialects,
+            exp,
+        })
     }
 }
 

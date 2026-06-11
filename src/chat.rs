@@ -26,10 +26,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use url::Url;
 
 use crate::chat_frame::decode_payload;
-use crate::signed_transport::{SignedConn, parse_conn_bootstrap};
 use crate::chat_responder::{Action, Responder, WindowOutcome};
 use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore};
 use crate::identity::ChatIdentity;
+use crate::signed_transport::{SignedConn, parse_conn_bootstrap};
 
 pub const CHAT_WS_PATH: &str = "/chat/v1";
 
@@ -263,8 +263,9 @@ pub async fn create_chat_agent(
     match &learned_hub {
         Some(registry) => {
             let mut store = cbcl_core::store::ThreadedMessageStore::new();
-            crate::cbcl_validation::validate_for_emit(&announce, registry, &mut store)
-                .map_err(|error| ChatError::Hello(format!("announce is not valid CBCL: {error}")))?;
+            crate::cbcl_validation::validate_for_emit(&announce, registry, &mut store).map_err(
+                |error| ChatError::Hello(format!("announce is not valid CBCL: {error}")),
+            )?;
         }
         None => warnings.push(format!(
             "hub {channel} taught no control dialect (legacy hub); \
@@ -344,7 +345,9 @@ fn build_announce_frame(
     // it (and verifies the frame signature against it) or the frame is rejected
     // as `missing-from` and never fanned. `:agent` is what chat clients key the
     // agent rendering off; both are the agent's own handle.
-    format!("(announce {channel} :from {agent_handle} :agent {agent_handle} :dialects ({list}){added})")
+    format!(
+        "(announce {channel} :from {agent_handle} :agent {agent_handle} :dialects ({list}){added})"
+    )
 }
 
 /// Receive + parse the chat hub's conn-nonce bootstrap (its first frame:
@@ -383,7 +386,9 @@ async fn recv_bootstrap(ws: &mut ChatSocket) -> Result<SignedConn, ChatError> {
     parse_conn_bootstrap(&text)
         .map(|boot| SignedConn::from_bootstrap(&boot))
         .ok_or_else(|| {
-            ChatError::ConnectionFailed(format!("first frame was not a conn-nonce bootstrap: {text}"))
+            ChatError::ConnectionFailed(format!(
+                "first frame was not a conn-nonce bootstrap: {text}"
+            ))
         })
 }
 
@@ -681,7 +686,12 @@ mod tests {
     #[test]
     fn builds_announce_frame_with_channel_audience_and_dialects() {
         assert_eq!(
-            build_announce_frame("@demo", "@aria", &["cite".to_owned(), "vote".to_owned()], None),
+            build_announce_frame(
+                "@demo",
+                "@aria",
+                &["cite".to_owned(), "vote".to_owned()],
+                None
+            ),
             r#"(announce @demo :from @aria :agent @aria :dialects ("cite" "vote"))"#
         );
         // Advertising nothing is still a legible agent (HP-2 + REQ-006).

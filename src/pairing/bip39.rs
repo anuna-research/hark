@@ -38,7 +38,9 @@ pub fn phrase_to_wib(words: &[String]) -> Result<[u8; 6], PhraseError> {
     let mut idx = [0u16; 4];
     for (slot, word) in idx.iter_mut().zip(words) {
         let lw = word.trim().to_lowercase();
-        *slot = *map.get(lw.as_str()).ok_or_else(|| PhraseError::UnknownWord(word.clone()))?;
+        *slot = *map
+            .get(lw.as_str())
+            .ok_or_else(|| PhraseError::UnknownWord(word.clone()))?;
     }
     Ok(pack(idx))
 }

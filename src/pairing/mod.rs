@@ -17,8 +17,8 @@ pub mod record;
 pub mod spake2;
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
 
 /// The AEAD additional-data + nonce the hub binds the record under
@@ -76,7 +76,10 @@ pub fn open_record(
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(&RECORD_NONCE),
-            Payload { msg: ciphertext, aad: RECORD_AAD },
+            Payload {
+                msg: ciphertext,
+                aad: RECORD_AAD,
+            },
         )
         .map_err(|_| PairError::RecordUndecryptable)?;
     Ok(record::PairingRecord::decode(&plaintext)?)
@@ -97,6 +100,9 @@ mod tests {
         assert_eq!(c.pairing_id, "42");
         assert_eq!(c.words.len(), 4);
 
-        assert!(matches!(parse_code("too-few-words"), Err(PairError::MalformedCode)));
+        assert!(matches!(
+            parse_code("too-few-words"),
+            Err(PairError::MalformedCode)
+        ));
     }
 }

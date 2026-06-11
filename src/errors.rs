@@ -31,7 +31,9 @@ pub enum AppError {
     DaemonAlreadyRunning,
     #[error("stale daemon state")]
     StaleDaemonState,
-    #[error("no agent handle: CBCL_AGENT_HANDLE is unset and no active agent is open (run `hark init` or `hark join`)")]
+    #[error(
+        "no agent handle: CBCL_AGENT_HANDLE is unset and no active agent is open (run `hark init` or `hark join`)"
+    )]
     MissingAgentHandle,
     #[error("agent handle is not active or usable")]
     AgentHandleUnavailable,

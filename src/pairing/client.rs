@@ -3,7 +3,7 @@
 //! crypto is in [`super::spake2`]; this module owns the wire (JSON frames,
 //! base64 payloads) and the orchestration.
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use url::Url;
 
 use super::record::PairingRecord;
 use super::spake2::{Context, Initiator};
-use super::{open_record, PairError, PairingCode};
+use super::{PairError, PairingCode, open_record};
 
 /// The pairing WS path (sibling to `/chat/v1`).
 pub const PAIR_WS_PATH: &str = "/pair/v1";
@@ -79,7 +79,10 @@ fn b64d(s: &str, field: &str) -> Result<Vec<u8>, PairClientError> {
 /// Run the full pairing handshake against `pair_url` for `code`, returning the
 /// hub-released record. The four BIP39 words are the PAKE secret and never
 /// leave this process; only the public `pairing_id` is sent.
-pub async fn run_pairing(pair_url: &Url, code: &PairingCode) -> Result<PairingRecord, PairClientError> {
+pub async fn run_pairing(
+    pair_url: &Url,
+    code: &PairingCode,
+) -> Result<PairingRecord, PairClientError> {
     let mut ephemeral = [0u8; 64];
     rand::rng().fill_bytes(&mut ephemeral);
     run_pairing_with_ephemeral(pair_url, code, &ephemeral).await
@@ -122,30 +125,41 @@ pub async fn run_pairing_with_ephemeral(
     // Frame 2 ← pair_resp
     let msg_b = match recv_frame(&mut ws).await? {
         ServerFrame::PairResp { msg_b } => b64d(&msg_b, "msg_b")?,
-        ServerFrame::Error { code, message } => return Err(PairClientError::HubError { code, message }),
+        ServerFrame::Error { code, message } => {
+            return Err(PairClientError::HubError { code, message });
+        }
         ServerFrame::PairRelease { .. } => {
             return Err(PairClientError::UnexpectedFrame {
                 expected: "pair_resp".into(),
                 got: "pair_release".into(),
-            })
+            });
         }
     };
     let mac_a = agent.step1(&msg_b).map_err(PairError::from)?;
 
     // Frame 3 → pair_confirm
-    send_json(&mut ws, &PairConfirm { r#type: "pair_confirm", mac_a: B64.encode(mac_a) }).await?;
+    send_json(
+        &mut ws,
+        &PairConfirm {
+            r#type: "pair_confirm",
+            mac_a: B64.encode(mac_a),
+        },
+    )
+    .await?;
 
     // Frame 4 ← pair_release
     let (mac_b, ciphertext) = match recv_frame(&mut ws).await? {
         ServerFrame::PairRelease { mac_b, ciphertext } => {
             (b64d(&mac_b, "mac_b")?, b64d(&ciphertext, "ciphertext")?)
         }
-        ServerFrame::Error { code, message } => return Err(PairClientError::HubError { code, message }),
+        ServerFrame::Error { code, message } => {
+            return Err(PairClientError::HubError { code, message });
+        }
         ServerFrame::PairResp { .. } => {
             return Err(PairClientError::UnexpectedFrame {
                 expected: "pair_release".into(),
                 got: "pair_resp".into(),
-            })
+            });
         }
     };
 
@@ -180,11 +194,11 @@ async fn recv_frame(
             Some(Err(e)) => return Err(PairClientError::ConnectionFailed(e.to_string())),
             Some(Ok(WsMessage::Text(text))) => {
                 return serde_json::from_str(&text)
-                    .map_err(|e| PairClientError::MalformedFrame(e.to_string()))
+                    .map_err(|e| PairClientError::MalformedFrame(e.to_string()));
             }
             Some(Ok(WsMessage::Binary(bytes))) => {
                 return serde_json::from_slice(&bytes)
-                    .map_err(|e| PairClientError::MalformedFrame(e.to_string()))
+                    .map_err(|e| PairClientError::MalformedFrame(e.to_string()));
             }
             Some(Ok(WsMessage::Close(_))) => return Err(PairClientError::ClosedEarly),
             Some(Ok(_)) => continue, // ping/pong/etc.

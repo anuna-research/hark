@@ -39,7 +39,8 @@ pub enum HubDialectError {
 /// the learned hub dialect, so the agent validates its control-plane frames
 /// against the grammar the hub *actually* declared — no baked copy to drift.
 pub fn learn_hub_dialect(meta_frame: &str) -> Result<DialectRegistry, HubDialectError> {
-    let sexpr = cbcl_parser::parse(meta_frame).map_err(|e| HubDialectError::Parse(e.to_string()))?;
+    let sexpr =
+        cbcl_parser::parse(meta_frame).map_err(|e| HubDialectError::Parse(e.to_string()))?;
     let message = cbcl_parser::parse_message(&sexpr).map_err(HubDialectError::Parse)?;
     let Message::Meta { dialect_def } = message else {
         return Err(HubDialectError::NotMeta);

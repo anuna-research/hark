@@ -4,8 +4,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::Message as WsMessage,
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
 };
 
 use crate::{
@@ -242,7 +241,9 @@ async fn recv_bootstrap(ws: &mut RouterWebSocket) -> Result<SignedConn, RouterEr
         }
     };
     let boot = parse_conn_bootstrap(&text).ok_or_else(|| {
-        RouterError::ConnectionFailed(format!("first frame was not a conn-nonce bootstrap: {text}"))
+        RouterError::ConnectionFailed(format!(
+            "first frame was not a conn-nonce bootstrap: {text}"
+        ))
     })?;
     Ok(SignedConn::from_bootstrap(&boot))
 }
@@ -432,9 +433,7 @@ async fn process_inbound(
                 })
             }
         },
-        InboundClass::MetaReply => {
-            Some(crate::daemon::MetaReplyDelivery::Reply(text.clone()))
-        }
+        InboundClass::MetaReply => Some(crate::daemon::MetaReplyDelivery::Reply(text.clone())),
         _ => None,
     };
     // Meta-reply correlation: only consume frames whose shape matches the

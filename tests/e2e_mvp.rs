@@ -20,8 +20,7 @@ use support::{TestEnv, assert_success, output_debug};
 
 const ROUTER_SECRET: &str = "shr_test.secret";
 const DISPATCH: &str = "(lang elf (ask @router \"work\" :thread \"rcp-1\"))";
-const BOOTSTRAP: &str =
-    "(tell @agent \"conn-nonce\" :from @cbcl-router :nonce \"AAAAAAAAAAAAAAAAAAAAAA==\" :hub \"cbcl-router\")";
+const BOOTSTRAP: &str = "(tell @agent \"conn-nonce\" :from @cbcl-router :nonce \"AAAAAAAAAAAAAAAAAAAAAA==\" :hub \"cbcl-router\")";
 
 #[test]
 fn e2e_mvp_happy_path_start_init_recv_progress_reply_close_stop() {

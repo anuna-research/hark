@@ -72,7 +72,10 @@ impl Selector for RendezvousHash {
             .map(|handle| (Self::draw(ask_id, handle), handle.as_str()))
             .collect();
         scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-        scored.into_iter().map(|(_, handle)| handle.to_owned()).collect()
+        scored
+            .into_iter()
+            .map(|(_, handle)| handle.to_owned())
+            .collect()
     }
 }
 
@@ -94,7 +97,10 @@ mod tests {
     #[test]
     fn single_contender_wins() {
         let s = RendezvousHash;
-        assert_eq!(s.winner("ask-1", &handles(&["@aria"])), Some("@aria".to_owned()));
+        assert_eq!(
+            s.winner("ask-1", &handles(&["@aria"])),
+            Some("@aria".to_owned())
+        );
     }
 
     #[test]
@@ -114,7 +120,11 @@ mod tests {
         let mut sorted = ranking.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(sorted.len(), 3, "every contender appears exactly once: {ranking:?}");
+        assert_eq!(
+            sorted.len(),
+            3,
+            "every contender appears exactly once: {ranking:?}"
+        );
     }
 
     #[test]
@@ -143,7 +153,10 @@ mod tests {
                 winners.insert(w);
             }
         }
-        assert!(winners.len() > 1, "winner never varied across 50 asks: {winners:?}");
+        assert!(
+            winners.len() > 1,
+            "winner never varied across 50 asks: {winners:?}"
+        );
     }
 
     #[test]

@@ -14,9 +14,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use cbcl_core::{
-    canonical::canonical_encode, message::Message, sexpr::SExpr, store::ContentHash,
-};
+use cbcl_core::{canonical::canonical_encode, message::Message, sexpr::SExpr, store::ContentHash};
 use cbcl_parser::{parse, parse_message};
 use futures_util::{SinkExt, StreamExt};
 use hark::{
@@ -155,8 +153,14 @@ async fn outbound_happy_path_succeeds_and_appends_to_store() {
 
     // The frame must have been forwarded to the router. The wire frame is a
     // signed envelope (SPEC-012) embedding the payload verbatim.
-    harness.router.wait_for_captured_frame(Duration::from_secs(1)).await;
-    let captured = harness.router.captured_frame().expect("a frame was captured");
+    harness
+        .router
+        .wait_for_captured_frame(Duration::from_secs(1))
+        .await;
+    let captured = harness
+        .router
+        .captured_frame()
+        .expect("a frame was captured");
     assert!(
         captured.contains(message),
         "captured frame should embed the payload: {captured:?}"
@@ -197,7 +201,9 @@ async fn inbound_shape_violation_is_dropped() {
     // Recv should time out — nothing reached the queue.
     let result = timeout(
         Duration::from_millis(250),
-        harness.agents.recv(&handle, Some(Duration::from_millis(150))),
+        harness
+            .agents
+            .recv(&handle, Some(Duration::from_millis(150))),
     )
     .await
     .expect("outer timeout must not fire before inner");
@@ -225,7 +231,9 @@ async fn inbound_causal_violation_is_dropped() {
 
     let result = timeout(
         Duration::from_millis(250),
-        harness.agents.recv(&handle, Some(Duration::from_millis(150))),
+        harness
+            .agents
+            .recv(&handle, Some(Duration::from_millis(150))),
     )
     .await
     .expect("outer timeout must not fire before inner");
@@ -265,9 +273,7 @@ async fn concurrent_outbound_and_inbound_do_not_deadlock() {
         .collect();
     let outbound_bodies: Vec<String> = (0..BURST)
         .map(|i| {
-            format!(
-                r#"(lang greet-d (reply @router "ok" :thread "t-out-{i}" :caused-by "begin"))"#
-            )
+            format!(r#"(lang greet-d (reply @router "ok" :thread "t-out-{i}" :caused-by "begin"))"#)
         })
         .collect();
 
@@ -349,7 +355,9 @@ async fn inbound_happy_path_enqueues_and_appends_to_store() {
     // Recv must observe the message.
     let received = timeout(
         Duration::from_secs(1),
-        harness.agents.recv(&handle, Some(Duration::from_millis(500))),
+        harness
+            .agents
+            .recv(&handle, Some(Duration::from_millis(500))),
     )
     .await
     .expect("recv must complete within timeout")
@@ -438,8 +446,8 @@ impl Harness {
         // Wait for the daemon to complete the router hello handshake so the
         // dialect_cache_handle resolves cleanly before we try to install.
         self.router.wait_for_hello(Duration::from_secs(1)).await;
-        let handle = AgentHandle::new(created.agent_handle.clone())
-            .expect("returned handle must be valid");
+        let handle =
+            AgentHandle::new(created.agent_handle.clone()).expect("returned handle must be valid");
         let cache = self
             .agents
             .dialect_cache_handle(&handle)

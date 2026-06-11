@@ -48,9 +48,13 @@ pub fn parse_conn_bootstrap(payload: &str) -> Option<ConnBootstrap> {
         return None;
     }
     let nonce_b64 = quoted_kw(payload, ":nonce")?;
-    let hub = quoted_kw(payload, ":hub").unwrap_or_else(|| String::from_utf8_lossy(ROUTER_HUB_DEFAULT).into_owned());
+    let hub = quoted_kw(payload, ":hub")
+        .unwrap_or_else(|| String::from_utf8_lossy(ROUTER_HUB_DEFAULT).into_owned());
     let conn_nonce = B64.decode(nonce_b64.as_bytes()).ok()?;
-    Some(ConnBootstrap { conn_nonce, hub_id: hub.into_bytes() })
+    Some(ConnBootstrap {
+        conn_nonce,
+        hub_id: hub.into_bytes(),
+    })
 }
 
 /// Extract the double-quoted value immediately following a `:keyword`, e.g.
@@ -74,17 +78,30 @@ pub struct SignedConn {
 impl SignedConn {
     /// Build from a parsed bootstrap (the usual path).
     pub fn from_bootstrap(b: &ConnBootstrap) -> Self {
-        Self { hub_id: b.hub_id.clone(), conn_nonce: b.conn_nonce.clone(), seq: 0 }
+        Self {
+            hub_id: b.hub_id.clone(),
+            conn_nonce: b.conn_nonce.clone(),
+            seq: 0,
+        }
     }
 
     /// Build directly (tests / non-bootstrap callers).
     pub fn new(hub_id: impl Into<Vec<u8>>, conn_nonce: impl Into<Vec<u8>>) -> Self {
-        Self { hub_id: hub_id.into(), conn_nonce: conn_nonce.into(), seq: 0 }
+        Self {
+            hub_id: hub_id.into(),
+            conn_nonce: conn_nonce.into(),
+            seq: 0,
+        }
     }
 
     /// Sign `payload` for `audience` into a wire frame, advancing the connection
     /// seq. `signer` signs the domain-separated envelope (not the bare payload).
-    pub fn sign_frame(&mut self, signer: &dyn FrameSigner, audience: &[u8], payload: &[u8]) -> Vec<u8> {
+    pub fn sign_frame(
+        &mut self,
+        signer: &dyn FrameSigner,
+        audience: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
         self.seq += 1;
         let env = envelope(&self.hub_id, audience, self.seq, &self.conn_nonce, payload);
         let sig = signer.sign(&env);
@@ -183,7 +200,10 @@ mod tests {
         // conn_nonce, payload) and verifies the sig against the advertised key
         let env = envelope(b"cbcl-router", ROUTER_AUDIENCE, seq, &[7u8; 16], payload);
         let sig = Signature::from_bytes(sig.try_into().expect("64"));
-        assert!(vk.verify(&env, &sig).is_ok(), "hub must accept the signed frame");
+        assert!(
+            vk.verify(&env, &sig).is_ok(),
+            "hub must accept the signed frame"
+        );
 
         // next frame advances seq
         let wire2 = conn.sign_router_frame(&signer, b"(tell @router \"progress\")");
@@ -194,7 +214,10 @@ mod tests {
     #[test]
     fn hello_has_signed_member_shape() {
         let h = build_router_hello("agent-x", "PUBKEYB64", &["demo".into(), "echo".into()]);
-        assert_eq!(h, "(hello @router :from @agent-x :key \"PUBKEYB64\" :dialects (\"demo\" \"echo\"))");
+        assert_eq!(
+            h,
+            "(hello @router :from @agent-x :key \"PUBKEYB64\" :dialects (\"demo\" \"echo\"))"
+        );
     }
 
     #[test]
@@ -207,8 +230,17 @@ mod tests {
 
     #[test]
     fn chat_audience_keeps_the_sigil() {
-        assert_eq!(chat_audience(b"(hello @general :from @h :key \"k\")").unwrap(), b"@general");
-        assert_eq!(chat_audience(b"(keypub @hub :last \"l\" :from @a)").unwrap(), b"@hub");
-        assert_eq!(chat_audience(b"(lang cbcl-chat (tell @room \"x\" :from @a))").unwrap(), b"@room");
+        assert_eq!(
+            chat_audience(b"(hello @general :from @h :key \"k\")").unwrap(),
+            b"@general"
+        );
+        assert_eq!(
+            chat_audience(b"(keypub @hub :last \"l\" :from @a)").unwrap(),
+            b"@hub"
+        );
+        assert_eq!(
+            chat_audience(b"(lang cbcl-chat (tell @room \"x\" :from @a))").unwrap(),
+            b"@room"
+        );
     }
 }

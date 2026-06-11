@@ -31,7 +31,13 @@ fn lp(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Build the domain-separated envelope that the Ed25519 signature covers.
-pub fn envelope(hub_id: &[u8], audience: &[u8], seq: u64, conn_nonce: &[u8], payload: &[u8]) -> Vec<u8> {
+pub fn envelope(
+    hub_id: &[u8],
+    audience: &[u8],
+    seq: u64,
+    conn_nonce: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::new();
     lp(&mut out, DS_TAG);
     lp(&mut out, hub_id);

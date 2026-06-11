@@ -107,7 +107,13 @@ impl Initiator {
     /// Begin the handshake. `wib` is the word-index bytes derived from the
     /// phrase; `id_a` binds the transcript to this pairing (the pairing_id);
     /// `hub_id` feeds idB; `ephemeral64` is 64 CSPRNG bytes (the agent's x).
-    pub fn start(ctx: Context, wib: &[u8], id_a: &[u8], hub_id: &[u8], ephemeral64: &[u8; 64]) -> Self {
+    pub fn start(
+        ctx: Context,
+        wib: &[u8],
+        id_a: &[u8],
+        hub_id: &[u8],
+        ephemeral64: &[u8; 64],
+    ) -> Self {
         let w_bytes = hkdf_sha256(wib, &ctx.w_salt, &ctx.w_info, 64);
         let mut w_wide = [0u8; 64];
         w_wide.copy_from_slice(&w_bytes);
@@ -237,7 +243,9 @@ mod proptests {
 
             let peer = CompressedRistretto::from_slice(msg_a).ok()?.decompress()?;
             // msg_B = y*B + w*N
-            let msg_b = (RISTRETTO_BASEPOINT_TABLE * &y + w * n_point()).compress().to_bytes();
+            let msg_b = (RISTRETTO_BASEPOINT_TABLE * &y + w * n_point())
+                .compress()
+                .to_bytes();
             // K_spake2 = y * (msg_A - w*M)
             let k_spake2 = (y * (peer - w * m_point())).compress().to_bytes();
 

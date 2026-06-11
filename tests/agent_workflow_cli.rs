@@ -3,8 +3,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use hark::config::{AppConfig, SAMPLE_CONFIG};
 use futures_util::{SinkExt, StreamExt};
+use hark::config::{AppConfig, SAMPLE_CONFIG};
 use tokio::{net::TcpListener, task::JoinHandle, time::Duration};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -12,8 +12,7 @@ mod support;
 use support::{TestEnv, assert_success, output_debug};
 
 const DISPATCH: &str = "(lang elf (ask @router \"work\" :thread \"rcp-1\"))";
-const BOOTSTRAP: &str =
-    "(tell @agent \"conn-nonce\" :from @cbcl-router :nonce \"AAAAAAAAAAAAAAAAAAAAAA==\" :hub \"cbcl-router\")";
+const BOOTSTRAP: &str = "(tell @agent \"conn-nonce\" :from @cbcl-router :nonce \"AAAAAAAAAAAAAAAAAAAAAA==\" :hub \"cbcl-router\")";
 
 #[test]
 fn cli_workflow_init_recv_and_close_keeps_stdout_clean() {
@@ -172,7 +171,11 @@ fn cli_emit_sends_full_cbcl_form_upstream() {
     // a full CBCL form passes through.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        if router.received().iter().any(|frame| frame.contains(message)) {
+        if router
+            .received()
+            .iter()
+            .any(|frame| frame.contains(message))
+        {
             break;
         }
         assert!(
@@ -240,13 +243,7 @@ fn cli_rejects_missing_handle_and_duplicate_init_values() {
     assert_eq!(recv.status.code(), Some(3), "{}", output_debug(&recv));
 
     let duplicate_dialect = env
-        .command([
-            "init",
-            "--dialect",
-            "elf",
-            "--dialect",
-            "elf",
-        ])
+        .command(["init", "--dialect", "elf", "--dialect", "elf"])
         .output()
         .expect("init runs");
     assert_eq!(

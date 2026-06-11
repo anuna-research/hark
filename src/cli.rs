@@ -10,9 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::net::TcpListener;
 
 use crate::cbcl_validation::{MessageKind, validate_for_emit, validate_for_send};
-use crate::config::{
-    SAMPLE_CONFIG, default_config_file, validate_dialect_id,
-};
+use crate::config::{SAMPLE_CONFIG, default_config_file, validate_dialect_id};
 use crate::constants::{COMMAND_NAME, DEFAULT_PROGRESS_DIALECT, MAX_RECV_TIMEOUT_MS};
 use crate::daemon::{
     AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord, RuntimePaths, acquire_daemon_lock,
@@ -74,7 +72,9 @@ pub enum Command {
 pub enum DialectCommand {
     #[command(about = "Publish a dialect to the router via (meta (teach @router <define>))")]
     Publish(DialectPublishArgs),
-    #[command(about = "Ask the router whether it knows a dialect by name and install the teach-back")]
+    #[command(
+        about = "Ask the router whether it knows a dialect by name and install the teach-back"
+    )]
     Query(DialectQueryArgs),
     #[command(about = "List every dialect currently known to the router")]
     List,
@@ -138,10 +138,7 @@ pub enum DaemonCommand {
 pub struct JoinArgs {
     #[arg(help = "Channel to join (@name)")]
     pub channel: String,
-    #[arg(
-        long = "as",
-        help = "The agent's wire handle in the channel (@name)"
-    )]
+    #[arg(long = "as", help = "The agent's wire handle in the channel (@name)")]
     pub as_handle: String,
     #[arg(
         long = "speak",
@@ -163,9 +160,7 @@ pub struct JoinArgs {
 
 #[derive(Debug, Args)]
 pub struct PairArgs {
-    #[arg(
-        help = "The pairing code from the web app: `<pairing-id>-word-word-word-word`"
-    )]
+    #[arg(help = "The pairing code from the web app: `<pairing-id>-word-word-word-word`")]
     pub code: String,
     #[arg(
         long = "as",
@@ -488,7 +483,10 @@ async fn pair_command(args: PairArgs) -> AppResult<()> {
     // 4. Daemon + join under the adder-set name (--as overrides, REQ-011).
     daemon_start().await?;
     let client = discover_live_client().await?;
-    let handle = args.as_handle.clone().unwrap_or_else(|| record.agent_name.clone());
+    let handle = args
+        .as_handle
+        .clone()
+        .unwrap_or_else(|| record.agent_name.clone());
     let dialects: Vec<String> = record.dialects.iter().map(|d| d.name.clone()).collect();
     let response = client
         .create_agent(&CreateAgentRequest {
@@ -663,7 +661,9 @@ async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
     let input = read_message_input(args.message)?;
     let input = input.trim();
     if input.is_empty() {
-        return Err(AppError::Usage("emit requires a non-empty message".to_owned()));
+        return Err(AppError::Usage(
+            "emit requires a non-empty message".to_owned(),
+        ));
     }
 
     let client = discover_live_client().await?;
@@ -694,7 +694,13 @@ async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
     })?;
 
     client
-        .send(&handle, &SendRequest { kind: SendMessageKind::Emit, message })
+        .send(
+            &handle,
+            &SendRequest {
+                kind: SendMessageKind::Emit,
+                message,
+            },
+        )
         .await
         .map_err(map_local_api_request_error)?;
     Ok(())
@@ -794,7 +800,12 @@ async fn dialect_subscribe_command(args: DialectSubscribeArgs) -> AppResult<()> 
     let client = discover_live_client().await?;
     let handle = resolve_session_handle(&client).await?;
     client
-        .meta_subscribe(&handle, &MetaSubscribeRequest { pattern: args.pattern })
+        .meta_subscribe(
+            &handle,
+            &MetaSubscribeRequest {
+                pattern: args.pattern,
+            },
+        )
         .await
         .map_err(map_local_api_request_error)?;
     Ok(())
@@ -846,10 +857,7 @@ async fn resolve_session_handle(client: &LocalApiClient) -> AppResult<AgentHandl
     choose_agent_handle(env, active)
 }
 
-fn choose_agent_handle(
-    env: Option<String>,
-    active: Option<String>,
-) -> AppResult<AgentHandle> {
+fn choose_agent_handle(env: Option<String>, active: Option<String>) -> AppResult<AgentHandle> {
     let value = env.or(active).ok_or(AppError::MissingAgentHandle)?;
     AgentHandle::new(value).map_err(|error| AppError::Usage(error.to_string()))
 }
@@ -888,9 +896,9 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "router_auth_rejected"
                 | "router_connection_failed"
                 | "chat_connection_failed" => AppError::RouterConnection,
-                "missing_chat_handle"
-                | "chat_join_rejected"
-                | "not_supported_on_chat_hub" => AppError::Usage(error.error.message),
+                "missing_chat_handle" | "chat_join_rejected" | "not_supported_on_chat_hub" => {
+                    AppError::Usage(error.error.message)
+                }
                 "chat_join_timeout" => AppError::Timeout,
                 "chat_identity_unavailable" => AppError::Internal(error.error.message),
                 "missing_dialect"
@@ -908,9 +916,7 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "causal_violation" => AppError::CbclValidation,
                 "meta_reply_malformed"
                 | "meta_reply_missing_digest"
-                | "meta_reply_missing_name" => {
-                    AppError::Internal(error.error.message)
-                }
+                | "meta_reply_missing_name" => AppError::Internal(error.error.message),
                 "daemon_stopping" => AppError::Internal(error.error.message),
                 _ if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
                     AppError::RouterConnection
@@ -1379,7 +1385,13 @@ mod tests {
     #[test]
     fn parses_join_arguments() {
         let cli = Cli::parse_from([
-            "hark", "join", "@research", "--as", "@aria", "--speak", "cite,vote",
+            "hark",
+            "join",
+            "@research",
+            "--as",
+            "@aria",
+            "--speak",
+            "cite,vote",
         ]);
         let Command::Join(args) = cli.command else {
             panic!("expected join command");
@@ -1409,7 +1421,13 @@ mod tests {
         assert_eq!(args.hub, None);
 
         let cli = Cli::parse_from([
-            "hark", "pair", "code", "--as", "@bot", "--hub", "wss://h/chat/v1",
+            "hark",
+            "pair",
+            "code",
+            "--as",
+            "@bot",
+            "--hub",
+            "wss://h/chat/v1",
         ]);
         let Command::Pair(args) = cli.command else {
             panic!("expected pair command");
@@ -1525,8 +1543,6 @@ mod tests {
         // missing dialect → reject
         assert!(validate_init_advertisement(&[]).is_err());
         // duplicate dialect → reject
-        assert!(
-            validate_init_advertisement(&["elf".to_owned(), "elf".to_owned()]).is_err()
-        );
+        assert!(validate_init_advertisement(&["elf".to_owned(), "elf".to_owned()]).is_err());
     }
 }
