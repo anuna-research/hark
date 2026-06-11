@@ -429,3 +429,11 @@
 (claims agent:claude
   :at "2026-06-10T23:13:24Z"
   (given completed-removal))
+
+(claims agent:claude
+  :at "2026-06-11T05:41:35Z"
+  (given discovered-round7-review-f001-digest-leg-overclaimed))
+
+(claims agent:claude
+  :at "2026-06-11T05:41:35Z"
+  (given decided-digest-install-deferred-to-spec-015-spec-v0-6-5-records-it))
