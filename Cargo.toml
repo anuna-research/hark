@@ -44,5 +44,6 @@ url = "2.5"
 assert_cmd = "2.0"
 clap_mangen = "0.2"
 predicates = "3.1"
+proptest = "1"
 tempfile = "3.16"
 tokio = { version = "1.44", features = ["test-util"] }

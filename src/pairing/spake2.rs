@@ -197,3 +197,141 @@ fn mac(key: &[u8], label: &[u8], transcript: &[u8]) -> [u8; 32] {
     m.update(transcript);
     m.finalize().into_bytes().into()
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A test-only SPAKE2 responder built from the *same* primitives as
+    /// [`Initiator`], so property tests can drive a full handshake over
+    /// arbitrary inputs (the cross-stack KAT pins it to the LFE hub; this pins
+    /// the algebra + security properties for any wib/ephemerals, not one
+    /// fixture). Mirrors `cbcl-crypto-spake2`'s responder.
+    struct Responder {
+        msg_b: [u8; 32],
+        session_key: [u8; 32],
+        mac_a_expected: [u8; 32],
+        mac_b: [u8; 32],
+    }
+
+    impl Responder {
+        /// Run the responder against the agent's `msg_a`. Returns None if
+        /// `msg_a` is not a valid ristretto point (fail-closed, like the hub).
+        fn respond(
+            ctx: &Context,
+            wib: &[u8],
+            id_a: &[u8],
+            hub_id: &[u8],
+            ephemeral64: &[u8; 64],
+            msg_a: &[u8],
+        ) -> Option<Self> {
+            let w_bytes = hkdf_sha256(wib, &ctx.w_salt, &ctx.w_info, 64);
+            let mut w_wide = [0u8; 64];
+            w_wide.copy_from_slice(&w_bytes);
+            let w = Scalar::from_bytes_mod_order_wide(&w_wide);
+            let y = Scalar::from_bytes_mod_order_wide(ephemeral64);
+
+            let mut id_b = ctx.id_b_prefix.clone();
+            id_b.extend_from_slice(hub_id);
+
+            let peer = CompressedRistretto::from_slice(msg_a).ok()?.decompress()?;
+            // msg_B = y*B + w*N
+            let msg_b = (RISTRETTO_BASEPOINT_TABLE * &y + w * n_point()).compress().to_bytes();
+            // K_spake2 = y * (msg_A - w*M)
+            let k_spake2 = (y * (peer - w * m_point())).compress().to_bytes();
+
+            let mut t = Vec::new();
+            lv(&mut t, id_a);
+            lv(&mut t, &id_b);
+            lv(&mut t, msg_a);
+            lv(&mut t, &msg_b);
+            lv(&mut t, &k_spake2);
+            lv(&mut t, &w_bytes);
+            let transcript: [u8; 32] = Sha256::digest(&t).into();
+
+            let key = hkdf_sha256(&transcript, b"", &ctx.sk_info, 32);
+            let mut session_key = [0u8; 32];
+            session_key.copy_from_slice(&key);
+
+            Some(Self {
+                msg_b,
+                session_key,
+                mac_a_expected: mac(&session_key, &ctx.mac_a_label, &transcript),
+                mac_b: mac(&session_key, &ctx.mac_b_label, &transcript),
+            })
+        }
+    }
+
+    fn arb_bytes(n: usize) -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), n)
+    }
+
+    proptest! {
+        /// For ANY phrase verifier + ephemerals, an honest handshake agrees:
+        /// the agent's mac_a is what the responder expects, the agent verifies
+        /// the responder's mac_b, and both derive the same session key K.
+        #[test]
+        fn honest_handshake_agrees(
+            wib in arb_bytes(6),
+            x in arb_bytes(64),
+            y in arb_bytes(64),
+        ) {
+            let ctx = Context::pairing();
+            let (x, y): ([u8; 64], [u8; 64]) =
+                (x.try_into().unwrap(), y.try_into().unwrap());
+            let id_a = b"42";
+            let hub = b"cbcl-chat";
+
+            let mut agent = Initiator::start(ctx.clone(), &wib, id_a, hub, &x);
+            let resp = Responder::respond(&ctx, &wib, id_a, hub, &y, &agent.msg_a())
+                .expect("agent's msg_a is a valid point");
+            let mac_a = agent.step1(&resp.msg_b).expect("responder msg_b is valid");
+
+            prop_assert_eq!(mac_a, resp.mac_a_expected);     // responder accepts the agent
+            prop_assert!(agent.verify_hub(&resp.mac_b).is_ok()); // agent accepts the hub
+            prop_assert_eq!(agent.session_key().unwrap(), resp.session_key);
+        }
+
+        /// A wrong phrase NEVER yields a mutual accept: the agent's mac_a is not
+        /// what the responder expects, and the agent rejects the responder's
+        /// mac_b. (No false accept — the security property under the N=3 bound.)
+        #[test]
+        fn wrong_phrase_never_accepts(
+            wib_a in arb_bytes(6),
+            wib_b in arb_bytes(6),
+            x in arb_bytes(64),
+            y in arb_bytes(64),
+        ) {
+            prop_assume!(wib_a != wib_b);
+            let ctx = Context::pairing();
+            let (x, y): ([u8; 64], [u8; 64]) =
+                (x.try_into().unwrap(), y.try_into().unwrap());
+            let id_a = b"42";
+            let hub = b"cbcl-chat";
+
+            let mut agent = Initiator::start(ctx.clone(), &wib_a, id_a, hub, &x);
+            // Responder holds a DIFFERENT verifier (wrong phrase).
+            let resp = Responder::respond(&ctx, &wib_b, id_a, hub, &y, &agent.msg_a())
+                .expect("msg_a is still a valid point");
+            let mac_a = agent.step1(&resp.msg_b).expect("msg_b is a valid point");
+
+            prop_assert_ne!(mac_a, resp.mac_a_expected);      // responder would reject
+            prop_assert!(agent.verify_hub(&resp.mac_b).is_err()); // agent rejects the hub
+        }
+
+        /// step1 on ARBITRARY peer bytes never panics — it returns a MAC (if the
+        /// 32 bytes decode to a point) or InvalidPeerPoint (fail-closed). No
+        /// crash, no UB on attacker-chosen input.
+        #[test]
+        fn step1_on_arbitrary_peer_bytes_is_total(
+            wib in arb_bytes(6),
+            x in arb_bytes(64),
+            msg_b in arb_bytes(32),
+        ) {
+            let x: [u8; 64] = x.try_into().unwrap();
+            let mut agent = Initiator::start(Context::pairing(), &wib, b"42", b"cbcl-chat", &x);
+            let _ = agent.step1(&msg_b); // Ok or Err — must not panic
+        }
+    }
+}
