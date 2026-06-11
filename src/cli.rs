@@ -487,6 +487,11 @@ async fn pair_command(args: PairArgs) -> AppResult<()> {
         .as_handle
         .clone()
         .unwrap_or_else(|| record.agent_name.clone());
+    // REQ-007 digest leg (deferred): the record schema carries (name, digest)
+    // pairs, but the hub mints empty digests until the SPEC-015 roomcfg menu +
+    // fetch-by-digest endpoint land (`cbcl-chat-session-ws:dialect-entry`), so
+    // install-by-digest cannot run yet — dialects pass by name and the gap is
+    // surfaced by the join's acquisition warning, not hidden.
     let dialects: Vec<String> = record.dialects.iter().map(|d| d.name.clone()).collect();
     let response = client
         .create_agent(&CreateAgentRequest {

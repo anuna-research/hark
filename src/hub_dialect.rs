@@ -14,7 +14,11 @@
 //! `apps/cbcl_chat/priv/dialects/hub.cbcl`), the agent **learns** it from the
 //! hub: the hub leads each join with a `(meta (define hub …))` advertisement,
 //! and [`learn_hub_dialect`] installs it — CBCL's native dialect-distribution
-//! path. The grammar is single-sourced at the hub; hark holds no copy.
+//! path. The grammar is single-sourced at the hub; hark holds no *runtime*
+//! copy. (The tests DO carry a fixture copy — `src/dialects/hub.cbcl` — to
+//! synthesize the hub's advertisement; it is held byte-identical to the
+//! canonical file by `hub_dialect_fixture_matches_the_canonical_cbcl_bus_grammar`
+//! in `tests/join_cli.rs`.)
 
 use cbcl_core::dialect::DialectRegistry;
 use cbcl_core::message::Message;

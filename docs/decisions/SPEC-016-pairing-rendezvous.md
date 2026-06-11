@@ -52,7 +52,13 @@ secret**, so it leaks nothing about the phrase. We adopt exactly this:
   pairs the small nameplate with **server-side rate limiting**; so do we:
   `cbcl-chat-pair-ratelimit` (per-source sliding window) gates `/pair/v1` before
   any pairing work and burns budget on each failed attempt. The per-record N=3
-  stops guessing one record; the limiter stops enumerating across many.
+  stops guessing one record; the limiter **throttles** enumeration across many —
+  it does not stop it. At the defaults (10 failures/min per source, then a 5-min
+  cooldown) one source can still burn up to ~3 pending records a minute before
+  lockout, and distributed sources scale that linearly. The residual risk is
+  bounded and is **availability, never secrecy**: a burned pairing deletes a
+  pending record (single-use, 10-min TTL, normally one outstanding) and the
+  adder re-mints; no failure budget leaks anything about the phrase.
 
 The 32-hex id originally shipped was *also* secure (unguessable ⇒
 un-enumerable) — it was just unmemorable, and it had been quietly doing the

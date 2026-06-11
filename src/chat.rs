@@ -261,14 +261,18 @@ pub async fn create_chat_agent(
     // announce locally before it reaches the wire. A legacy hub that teaches no
     // dialect degrades to a surfaced warning rather than a faked pass.
     match &learned_hub {
-        Some(registry) => {
+        HubTeaching::Learned(registry) => {
             let mut store = cbcl_core::store::ThreadedMessageStore::new();
             crate::cbcl_validation::validate_for_emit(&announce, registry, &mut store).map_err(
                 |error| ChatError::Hello(format!("announce is not valid CBCL: {error}")),
             )?;
         }
-        None => warnings.push(format!(
+        HubTeaching::None => warnings.push(format!(
             "hub {channel} taught no control dialect (legacy hub); \
+             announce emitted without local CBCL self-validation"
+        )),
+        HubTeaching::Malformed(error) => warnings.push(format!(
+            "hub {channel} taught a control dialect hark could not learn ({error}); \
              announce emitted without local CBCL self-validation"
         )),
     }
@@ -414,20 +418,36 @@ enum ClaimTimer {
     Fallback(String),
 }
 
+/// What the hub taught about its control dialect during the join handshake.
+enum HubTeaching {
+    /// No `(meta …)` advertisement arrived before the verdict.
+    None,
+    /// The advertisement parsed and installed.
+    Learned(DialectRegistry),
+    /// An advertisement arrived but could not be learned (why, for the operator).
+    Malformed(String),
+}
+
 /// Wait for the hub's verdict on a freshly sent `hello`. A successful join leads
 /// with a `roomcfg` frame (then backfill + a `presence` broadcast); a rejected
 /// one is a single `(error @room "slug")` with the socket left open. We consume
 /// only the acknowledging frame and leave any backfill/presence for the receive
 /// loop to enqueue.
-async fn await_join_ack(
-    websocket: &mut ChatSocket,
-) -> Result<(RoomCfg, Option<DialectRegistry>), ChatError> {
+///
+/// Ordering contract: the hub teaches its control dialect BEFORE the verdict —
+/// `cbcl-chat-room:join` builds the reply as `[meta, roomcfg | backfill]`, and
+/// cbcl-bus pins that order in `join-leads-with-the-hub-dialect-meta`. A hub
+/// that only teaches after its verdict is indistinguishable from one that
+/// teaches nothing: we return on the verdict, and the agent degrades to the
+/// "taught no control dialect" warning rather than waiting on a frame that may
+/// never come.
+async fn await_join_ack(websocket: &mut ChatSocket) -> Result<(RoomCfg, HubTeaching), ChatError> {
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
     // The hub leads the join with a `(meta (define hub …))` advertising its
     // control dialect (SPEC-016): we learn it here, before the verdict, so the
     // agent can validate its own control-plane frames against the grammar the
     // hub actually declared — no baked copy.
-    let mut learned_hub: Option<DialectRegistry> = None;
+    let mut learned_hub = HubTeaching::None;
     loop {
         let message = match tokio::time::timeout_at(deadline, websocket.next()).await {
             Err(_elapsed) => return Err(ChatError::JoinTimeout(JOIN_TIMEOUT)),
@@ -474,12 +494,15 @@ async fn await_join_ack(
             // The hub's control-dialect advertisement: learn it (the language's
             // native `(meta (define …))` path) and keep waiting for the verdict.
             // A malformed advertisement is non-fatal — the join still proceeds;
-            // the announce self-check degrades to a surfaced warning.
+            // the announce self-check degrades to a surfaced warning carrying
+            // the learn error, so a teaching-but-broken hub is distinguishable
+            // from a legacy hub that teaches nothing.
             Some("meta") => {
                 match crate::hub_dialect::learn_hub_dialect(&text) {
-                    Ok(registry) => learned_hub = Some(registry),
+                    Ok(registry) => learned_hub = HubTeaching::Learned(registry),
                     Err(error) => {
                         tracing::warn!("could not learn the hub dialect: {error}");
+                        learned_hub = HubTeaching::Malformed(error.to_string());
                     }
                 }
                 continue;

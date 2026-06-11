@@ -62,8 +62,10 @@ fn cli_join_scaffolds_config_starts_daemon_and_joins() {
 ///
 /// HP-2 puts an agent into a public channel in a SINGLE command (`hark join`),
 /// so the command budget is 1 (≤ 3). We wall-clock the whole one-shot against a
-/// real local WS hub (full config-scaffold → daemon-spawn → signed hello → ack
-/// path) and assert it lands inside the 60 s budget. We separately clock the
+/// local in-process MOCK WS hub (full config-scaffold → daemon-spawn → signed
+/// hello → ack path, loopback transport — so this bounds hark's own overhead,
+/// not real-network latency, and says nothing about `hark pair`) and assert it
+/// lands inside the 60 s budget. We separately clock the
 /// hub's ack → the foreground reporting success: a conservative upper bound on
 /// the Doherty feedback latency (it also includes the post-ack announce and the
 /// foreground's confirmation poll), asserted within 400 ms.
@@ -168,6 +170,67 @@ fn cli_join_learns_the_hub_dialect_from_the_meta_advertisement() {
 
     assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
     runtime.block_on(hub.wait());
+}
+
+/// A hub that teaches a MALFORMED control dialect is distinguishable from a
+/// legacy hub that teaches none: the surfaced warning carries the learn error,
+/// and the join still completes (degrade, not fail).
+#[test]
+fn cli_join_warns_with_the_learn_error_when_the_taught_dialect_is_malformed() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+    // Parses as a (meta …) frame, but carries no learnable dialect definition.
+    let hub = runtime.block_on(MockChatHub::start_teaching(
+        "(roomcfg @demo :enc false)",
+        "(meta (not-a-dialect))",
+    ));
+    let env = TestEnv::new();
+
+    let join = env
+        .command(["join", "@demo", "--as", "@aria", "--hub", &hub.ws_url()])
+        .output()
+        .expect("join runs");
+    assert_success(&join);
+    let stderr = String::from_utf8_lossy(&join.stderr);
+    assert!(
+        stderr.contains("could not learn"),
+        "expected the malformed-teaching warning: {}",
+        output_debug(&join)
+    );
+    assert!(
+        !stderr.contains("taught no control dialect"),
+        "malformed teaching must not masquerade as a legacy hub: {}",
+        output_debug(&join)
+    );
+
+    assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
+    runtime.block_on(hub.wait());
+}
+
+/// Drift guard: the hub-grammar fixture these tests teach from
+/// (`src/dialects/hub.cbcl`) must stay byte-identical to the hub's canonical
+/// `apps/cbcl_chat/priv/dialects/hub.cbcl` — otherwise the meta-learning tests
+/// above verify hark against a grammar the real hub no longer speaks. Uses the
+/// same sibling-checkout layout the `../cbcl-rs` path deps already assume;
+/// skips (loudly) when no sibling cbcl-bus checkout is present.
+#[test]
+fn hub_dialect_fixture_matches_the_canonical_cbcl_bus_grammar() {
+    let canonical = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../cbcl-bus/apps/cbcl_chat/priv/dialects/hub.cbcl");
+    if !canonical.exists() {
+        eprintln!(
+            "SKIPPED: no sibling cbcl-bus checkout at {} — fixture drift not checked",
+            canonical.display()
+        );
+        return;
+    }
+    let canonical = std::fs::read(&canonical).expect("canonical grammar is readable");
+    let fixture = include_bytes!("../src/dialects/hub.cbcl");
+    assert_eq!(
+        String::from_utf8_lossy(&canonical),
+        String::from_utf8_lossy(fixture),
+        "src/dialects/hub.cbcl has drifted from the hub's canonical hub.cbcl — \
+         copy the canonical file over the fixture"
+    );
 }
 
 /// The counterpart: a legacy hub that teaches no control dialect warns

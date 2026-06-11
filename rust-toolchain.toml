@@ -1,0 +1,7 @@
+# Pins the toolchain (and so rustfmt's formatting behaviour) for everyone —
+# local dev and release CI alike. Without it, `cargo fmt` churn tracks whatever
+# stable each contributor happens to have, and release artifacts build on an
+# unpinned compiler. Bump deliberately, in its own commit, alongside any
+# resulting fmt diff.
+[toolchain]
+channel = "1.95.0"

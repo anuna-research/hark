@@ -12,6 +12,12 @@
 # ./cbcl-rs next to it. cbcl-rs lives on Codeberg; for a private repo, set the
 # CODEBERG_TOKEN secret (injected into the clone URL below).
 #
+# cbcl-rs is PINNED to a commit (CBCL_RS_REF): Cargo's `--locked` cannot pin
+# path-dependency *contents*, so building against a moving branch would let an
+# unrelated cbcl-rs change break (or silently alter) a hark release with no
+# hark diff. Bump the pin deliberately in the release-prep commit; the
+# workflow_dispatch input overrides it for one-off builds.
+#
 # Trigger: push a tag like `v0.1.0`, or run manually (workflow_dispatch).
 #
 # NOTE: targets GitHub-hosted runners (macOS + the ubuntu arm64 image). The
@@ -28,15 +34,17 @@ on:
   workflow_dispatch:
     inputs:
       cbcl_rs_ref:
-        description: "cbcl-rs git ref to build against"
+        description: "cbcl-rs git ref to build against (default: the pinned commit)"
         required: false
-        default: "main"
+        default: ""
 
 permissions:
   contents: write
 
 env:
-  CBCL_RS_REF: ${{ github.event.inputs.cbcl_rs_ref || 'main' }}
+  # The pinned cbcl-rs commit hark releases build against (bump per release);
+  # the workflow_dispatch input overrides it when non-empty.
+  CBCL_RS_REF: ${{ github.event.inputs.cbcl_rs_ref || '1c6fa8f581a69a7bcb88fb787fa37c81f5de4221' }}
 
 jobs:
   build:
@@ -73,11 +81,18 @@ jobs:
           else
             url="https://codeberg.org/anuna/cbcl-rs.git"
           fi
-          git clone --depth 1 --branch "$CBCL_RS_REF" "$url" cbcl-rs
+          # Full clone + detached checkout: works uniformly for a pinned
+          # commit SHA, a branch, or a tag (`git clone --branch` cannot take
+          # a SHA, and shallow-fetching one needs server-side opt-in).
+          git clone "$url" cbcl-rs
+          git -C cbcl-rs checkout --detach "$CBCL_RS_REF"
 
       - name: Install the Rust toolchain
+        # Run inside hark/ so rustup resolves the rust-toolchain.toml pin —
+        # the same compiler (and rustfmt) every contributor builds with.
+        working-directory: hark
         run: |
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install --profile minimal
           rustup target add ${{ matrix.target }}
 
       - name: Build the release binary
