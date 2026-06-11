@@ -9,10 +9,8 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::net::TcpListener;
 
-use crate::cbcl_validation::{MessageKind, validate_for_send};
-use crate::config::{
-    SAMPLE_CONFIG, default_config_file, validate_dialect_id,
-};
+use crate::cbcl_validation::{MessageKind, validate_for_emit, validate_for_send};
+use crate::config::{SAMPLE_CONFIG, default_config_file, validate_dialect_id};
 use crate::constants::{COMMAND_NAME, DEFAULT_PROGRESS_DIALECT, MAX_RECV_TIMEOUT_MS};
 use crate::daemon::{
     AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord, RuntimePaths, acquire_daemon_lock,
@@ -41,6 +39,14 @@ pub enum Command {
     #[command(about = "Manage the per-user local daemon")]
     #[command(subcommand)]
     Daemon(DaemonCommand),
+    #[command(
+        about = "One-shot join: scaffold config if absent, start the daemon if needed, and join a chat channel"
+    )]
+    Join(JoinArgs),
+    #[command(
+        about = "Pair an agent into a channel via a memorable code: `hark pair <id>-word-word`"
+    )]
+    Pair(PairArgs),
     #[command(about = "Create an agent WebSocket and print the local handle")]
     Init(InitArgs),
     #[command(about = "Receive one CBCL message for the current agent handle")]
@@ -51,6 +57,10 @@ pub enum Command {
     Error(MessageInputArgs),
     #[command(about = "Build and send a non-terminal progress message")]
     Progress(ProgressArgs),
+    #[command(
+        about = "Send a proactive message: plain text becomes (tell @channel \"…\"), a CBCL form passes through"
+    )]
+    Emit(MessageInputArgs),
     #[command(about = "Dialect discovery, subscription, and publication")]
     #[command(subcommand)]
     Dialect(DialectCommand),
@@ -65,9 +75,15 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct SafetyNumberArgs {
-    #[arg(long = "handle", help = "Wire handle (@name) whose session state to read")]
+    #[arg(
+        long = "handle",
+        help = "Wire handle (@name) whose session state to read"
+    )]
     pub handle: String,
-    #[arg(long = "channel", help = "Channel; defaults to chat.channel from config")]
+    #[arg(
+        long = "channel",
+        help = "Channel; defaults to chat.channel from config"
+    )]
     pub channel: Option<String>,
 }
 
@@ -75,7 +91,9 @@ pub struct SafetyNumberArgs {
 pub enum DialectCommand {
     #[command(about = "Publish a dialect to the router via (meta (teach @router <define>))")]
     Publish(DialectPublishArgs),
-    #[command(about = "Ask the router whether it knows a dialect by name and install the teach-back")]
+    #[command(
+        about = "Ask the router whether it knows a dialect by name and install the teach-back"
+    )]
     Query(DialectQueryArgs),
     #[command(about = "List every dialect currently known to the router")]
     List,
@@ -133,6 +151,46 @@ pub enum DaemonCommand {
     Status,
     #[command(about = "Stop the daemon")]
     Stop,
+}
+
+#[derive(Debug, Args)]
+pub struct JoinArgs {
+    #[arg(help = "Channel to join (@name)")]
+    pub channel: String,
+    #[arg(long = "as", help = "The agent's wire handle in the channel (@name)")]
+    pub as_handle: String,
+    #[arg(
+        long = "speak",
+        value_delimiter = ',',
+        help = "Dialect(s) to advertise (repeat or comma-separate); omit to advertise nothing"
+    )]
+    pub speak: Vec<String>,
+    #[arg(
+        long = "cap",
+        help = "Capability token or invite for a private channel"
+    )]
+    pub cap: Option<String>,
+    #[arg(
+        long = "hub",
+        help = "Chat hub WebSocket URL (…/chat/v1); defaults to the configured hub or the public hub"
+    )]
+    pub hub: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PairArgs {
+    #[arg(help = "The pairing code from the web app: `<pairing-id>-word-word`")]
+    pub code: String,
+    #[arg(
+        long = "as",
+        help = "Override the adder-set channel handle (@name); defaults to the record's name"
+    )]
+    pub as_handle: Option<String>,
+    #[arg(
+        long = "hub",
+        help = "Chat hub WebSocket URL; defaults to the configured hub or the public hub"
+    )]
+    pub hub: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -215,11 +273,14 @@ pub async fn run(cli: Cli) -> AppResult<()> {
             DaemonCommand::Status => daemon_status().await,
             DaemonCommand::Stop => daemon_stop().await,
         },
+        Command::Join(args) => join_command(args).await,
+        Command::Pair(args) => pair_command(args).await,
         Command::Init(args) => init_command(args).await,
         Command::Recv(args) => recv_command(args).await,
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args).await,
         Command::Error(args) => send_message_command(SendMessageKind::Error, args).await,
         Command::Progress(args) => progress_command(args).await,
+        Command::Emit(args) => emit_command(args).await,
         Command::Dialect(command) => match command {
             DialectCommand::Publish(args) => dialect_publish_command(args).await,
             DialectCommand::Query(args) => dialect_query_command(args).await,
@@ -237,8 +298,8 @@ pub async fn run(cli: Cli) -> AppResult<()> {
 /// rotation. Reads the persisted session state directly (no daemon
 /// round-trip); the state is current as of the last group mutation.
 fn safety_number_command(args: SafetyNumberArgs) -> AppResult<()> {
-    let config = crate::config::AppConfig::load()
-        .map_err(|error| AppError::Usage(error.to_string()))?;
+    let config =
+        crate::config::AppConfig::load().map_err(|error| AppError::Usage(error.to_string()))?;
     let chat = config
         .validate_chat()
         .map_err(|error| AppError::Usage(error.to_string()))?;
@@ -247,12 +308,9 @@ fn safety_number_command(args: SafetyNumberArgs) -> AppResult<()> {
         None => chat.channel.clone(),
     };
     let file_stem = crate::local_api::chat_key_filename(&args.handle);
-    let (numbers, _trust) = crate::mls::session::offline_safety_numbers(
-        &chat.identity_dir,
-        &file_stem,
-        &channel,
-    )
-    .map_err(|error| AppError::Usage(error.to_string()))?;
+    let (numbers, _trust) =
+        crate::mls::session::offline_safety_numbers(&chat.identity_dir, &file_stem, &channel)
+            .map_err(|error| AppError::Usage(error.to_string()))?;
     println!("channel: {channel}");
     println!("identity safety number (compare out-of-band; stable across normal commits):");
     println!("  {}", numbers.identity);
@@ -324,6 +382,232 @@ fn write_new_config_file(path: &Path, contents: &str) -> AppResult<()> {
     })
 }
 
+/// REQ-002 (SPEC-016, ADR-001): the one-shot join. Composes config scaffolding,
+/// daemon startup, and agent creation so an operator never edits TOML, learns
+/// the `/chat/v1` transport rule, or `eval`s anything (NFR-002).
+async fn join_command(args: JoinArgs) -> AppResult<()> {
+    crate::config::validate_chat_handle("channel", &args.channel)
+        .map_err(|error| AppError::Usage(error.to_string()))?;
+    crate::config::validate_chat_handle("handle", &args.as_handle)
+        .map_err(|error| AppError::Usage(error.to_string()))?;
+    let mut seen = std::collections::HashSet::new();
+    for dialect in &args.speak {
+        validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        if !seen.insert(dialect) {
+            return Err(AppError::Usage(format!("duplicate dialect: {dialect}")));
+        }
+    }
+
+    // 1. Config: scaffold a chat config when none exists; otherwise verify the
+    //    existing one actually points at a chat hub.
+    let path = resolve_config_file()?;
+    if !path.exists() {
+        let hub = args
+            .hub
+            .as_deref()
+            .unwrap_or(crate::constants::DEFAULT_CHAT_HUB_URL);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to create config directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        write_new_config_file(&path, &build_chat_config_toml(hub))?;
+        eprintln!("scaffolded config at {}", path.display());
+    }
+    let config = crate::config::AppConfig::load()
+        .map_err(|error| AppError::Usage(format!("failed to load config: {error}")))?;
+    if let Some(hub) = args.hub.as_deref() {
+        if config.router.ws_url.as_deref() != Some(hub) {
+            return Err(AppError::Usage(format!(
+                "config {} already points at {}; remove it or drop --hub",
+                path.display(),
+                config.router.ws_url.as_deref().unwrap_or("<unset>")
+            )));
+        }
+    }
+    let transport = config
+        .transport()
+        .map_err(|error| AppError::Usage(format!("invalid config: {error}")))?;
+    if transport != crate::config::Transport::Chat {
+        return Err(AppError::Usage(format!(
+            "the configured ws_url is not a chat hub (its path must be /chat/v1); \
+             edit {} or remove it and re-run `hark join`",
+            path.display()
+        )));
+    }
+
+    // 2. Daemon: idempotent start.
+    daemon_start().await?;
+
+    // 3. Join the channel. The new agent becomes the session's active handle
+    //    (REQ-003) — no eval, no exported variable.
+    let client = discover_live_client().await?;
+    let response = client
+        .create_agent(&CreateAgentRequest {
+            dialects: args.speak,
+            auto_install_advertised: None,
+            channel: Some(args.channel.clone()),
+            handle: Some(args.as_handle.clone()),
+            cap: args.cap,
+            added_by: None,
+            // `join` never bootstraps an MLS group; `init --mls-create` is the
+            // room-creator path (SPEC-013 REQ-016 operator intent).
+            mls_create: None,
+        })
+        .await
+        .map_err(map_local_api_request_error)?;
+
+    for warning in &response.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let speaking = if response.dialects.is_empty() {
+        "nothing".to_owned()
+    } else {
+        response.dialects.join(", ")
+    };
+    println!(
+        "joined {} as {} · speaking: {speaking}",
+        args.channel, args.as_handle
+    );
+    Ok(())
+}
+
+/// REQ-007/REQ-011 (SPEC-016): `hark pair "<code>"` — run the SPAKE2 pairing
+/// handshake with the hub, then join the channel under the adder-set name with
+/// the released invite cap. The four phrase words are the PAKE secret and never
+/// leave this process. Composes config-scaffold + daemon-start like `join`.
+async fn pair_command(args: PairArgs) -> AppResult<()> {
+    let code = crate::pairing::parse_code(&args.code)
+        .map_err(|error| AppError::Usage(error.to_string()))?;
+
+    // 1. Config: scaffold a chat config when absent; verify it's a chat hub.
+    let path = resolve_config_file()?;
+    if !path.exists() {
+        let hub = args
+            .hub
+            .as_deref()
+            .unwrap_or(crate::constants::DEFAULT_CHAT_HUB_URL);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to create config directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        write_new_config_file(&path, &build_chat_config_toml(hub))?;
+        eprintln!("scaffolded config at {}", path.display());
+    }
+    let config = crate::config::AppConfig::load()
+        .map_err(|error| AppError::Usage(format!("failed to load config: {error}")))?;
+    let hub_ws = args
+        .hub
+        .as_deref()
+        .or(config.router.ws_url.as_deref())
+        .ok_or_else(|| AppError::Usage("no chat hub configured; pass --hub <ws-url>".to_owned()))?;
+    let pair_url = crate::pairing::client::pair_url_from(hub_ws)
+        .map_err(|error| AppError::Usage(error.to_string()))?;
+
+    // 2. Run the pairing handshake → the hub-released record (bound to K).
+    let record = crate::pairing::client::run_pairing(&pair_url, &code)
+        .await
+        .map_err(map_pair_error)?;
+
+    // 3. Encryption pin (R4-01): the cap's PRESENCE — not the advisory `enc`
+    //    bit a hub could flip — decides private⇒encrypted. Surface a conflict.
+    let cap = if record.has_cap() {
+        if !record.enc {
+            eprintln!(
+                "warning: record carries an invite cap (private channel) but enc=false; \
+                 the cap-derived pin wins (treating the channel as encrypted)"
+            );
+        }
+        Some(String::from_utf8_lossy(&record.cap).into_owned())
+    } else {
+        if record.enc {
+            return Err(AppError::Usage(
+                "record claims enc=true but carries no invite cap; refusing to send into a \
+                 believed-private channel without a cap — request a fresh pairing"
+                    .to_owned(),
+            ));
+        }
+        None
+    };
+
+    // 4. Daemon + join under the adder-set name (--as overrides, REQ-011).
+    daemon_start().await?;
+    let client = discover_live_client().await?;
+    let handle = args
+        .as_handle
+        .clone()
+        .unwrap_or_else(|| record.agent_name.clone());
+    // REQ-007 digest leg (deferred): the record schema carries (name, digest)
+    // pairs, but the hub mints empty digests until the SPEC-015 roomcfg menu +
+    // fetch-by-digest endpoint land (`cbcl-chat-session-ws:dialect-entry`), so
+    // install-by-digest cannot run yet — dialects pass by name and the gap is
+    // surfaced by the join's acquisition warning, not hidden.
+    let dialects: Vec<String> = record.dialects.iter().map(|d| d.name.clone()).collect();
+    let response = client
+        .create_agent(&CreateAgentRequest {
+            dialects: dialects.clone(),
+            auto_install_advertised: None,
+            channel: Some(record.channel.clone()),
+            handle: Some(handle.clone()),
+            cap,
+            added_by: Some(record.adder.clone()),
+            // A paired agent joins an existing channel; it is never the MLS
+            // room creator (SPEC-013 REQ-016 stays an explicit operator act).
+            mls_create: None,
+        })
+        .await
+        .map_err(map_local_api_request_error)?;
+
+    for warning in &response.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let speaking = if response.dialects.is_empty() {
+        "nothing".to_owned()
+    } else {
+        response.dialects.join(", ")
+    };
+    println!(
+        "paired into {} as {} (added by {}) · speaking: {speaking}",
+        record.channel, handle, record.adder
+    );
+    Ok(())
+}
+
+fn map_pair_error(error: crate::pairing::client::PairClientError) -> AppError {
+    use crate::pairing::client::PairClientError;
+    match error {
+        PairClientError::BadHubUrl(_) | PairClientError::Pair(_) => {
+            AppError::Usage(error.to_string())
+        }
+        PairClientError::HubError { .. } => AppError::Usage(error.to_string()),
+        PairClientError::ConnectionFailed(_) | PairClientError::ClosedEarly => {
+            AppError::RouterConnection
+        }
+        PairClientError::UnexpectedFrame { .. } | PairClientError::MalformedFrame(_) => {
+            AppError::Internal(error.to_string())
+        }
+    }
+}
+
+/// The config `hark join` scaffolds: the chat hub URL is the only required
+/// key — every other section has defaults.
+fn build_chat_config_toml(hub_url: &str) -> String {
+    format!(
+        "# hark configuration — scaffolded by `hark join`.\n\
+         # The ws_url PATH selects the transport: /chat/v1 -> chat hub,\n\
+         # anything else -> router.\n\
+         [router]\n\
+         ws_url = \"{hub_url}\"\n"
+    )
+}
+
 async fn init_command(args: InitArgs) -> AppResult<()> {
     validate_init_advertisement(&args.dialects)?;
     let client = discover_live_client().await.map_err(|error| {
@@ -343,11 +627,15 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
             channel: args.channel,
             handle: args.handle,
             cap: args.cap,
+            added_by: None,
             mls_create: if args.mls_create { Some(true) } else { None },
         })
         .await
         .map_err(map_local_api_request_error)?;
 
+    for warning in &response.warnings {
+        eprintln!("warning: {warning}");
+    }
     if args.json {
         println!(
             "{}",
@@ -366,12 +654,12 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
 }
 
 async fn recv_command(args: RecvArgs) -> AppResult<()> {
-    let handle = resolve_agent_handle()?;
     let timeout_ms = match args.timeout {
         Some(timeout) => Some(parse_recv_timeout_ms(&timeout)?),
         None => None,
     };
     let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
     let response = client
         .recv(&handle, timeout_ms)
         .await
@@ -381,8 +669,8 @@ async fn recv_command(args: RecvArgs) -> AppResult<()> {
 }
 
 async fn close_command() -> AppResult<()> {
-    let handle = resolve_agent_handle()?;
     let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
     client
         .close(&handle)
         .await
@@ -430,9 +718,98 @@ async fn progress_command(args: ProgressArgs) -> AppResult<()> {
     send_validated_message(SendMessageKind::Progress, message).await
 }
 
-async fn send_validated_message(kind: SendMessageKind, message: String) -> AppResult<()> {
-    let handle = resolve_agent_handle()?;
+/// REQ-004 (SPEC-016): `hark emit` — the proactive plain-chat verb. Plain text
+/// is wrapped into a valid CBCL `(tell @<channel> "<text>")` against the
+/// agent's joined chat channel; an input that already looks like a CBCL form
+/// (leading `(`) is validated and sent as-is. The wire frame is always valid
+/// CBCL — there are no raw-text frames.
+async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
+    let input = read_message_input(args.message)?;
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(AppError::Usage(
+            "emit requires a non-empty message".to_owned(),
+        ));
+    }
+
     let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
+
+    let message = if emit_input_is_cbcl_form(input) {
+        input.to_owned()
+    } else {
+        let (channel, wire_handle) = agent_chat_channel(&client, &handle).await?;
+        let channel = channel.ok_or_else(|| {
+            AppError::Usage(
+                "plain-text emit needs a chat-hub agent with a channel; \
+                 on the router transport pass a full CBCL form instead"
+                    .to_owned(),
+            )
+        })?;
+        build_emit_message(input, &channel, &wire_handle)
+    };
+
+    // Mirror reply/error/progress: validate locally before bothering the
+    // daemon. An empty registry + fresh store is the lightweight context —
+    // unknown dialects fall back to the base pipeline, exactly like the
+    // daemon's fallback for not-yet-installed dialects.
+    let registry = cbcl_core::dialect::DialectRegistry::default();
+    let mut store = cbcl_core::store::ThreadedMessageStore::new();
+    validate_for_emit(&message, &registry, &mut store).map_err(|error| {
+        eprintln!("{}: {error}", error.code());
+        AppError::CbclValidation
+    })?;
+
+    client
+        .send(
+            &handle,
+            &SendRequest {
+                kind: SendMessageKind::Emit,
+                message,
+            },
+        )
+        .await
+        .map_err(map_local_api_request_error)?;
+    Ok(())
+}
+
+/// The joined chat channel (`None` on the router transport) and the wire
+/// handle (`@name`) for `handle`.
+async fn agent_chat_channel(
+    client: &LocalApiClient,
+    handle: &AgentHandle,
+) -> AppResult<(Option<String>, String)> {
+    let agents = client
+        .agents()
+        .await
+        .map_err(|error| map_client_error(error, "daemon agents query failed"))?;
+    let agent = agents
+        .agents
+        .into_iter()
+        .find(|agent| agent.agent_handle == handle.as_str())
+        .ok_or(AppError::AgentHandleUnavailable)?;
+    Ok((agent.channel, agent.router_agent_id))
+}
+
+/// `true` when the emit input is already a CBCL form rather than plain text.
+fn emit_input_is_cbcl_form(input: &str) -> bool {
+    input.trim_start().starts_with('(')
+}
+
+// `:from` identifies the signed-member sender — the hub's dispatch resolves
+// the sender handle from it on EVERY frame and rejects a frame without one
+// (`missing-from`, cbcl-chat-session-ws:dispatch). Same contract the announce
+// frame carries; found live — mock hubs don't enforce it.
+fn build_emit_message(text: &str, channel: &str, from: &str) -> String {
+    format!(
+        "(tell {channel} \"{}\" :from {from})",
+        escape_cbcl_string(text)
+    )
+}
+
+async fn send_validated_message(kind: SendMessageKind, message: String) -> AppResult<()> {
+    let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
     client
         .send(&handle, &SendRequest { kind, message })
         .await
@@ -443,8 +820,8 @@ async fn send_validated_message(kind: SendMessageKind, message: String) -> AppRe
 async fn dialect_publish_command(args: DialectPublishArgs) -> AppResult<()> {
     let define = read_message_input(args.define)?;
     let define = define.trim().to_owned();
-    let handle = resolve_agent_handle()?;
     let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
     let response = client
         .meta_publish(&handle, &MetaPublishRequest { define })
         .await
@@ -462,8 +839,8 @@ async fn dialect_publish_command(args: DialectPublishArgs) -> AppResult<()> {
 }
 
 async fn dialect_query_command(args: DialectQueryArgs) -> AppResult<()> {
-    let handle = resolve_agent_handle()?;
     let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
     let response = client
         .meta_query(&handle, &MetaQueryRequest { name: args.name })
         .await
@@ -482,8 +859,8 @@ async fn dialect_query_command(args: DialectQueryArgs) -> AppResult<()> {
 }
 
 async fn dialect_list_command() -> AppResult<()> {
-    let handle = resolve_agent_handle()?;
     let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
     let response = client
         .meta_list(&handle)
         .await
@@ -495,18 +872,23 @@ async fn dialect_list_command() -> AppResult<()> {
 }
 
 async fn dialect_subscribe_command(args: DialectSubscribeArgs) -> AppResult<()> {
-    let handle = resolve_agent_handle()?;
     let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
     client
-        .meta_subscribe(&handle, &MetaSubscribeRequest { pattern: args.pattern })
+        .meta_subscribe(
+            &handle,
+            &MetaSubscribeRequest {
+                pattern: args.pattern,
+            },
+        )
         .await
         .map_err(map_local_api_request_error)?;
     Ok(())
 }
 
 async fn dialect_unsubscribe_command() -> AppResult<()> {
-    let handle = resolve_agent_handle()?;
     let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
     client
         .meta_unsubscribe(&handle)
         .await
@@ -533,8 +915,25 @@ fn read_message_input(message: Option<String>) -> AppResult<String> {
     Ok(message)
 }
 
-fn resolve_agent_handle() -> AppResult<AgentHandle> {
-    let value = std::env::var("CBCL_AGENT_HANDLE").map_err(|_| AppError::MissingAgentHandle)?;
+/// Resolve the agent handle for a session command (REQ-003, SPEC-016):
+/// an explicit `CBCL_AGENT_HANDLE` always wins (multi-agent scripting);
+/// otherwise fall back to the daemon-tracked active handle — no `eval`.
+async fn resolve_session_handle(client: &LocalApiClient) -> AppResult<AgentHandle> {
+    let env = std::env::var("CBCL_AGENT_HANDLE").ok();
+    let active = if env.is_some() {
+        None // don't bother the daemon; the env var decides
+    } else {
+        client
+            .agents()
+            .await
+            .map_err(|error| map_client_error(error, "daemon agents query failed"))?
+            .active_agent_handle
+    };
+    choose_agent_handle(env, active)
+}
+
+fn choose_agent_handle(env: Option<String>, active: Option<String>) -> AppResult<AgentHandle> {
+    let value = env.or(active).ok_or(AppError::MissingAgentHandle)?;
     AgentHandle::new(value).map_err(|error| AppError::Usage(error.to_string()))
 }
 
@@ -572,14 +971,15 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "router_auth_rejected"
                 | "router_connection_failed"
                 | "chat_connection_failed" => AppError::RouterConnection,
-                "missing_chat_handle"
-                | "chat_join_rejected"
-                | "not_supported_on_chat_hub" => AppError::Usage(error.error.message),
+                "missing_chat_handle" | "chat_join_rejected" | "not_supported_on_chat_hub" => {
+                    AppError::Usage(error.error.message)
+                }
                 "chat_join_timeout" => AppError::Timeout,
                 "chat_identity_unavailable" => AppError::Internal(error.error.message),
                 "missing_dialect"
                 | "duplicate_dialect"
                 | "invalid_dialect"
+                | "undeclared_dialect"
                 | "invalid_subscribe_pattern"
                 | "dialect_unknown_to_router" => AppError::Usage(error.error.message),
                 "cbcl_validation_failed"
@@ -591,9 +991,7 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 | "causal_violation" => AppError::CbclValidation,
                 "meta_reply_malformed"
                 | "meta_reply_missing_digest"
-                | "meta_reply_missing_name" => {
-                    AppError::Internal(error.error.message)
-                }
+                | "meta_reply_missing_name" => AppError::Internal(error.error.message),
                 "daemon_stopping" => AppError::Internal(error.error.message),
                 _ if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
                     AppError::RouterConnection
@@ -783,6 +1181,9 @@ async fn daemon_status() -> AppResult<()> {
             println!("version: {}", agents.daemon.version);
             println!("api_version: {}", agents.daemon.api_version);
             println!("agents: {}", agents.agents.len());
+            if let Some(active) = &agents.active_agent_handle {
+                println!("active: {active}");
+            }
             for agent in agents.agents {
                 let dialects = agent.dialects.join(",");
                 println!(
@@ -963,7 +1364,8 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        Cli, Command, ConfigCommand, DaemonCommand, build_progress_message, escape_cbcl_string,
+        Cli, Command, ConfigCommand, DaemonCommand, build_chat_config_toml, build_emit_message,
+        build_progress_message, choose_agent_handle, emit_input_is_cbcl_form, escape_cbcl_string,
         parse_recv_timeout_ms, validate_init_advertisement,
     };
 
@@ -1056,6 +1458,134 @@ mod tests {
     }
 
     #[test]
+    fn parses_join_arguments() {
+        let cli = Cli::parse_from([
+            "hark",
+            "join",
+            "@research",
+            "--as",
+            "@aria",
+            "--speak",
+            "cite,vote",
+        ]);
+        let Command::Join(args) = cli.command else {
+            panic!("expected join command");
+        };
+        assert_eq!(args.channel, "@research");
+        assert_eq!(args.as_handle, "@aria");
+        assert_eq!(args.speak, ["cite", "vote"]);
+        assert_eq!(args.cap, None);
+        assert_eq!(args.hub, None);
+
+        // Omitting --speak advertises nothing (HP-2).
+        let cli = Cli::parse_from(["hark", "join", "@demo", "--as", "@aria"]);
+        let Command::Join(args) = cli.command else {
+            panic!("expected join command");
+        };
+        assert!(args.speak.is_empty());
+    }
+
+    #[test]
+    fn parses_pair_arguments() {
+        let cli = Cli::parse_from(["hark", "pair", "42-account-clinic-text-wheel"]);
+        let Command::Pair(args) = cli.command else {
+            panic!("expected pair command");
+        };
+        assert_eq!(args.code, "42-account-clinic-text-wheel");
+        assert_eq!(args.as_handle, None);
+        assert_eq!(args.hub, None);
+
+        let cli = Cli::parse_from([
+            "hark",
+            "pair",
+            "code",
+            "--as",
+            "@bot",
+            "--hub",
+            "wss://h/chat/v1",
+        ]);
+        let Command::Pair(args) = cli.command else {
+            panic!("expected pair command");
+        };
+        assert_eq!(args.as_handle.as_deref(), Some("@bot"));
+        assert_eq!(args.hub.as_deref(), Some("wss://h/chat/v1"));
+    }
+
+    #[test]
+    fn builds_chat_scaffold_config() {
+        let toml = build_chat_config_toml("wss://hub.example/chat/v1");
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &toml).expect("scaffold should be written");
+        // File-only load: env overrides would race other tests' env vars.
+        let config = crate::config::load_file_backed_config(Some(path))
+            .expect("scaffold config should parse");
+        assert_eq!(
+            config.router.ws_url.as_deref(),
+            Some("wss://hub.example/chat/v1")
+        );
+        assert_eq!(
+            config.transport().expect("transport should resolve"),
+            crate::config::Transport::Chat
+        );
+    }
+
+    #[test]
+    fn chooses_env_handle_over_daemon_active_handle() {
+        let env_handle = crate::daemon::AgentHandle::generate();
+        let active_handle = crate::daemon::AgentHandle::generate();
+
+        // An explicit env var always wins (multi-agent scripting).
+        let chosen = choose_agent_handle(
+            Some(env_handle.as_str().to_owned()),
+            Some(active_handle.as_str().to_owned()),
+        )
+        .expect("env handle should resolve");
+        assert_eq!(chosen.as_str(), env_handle.as_str());
+
+        // Without the env var the daemon-tracked active handle is used.
+        let chosen = choose_agent_handle(None, Some(active_handle.as_str().to_owned()))
+            .expect("active handle should resolve");
+        assert_eq!(chosen.as_str(), active_handle.as_str());
+
+        // Neither → the missing-handle error.
+        assert!(choose_agent_handle(None, None).is_err());
+    }
+
+    #[test]
+    fn parses_emit_arguments() {
+        let cli = Cli::parse_from(["hark", "emit", "looking into it"]);
+        let Command::Emit(args) = cli.command else {
+            panic!("expected emit command");
+        };
+        assert_eq!(args.message.as_deref(), Some("looking into it"));
+    }
+
+    #[test]
+    fn wraps_plain_text_emit_into_tell() {
+        // `:from` is required by the hub's per-frame sender resolution
+        // (`missing-from` rejection) — a tell without it is silently useless.
+        assert_eq!(
+            build_emit_message("looking into it", "@research", "@aria"),
+            r#"(tell @research "looking into it" :from @aria)"#
+        );
+        assert_eq!(
+            build_emit_message("say \"hi\"\nnow", "@general", "@bot"),
+            r#"(tell @general "say \"hi\"\nnow" :from @bot)"#
+        );
+    }
+
+    #[test]
+    fn detects_full_cbcl_emit_input() {
+        assert!(emit_input_is_cbcl_form(r#"(tell @a "x")"#));
+        assert!(emit_input_is_cbcl_form(
+            "  (lang elf (ask @router \"work\" :thread \"rcp-9\"))  "
+        ));
+        assert!(!emit_input_is_cbcl_form("hello world"));
+        assert!(!emit_input_is_cbcl_form(""));
+    }
+
+    #[test]
     fn builds_progress_message_with_escaped_values() {
         assert_eq!(
             build_progress_message("rcp-1", None, "elf"),
@@ -1090,8 +1620,6 @@ mod tests {
         // missing dialect → reject
         assert!(validate_init_advertisement(&[]).is_err());
         // duplicate dialect → reject
-        assert!(
-            validate_init_advertisement(&["elf".to_owned(), "elf".to_owned()]).is_err()
-        );
+        assert!(validate_init_advertisement(&["elf".to_owned(), "elf".to_owned()]).is_err());
     }
 }

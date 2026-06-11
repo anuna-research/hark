@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use cbcl_core::dialect::DialectRegistry;
 use cbcl_core::sexpr::{Atom, SExpr};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
@@ -55,8 +56,94 @@ pub enum ChatError {
     JoinTimeout(Duration),
     #[error("agent store rejected the connection: {0}")]
     Store(String),
+    /// REQ-008 (SPEC-016): the operator chose a dialect the channel does not
+    /// declare. Carries the declared names so the error can show the menu.
+    #[error("dialect {dialect} is not declared by the channel")]
+    UndeclaredDialect {
+        dialect: String,
+        declared: Vec<String>,
+    },
     #[error("encryption downgrade refused (REQ-023): {0}")]
     DowngradeRefused(String),
+}
+
+/// One entry of a channel's declared-dialect menu (SPEC-015 CON-001):
+/// a `(name, digest-hex)` pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredDialect {
+    pub name: String,
+    pub digest: String,
+}
+
+/// The hub's join acknowledgement (`roomcfg`), parsed. `declared: None` means
+/// the hub conveyed no `:dialects` menu (a legacy hub) — distinct from
+/// `Some([])`, a channel that declares an empty set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomCfg {
+    pub enc: bool,
+    pub declared: Option<Vec<DeclaredDialect>>,
+}
+
+impl RoomCfg {
+    fn absent() -> Self {
+        Self {
+            enc: false,
+            declared: None,
+        }
+    }
+}
+
+/// Parse a `roomcfg` frame per SPEC-015 CON-001:
+/// `(roomcfg @room :enc true|false :dialects ((<name> <digest-hex>) …))`.
+/// Returns `None` for any other frame.
+fn parse_roomcfg(text: &str) -> Option<RoomCfg> {
+    let SExpr::List(items) = cbcl_parser::parse(text).ok()? else {
+        return None;
+    };
+    match items.first()? {
+        SExpr::Atom(Atom::Symbol(symbol)) if symbol == "roomcfg" => {}
+        _ => return None,
+    }
+
+    let mut cfg = RoomCfg::absent();
+    let mut index = 1;
+    while index < items.len() {
+        let SExpr::Atom(Atom::Keyword(keyword)) = &items[index] else {
+            index += 1;
+            continue;
+        };
+        let value = items.get(index + 1);
+        match (keyword.as_str(), value) {
+            ("enc", Some(SExpr::Atom(Atom::Bool(enc)))) => cfg.enc = *enc,
+            ("enc", Some(SExpr::Atom(Atom::Symbol(word)))) => cfg.enc = word == "true",
+            ("dialects", Some(SExpr::List(entries))) => {
+                let mut declared = Vec::new();
+                for entry in entries {
+                    let SExpr::List(pair) = entry else { continue };
+                    let (Some(name), Some(digest)) =
+                        (atom_text(pair.first()), atom_text(pair.get(1)))
+                    else {
+                        continue;
+                    };
+                    declared.push(DeclaredDialect { name, digest });
+                }
+                cfg.declared = Some(declared);
+            }
+            _ => {}
+        }
+        index += 2;
+    }
+    Some(cfg)
+}
+
+/// The textual value of a string or symbol atom, if `expr` is one.
+fn atom_text(expr: Option<&SExpr>) -> Option<String> {
+    match expr {
+        Some(SExpr::Atom(Atom::Str(text))) | Some(SExpr::Atom(Atom::Symbol(text))) => {
+            Some(text.clone())
+        }
+        _ => None,
+    }
 }
 
 /// The exact payload bytes to sign and transmit. We validate that `text`
@@ -98,12 +185,13 @@ pub async fn create_chat_agent(
     agent_handle: &str,
     dialects: Vec<String>,
     cap: Option<String>,
+    added_by: Option<String>,
     claim_window: Duration,
     liveness_timeout: Duration,
     identity: Arc<ChatIdentity>,
     mut mls: Option<MlsSession>,
     mls_create: bool,
-) -> Result<AgentHandle, ChatError> {
+) -> Result<(AgentHandle, Vec<String>), ChatError> {
     AgentStore::validate_advertisement(&dialects)
         .map_err(|error| ChatError::Store(error.to_string()))?;
     let (mut websocket, _response) = connect_async(ws_url.as_str())
@@ -133,7 +221,7 @@ pub async fn create_chat_agent(
     // this would hand back a "joined" handle the agent is not actually a member
     // of. On rejection or timeout the websocket drops here, before any store
     // entry exists — nothing to mark unhealthy or clean up.
-    let ack = await_join_ack(&mut websocket).await?;
+    let (ack, roomcfg, learned_hub) = await_join_ack(&mut websocket).await?;
 
     // SPEC-013: judge the ack against the encryption-mode pin (REQ-023) —
     // a `roomcfg :enc false` on a pinned-encrypted channel is a refused
@@ -166,6 +254,71 @@ pub async fn create_chat_agent(
         }
     }
 
+    // REQ-008 (SPEC-016): the advertised set must be a subset of the channel's
+    // declared menu when one is conveyed. A hub that conveys no menu (today's
+    // cbcl-bus) soft-passes with an explicit warning — never silently.
+    let mut warnings = Vec::new();
+    match &roomcfg.declared {
+        None => warnings.push(format!(
+            "channel {channel} declares no dialect menu (legacy hub); --speak validation skipped"
+        )),
+        Some(menu) => {
+            for dialect in &dialects {
+                if !menu.iter().any(|entry| entry.name == *dialect) {
+                    return Err(ChatError::UndeclaredDialect {
+                        dialect: dialect.clone(),
+                        declared: menu.iter().map(|entry| entry.name.clone()).collect(),
+                    });
+                }
+            }
+            // REQ-005 acquisition-by-digest: blocked on the hub's
+            // fetch-by-digest endpoint (SPEC-015 REQ-005, not yet served by
+            // cbcl-bus). Until it lands, chosen dialects are advertised with
+            // base-level validation and the gap is surfaced, not hidden.
+            if !dialects.is_empty() {
+                warnings.push(format!(
+                    "definitions for {} cannot be acquired by digest yet (hub fetch pending); \
+                     advertising with base validation",
+                    dialects.join(", ")
+                ));
+            }
+        }
+    }
+
+    // REQ-006 (SPEC-016): announce ourselves so chat clients render this
+    // member as an agent (the agent treatment is *earned* by the announce
+    // performative, not inferable from the handle). Sent once, right after
+    // the join ack — a failure here is a failed join, not a silent
+    // plain-member fallback.
+    let announce = build_announce_frame(channel, agent_handle, &dialects, added_by.as_deref());
+    // Enforce the announce is valid CBCL against the hub dialect the hub *taught*
+    // us via its `(meta (define hub …))` advertisement — a real conformance check
+    // against the grammar the peer actually declared, catching a malformed
+    // announce locally before it reaches the wire. A legacy hub that teaches no
+    // dialect degrades to a surfaced warning rather than a faked pass.
+    match &learned_hub {
+        HubTeaching::Learned(registry) => {
+            let mut store = cbcl_core::store::ThreadedMessageStore::new();
+            crate::cbcl_validation::validate_for_emit(&announce, registry, &mut store).map_err(
+                |error| ChatError::Hello(format!("announce is not valid CBCL: {error}")),
+            )?;
+        }
+        HubTeaching::None => warnings.push(format!(
+            "hub {channel} taught no control dialect (legacy hub); \
+             announce emitted without local CBCL self-validation"
+        )),
+        HubTeaching::Malformed(error) => warnings.push(format!(
+            "hub {channel} taught a control dialect hark could not learn ({error}); \
+             announce emitted without local CBCL self-validation"
+        )),
+    }
+    let announce_payload = payload_bytes(&announce).map_err(ChatError::Hello)?;
+    let announce_frame = conn.sign_chat_frame(identity.as_ref(), &announce_payload);
+    websocket
+        .send(WsMessage::Binary(announce_frame.into()))
+        .await
+        .map_err(|error| ChatError::ConnectionFailed(error.to_string()))?;
+
     let handle = AgentHandle::generate();
     let (close_tx, close_rx) = oneshot::channel();
     let (send_tx, send_rx) = mpsc::channel(8);
@@ -179,11 +332,20 @@ pub async fn create_chat_agent(
             Some(close_tx),
             Some(AgentSendChannel::new(send_tx)),
             Some(agent_handle.to_owned()), // the chat wire identity (@handle)
+            Some(channel.to_owned()),
         )
         .await
         .map_err(|error| ChatError::Store(error.to_string()))?;
 
-    let responder = Responder::new(agent_handle.to_owned(), channel.to_owned(), capability);
+    let responder = Responder::new(
+        agent_handle.to_owned(),
+        channel.to_owned(),
+        capability,
+        roomcfg
+            .declared
+            .as_ref()
+            .map(|menu| menu.iter().map(|entry| entry.name.clone()).collect()),
+    );
     spawn_receive_loop(ReceiveLoopArgs {
         store,
         handle: handle.clone(),
@@ -198,7 +360,35 @@ pub async fn create_chat_agent(
         mls,
     });
 
-    Ok(handle)
+    Ok((handle, warnings))
+}
+
+/// The agent's `announce` frame (SPEC-016 REQ-006): addressed to the channel
+/// (the first `@`-token is the signing audience), carrying the agent handle
+/// and its advertised dialects. When the agent was paired in, it also carries
+/// `:added-by` so every client can show the provenance (REQ-010). Chat clients
+/// key the agent rendering off this performative.
+fn build_announce_frame(
+    channel: &str,
+    agent_handle: &str,
+    dialects: &[String],
+    added_by: Option<&str>,
+) -> String {
+    let list = dialects
+        .iter()
+        .map(|dialect| format!("\"{}\"", dialect.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let added = added_by
+        .map(|adder| format!(" :added-by {adder}"))
+        .unwrap_or_default();
+    // `:from` identifies the signed-member sender — the hub's dispatch requires
+    // it (and verifies the frame signature against it) or the frame is rejected
+    // as `missing-from` and never fanned. `:agent` is what chat clients key the
+    // agent rendering off; both are the agent's own handle.
+    format!(
+        "(announce {channel} :from {agent_handle} :agent {agent_handle} :dialects ({list}){added})"
+    )
 }
 
 /// Receive + parse the chat hub's conn-nonce bootstrap (its first frame:
@@ -237,7 +427,9 @@ async fn recv_bootstrap(ws: &mut ChatSocket) -> Result<SignedConn, ChatError> {
     parse_conn_bootstrap(&text)
         .map(|boot| SignedConn::from_bootstrap(&boot))
         .ok_or_else(|| {
-            ChatError::ConnectionFailed(format!("first frame was not a conn-nonce bootstrap: {text}"))
+            ChatError::ConnectionFailed(format!(
+                "first frame was not a conn-nonce bootstrap: {text}"
+            ))
         })
 }
 
@@ -266,13 +458,39 @@ enum ClaimTimer {
     Fallback(String),
 }
 
+/// What the hub taught about its control dialect during the join handshake.
+enum HubTeaching {
+    /// No `(meta …)` advertisement arrived before the verdict.
+    None,
+    /// The advertisement parsed and installed.
+    Learned(DialectRegistry),
+    /// An advertisement arrived but could not be learned (why, for the operator).
+    Malformed(String),
+}
+
 /// Wait for the hub's verdict on a freshly sent `hello`. A successful join leads
 /// with a `roomcfg` frame (then backfill + a `presence` broadcast); a rejected
 /// one is a single `(error @room "slug")` with the socket left open. We consume
-/// only the acknowledging frame (returned for the REQ-023 mode-pin check) and
-/// leave any backfill/presence for the receive loop to enqueue.
-async fn await_join_ack(websocket: &mut ChatSocket) -> Result<String, ChatError> {
+/// only the acknowledging frame (returned raw for the SPEC-013 REQ-023
+/// mode-pin check, and parsed for the SPEC-016 REQ-008 menu check) and leave
+/// any backfill/presence for the receive loop to enqueue.
+///
+/// Ordering contract: the hub teaches its control dialect BEFORE the verdict —
+/// `cbcl-chat-room:join` builds the reply as `[meta, roomcfg | backfill]`, and
+/// cbcl-bus pins that order in `join-leads-with-the-hub-dialect-meta`. A hub
+/// that only teaches after its verdict is indistinguishable from one that
+/// teaches nothing: we return on the verdict, and the agent degrades to the
+/// "taught no control dialect" warning rather than waiting on a frame that may
+/// never come.
+async fn await_join_ack(
+    websocket: &mut ChatSocket,
+) -> Result<(String, RoomCfg, HubTeaching), ChatError> {
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+    // The hub leads the join with a `(meta (define hub …))` advertising its
+    // control dialect (SPEC-016): we learn it here, before the verdict, so the
+    // agent can validate its own control-plane frames against the grammar the
+    // hub actually declared — no baked copy.
+    let mut learned_hub = HubTeaching::None;
     loop {
         let message = match tokio::time::timeout_at(deadline, websocket.next()).await {
             Err(_elapsed) => return Err(ChatError::JoinTimeout(JOIN_TIMEOUT)),
@@ -304,11 +522,43 @@ async fn await_join_ack(websocket: &mut ChatSocket) -> Result<String, ChatError>
             _ => continue, // ping/pong/etc.
         };
         match frame_performative(&text).as_deref() {
-            Some("roomcfg") | Some("presence") => return Ok(text),
+            // A roomcfg carries the channel's config (enc + declared dialect
+            // menu, SPEC-015 CON-001); a presence-first ack conveys neither.
+            Some("roomcfg") => {
+                let roomcfg = parse_roomcfg(&text).unwrap_or_else(RoomCfg::absent);
+                return Ok((text, roomcfg, learned_hub));
+            }
+            Some("presence") => return Ok((text, RoomCfg::absent(), learned_hub)),
             Some("error") => {
                 return Err(ChatError::JoinRejected(
                     error_slug(&text).unwrap_or_else(|| "unknown".to_owned()),
                 ));
+            }
+            // The hub's control-dialect advertisement: learn it (the language's
+            // native `(meta (define …))` path) and keep waiting for the verdict.
+            // Only the dialect actually named `hub` counts — the same meta path
+            // can carry other dialect distributions (cite, poll, …), which are
+            // not the control grammar and must not be installed as it (R7-001).
+            // A malformed advertisement is non-fatal — the join still proceeds;
+            // the announce self-check degrades to a surfaced warning carrying
+            // the learn error, so a teaching-but-broken hub is distinguishable
+            // from a legacy hub that teaches nothing. A hub dialect already
+            // learned is never clobbered by a later bad frame.
+            Some("meta") => {
+                use crate::hub_dialect::HubDialectError;
+                match crate::hub_dialect::learn_hub_dialect(&text) {
+                    Ok(registry) => learned_hub = HubTeaching::Learned(registry),
+                    Err(HubDialectError::NotHub(name)) => {
+                        tracing::debug!("ignoring a non-hub dialect meta ({name})");
+                    }
+                    Err(error) => {
+                        tracing::warn!("could not learn the hub dialect: {error}");
+                        if !matches!(learned_hub, HubTeaching::Learned(_)) {
+                            learned_hub = HubTeaching::Malformed(error.to_string());
+                        }
+                    }
+                }
+                continue;
             }
             // Any other frame (e.g. backfill arriving before the leading roomcfg
             // on some hub ordering) is not a verdict — keep waiting.
@@ -538,7 +788,90 @@ fn sanitize(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_part, error_slug, frame_performative, payload_bytes};
+    use super::{build_announce_frame, cap_part, error_slug, frame_performative, payload_bytes};
+
+    #[test]
+    fn parses_roomcfg_with_and_without_declared_dialects() {
+        // Legacy hub: no :dialects key → the menu is absent (None), which is
+        // different from a declared-empty menu (Some([])).
+        let cfg = super::parse_roomcfg("(roomcfg @demo :enc false)")
+            .expect("legacy roomcfg should parse");
+        assert!(!cfg.enc);
+        assert_eq!(cfg.declared, None);
+
+        let cfg = super::parse_roomcfg("(roomcfg @demo :enc true :dialects ())")
+            .expect("empty menu should parse");
+        assert!(cfg.enc);
+        assert_eq!(cfg.declared, Some(vec![]));
+
+        let cfg = super::parse_roomcfg(
+            r#"(roomcfg @demo :enc false :dialects (("cite" "abc123") ("vote" "def456")))"#,
+        )
+        .expect("menu should parse");
+        let declared = cfg.declared.expect("menu is present");
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].name, "cite");
+        assert_eq!(declared[0].digest, "abc123");
+        assert_eq!(declared[1].name, "vote");
+        assert_eq!(declared[1].digest, "def456");
+
+        // Not a roomcfg → None.
+        assert!(super::parse_roomcfg("(presence @demo :members ())").is_none());
+    }
+
+    #[test]
+    fn builds_announce_frame_with_channel_audience_and_dialects() {
+        assert_eq!(
+            build_announce_frame(
+                "@demo",
+                "@aria",
+                &["cite".to_owned(), "vote".to_owned()],
+                None
+            ),
+            r#"(announce @demo :from @aria :agent @aria :dialects ("cite" "vote"))"#
+        );
+        // Advertising nothing is still a legible agent (HP-2 + REQ-006).
+        assert_eq!(
+            build_announce_frame("@demo", "@aria", &[], None),
+            "(announce @demo :from @aria :agent @aria :dialects ())"
+        );
+        // A paired agent carries its adder (REQ-010).
+        assert_eq!(
+            build_announce_frame("@demo", "@aria", &["cite".to_owned()], Some("@mira")),
+            r#"(announce @demo :from @aria :agent @aria :dialects ("cite") :added-by @mira)"#
+        );
+    }
+
+    /// Every chat-wire frame must be a well-formed CBCL *s-expression* — that
+    /// is the bar the chat send path enforces (`payload_bytes` runs
+    /// `cbcl_parser::parse`), and the hub's lenient parser likewise accepts it.
+    ///
+    /// NOTE: this is R1 (s-expression well-formedness), NOT full CBCL *message*
+    /// validity. `addagent`/`paircode`/`removeagent`/`agent-removed`/`announce`
+    /// are bare *custom* performatives, so the strict CBCL evaluator rejects
+    /// them as `UnknownPerformative` (only the 8 core performatives or a
+    /// dialect performative inside `(lang …)` resolve). They are cbcl-chat
+    /// *protocol* verbs — recognized by name by the hub, like the pre-existing
+    /// `presence`/`roomcfg`/`invite`/`channels` — not strict CBCL messages.
+    /// This test pins their syntax + the shared grammar (the hyphenated
+    /// `agent-removed` performative and `:added-by` keyword) across the stack.
+    #[test]
+    fn pairing_chat_frames_parse_as_wellformed_sexprs() {
+        let announce = build_announce_frame("@demo", "@aria", &["cite".to_owned()], Some("@mira"));
+        let frames = [
+            announce.as_str(),
+            r#"(addagent @general :name @aria :dialects ("cite") :from @mira)"#,
+            r#"(paircode @general :name @aria :id "1" :code "1-rocket-anchor")"#,
+            r#"(removeagent @general :name @aria :from @mira)"#,
+            "(agent-removed @general :name @aria)",
+        ];
+        for frame in frames {
+            assert!(
+                cbcl_parser::parse(frame).is_ok(),
+                "not a well-formed CBCL s-expression: {frame}"
+            );
+        }
+    }
 
     #[test]
     fn cap_part_is_empty_when_absent_or_blank() {

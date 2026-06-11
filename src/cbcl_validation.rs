@@ -187,14 +187,14 @@ pub fn validate_for_emit(
             Ok(())
         }
         PipelineResult::ParseError(error) => Err(malformed_parse(error)),
-        PipelineResult::ValidationError(error) => Err(
-            CbclValidationError::from_pipeline_validation(
+        PipelineResult::ValidationError(error) => {
+            Err(CbclValidationError::from_pipeline_validation(
                 &error,
                 violation_performative(&error),
                 violation_thread(&error),
             )
-            .unwrap_or_else(|| CbclValidationError::Malformed(error.to_string())),
-        ),
+            .unwrap_or_else(|| CbclValidationError::Malformed(error.to_string())))
+        }
         PipelineResult::Pending { message, reason } => Err(CbclValidationError::CausalViolation {
             detail: format!("causal predecessor unknown: {reason:?}"),
             performative: message
@@ -221,14 +221,16 @@ fn validate_for_send_inner(
         PipelineResult::Success(message) => message,
         PipelineResult::ParseError(error) => return Err(malformed_parse(error)),
         PipelineResult::ValidationError(error) => {
-            return Err(match CbclValidationError::from_pipeline_validation(
-                &error,
-                violation_performative(&error),
-                violation_thread(&error),
-            ) {
-                Some(err) => err,
-                None => CbclValidationError::Malformed(error.to_string()),
-            });
+            return Err(
+                match CbclValidationError::from_pipeline_validation(
+                    &error,
+                    violation_performative(&error),
+                    violation_thread(&error),
+                ) {
+                    Some(err) => err,
+                    None => CbclValidationError::Malformed(error.to_string()),
+                },
+            );
         }
         PipelineResult::Pending { message, reason } => {
             // Under the default `Reject` policy this means a `:caused-by`
@@ -737,8 +739,7 @@ mod tests {
 
     #[test]
     fn classify_inbound_passes_through_ordinary_frames() {
-        let dispatched_ask =
-            r#"(lang arena-v1 (ask @worker "psi-commit" :n 7 :thread "rcp-1"))"#;
+        let dispatched_ask = r#"(lang arena-v1 (ask @worker "psi-commit" :n 7 :thread "rcp-1"))"#;
         assert!(matches!(
             classify_inbound(dispatched_ask),
             InboundClass::Ordinary

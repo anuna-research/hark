@@ -30,9 +30,9 @@ pub mod session;
 pub mod validation;
 
 use openmls::prelude::Ciphersuite;
+use openmls::prelude::{BasicCredential, CredentialWithKey};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::SignatureScheme;
-use openmls::prelude::{BasicCredential, CredentialWithKey};
 
 use crate::identity::ChatIdentity;
 

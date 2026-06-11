@@ -5,6 +5,15 @@ Status: **APPROVED** — project-owner sign-off 2026-06-09, folded into
 **Tier-3 (DX)** except **OQ-001's SPAKE2 pairing handshake**, which carries a **Tier-1**
 gate (cross-model review + crypto sign-off) before that piece is implemented.
 
+> **Historical record — OQ-001 details superseded.** This captures the decision as
+> signed off; later review rounds corrected three OQ-001 details, and the spec
+> (REQ-007, v0.5+) is authoritative: the hub's stored verifier is
+> **password-equivalent, NOT "only an HMAC"** (a SPAKE2 responder cannot run from a
+> one-way digest — round 3); the online-guess budget is **mechanized** (single-use +
+> TTL + burn-on-first-failed-MAC (N=1, v0.7.0; originally N=3) + per-source rate limiting), not an asserted "one
+> guess per run" (R3-04); and **install-by-digest is deferred to SPEC-015** (records
+> carry `(name, digest)` but the hub mints empty digests today — spec §7a).
+
 ---
 
 ## OQ-001 — Pairing mechanism — **APPROVED (Tier-1 carve-out)**

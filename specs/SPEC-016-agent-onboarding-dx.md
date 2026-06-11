@@ -1,12 +1,12 @@
 ---
 id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
-status: approved (DX scope); pairing handshake CLEARED 2026-06-10 with SPEC-013 (J binds IMPL-016 — see review-gate)
+status: IMPLEMENTED 2026-06-11 (IMPL-016 — all REQs EXCEPT the digest-install leg of REQ-005/REQ-007, deferred to SPEC-015 — see §7a; pairing handshake cross-stack-verified; J-a/J-b done)
 tier: 3 (pairing handshake — Tier-1)
-version: 0.6.1
+version: 0.7.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance)
-last-updated: 2026-06-10
+author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance; v0.6.2 records the condition-J satisfaction, J-a/J-b riding; v0.6.3 records full IMPL-016 implementation; v0.6.4 folds the rendezvous design + REQ-012 live eviction; v0.6.5 folds the round-7 review — digest-leg deferral made explicit, NFR claims scoped to what is measured, release pin; v0.7.0 owner decision: 2-word phrase + N=1 burn-on-first-failure, wormhole-style)
+last-updated: 2026-06-11
 approved-date: 2026-06-09
 approved-by: project owner (OQ-001…004 settled in dialogue; REQ-007 re-opened by round-3 — see below)
 owner-repo: hark
@@ -24,9 +24,14 @@ review-gate: Tier-3 DX scope approved; the SPAKE2 pairing handshake (REQ-007/OQ-
   availability cost. **The Tier-1 gate is CLEARED 2026-06-10**: human sign-off
   (hark/docs/decisions/SPEC-013-tier1-signoff.md, D-1 ratified) + the round-6 independent
   spot-check (GPT-5.x, D-1 independently endorsed —
-  hark/docs/decisions/SPEC-013-round6-spotcheck-findings.md). One condition rides into
-  implementation: the **`cbcl_ristretto` point-validation audit (condition J) blocks
-  IMPL-016's handshake implementation** specifically.
+  hark/docs/decisions/SPEC-013-round6-spotcheck-findings.md). The **`cbcl_ristretto`
+  point-validation audit (condition J) is SATISFIED 2026-06-11**
+  (hark/docs/decisions/SPEC-013-condition-J-ristretto-audit.md: no blocking finding;
+  owner-ratified after a live probe re-run). Two conditions ride into the handshake
+  implementation: **J-a** (fix the `ct-equal?` strict-`and` MAC-length crash so the
+  failed-attempt counter cannot be evaded) and **J-b** (the audit's §6 negative
+  tests: K-=-identity abort, wrong-length MAC, M/N known-answer) — both bind
+  **before `hark pair` ships**.
 ---
 
 # SPEC-016 — Agent Onboarding DX: Frictionless Join & Auto-Learn
@@ -81,8 +86,8 @@ if absent, starts the daemon if needed, joins, and learns just `cite` — **no T
 no `eval`**. (`--speak` is the validated subset of [[#REQ-008]]; omit it to advertise
 nothing.)
 **HP-3 — in-app pairing.** In the web app the operator **names** the agent and picks its
-dialects → the hub mints a pairing record + a **3–4 word BIP39 phrase**
-(*"rocket anchor velvet"*). `hark pair "rocket anchor velvet"` runs **SPAKE2** with the
+dialects → the hub mints a pairing record + a **2-word BIP39 phrase**
+(*"rocket anchor"*). `hark pair 1-rocket-anchor` runs **SPAKE2** with the
 hub; on success the hub releases the record (bound to the PAKE key) —
 `{name, dialects, enc-mode, a cbcl-chat-invite cap}` — and hark joins under that name with
 the invite, pinning the channel's encryption mode, no `--as`/`--speak`.
@@ -127,7 +132,8 @@ key, accountability is the **adding member**.
   on success the hub releases the record **bound to the PAKE-derived session key K** (encrypted
   and/or MAC'd under K, not merely "sent after success"), and hark joins the channel **under
   that name** with the **invite-as-cap** ([[SPEC-013-mls-private-channels#HP-1]]) and installs
-  the dialects by digest.
+  the dialects by digest *(the digest-install leg is deferred to SPEC-015 — implementation
+  status in §7a; today the record carries names with empty digests)*.
   - **The `enc` field is advisory, NOT the encryption-pin source (R4-01).** The record is
     hub-stored and hub-released, and (per the scope note below) its contents cannot be
     authenticated *against* the hub — so a hub-alterable `enc` bit must not decide whether the
@@ -147,16 +153,22 @@ key, accountability is the **adding member**.
     an HMAC-as-password-input) is **password-equivalent**; SPAKE2 is not an augmented PAKE, so
     a hub-DB reader can complete the pairing as either side. The spec SHALL state this plainly
     (do not claim "stored only as an HMAC"). The exposure is bounded by **single-use + short
-    TTL + a failed-attempt bound** (delete the record after **N=3 failed MAC verifications**)
-    + hub-side rate limiting — a 3–4-word BIP39 phrase is only ~33–44 bits, so the online-guess
-    budget must be mechanized, not asserted "one guess per run" (R3-04).
+    TTL + a failed-attempt bound** (delete the record on the **FIRST failed MAC
+    verification** — N=1, Magic-Wormhole's burn-the-code rule) + hub-side rate limiting —
+    a 2-word BIP39 phrase is only ~22 bits, so the online-guess budget must be mechanized,
+    not asserted "one guess per run" (R3-04). With the N=1 burn it IS one guess per mint,
+    enforced: success odds 2^-22 per record, a mistyped code burns the pairing (loudly —
+    the adder re-mints), and entropy adds nothing against a hub-DB reader anyway (the
+    verifier is password-equivalent), so the shorter, more memorable phrase costs nothing
+    the burn doesn't already cover.
   - **Pairing-specific transcript binding.** The reused module hard-codes router-enrolment
     identities/labels (`idB = "cbcl-router:" ++ deployment_id`, salt `"CBCL-enrollment-v1"`,
     MAC labels `cbcl-agent-confirm`/`cbcl-router-confirm`, a 3-word/5-byte password encoding).
     Pairing SHALL pin **its own** identity strings (e.g. `idB = "cbcl-chat-pair:" ++ hub_id`,
-    a defined `idA`), its own HKDF salt/info, and an encoding covering **4 words** — so a
-    pairing transcript is domain-distinct from an enrolment transcript and the promised
-    "rocket anchor velvet" 4-word phrase actually fits (R3-03).
+    a defined `idA`), its own HKDF salt/info, and an encoding covering the pairing
+    phrase's **2 words** (`<<i1:11, i2:11, 0:2>>`) — so a pairing transcript is
+    domain-distinct from an enrolment transcript and the promised "rocket anchor"
+    phrase actually fits (R3-03).
   - **Scope.** This handshake authenticates **capability + name delivery to the intended
     agent** against third parties; it is **NOT** the agent Authentication Service and carries
     **no peer-identity material** — agent first-contact identity is hub-mediated TOFU + the
@@ -235,6 +247,106 @@ Settled in dialogue (project owner, 2026-06-09):
 | OQ-002 | A plain-chat verb **`hark emit`** exposing the existing `kind=emit`; all wire frames are **valid CBCL** (`tell`), the chat unwraps for display ([[#REQ-004]]). |
 | OQ-003 | **`files.anuna.io/hark/install.sh`** curl install over a single binary ([[#REQ-001]], ADR-006). |
 | OQ-004 | An agent is removable **only by its `added_by` member** ([[#REQ-012]]). |
+
+## 7a. Implementation status (IMPL-016, 2026-06-11)
+
+All twelve requirements implemented across `hark` (Rust) + `cbcl-bus`
+(LFE/Erlang) — EXCEPT the **digest-install leg of REQ-005/REQ-007, which is
+deferred to SPEC-015**, not claimed (see the follow-ons below); plan of record
+`plans/IMPL-016-agent-onboarding-dx.spl`.
+
+- **Tier-3 DX (hark):** REQ-001 install.sh + `make dist` + release CI
+  (`.github/workflows/release.yml` builds all four `hark-<os>-<arch>` binaries
+  + `.sha256` on native runners, names matching install.sh; it targets
+  GitHub-hosted runners, so it runs on a **GitHub mirror** — Codeberg-hosted
+  runners are Linux-only — and builds against a cbcl-rs commit **pinned in the
+  workflow** (`--locked` cannot pin path-dependency contents; bump the pin per
+  release)); REQ-002 `hark join`;
+  REQ-003 daemon-tracked active handle (no `eval`); REQ-004 `hark emit`;
+  REQ-005/008 declared-menu `--speak` validation; REQ-006 `announce`; REQ-009
+  response scoping.
+- **Pairing (Tier-1, REQ-007/011):** the SPAKE2 handshake is implemented on
+  both sides and **cross-stack byte-verified** by a shared known-answer fixture
+  (`tests/fixtures/pairing-vectors.json`): the LFE hub responder
+  (`cbcl-chat-pairing`, over the relocated shared `cbcl_bus` crypto) and the
+  Rust initiator (`hark pair`, curve25519-dalek) reproduce identical
+  msg_a/msg_b/K/MACs/AEAD-record. Store enforces single-use + TTL + the N=1
+  burn-on-first-failed-MAC bound (wormhole-style); the record is released bound to K; the encryption pin
+  derives from invite-cap presence (R4-01). `/pair/v1` WS endpoint + the web
+  "add agent" mint flow (`addagent` → `paircode` code). The code is a
+  Magic-Wormhole nameplate (smallest free integer) + the 2-word phrase
+  (`1-rocket-anchor`); the phrase never crosses the wire, and the small
+  nameplate is paired with a per-source `/pair/v1` rate limiter that *throttles*
+  blind enumeration (it bounds the burn rate per source; it cannot stop a
+  distributed attacker — the residual risk is availability, never secrecy) —
+  see [[SPEC-016-pairing-rendezvous]].
+- **Provenance/removal (REQ-010/012):** `cbcl-chat-provenance` records the
+  adder; the agent's `announce` carries `:added-by` so every roster shows it;
+  `removeagent` is authorized only against the recorded adder and **evicts the
+  agent from the live roster** (`cbcl-chat-room:evict`).
+- **Control dialect learned from the hub (no baked copy):** the hub's control
+  performatives (`announce`/`addagent`/`paircode`/… + the folded-in room/MLS
+  verbs) are a real CBCL dialect. Rather than ship a copy that drifts, the hub
+  **teaches** it: every join leads with a `(meta (define hub …))` advertisement
+  (CBCL's native dialect-distribution path), built from the hub's canonical
+  `priv/dialects/hub.cbcl` (`cbcl-chat-dialects:hub-meta-frame`). hark learns it
+  via the Meta → `InstallDialect` mechanism (`hub_dialect::learn_hub_dialect`)
+  and validates its own `announce` against the grammar the hub actually
+  declared. **Ordering contract:** the meta precedes the join verdict
+  (`roomcfg`/`presence`) — pinned hub-side by
+  `join-leads-with-the-hub-dialect-meta`; a hub that taught only after its
+  verdict would degrade to the taught-nothing path. Only the dialect actually
+  *named* `hub` (and defining `announce`, the frame the agent self-validates)
+  counts as control-grammar teaching — other dialects distributed over the
+  same meta path (e.g. `cite`) are ignored for this purpose, and a hub
+  dialect once learned is never clobbered by a later bad frame (R7-001). A
+  legacy hub that teaches nothing — and a hub whose advertisement cannot be
+  learned (warning carries the learn error) — degrades to a surfaced warning
+  (announce still emitted).
+  hark's test fixture of the grammar is drift-guarded byte-for-byte against
+  the canonical hub file when a sibling `cbcl-bus` checkout is present
+  (`hub_dialect_fixture_matches_the_canonical_cbcl_bus_grammar`). Verified
+  end-to-end against the live hub.
+- **Condition J:** signed off; J-a (`ct-equal?` fix) and J-b (negative tests)
+  implemented.
+- **NFRs measured (scope: `hark join`, local mock hub):** the one-shot
+  `hark join` against a local in-process **mock** WS hub (a real WebSocket
+  server speaking the join protocol; full config-scaffold → daemon-spawn →
+  signed hello → ack) is a **single command** completing in **~1.0 s**
+  (NFR-001: ≤ 3 commands, ≤ 60 s), with the hub-ack → success-report feedback
+  at **~3 ms** (NFR-003: ≤ 400 ms Doherty) — asserted as a budget regression
+  guard by `nfr_time_to_agent_and_feedback_within_budget` in
+  `tests/join_cli.rs`. This is loopback CLI-overhead measurement, NOT a field
+  measurement: real-network latency and the `hark pair` feedback path are not
+  measured. The SPAKE2 handshake algebra + the no-false-accept
+  security property are property-tested over arbitrary verifiers/ephemerals
+  (`src/pairing/spake2.rs::proptests`), beyond the single cross-stack KAT.
+
+- **Live playtest (2026-06-11, browser-automated web + real hub):** the happy
+  paths verified end-to-end against a local cbcl-bus hub — HP-1 (install.sh
+  artifact resolution), HP-2 (one-shot join, 0.07 s, hub-taught dialect
+  learned, no warnings beyond the expected menu-absent soft-pass), HP-3 (web
+  `addagent` → `1-ice-boat` → `hark pair`, 0.03 s), HP-4 (`hark emit` rendered
+  for the web member as a verified signer), HP-6 (roster: agent treatment +
+  *"aria · added by @mira"* + adder-only remove control); plus single-use and
+  the N=1 burn live. The playtest caught one real defect, fixed: `hark emit`
+  wrapped tells WITHOUT `:from`, which the hub's per-frame sender resolution
+  rejects (`missing-from`) — the same omission the announce had (mock hubs
+  don't enforce `:from`; only a live hub could catch it).
+
+**Documented follow-ons (dependent on other work, surfaced not faked):** the
+**digest leg of REQ-005 and REQ-007** waits on the hub's SPEC-015 `roomcfg`
+dialect menu + fetch-by-digest endpoint. Concretely, today: the web `addagent`
+prompt sends dialect **names only** (`priv/web/app.js`), the hub mints pairing
+records with **empty digests** (`cbcl-chat-session-ws:dialect-entry` — `{name,
+<<>>}`), and `hark pair` passes the names through to the join, where
+acquisition degrades to the surfaced "cannot be acquired by digest yet"
+warning. The `{name, digest}` record **schema** is in place end-to-end (and
+KAT-verified with a non-empty digest); the install-by-digest / fail-closed
+behaviour is NOT claimed implemented and lands with SPEC-015. (REQ-012 live
+roster eviction is now implemented — `cbcl-chat-room:evict`; only rejoin
+prevention for a still-cap-holding agent is deferred, a cap-revocation concern
+orthogonal to de-listing.)
 
 ## 8. Verification Strategy (Phase 2 — IMPL-016)
 

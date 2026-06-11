@@ -167,8 +167,9 @@ impl DurableProvider {
         let values = match fs::read(&self.path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(MlsError::Storage(e)),
-            Ok(bytes) => Self::decode(&bytes)
-                .map_err(|r| MlsError::Storage(std::io::Error::other(r)))?,
+            Ok(bytes) => {
+                Self::decode(&bytes).map_err(|r| MlsError::Storage(std::io::Error::other(r)))?
+            }
         };
         *self.storage.values.write().unwrap() = values;
         Ok(())

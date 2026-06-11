@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 Anuna Research
+#
+# Release CI (SPEC-016 REQ-001, ADR-006). Builds the four prebuilt binaries
+# that scripts/install.sh downloads — hark-darwin-arm64, hark-darwin-x64,
+# hark-linux-x64, hark-linux-arm64 — each with a matching .sha256, and attaches
+# them to the GitHub Release for the pushed tag. No cross toolchain: every
+# target builds on a native runner.
+#
+# hark depends on the sibling cbcl-rs repo via `../cbcl-rs/...` path deps
+# (Cargo.toml), so each job checks out hark into ./hark and clones cbcl-rs into
+# ./cbcl-rs next to it. cbcl-rs lives on Codeberg; for a private repo, set the
+# CODEBERG_TOKEN secret (injected into the clone URL below).
+#
+# cbcl-rs is PINNED to a commit (CBCL_RS_REF): Cargo's `--locked` cannot pin
+# path-dependency *contents*, so building against a moving branch would let an
+# unrelated cbcl-rs change break (or silently alter) a hark release with no
+# hark diff. Bump the pin deliberately in the release-prep commit; the
+# workflow_dispatch input overrides it for one-off builds.
+#
+# Trigger: push a tag like `v0.1.0`, or run manually (workflow_dispatch).
+#
+# NOTE: targets GitHub-hosted runners (macOS + the ubuntu arm64 image). The
+# canonical remote is Codeberg/Forgejo, whose hosted runners are Linux-only;
+# run this on a GitHub mirror, or adapt the macOS jobs to osxcross to build
+# darwin artifacts from Linux.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      cbcl_rs_ref:
+        description: "cbcl-rs git ref to build against (default: the pinned commit)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # The pinned cbcl-rs commit hark releases build against (bump per release);
+  # the workflow_dispatch input overrides it when non-empty.
+  CBCL_RS_REF: ${{ github.event.inputs.cbcl_rs_ref || '1c6fa8f581a69a7bcb88fb787fa37c81f5de4221' }}
+
+jobs:
+  build:
+    name: build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: hark-darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - artifact: hark-darwin-x64
+            runner: macos-13
+            target: x86_64-apple-darwin
+          - artifact: hark-linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - artifact: hark-linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - name: Check out hark
+        uses: actions/checkout@v4
+        with:
+          path: hark
+
+      - name: Clone the sibling cbcl-rs (path dependency)
+        run: |
+          set -euo pipefail
+          token="${{ secrets.CODEBERG_TOKEN }}"
+          if [ -n "$token" ]; then
+            url="https://x-access-token:${token}@codeberg.org/anuna/cbcl-rs.git"
+          else
+            url="https://codeberg.org/anuna/cbcl-rs.git"
+          fi
+          # Full clone + detached checkout: works uniformly for a pinned
+          # commit SHA, a branch, or a tag (`git clone --branch` cannot take
+          # a SHA, and shallow-fetching one needs server-side opt-in).
+          git clone "$url" cbcl-rs
+          git -C cbcl-rs checkout --detach "$CBCL_RS_REF"
+
+      - name: Install the Rust toolchain
+        # Run inside hark/ so rustup resolves the rust-toolchain.toml pin —
+        # the same compiler (and rustfmt) every contributor builds with.
+        working-directory: hark
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Build the release binary
+        working-directory: hark
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage the artifact + checksum
+        working-directory: hark
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/hark" "dist/${{ matrix.artifact }}"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          fi
+
+      - name: Upload the build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            hark/dist/${{ matrix.artifact }}
+            hark/dist/${{ matrix.artifact }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: attach to the release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

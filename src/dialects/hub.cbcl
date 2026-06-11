@@ -1,0 +1,58 @@
+;; hub dialect (SPEC-016) — the cbcl-chat control plane as a real CBCL dialect.
+;;
+;; The hub's control performatives were bare custom performatives: well-formed
+;; s-expressions the hub routes by name, but NOT valid CBCL *messages* (the
+;; strict evaluator rejects an unscoped custom performative as
+;; UnknownPerformative). Defining them here makes them resolve against the
+;; registry — a bare `(addagent …)` / `(presence …)` is now valid CBCL, while
+;; the hub still routes by the head performative (no `(lang …)` wrapper, so
+;; dispatch is unchanged). `@room` is the recipient placeholder; undeclared
+;; keywords (e.g. the universal `:from`, or `:key`/`:cap` on a hello) are
+;; tolerated, so each performative declares only its content params.
+;;
+;; Covers the whole control plane EXCEPT the core CBCL verbs (tell/ask/reply/
+;; error/ok/cancel/hello/bye — the base dialect) and the verbs that already
+;; have their own dialect (cite, propose/vote in poll, do in concierge).
+;;
+;; Verified well-formed (R1/R2/R3/R5) by cbcl_erl:verify_dialect at startup.
+
+(define hub (cbcl) @cbcl-chat
+  (:resource-requirements ((max-depth 8) (max-expansion-size 512) (verification-time 10)))
+
+  ;; --- SPEC-016 agent pairing + legibility ------------------------------
+  (extend announce (agent dialects added-by)
+    (tell @room (agent-presence :agent agent :dialects dialects :added-by added-by)))
+  (extend addagent (name dialects)
+    (tell @room (pair-request :name name :dialects dialects)))
+  (extend paircode (name id code)
+    (tell @room (pair-code :name name :id id :code code)))
+  (extend removeagent (name)
+    (tell @room (remove-request :name name)))
+  (extend agent-removed (name)
+    (tell @room (removal-ack :name name)))
+
+  ;; --- SPEC-001 rooms: presence, config, invites, directory, history ----
+  (extend presence (members)
+    (tell @room (roster :members members)))
+  (extend roomcfg (enc)
+    (tell @room (room-config :enc enc)))
+  (extend invite (ttl uses)
+    (tell @room (invite-request :ttl ttl :uses uses)))
+  (extend invited (token ttl uses)
+    (tell @room (invite-token :token token :ttl ttl :uses uses)))
+  (extend channels (public)
+    (tell @room (channel-directory :public public)))
+  (extend history (before limit)
+    (tell @room (history-request :before before :limit limit)))
+
+  ;; --- SPEC-002 MLS KeyPackage directory + E2EE delivery ----------------
+  (extend keypub (last onetime)
+    (tell @room (keypackage-publish :last last :onetime onetime)))
+  (extend keyget (for)
+    (tell @room (keypackage-request :for for)))
+  (extend keypkg (for kp)
+    (tell @room (keypackage :for for :kp kp)))
+  (extend welcome (for ct)
+    (tell @room (mls-welcome :for for :ct ct)))
+  (extend deliver (enc epoch ct)
+    (tell @room (mls-message :enc enc :epoch epoch :ct ct))))

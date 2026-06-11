@@ -24,9 +24,7 @@ use cbcl_core::{
 };
 
 use crate::{
-    config::validate_dialect_id,
-    constants::LOCAL_API_VERSION,
-    dialect_cache::DialectCache,
+    config::validate_dialect_id, constants::LOCAL_API_VERSION, dialect_cache::DialectCache,
     local_api::PingResponse,
 };
 
@@ -59,6 +57,9 @@ pub struct AgentStatusSnapshot {
     pub queued_bytes: usize,
     pub unhealthy_reason: Option<String>,
     pub unhealthy_detail: Option<String>,
+    /// The chat channel this agent joined (`@name`); `None` on the router
+    /// transport, which has no channel notion.
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -117,12 +118,18 @@ pub enum AgentError {
 struct AgentRegistry {
     config: AgentStoreConfig,
     agents: HashMap<AgentHandle, AgentEntry>,
+    /// The session's active handle (REQ-003, SPEC-016 ADR-002): the most
+    /// recently created agent. CLI commands fall back to it when
+    /// `CBCL_AGENT_HANDLE` is unset, dropping the `eval` ritual.
+    active: Option<AgentHandle>,
 }
 
 #[derive(Debug)]
 struct AgentEntry {
     router_agent_id: String,
     dialects: Vec<String>,
+    /// The chat channel this agent joined; `None` on the router transport.
+    channel: Option<String>,
     state: AgentState,
     unhealthy_reason: Option<String>,
     unhealthy_detail: Option<String>,
@@ -393,6 +400,7 @@ impl AgentStore {
             inner: Arc::new(Mutex::new(AgentRegistry {
                 config,
                 agents: HashMap::new(),
+                active: None,
             })),
         }
     }
@@ -416,7 +424,7 @@ impl AgentStore {
         dialects: Vec<String>,
         close_tx: Option<oneshot::Sender<()>>,
     ) -> Result<AgentStatusSnapshot, AgentError> {
-        self.insert_connected_with_router_channels(handle, dialects, close_tx, None, None)
+        self.insert_connected_with_router_channels(handle, dialects, close_tx, None, None, None)
             .await
     }
 
@@ -427,6 +435,7 @@ impl AgentStore {
         close_tx: Option<oneshot::Sender<()>>,
         send_channel: Option<AgentSendChannel>,
         wire_id: Option<String>,
+        channel: Option<String>,
     ) -> Result<AgentStatusSnapshot, AgentError> {
         validate_agent_advertisement(&dialects)?;
         let mut inner = self.inner.lock().await;
@@ -452,13 +461,22 @@ impl AgentStore {
             store: Arc::new(Mutex::new(ThreadedMessageStore::new())),
             send_sequencer: Arc::new(Mutex::new(())),
             dialect_cache: DialectCache::new(),
+            channel,
         };
         inner.agents.insert(handle.clone(), entry);
+        // The newest agent becomes the session's active handle (REQ-003).
+        inner.active = Some(handle.clone());
         Ok(inner
             .agents
             .get(&handle)
             .expect("agent was just inserted")
             .snapshot(&handle))
+    }
+
+    /// The session's active handle: the most recently created, still-open
+    /// agent. `None` when no agent is open (or the active one was closed).
+    pub async fn active_handle(&self) -> Option<AgentHandle> {
+        self.inner.lock().await.active.clone()
     }
 
     pub async fn send_outbound(
@@ -540,7 +558,10 @@ impl AgentStore {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut inner = self.inner.lock().await;
-            let entry = inner.agents.get_mut(handle).ok_or(AgentError::UnknownHandle)?;
+            let entry = inner
+                .agents
+                .get_mut(handle)
+                .ok_or(AgentError::UnknownHandle)?;
             entry.ensure_healthy()?;
             if entry.pending_meta_reply.is_some() {
                 return Err(AgentError::MetaSendBusy);
@@ -572,9 +593,7 @@ impl AgentStore {
                 // the full timeout.
                 Err(AgentError::Unhealthy {
                     reason: "meta_reply_channel_closed".to_owned(),
-                    detail: Some(
-                        "router connection closed before meta reply arrived".to_owned(),
-                    ),
+                    detail: Some("router connection closed before meta reply arrived".to_owned()),
                 })
             }
             Err(_elapsed) => {
@@ -712,6 +731,9 @@ impl AgentStore {
                 .agents
                 .remove(handle)
                 .ok_or(AgentError::UnknownHandle)?;
+            if inner.active.as_ref() == Some(handle) {
+                inner.active = None;
+            }
             let mut entry = entry;
             entry.close_connection();
             entry.notify
@@ -801,10 +823,7 @@ impl AgentStore {
     /// order matching their store-append order. Never taken by the
     /// router receive loop — taking it there would re-introduce the
     /// inbound-vs-outbound deadlock this sequencer was added to avoid.
-    pub async fn send_sequencer(
-        &self,
-        handle: &AgentHandle,
-    ) -> Result<Arc<Mutex<()>>, AgentError> {
+    pub async fn send_sequencer(&self, handle: &AgentHandle) -> Result<Arc<Mutex<()>>, AgentError> {
         let inner = self.inner.lock().await;
         let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
         Ok(Arc::clone(&entry.send_sequencer))
@@ -874,10 +893,7 @@ impl MetaReplyDelivery {
     }
 }
 
-fn expectation_matches(
-    expectation: &MetaReplyExpectation,
-    delivery: &MetaReplyDelivery,
-) -> bool {
+fn expectation_matches(expectation: &MetaReplyExpectation, delivery: &MetaReplyDelivery) -> bool {
     match (expectation, delivery) {
         (_, MetaReplyDelivery::Reply(_)) => true,
         (MetaReplyExpectation::Reply, _) => false,
@@ -951,6 +967,7 @@ impl AgentEntry {
             queued_bytes: self.queued_bytes,
             unhealthy_reason: self.unhealthy_reason.clone(),
             unhealthy_detail: self.unhealthy_detail.clone(),
+            channel: self.channel.clone(),
         }
     }
 }
@@ -998,10 +1015,9 @@ pub fn is_valid_agent_handle(value: &str) -> bool {
 }
 
 fn validate_agent_advertisement(dialects: &[String]) -> Result<(), AgentError> {
-    if dialects.is_empty() {
-        return Err(AgentError::MissingDialect);
-    }
-
+    // An empty advertisement is allowed: "advertise nothing" (SPEC-016 HP-2,
+    // `hark join` without `--speak`). `hark init` still requires at least one
+    // dialect at the CLI layer.
     let mut seen = std::collections::HashSet::new();
     for dialect in dialects {
         validate_dialect_id(dialect)
@@ -1590,6 +1606,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_handle_tracks_most_recent_insert_and_clears_on_close() {
+        let store = agent_store(10, 100);
+        assert_eq!(store.active_handle().await, None);
+
+        let first = super::AgentHandle::generate();
+        store
+            .insert_connected(first.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("agent should insert");
+        assert_eq!(store.active_handle().await, Some(first.clone()));
+
+        let second = super::AgentHandle::generate();
+        store
+            .insert_connected(second.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("agent should insert");
+        assert_eq!(store.active_handle().await, Some(second.clone()));
+
+        // Closing a non-active agent leaves the active one in place.
+        store.close(&first).await.expect("close should succeed");
+        assert_eq!(store.active_handle().await, Some(second.clone()));
+
+        // Closing the active agent clears it.
+        store.close(&second).await.expect("close should succeed");
+        assert_eq!(store.active_handle().await, None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_chat_channel_when_present() {
+        let store = agent_store(10, 100);
+        let handle = handle();
+        store
+            .insert_connected_with_router_channels(
+                handle.clone(),
+                vec!["elf".to_owned()],
+                None,
+                None,
+                Some("@aria".to_owned()),
+                Some("@research".to_owned()),
+            )
+            .await
+            .expect("agent should insert");
+
+        let status = store.status_snapshots().await;
+        assert_eq!(status[0].channel.as_deref(), Some("@research"));
+
+        // A router agent has no channel.
+        let router_handle = super::AgentHandle::generate();
+        store
+            .insert_connected(router_handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("agent should insert");
+        let status = store.status_snapshots().await;
+        let router_status = status
+            .iter()
+            .find(|status| status.agent_handle == router_handle.as_str())
+            .expect("router agent snapshot exists");
+        assert_eq!(router_status.channel, None);
+    }
+
+    #[tokio::test]
     async fn agent_state_queue_delivers_fifo_and_tracks_bytes() {
         let store = agent_store(10, 100);
         let handle = handle();
@@ -1823,7 +1900,10 @@ mod tests {
         let handle = handle();
 
         let snapshot = store
-            .insert_connected(handle.clone(), vec!["elf".to_owned(), "arena-v1".to_owned()])
+            .insert_connected(
+                handle.clone(),
+                vec!["elf".to_owned(), "arena-v1".to_owned()],
+            )
             .await
             .expect("agent should insert");
 
@@ -1841,13 +1921,16 @@ mod tests {
         let store = agent_store(10, 100);
         let handle = handle();
 
-        assert_eq!(
-            store
-                .insert_connected(handle.clone(), vec![])
-                .await
-                .expect_err("missing dialect should fail"),
-            super::AgentError::MissingDialect
-        );
+        // SPEC-016 HP-2: an empty advertisement is "advertise nothing" —
+        // a chat agent may join a channel without speaking any dialect.
+        let snapshot = store
+            .insert_connected(handle.clone(), vec![])
+            .await
+            .expect("empty advertisement should be allowed");
+        assert!(snapshot.dialects.is_empty());
+        store.close(&handle).await.expect("close should succeed");
+
+        let handle = super::AgentHandle::generate();
         assert_eq!(
             store
                 .insert_connected(handle, vec!["elf".to_owned(), "elf".to_owned()])

@@ -40,13 +40,14 @@ async fn signed_hello_is_accepted_by_live_hub() {
     // after the hub acknowledged the join with a roomcfg frame, which it does
     // only once it has verified the Ed25519 signature against the :key. A broken
     // signature would come back as ChatError::JoinRejected("bad-signature").
-    let handle = create_chat_agent(
+    let (handle, _warnings) = create_chat_agent(
         store.clone(),
         &ws_url,
         "@general",
         "@hark-test",
         vec!["cite".to_owned()],
         None, // public channel: no cap
+        None, // added_by
         Duration::from_millis(400),
         Duration::from_secs(2),
         identity,
@@ -80,6 +81,7 @@ async fn join_to_unknown_channel_is_rejected() {
         "@hark-test-reject",
         vec!["cite".to_owned()],
         None,
+        None, // added_by
         Duration::from_millis(400),
         Duration::from_secs(2),
         identity,

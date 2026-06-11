@@ -20,6 +20,7 @@ use support::{TestEnv, assert_success, output_debug};
 
 const ROUTER_SECRET: &str = "shr_test.secret";
 const DISPATCH: &str = "(lang elf (ask @router \"work\" :thread \"rcp-1\"))";
+const BOOTSTRAP: &str = "(tell @agent \"conn-nonce\" :from @cbcl-router :nonce \"AAAAAAAAAAAAAAAAAAAAAA==\" :hub \"cbcl-router\")";
 
 #[test]
 fn e2e_mvp_happy_path_start_init_recv_progress_reply_close_stop() {
@@ -95,10 +96,11 @@ fn e2e_mvp_happy_path_start_init_recv_progress_reply_close_stop() {
     runtime.block_on(router.wait());
     let frames = router.frames();
     assert!(frames.iter().any(|frame| frame.contains("\"progress\"")));
+    // Outbound frames are signed envelopes (SPEC-012) embedding the payload.
     assert!(
         frames
             .iter()
-            .any(|frame| frame == r#"(lang elf (reply "done" :thread "rcp-1"))"#)
+            .any(|frame| frame.contains(r#"(lang elf (reply "done" :thread "rcp-1"))"#))
     );
     assert_no_token_leak(&init, &env);
     assert_no_token_leak(&recv, &env);
@@ -325,6 +327,12 @@ impl MockRouter {
             let Ok(mut websocket) = accept_hdr_async(stream, callback).await else {
                 return;
             };
+
+            // SPEC-012 signed-member connect: the hub's first frame is the
+            // conn-nonce bootstrap; the daemon waits for it before its hello.
+            let _ = websocket
+                .send(Message::Text(BOOTSTRAP.to_owned().into()))
+                .await;
 
             if let Some(Ok(message)) = websocket.next().await {
                 task_shared

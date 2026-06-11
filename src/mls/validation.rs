@@ -65,10 +65,7 @@ pub enum Inbound {
     /// A validated, merged Commit or stored proposal.
     Handshake,
     /// An undecryptable/unprocessable frame — dropped, counted (REQ-006).
-    Dropped {
-        reason: String,
-        probable_fork: bool,
-    },
+    Dropped { reason: String, probable_fork: bool },
 }
 
 /// REQ-005: encrypt one outbound channel message as an MLS application
@@ -209,8 +206,7 @@ pub fn process_inbound(
                     let leaf = add.add_proposal().key_package().leaf_node();
                     let handle = credential_handle(leaf.credential()).ok()?;
                     if pins.pinned(&handle).is_none() {
-                        let key =
-                            <[u8; 32]>::try_from(leaf.signature_key().as_slice()).ok()?;
+                        let key = <[u8; 32]>::try_from(leaf.signature_key().as_slice()).ok()?;
                         Some((handle, key))
                     } else {
                         None
@@ -288,8 +284,7 @@ fn validate_staged_commit(
     if changes_membership {
         match elect_owner(&members) {
             Some((owner_handle, owner_key))
-                if owner_handle == committer_handle
-                    && owner_key == committer.signature_key => {}
+                if owner_handle == committer_handle && owner_key == committer.signature_key => {}
             Some((owner_handle, _)) => {
                 return Err(MlsError::Rejected(format!(
                     "membership-changing commit from {committer_handle}, but the elected \
@@ -320,7 +315,12 @@ fn validate_staged_commit(
                 )));
             }
         };
-        validate_updated_leaf(group, update.update_proposal().leaf_node(), updater_index.u32(), pins)?;
+        validate_updated_leaf(
+            group,
+            update.update_proposal().leaf_node(),
+            updater_index.u32(),
+            pins,
+        )?;
     }
 
     // (c) The committer's UpdatePath leaf — the path the §10 spike proved
@@ -395,7 +395,9 @@ fn validate_standalone_proposal(
 ) -> Result<(), MlsError> {
     use openmls::prelude::Proposal;
     match proposal.proposal() {
-        Proposal::Add(add) => validate_leaf_against_pins(add.key_package().leaf_node(), pins, "Add"),
+        Proposal::Add(add) => {
+            validate_leaf_against_pins(add.key_package().leaf_node(), pins, "Add")
+        }
         Proposal::Update(update) => {
             let updater_index = match proposal.sender() {
                 Sender::Member(idx) => idx.u32(),
@@ -515,9 +517,7 @@ fn validate_updated_leaf(
 mod tests {
     use super::*;
     use crate::identity::ChatIdentity;
-    use openmls::prelude::{
-        BasicCredential, CredentialWithKey, LeafNodeParameters,
-    };
+    use openmls::prelude::{BasicCredential, CredentialWithKey, LeafNodeParameters};
     use std::fs;
     use std::path::PathBuf;
 
@@ -560,8 +560,13 @@ mod tests {
     /// adds bob; both fully pinned; bob joined.
     fn two_member_group(
         tag: &str,
-    ) -> (Party, Party, openmls::prelude::MlsGroup, openmls::prelude::MlsGroup, GenesisAssertion)
-    {
+    ) -> (
+        Party,
+        Party,
+        openmls::prelude::MlsGroup,
+        openmls::prelude::MlsGroup,
+        GenesisAssertion,
+    ) {
         let mut alice = party(tag, 51, "@alice");
         let mut bob = party(tag, 52, "@bob");
         let keys = [
@@ -821,8 +826,7 @@ mod tests {
     /// every validator merge the Remove.
     #[test]
     fn remove_with_fresh_evidence_merges() {
-        let (alice, bob, mut bob_group, genesis, commit_wire, evidence) =
-            remove_fixture("rm-ok");
+        let (alice, bob, mut bob_group, genesis, commit_wire, evidence) = remove_fixture("rm-ok");
         let mut bob_pins = bob.pins;
         let mut fork = ForkSignal::default();
         let inbound = process_inbound(
@@ -851,8 +855,7 @@ mod tests {
         let mut fork = ForkSignal::default();
 
         use openmls::prelude::{
-            Extension, ExtensionType, Extensions, RequiredCapabilitiesExtension,
-            UnknownExtension,
+            Extension, ExtensionType, Extensions, RequiredCapabilitiesExtension, UnknownExtension,
         };
         // Both members advertise 0xF013, so openmls accepts this GCE shape —
         // the app-level allowlist is what must stop it.
@@ -899,13 +902,8 @@ mod tests {
         let mut bob_pins = bob.pins;
         let mut fork = ForkSignal::default();
 
-        let wire = encrypt_message(
-            &alice.provider,
-            &alice.identity,
-            &mut alice_group,
-            b"once",
-        )
-        .unwrap();
+        let wire =
+            encrypt_message(&alice.provider, &alice.identity, &mut alice_group, b"once").unwrap();
         // First processing succeeds…
         let ok = process_inbound(
             &bob.provider,
@@ -947,13 +945,8 @@ mod tests {
         assert!(fork.probable_fork());
 
         // A successful decrypt resets the run.
-        let wire2 = encrypt_message(
-            &alice.provider,
-            &alice.identity,
-            &mut alice_group,
-            b"again",
-        )
-        .unwrap();
+        let wire2 =
+            encrypt_message(&alice.provider, &alice.identity, &mut alice_group, b"again").unwrap();
         let ok = process_inbound(
             &bob.provider,
             &mut bob_group,

@@ -341,7 +341,12 @@ pub fn default_chat_identity_dir() -> Option<PathBuf> {
 /// `auth_token` bearer credential under SPEC-012). The hub TOFU-enrols it.
 pub fn default_router_identity_path() -> Option<PathBuf> {
     let base_dirs = BaseDirs::new()?;
-    Some(base_dirs.config_dir().join(COMMAND_NAME).join("router-agent.key"))
+    Some(
+        base_dirs
+            .config_dir()
+            .join(COMMAND_NAME)
+            .join("router-agent.key"),
+    )
 }
 
 pub fn default_config_file() -> Option<PathBuf> {
@@ -386,7 +391,9 @@ pub fn validate_dialect_id(value: &str) -> Result<(), ConfigError> {
     )
 }
 
-fn load_file_backed_config(config_file: Option<PathBuf>) -> Result<AppConfig, ConfigError> {
+pub(crate) fn load_file_backed_config(
+    config_file: Option<PathBuf>,
+) -> Result<AppConfig, ConfigError> {
     let mut builder = Config::builder()
         .set_default("agent.agent_id_prefix", DEFAULT_AGENT_ID_PREFIX)?
         .set_default("daemon.bind", DEFAULT_DAEMON_BIND)?

@@ -22,16 +22,14 @@ use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use cbcl_core::sexpr::{Atom, SExpr};
-use openmls::prelude::MlsGroup;
 use openmls::group::GroupId;
+use openmls::prelude::MlsGroup;
 use rand::Rng as _;
 
 use super::group::{
     GenesisAssertion, GenesisTrust, add_member, create_group, is_owner, join_from_welcome,
 };
-use super::keypackages::{
-    ConsumedLedger, ONE_TIME_POOL_TARGET, build_last_resort, build_one_time,
-};
+use super::keypackages::{ConsumedLedger, ONE_TIME_POOL_TARGET, build_last_resort, build_one_time};
 use super::pins::{PinStore, idkey_signing_bytes};
 use super::provider::DurableProvider;
 use super::removal::{RemovalEvidence, remove_member};
@@ -128,9 +126,9 @@ impl MlsSession {
         let meta: Option<SessionMeta> = match fs::read(&meta_path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(MlsError::Storage(e)),
-            Ok(bytes) => serde_json::from_slice(&bytes).ok().filter(
-                |m: &SessionMeta| m.version == META_VERSION && m.room == room,
-            ),
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .ok()
+                .filter(|m: &SessionMeta| m.version == META_VERSION && m.room == room),
         };
 
         let identity = MlsIdentity::from_wire_identity(wire, handle);
@@ -160,12 +158,10 @@ impl MlsSession {
             if let Some(group_id_b64) = meta.group_id_b64 {
                 if let Ok(group_id) = B64.decode(&group_id_b64) {
                     use openmls_traits::OpenMlsProvider as _;
-                    session.group = MlsGroup::load(
-                        session.provider.storage(),
-                        &GroupId::from_slice(&group_id),
-                    )
-                    .ok()
-                    .flatten();
+                    session.group =
+                        MlsGroup::load(session.provider.storage(), &GroupId::from_slice(&group_id))
+                            .ok()
+                            .flatten();
                     if session.group.is_some() && session.genesis.is_some() {
                         // Restore the trust grade faithfully: a group joined as
                         // unconfirmed TOFU stays TOFU-pending across restart so
@@ -357,9 +353,7 @@ impl MlsSession {
         self.present
             .iter()
             .filter(|h| {
-                **h != self.handle
-                    && !members.contains(*h)
-                    && self.pins.pinned(h).is_some()
+                **h != self.handle && !members.contains(*h) && self.pins.pinned(h).is_some()
             })
             .map(|h| self.keyget_frame(h))
             .collect()
@@ -523,8 +517,8 @@ impl MlsSession {
             };
         };
         // Removal evidence rides alongside a Remove commit (REQ-014).
-        let evidence: Option<RemovalEvidence> = kw_b64(text, ":evidence")
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let evidence: Option<RemovalEvidence> =
+            kw_b64(text, ":evidence").and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let genesis = match self.genesis.as_ref() {
             Some(g) => g.clone(),
             None => {
@@ -699,10 +693,7 @@ impl MlsSession {
 
     /// Remove a member as the elected owner, given verified evidence
     /// (REQ-014). Returns the deliver frame carrying commit + evidence.
-    pub fn remove_with_evidence(
-        &mut self,
-        evidence: &RemovalEvidence,
-    ) -> Result<String, MlsError> {
+    pub fn remove_with_evidence(&mut self, evidence: &RemovalEvidence) -> Result<String, MlsError> {
         let creator = self
             .genesis
             .as_ref()
@@ -904,13 +895,18 @@ mod tests {
             MlsSession::open(&dir, "aria", "@research", "@aria", &wire, true).unwrap();
         assert!(session.encrypted(), "cap presence pins encrypted");
 
-        let err = session.on_roomcfg("(roomcfg @research :enc false)").unwrap_err();
+        let err = session
+            .on_roomcfg("(roomcfg @research :enc false)")
+            .unwrap_err();
         assert!(matches!(err, MlsError::Rejected(_)));
         assert!(session.downgrade_refused());
 
         // Fail closed: no sends, ever, in this state.
         let err = session.encrypt_outbound("(say @research :from @aria :text \"x\")");
-        assert!(err.is_err(), "must refuse to send after a downgrade attempt");
+        assert!(
+            err.is_err(),
+            "must refuse to send after a downgrade attempt"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -921,7 +917,11 @@ mod tests {
         let (dir, wire) = setup("nojoin", 82, "@aria");
         let mut session =
             MlsSession::open(&dir, "aria", "@research", "@aria", &wire, true).unwrap();
-        assert!(session.encrypt_outbound("(say @research :from @aria)").is_err());
+        assert!(
+            session
+                .encrypt_outbound("(say @research :from @aria)")
+                .is_err()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -932,8 +932,7 @@ mod tests {
         {
             let _ = MlsSession::open(&dir, "aria", "@research", "@aria", &wire, true).unwrap();
         }
-        let session =
-            MlsSession::open(&dir, "aria", "@research", "@aria", &wire, false).unwrap();
+        let session = MlsSession::open(&dir, "aria", "@research", "@aria", &wire, false).unwrap();
         assert!(
             session.encrypted(),
             "a previously pinned channel stays pinned without the cap"
@@ -986,8 +985,7 @@ mod tests {
 
         let mut alice =
             MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
-        let mut bob =
-            MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
+        let mut bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
 
         // Both broadcast idkey on join; each pins the other (REQ-019→REQ-011).
         let a_frames = alice.join_frames().unwrap();
@@ -1012,7 +1010,9 @@ mod tests {
             panic!("presence handled")
         };
         assert!(
-            outbound.iter().any(|f| f == "(keyget @hub :for @bob :from @alice)"),
+            outbound
+                .iter()
+                .any(|f| f == "(keyget @hub :for @bob :from @alice)"),
             "owner fetches the pinned, present non-member's KeyPackage: {outbound:?}"
         );
         assert!(
@@ -1114,7 +1114,10 @@ mod tests {
         // connected, so she never sees it (the hub fans it only to present
         // members). Bob's join frames go nowhere alice can hear.
         let _b_join = bob.join_frames().unwrap();
-        assert!(alice.pins.pinned("@bob").is_none(), "alice missed bob's join idkey");
+        assert!(
+            alice.pins.pinned("@bob").is_none(),
+            "alice missed bob's join idkey"
+        );
 
         // Alice joins, creates the group, and broadcasts her own idkey.
         alice.create_group_as_creator().unwrap();
@@ -1155,12 +1158,17 @@ mod tests {
 
         // Alice receives bob's re-broadcast idkey → pins him → and because she
         // is the owner and bob is present, immediately emits the keyget.
-        let SessionEvent::Handled { outbound: after_pin } = alice.handle_frame(bob_idkey) else {
+        let SessionEvent::Handled {
+            outbound: after_pin,
+        } = alice.handle_frame(bob_idkey)
+        else {
             panic!("idkey handled")
         };
         assert!(alice.pins.pinned("@bob").is_some(), "alice now pins bob");
         assert!(
-            after_pin.iter().any(|f| f == "(keyget @hub :for @bob :from @alice)"),
+            after_pin
+                .iter()
+                .any(|f| f == "(keyget @hub :for @bob :from @alice)"),
             "pinning bob unblocks the keyget: {after_pin:?}"
         );
 

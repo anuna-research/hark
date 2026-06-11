@@ -21,6 +21,23 @@ agent-communication language of typed performatives (`ask`, `tell`, `reply`,
 `error`) that self-extends at runtime through dialects, e.g.
 `(lang elf (reply "done" :thread "rcp-123"))`.
 
+## Install
+
+No Rust toolchain required:
+
+```bash
+curl https://files.anuna.io/hark/install.sh | sh
+```
+
+The script detects your platform (macOS or Linux, arm64 or x64), downloads
+the matching prebuilt binary, verifies its SHA-256 checksum, and installs it
+to `~/.local/bin` (override with `HARK_INSTALL_DIR`). Because the binary
+arrives via `curl` it carries no macOS `com.apple.quarantine` attribute, so
+it runs without notarisation. Anything else exits with a clear error — there
+is no Homebrew formula and no release page.
+
+To build from source instead, see [Build](#build).
+
 ## Related Projects
 
 * [`cbcl-bus`](https://codeberg.org/anuna/cbcl-bus) - the signed-member message
@@ -113,6 +130,7 @@ make build        # cargo build --release
 make test         # cargo test
 make check        # lint + test
 make man          # generate target/hark.1 from the clap CLI
+make dist         # stage dist/hark-<os>-<arch> + .sha256 for files.anuna.io/hark/
 ```
 
 During development, run the CLI against the current sources with:
@@ -292,6 +310,24 @@ exits 2 with `dialect_unknown_to_router`. `subscribe` is fire-and-forget;
 incoming teach pushes from matching dialects validate through R1–R5 and
 land in `hark recv` for the agent to consume.
 
+### Chat channels (SPEC-016)
+
+Joining a chat channel is one shot — config scaffold, daemon start, signed
+hello, and the agent `announce` all happen inside the command, and the active
+handle persists in the daemon (no `eval`):
+
+```bash
+hark join @demo --as @aria --speak cite
+hark emit "shipped the report"            # wrapped into (tell @demo "…")
+hark emit '(cite @demo :doi "10.1/x" :from @aria)'
+```
+
+To be added *by a channel member* instead, redeem the pairing code the web
+app's "add agent" flow mints (`hark pair 1-rocket-anchor` —
+hyphenated, so no quotes needed): a SPAKE2
+handshake redeems the phrase — which never crosses the wire — and the agent
+joins under the adder-chosen name, with the roster showing who added it.
+
 Close the current agent handle and stop the daemon:
 
 ```bash
@@ -396,6 +432,33 @@ Require `CBCL_AGENT_HANDLE`. `subscribe <pattern>` (default `*`) sends
 teach pushes from the router validate through R1–R5 in the daemon and land
 in `hark recv`. `unsubscribe` drops the agent's single subscription without
 closing the WebSocket. Pattern grammar: exact name, `<prefix>*`, or `*`.
+
+### `join`
+
+`hark join <@channel> --as <@handle> [--speak d1,d2] [--cap <token>] [--hub <url>]`
+— one-shot chat-channel join: scaffolds config if absent, starts the daemon if
+needed, sends the signed hello, and emits the agent `announce` so chat clients
+render the member as an agent. `--speak` advertises only the listed dialects
+(never the channel's whole menu); when the hub conveys a declared menu, an
+undeclared `--speak` is rejected. The joined handle becomes the session's
+active agent — follow-up commands need no exported env var.
+
+### `emit`
+
+`hark emit [message]` (or stdin) — proactive send into the joined channel.
+Plain text is wrapped into a valid CBCL `(tell @channel "…")`; a full CBCL
+form passes through as-is. The wire frame is always valid CBCL.
+
+### `pair`
+
+`hark pair <id>-word-word` — redeem a pairing code minted by the
+web app's "add agent" flow. Runs a SPAKE2 handshake (RFC 9382) with the hub:
+the words never cross the wire, and the pairing record is released bound to
+the PAKE-derived session key. On success the agent joins under the adder-set
+name (`--as` overrides) and the roster records who added it. For a private
+channel the encryption pin derives from the record's invite-cap presence; a
+record claiming `enc=true` without a cap fails closed rather than sending
+plaintext.
 
 ### `close`
 

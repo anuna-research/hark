@@ -229,8 +229,7 @@ pub fn remove_member(
     // Authority + binding + exact-epoch freshness — identical to the
     // validator-side check (REQ-017d), so a committer can never fan a
     // Commit its peers would reject for evidence reasons.
-    if evidence.signer_handle != evidence.target_handle
-        && evidence.signer_handle != creator_handle
+    if evidence.signer_handle != evidence.target_handle && evidence.signer_handle != creator_handle
     {
         return Err(MlsError::Rejected(format!(
             "removal evidence signed by {}, who is neither the subject nor the room creator",
@@ -278,9 +277,8 @@ mod tests {
     fn mint_at(epoch: u64) -> (RemovalEvidence, [u8; 32]) {
         let id = subject();
         let key = id.verifying_key_bytes();
-        let evidence = RemovalEvidence::mint(
-            &id, "@bob", "@research", b"group-1", epoch, "@bob", 3, &key,
-        );
+        let evidence =
+            RemovalEvidence::mint(&id, "@bob", "@research", b"group-1", epoch, "@bob", 3, &key);
         (evidence, key)
     }
 
@@ -353,10 +351,8 @@ mod tests {
         }
 
         fn party(tag: &str, seed: u8, handle: &str) -> Party {
-            let dir = std::env::temp_dir().join(format!(
-                "hark-mls-rm-{tag}-{handle}-{}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("hark-mls-rm-{tag}-{handle}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             let provider = DurableProvider::open(&dir.join("agent.mls")).unwrap();

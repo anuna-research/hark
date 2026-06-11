@@ -10,10 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 
 fn setup(tag: &str, seed: u8, name: &str) -> (PathBuf, ChatIdentity) {
-    let dir = std::env::temp_dir().join(format!(
-        "hark-it-mls-{tag}-{name}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("hark-it-mls-{tag}-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     (dir, ChatIdentity::from_seed([seed; 32]))
@@ -60,7 +57,9 @@ fn two_agents_full_encrypted_channel_lifecycle() {
         panic!("presence");
     };
     assert!(
-        outbound.iter().any(|f| f == "(keyget @hub :for @bob :from @alice)"),
+        outbound
+            .iter()
+            .any(|f| f == "(keyget @hub :for @bob :from @alice)"),
         "presence prompts a keyget for the pinned, present non-member: {outbound:?}"
     );
 
@@ -161,8 +160,7 @@ fn two_agents_full_encrypted_channel_lifecycle() {
 #[test]
 fn epoch_churn_does_not_accumulate_secrets_on_disk() {
     let (dir, wire) = setup("churn", 93, "alice");
-    let mut alice =
-        MlsSession::open(&dir, "alice", "@research", "@alice", &wire, true).unwrap();
+    let mut alice = MlsSession::open(&dir, "alice", "@research", "@alice", &wire, true).unwrap();
     alice.create_group_as_creator().unwrap();
 
     // Each encrypt persists; sample the state size across heavy ratchet use.

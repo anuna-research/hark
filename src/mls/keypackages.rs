@@ -20,9 +20,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use openmls::prelude::{
-    KeyPackage, KeyPackageIn, Lifetime, ProtocolVersion, Welcome,
-};
+use openmls::prelude::{KeyPackage, KeyPackageIn, Lifetime, ProtocolVersion, Welcome};
 use openmls_traits::OpenMlsProvider;
 use tls_codec::{DeserializeBytes as _, Serialize as _};
 
@@ -264,7 +262,9 @@ mod tests {
         let (_dir, provider, _identity) = setup("malformed");
         assert!(validate_key_package_bytes(&provider, b"").is_err());
         assert!(validate_key_package_bytes(&provider, b"garbage").is_err());
-        assert!(validate_key_package_bytes(&provider, &vec![0u8; MAX_KEYPACKAGE_BYTES + 1]).is_err());
+        assert!(
+            validate_key_package_bytes(&provider, &vec![0u8; MAX_KEYPACKAGE_BYTES + 1]).is_err()
+        );
     }
 
     /// REQ-022 (TEST-022): an expired KeyPackage is rejected by the
@@ -319,7 +319,9 @@ mod tests {
     #[test]
     fn init_keys_are_durably_stored_at_build() {
         let (dir, provider, identity) = setup("initkey");
-        let before = fs::read(dir.join("agent.mls")).map(|b| b.len()).unwrap_or(0);
+        let before = fs::read(dir.join("agent.mls"))
+            .map(|b| b.len())
+            .unwrap_or(0);
         build_one_time(&provider, &identity, 1).unwrap();
         let after = fs::read(dir.join("agent.mls")).unwrap().len();
         assert!(

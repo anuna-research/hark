@@ -43,13 +43,14 @@ async fn exactly_one_of_two_agents_is_elected() {
 
     let store_a = store("resp-a");
     let store_b = store("resp-b");
-    let agent_a = create_chat_agent(
+    let (agent_a, _warnings_a) = create_chat_agent(
         store_a.clone(),
         &ws,
         "@general",
         "@resp-a",
         vec!["summarize".to_owned()],
         None,
+        None, // added_by
         window,
         liveness,
         Arc::new(ChatIdentity::from_seed([11u8; 32])),
@@ -58,13 +59,14 @@ async fn exactly_one_of_two_agents_is_elected() {
     )
     .await
     .expect("agent A joins");
-    let agent_b = create_chat_agent(
+    let (agent_b, _warnings_b) = create_chat_agent(
         store_b.clone(),
         &ws,
         "@general",
         "@resp-b",
         vec!["summarize".to_owned()],
         None,
+        None, // added_by
         window,
         liveness,
         Arc::new(ChatIdentity::from_seed([12u8; 32])),
@@ -122,9 +124,8 @@ async fn exactly_one_of_two_agents_is_elected() {
     );
 }
 
-type LiveSocket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type LiveSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Read the hub's first frame — the `(tell @client "conn-nonce" …)` bootstrap —
 /// and prime a `SignedConn` from it, as `create_chat_agent` does internally.
@@ -145,7 +146,12 @@ async fn recv_bootstrap(sock: &mut LiveSocket) -> SignedConn {
     SignedConn::from_bootstrap(&boot)
 }
 
-async fn send_signed(sock: &mut LiveSocket, conn: &mut SignedConn, identity: &ChatIdentity, text: &str) {
+async fn send_signed(
+    sock: &mut LiveSocket,
+    conn: &mut SignedConn,
+    identity: &ChatIdentity,
+    text: &str,
+) {
     let frame = conn.sign_chat_frame(identity, text.as_bytes());
     sock.send(WsMessage::Binary(frame.into()))
         .await

@@ -4,8 +4,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::Message as WsMessage,
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
 };
 
 use crate::{
@@ -85,6 +84,7 @@ pub async fn create_router_agent(
             Some(close_tx),
             Some(AgentSendChannel::new(send_tx)),
             None, // router derives its wire id from the local handle
+            None, // the router transport has no channel
         )
         .await
         .map_err(|error| RouterError::ConnectionFailed(error.to_string()))?;
@@ -241,7 +241,9 @@ async fn recv_bootstrap(ws: &mut RouterWebSocket) -> Result<SignedConn, RouterEr
         }
     };
     let boot = parse_conn_bootstrap(&text).ok_or_else(|| {
-        RouterError::ConnectionFailed(format!("first frame was not a conn-nonce bootstrap: {text}"))
+        RouterError::ConnectionFailed(format!(
+            "first frame was not a conn-nonce bootstrap: {text}"
+        ))
     })?;
     Ok(SignedConn::from_bootstrap(&boot))
 }
@@ -431,9 +433,7 @@ async fn process_inbound(
                 })
             }
         },
-        InboundClass::MetaReply => {
-            Some(crate::daemon::MetaReplyDelivery::Reply(text.clone()))
-        }
+        InboundClass::MetaReply => Some(crate::daemon::MetaReplyDelivery::Reply(text.clone())),
         _ => None,
     };
     // Meta-reply correlation: only consume frames whose shape matches the

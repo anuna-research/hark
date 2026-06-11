@@ -17,19 +17,21 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use openmls::prelude::{
-    BasicCredential, Credential, Extension, Extensions, KeyPackage, MlsGroup,
-    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn, SenderRatchetConfiguration,
-    StagedWelcome, UnknownExtension,
-};
 use openmls::group::GroupId;
+use openmls::prelude::{
+    BasicCredential, Credential, Extension, Extensions, KeyPackage, MlsGroup, MlsGroupCreateConfig,
+    MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn, SenderRatchetConfiguration, StagedWelcome,
+    UnknownExtension,
+};
 use openmls_traits::OpenMlsProvider as _;
 use tls_codec::{DeserializeBytes as _, Serialize as _};
 
 use super::keypackages::{ConsumedLedger, validate_key_package_bytes, welcome_refs};
 use super::pins::{PinStore, lp};
 use super::provider::DurableProvider;
-use super::{CIPHERSUITE, DS_MLS_GENESIS, GENESIS_EXT_TYPE, MlsError, MlsIdentity, genesis_capabilities};
+use super::{
+    CIPHERSUITE, DS_MLS_GENESIS, GENESIS_EXT_TYPE, MlsError, MlsIdentity, genesis_capabilities,
+};
 use crate::chat_frame::FrameSigner;
 
 /// NFR-004 retention knobs, applied to every group this module creates or
@@ -675,10 +677,7 @@ mod tests {
         // Tie on handle → key tie-breaker.
         let dup1 = ("@x".to_string(), vec![2u8; 32]);
         let dup2 = ("@x".to_string(), vec![1u8; 32]);
-        assert_eq!(
-            elect_owner(&[dup1.clone(), dup2.clone()]),
-            Some(dup2),
-        );
+        assert_eq!(elect_owner(&[dup1.clone(), dup2.clone()]), Some(dup2),);
     }
 
     /// K-2 (REQ-016): a default-capability creator of a genesis-bearing
@@ -710,8 +709,7 @@ mod tests {
 
         // And the supported path always passes the guard.
         let ok = party("k2ok", 29, "@alice");
-        let (group, _genesis) =
-            create_group(&ok.provider, &ok.identity, "@research").unwrap();
+        let (group, _genesis) = create_group(&ok.provider, &ok.identity, "@research").unwrap();
         assert_creator_capability(&group).unwrap();
         let _ = fs::remove_dir_all(&omitted.dir);
         let _ = fs::remove_dir_all(&ok.dir);
@@ -770,10 +768,9 @@ mod tests {
         // DURABLE ledger (regression: this loop was previously dead, leaving
         // the single-use ledger permanently empty). Reopen it to prove it
         // persisted, and that a replayed Welcome to that ref is now rejected.
-        let ledger = super::super::keypackages::ConsumedLedger::open(
-            &bob.dir.join("agent.kpledger"),
-        )
-        .unwrap();
+        let ledger =
+            super::super::keypackages::ConsumedLedger::open(&bob.dir.join("agent.kpledger"))
+                .unwrap();
         assert!(
             bob.dir.join("agent.kpledger").exists(),
             "join must persist the consumed-ref ledger"
@@ -787,7 +784,10 @@ mod tests {
             &mut { ledger },
             None,
         );
-        assert!(replay.is_err(), "a replayed Welcome to a consumed ref is rejected (REQ-013)");
+        assert!(
+            replay.is_err(),
+            "a replayed Welcome to a consumed ref is rejected (REQ-013)"
+        );
 
         // Integrity guard: the owner refuses to add @bob a second time (an
         // unsolicited/replayed keypkg for an existing member must not seat a
@@ -1053,9 +1053,7 @@ mod tests {
         .unwrap();
         assert_eq!(joined.trust, GenesisTrust::TofuRequiresSafetyNumber);
         assert!(
-            joined
-                .first_contact_handles
-                .contains(&"@alice".to_string()),
+            joined.first_contact_handles.contains(&"@alice".to_string()),
             "alice was first contact for bob"
         );
         // Bob TOFU-pinned alice from the validated tree.

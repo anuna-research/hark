@@ -27,8 +27,8 @@ use crate::{
     config::{AppConfig, ConfigError, Transport, validate_chat_handle},
     constants::{COMMAND_NAME, LOCAL_API_VERSION, MAX_RECV_TIMEOUT_MS},
     daemon::{
-        AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord,
-        MetaReplyDelivery, MetaReplyExpectation, authenticated_headers,
+        AgentError, AgentHandle, AgentStore, AgentStoreConfig, DiscoveryRecord, MetaReplyDelivery,
+        MetaReplyExpectation, authenticated_headers,
     },
     identity::ChatIdentity,
     router::{RouterError, create_router_agent},
@@ -106,7 +106,6 @@ pub struct SendResponse {
     pub agent_handle: String,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MetaSubscribeRequest {
     pub pattern: String,
@@ -180,6 +179,11 @@ pub struct CreateAgentRequest {
     /// (the hub's `:cap`). Omit for public channels. Ignored by the router.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<String>,
+    /// Chat transport only: the member who added this agent (SPEC-016 REQ-010),
+    /// carried on the agent's `announce` so the roster shows the provenance.
+    /// Set by `hark pair` from the released record; `None` for a plain join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<String>,
     /// Chat transport only: bootstrap the channel's MLS group as the room
     /// creator after joining (SPEC-013 REQ-016 operator intent). Only acts on
     /// a pinned-encrypted channel. Ignored by the router.
@@ -193,12 +197,21 @@ pub struct CreateAgentResponse {
     pub router_agent_id: String,
     pub dialects: Vec<String>,
     pub state: String,
+    /// Non-fatal join caveats for the operator (e.g. the channel declares no
+    /// dialect menu, or chosen definitions are not yet acquirable by digest).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentsResponse {
     pub daemon: DaemonStatus,
     pub agents: Vec<AgentStatus>,
+    /// The session's active handle (REQ-003, SPEC-016): the most recently
+    /// created, still-open agent. CLI commands fall back to it when
+    /// `CBCL_AGENT_HANDLE` is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -220,6 +233,9 @@ pub struct AgentStatus {
     pub unhealthy_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unhealthy_detail: Option<String>,
+    /// The chat channel the agent joined; absent on the router transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -441,10 +457,7 @@ impl LocalApiClient {
     ) -> Result<MetaAckResponse, LocalApiRequestError> {
         let response = self
             .http
-            .post(self.url(&format!(
-                "/v1/agents/{}/meta/subscribe",
-                handle.as_str()
-            )))
+            .post(self.url(&format!("/v1/agents/{}/meta/subscribe", handle.as_str())))
             .header(AUTHORIZATION, self.auth_header.clone())
             .json(request)
             .send()
@@ -459,10 +472,7 @@ impl LocalApiClient {
     ) -> Result<MetaAckResponse, LocalApiRequestError> {
         let response = self
             .http
-            .post(self.url(&format!(
-                "/v1/agents/{}/meta/unsubscribe",
-                handle.as_str()
-            )))
+            .post(self.url(&format!("/v1/agents/{}/meta/unsubscribe", handle.as_str())))
             .header(AUTHORIZATION, self.auth_header.clone())
             .send()
             .await
@@ -477,10 +487,7 @@ impl LocalApiClient {
     ) -> Result<MetaPublishResponse, LocalApiRequestError> {
         let response = self
             .http
-            .post(self.url(&format!(
-                "/v1/agents/{}/meta/publish",
-                handle.as_str()
-            )))
+            .post(self.url(&format!("/v1/agents/{}/meta/publish", handle.as_str())))
             .header(AUTHORIZATION, self.auth_header.clone())
             .json(request)
             .send()
@@ -663,10 +670,7 @@ fn router(state: AppState) -> Router {
         .route("/v1/agents", get(agents).post(create_agent))
         .route("/v1/agents/{handle}/recv", get(recv))
         .route("/v1/agents/{handle}/send", post(send))
-        .route(
-            "/v1/agents/{handle}/meta/subscribe",
-            post(meta_subscribe),
-        )
+        .route("/v1/agents/{handle}/meta/subscribe", post(meta_subscribe))
         .route(
             "/v1/agents/{handle}/meta/unsubscribe",
             post(meta_unsubscribe),
@@ -747,6 +751,7 @@ async fn create_router_transport_agent(
         router_agent_id: created.router_agent_id,
         dialects: created.dialects,
         state: "connected".to_owned(),
+        warnings: Vec::new(),
     }))
 }
 
@@ -830,13 +835,14 @@ async fn create_chat_transport_agent(
             None,
         )
     })?;
-    let handle = create_chat_agent(
+    let (handle, warnings) = create_chat_agent(
         state.agents.clone(),
         &chat.ws_url,
         &channel,
         wire_handle,
         request.dialects,
         request.cap.clone(),
+        request.added_by.clone(),
         chat.claim_window,
         chat.liveness_timeout,
         std::sync::Arc::new(identity),
@@ -851,6 +857,7 @@ async fn create_chat_transport_agent(
         router_agent_id: wire_handle.to_owned(),
         dialects,
         state: "connected".to_owned(),
+        warnings,
     }))
 }
 
@@ -904,7 +911,11 @@ async fn auto_install_advertised_dialects(
             )
             .await;
         match outcome {
-            Ok(MetaReplyDelivery::PushInstalled { name: installed, digest, .. }) => {
+            Ok(MetaReplyDelivery::PushInstalled {
+                name: installed,
+                digest,
+                ..
+            }) => {
                 tracing::info!(
                     target: "hark::auto_install",
                     handle = handle.as_str(),
@@ -974,8 +985,14 @@ async fn agents(
             queued_bytes: snapshot.queued_bytes,
             unhealthy_reason: snapshot.unhealthy_reason,
             unhealthy_detail: snapshot.unhealthy_detail,
+            channel: snapshot.channel,
         })
         .collect();
+    let active_agent_handle = state
+        .agents
+        .active_handle()
+        .await
+        .map(|handle| handle.as_str().to_owned());
     Ok(Json(AgentsResponse {
         daemon: DaemonStatus {
             pid: state.record.pid,
@@ -984,6 +1001,7 @@ async fn agents(
             api_version: state.record.api_version,
         },
         agents,
+        active_agent_handle,
     }))
 }
 
@@ -1208,7 +1226,12 @@ async fn meta_publish(
     let frame = crate::router::build_meta_teach_frame(define);
     let delivery = state
         .agents
-        .send_meta_and_await(&handle, frame, MetaReplyExpectation::Reply, META_REPLY_TIMEOUT)
+        .send_meta_and_await(
+            &handle,
+            frame,
+            MetaReplyExpectation::Reply,
+            META_REPLY_TIMEOUT,
+        )
         .await
         .map_err(agent_error_to_api)?;
     let reply = match delivery {
@@ -1224,30 +1247,30 @@ async fn meta_publish(
             ));
         }
     };
-    let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
-        StatusCode::BAD_GATEWAY,
-        "meta_reply_malformed",
-        format!("router reply could not be parsed: {reason}"),
-        Some(reply.clone()),
-    ))?;
-    let digest = parsed
-        .get("digest")
-        .cloned()
-        .ok_or_else(|| ApiError::new(
+    let parsed = parse_meta_reply_params(&reply).map_err(|reason| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "meta_reply_malformed",
+            format!("router reply could not be parsed: {reason}"),
+            Some(reply.clone()),
+        )
+    })?;
+    let digest = parsed.get("digest").cloned().ok_or_else(|| {
+        ApiError::new(
             StatusCode::BAD_GATEWAY,
             "meta_reply_missing_digest",
             "router reply did not include a digest",
             Some(reply.clone()),
-        ))?;
-    let name = parsed
-        .get("name")
-        .cloned()
-        .ok_or_else(|| ApiError::new(
+        )
+    })?;
+    let name = parsed.get("name").cloned().ok_or_else(|| {
+        ApiError::new(
             StatusCode::BAD_GATEWAY,
             "meta_reply_missing_name",
             "router reply did not include a name",
             Some(reply.clone()),
-        ))?;
+        )
+    })?;
 
     // Install into the publishing handle's local dialect cache so the
     // outbound R5 pipeline (Phase B) can see the freshly-published
@@ -1355,7 +1378,12 @@ async fn meta_list(
     let frame = crate::router::build_meta_query_list_frame();
     let delivery = state
         .agents
-        .send_meta_and_await(&handle, frame, MetaReplyExpectation::Reply, META_REPLY_TIMEOUT)
+        .send_meta_and_await(
+            &handle,
+            frame,
+            MetaReplyExpectation::Reply,
+            META_REPLY_TIMEOUT,
+        )
         .await
         .map_err(agent_error_to_api)?;
     let reply = match delivery {
@@ -1369,12 +1397,14 @@ async fn meta_list(
             ));
         }
     };
-    let parsed = parse_meta_reply_params(&reply).map_err(|reason| ApiError::new(
-        StatusCode::BAD_GATEWAY,
-        "meta_reply_malformed",
-        format!("router list reply could not be parsed: {reason}"),
-        Some(reply.clone()),
-    ))?;
+    let parsed = parse_meta_reply_params(&reply).map_err(|reason| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "meta_reply_malformed",
+            format!("router list reply could not be parsed: {reason}"),
+            Some(reply.clone()),
+        )
+    })?;
     let names = parsed
         .get("names")
         .map(|joined| {
@@ -1480,7 +1510,9 @@ fn validate_define_for_publish(define: &str) -> Result<(), ApiError> {
 /// args (the recipient, the status content). Strings are unescaped for
 /// `\\` and `\"`. Best-effort: returns `Err(_)` if the frame doesn't
 /// look like a single top-level list at all.
-fn parse_meta_reply_params(text: &str) -> Result<std::collections::HashMap<String, String>, String> {
+fn parse_meta_reply_params(
+    text: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
     let bytes = text.as_bytes();
     let mut params = std::collections::HashMap::new();
     let mut i = 0;
@@ -1815,6 +1847,16 @@ fn chat_error_to_api(error: ChatError) -> ApiError {
         ChatError::Store(message) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_dialect", message, None)
         }
+        ChatError::UndeclaredDialect { dialect, declared } => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "undeclared_dialect",
+            format!("dialect {dialect} is not declared by the channel"),
+            Some(if declared.is_empty() {
+                "the channel declares no dialects".to_owned()
+            } else {
+                format!("declared dialects: {}", declared.join(", "))
+            }),
+        ),
         ChatError::DowngradeRefused(message) => ApiError::new(
             StatusCode::CONFLICT,
             "encryption_downgrade_refused",
@@ -1899,7 +1941,6 @@ fn cbcl_validation_error_to_api(error: CbclValidationError) -> ApiError {
     }
 }
 
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ApiError {
     status: StatusCode,
@@ -1931,11 +1972,7 @@ impl ApiError {
     /// error body surfaces what the spec advertises for
     /// `shape_violation` and `causal_violation`. Either side may be
     /// `None` when the pipeline couldn't extract it.
-    fn with_blame(
-        mut self,
-        performative: Option<String>,
-        thread: Option<String>,
-    ) -> Self {
+    fn with_blame(mut self, performative: Option<String>, thread: Option<String>) -> Self {
         self.performative = performative;
         self.thread = thread;
         self
@@ -2069,6 +2106,7 @@ mod tests {
                     api_version: server.record.api_version,
                 },
                 agents: Vec::new(),
+                active_agent_handle: None,
             }
         );
 

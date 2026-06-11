@@ -74,18 +74,31 @@ pub struct Responder {
     my_handle: String,
     channel: String,
     capability: HashSet<String>,
+    /// The channel's declared dialect names (SPEC-016 REQ-009): `None` when
+    /// the hub conveyed no menu (legacy — scope is the repertoire alone);
+    /// `Some` scopes responses to declared ∩ repertoire, so `Some([])` is an
+    /// empty response scope.
+    declared: Option<HashSet<String>>,
     selector: RendezvousHash,
     asks: HashMap<String, AskState>,
 }
 
 impl Responder {
     /// `capability` is the agent's advertised dialect set (REQ-002): it answers
-    /// `(lang <dialect> …)`-wrapped asks whose dialect is in this set.
-    pub fn new(my_handle: String, channel: String, capability: Vec<String>) -> Self {
+    /// `(lang <dialect> …)`-wrapped asks whose dialect is in this set —
+    /// intersected with the channel's `declared` menu when one was conveyed
+    /// (SPEC-016 REQ-009).
+    pub fn new(
+        my_handle: String,
+        channel: String,
+        capability: Vec<String>,
+        declared: Option<Vec<String>>,
+    ) -> Self {
         Self {
             my_handle,
             channel,
             capability: capability.into_iter().collect(),
+            declared: declared.map(|names| names.into_iter().collect()),
             selector: RendezvousHash,
             asks: HashMap::new(),
         }
@@ -146,6 +159,13 @@ impl Responder {
         };
         if !self.capability.contains(dialect) {
             return vec![]; // a dialect we have not learned: drop (REQ-002)
+        }
+        // SPEC-016 REQ-009: in a channel with a declared menu, respond only
+        // within declared ∩ repertoire; an empty declared set answers nothing.
+        if let Some(declared) = &self.declared {
+            if !declared.contains(dialect) {
+                return vec![];
+            }
         }
         // Addressing lives on the innermost Simple message (cbcl-rs model). The
         // sender is the cbcl-chat `:from` convention (a param, not `sender`).
@@ -273,7 +293,44 @@ mod tests {
             "@me".to_owned(),
             "@general".to_owned(),
             vec!["summarize".to_owned()],
+            None,
         )
+    }
+
+    #[test]
+    fn response_scope_is_declared_intersect_repertoire() {
+        // REQ-009 (SPEC-016, TEST-009): with a declared menu, the agent
+        // answers only asks in declared ∩ repertoire.
+        let mut r = Responder::new(
+            "@me".to_owned(),
+            "@general".to_owned(),
+            vec!["summarize".to_owned(), "cite-check".to_owned()],
+            Some(vec!["summarize".to_owned(), "translate".to_owned()]),
+        );
+        // declared ∩ repertoire → claim.
+        assert_eq!(r.on_inbound(&ask("t1", "@asker")).len(), 1);
+        // in repertoire but NOT declared → dropped.
+        assert!(
+            r.on_inbound("(lang cite-check (ask @general \"q\" :from @x :thread \"t2\"))")
+                .is_empty()
+        );
+        // declared but NOT in repertoire → dropped (unchanged REQ-002).
+        assert!(
+            r.on_inbound("(lang translate (ask @general \"q\" :from @x :thread \"t3\"))")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn empty_declared_set_means_empty_response_scope() {
+        let mut r = Responder::new(
+            "@me".to_owned(),
+            "@general".to_owned(),
+            vec!["summarize".to_owned()],
+            Some(vec![]),
+        );
+        assert!(r.on_inbound(&ask("t1", "@asker")).is_empty());
+        assert_eq!(r.tracked(), 0);
     }
 
     fn ask(thread: &str, from: &str) -> String {
@@ -348,11 +405,13 @@ mod tests {
             "@a".to_owned(),
             "@g".to_owned(),
             vec!["summarize".to_owned()],
+            None,
         );
         let mut b = Responder::new(
             "@b".to_owned(),
             "@g".to_owned(),
             vec!["summarize".to_owned()],
+            None,
         );
         a.on_inbound(payload);
         b.on_inbound(payload);

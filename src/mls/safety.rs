@@ -164,15 +164,15 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        assert!(safety_numbers_match(
-            &formatted,
-            &expected_hex
-        ));
+        assert!(safety_numbers_match(&formatted, &expected_hex));
         // Display shape: 8 space-separated groups of 8 lowercase hex chars.
         let groups: Vec<&str> = formatted.split(' ').collect();
         assert_eq!(groups.len(), 8);
-        assert!(groups.iter().all(|g| g.len() == 8
-            && g.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())));
+        assert!(groups.iter().all(|g| {
+            g.len() == 8
+                && g.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        }));
     }
 
     /// Comparison ignores spaces and case.
@@ -217,11 +217,11 @@ mod tests {
     #[test]
     fn live_group_stability_and_flip() {
         use crate::identity::ChatIdentity;
+        use crate::mls::MlsIdentity;
         use crate::mls::group::{add_member, create_group};
         use crate::mls::keypackages::{ConsumedLedger, build_one_time};
         use crate::mls::pins::PinStore;
         use crate::mls::provider::DurableProvider;
-        use crate::mls::MlsIdentity;
         use openmls::prelude::LeafNodeParameters;
         use std::fs;
 
@@ -261,7 +261,13 @@ mod tests {
         // Membership change: identity number flips.
         let kp = build_one_time(&b_provider, &b_id, 1).unwrap().remove(0);
         add_member(
-            &a_provider, &a_id, &mut group, &kp.bytes, "@bob", &a_pins, &a_ledger,
+            &a_provider,
+            &a_id,
+            &mut group,
+            &kp.bytes,
+            "@bob",
+            &a_pins,
+            &a_ledger,
         )
         .unwrap();
         let after_add = group_safety_numbers(&group).unwrap();
