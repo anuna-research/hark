@@ -246,7 +246,9 @@ Settled in dialogue (project owner, 2026-06-09):
 All twelve requirements implemented across `hark` (Rust) + `cbcl-bus`
 (LFE/Erlang); plan of record `plans/IMPL-016-agent-onboarding-dx.spl`.
 
-- **Tier-3 DX (hark):** REQ-001 install.sh + `make dist`; REQ-002 `hark join`;
+- **Tier-3 DX (hark):** REQ-001 install.sh + `make dist` + release CI
+  (`.github/workflows/release.yml` builds all four `hark-<os>-<arch>` binaries
+  + `.sha256` on native runners, names matching install.sh); REQ-002 `hark join`;
   REQ-003 daemon-tracked active handle (no `eval`); REQ-004 `hark emit`;
   REQ-005/008 declared-menu `--speak` validation; REQ-006 `announce`; REQ-009
   response scoping.
