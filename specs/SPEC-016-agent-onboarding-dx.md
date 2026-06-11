@@ -269,6 +269,16 @@ All twelve requirements implemented across `hark` (Rust) + `cbcl-bus`
   adder; the agent's `announce` carries `:added-by` so every roster shows it;
   `removeagent` is authorized only against the recorded adder and **evicts the
   agent from the live roster** (`cbcl-chat-room:evict`).
+- **Control dialect learned from the hub (no baked copy):** the hub's control
+  performatives (`announce`/`addagent`/`paircode`/… + the folded-in room/MLS
+  verbs) are a real CBCL dialect. Rather than ship a copy that drifts, the hub
+  **teaches** it: every join leads with a `(meta (define hub …))` advertisement
+  (CBCL's native dialect-distribution path), built from the hub's canonical
+  `priv/dialects/hub.cbcl` (`cbcl-chat-dialects:hub-meta-frame`). hark learns it
+  via the Meta → `InstallDialect` mechanism (`hub_dialect::learn_hub_dialect`)
+  and validates its own `announce` against the grammar the hub actually
+  declared. A legacy hub that teaches nothing degrades to a surfaced warning
+  (announce still emitted). Verified end-to-end against the live hub.
 - **Condition J:** signed off; J-a (`ct-equal?` fix) and J-b (negative tests)
   implemented.
 - **NFRs measured:** the one-shot `hark join` against a real local WS hub
