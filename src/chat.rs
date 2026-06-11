@@ -323,7 +323,11 @@ fn build_announce_frame(
     let added = added_by
         .map(|adder| format!(" :added-by {adder}"))
         .unwrap_or_default();
-    format!("(announce {channel} :agent {agent_handle} :dialects ({list}){added})")
+    // `:from` identifies the signed-member sender — the hub's dispatch requires
+    // it (and verifies the frame signature against it) or the frame is rejected
+    // as `missing-from` and never fanned. `:agent` is what chat clients key the
+    // agent rendering off; both are the agent's own handle.
+    format!("(announce {channel} :from {agent_handle} :agent {agent_handle} :dialects ({list}){added})")
 }
 
 /// Receive + parse the chat hub's conn-nonce bootstrap (its first frame:
@@ -640,17 +644,17 @@ mod tests {
     fn builds_announce_frame_with_channel_audience_and_dialects() {
         assert_eq!(
             build_announce_frame("@demo", "@aria", &["cite".to_owned(), "vote".to_owned()], None),
-            r#"(announce @demo :agent @aria :dialects ("cite" "vote"))"#
+            r#"(announce @demo :from @aria :agent @aria :dialects ("cite" "vote"))"#
         );
         // Advertising nothing is still a legible agent (HP-2 + REQ-006).
         assert_eq!(
             build_announce_frame("@demo", "@aria", &[], None),
-            "(announce @demo :agent @aria :dialects ())"
+            "(announce @demo :from @aria :agent @aria :dialects ())"
         );
         // A paired agent carries its adder (REQ-010).
         assert_eq!(
             build_announce_frame("@demo", "@aria", &["cite".to_owned()], Some("@mira")),
-            r#"(announce @demo :agent @aria :dialects ("cite") :added-by @mira)"#
+            r#"(announce @demo :from @aria :agent @aria :dialects ("cite") :added-by @mira)"#
         );
     }
 
