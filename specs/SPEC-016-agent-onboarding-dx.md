@@ -269,6 +269,14 @@ All twelve requirements implemented across `hark` (Rust) + `cbcl-bus`
   agent from the live roster** (`cbcl-chat-room:evict`).
 - **Condition J:** signed off; J-a (`ct-equal?` fix) and J-b (negative tests)
   implemented.
+- **NFRs measured:** the one-shot `hark join` against a real local WS hub
+  (full config-scaffold → daemon-spawn → signed hello → ack) is a **single
+  command** completing in **~1.0 s** (NFR-001: ≤ 3 commands, ≤ 60 s), with the
+  hub-ack → success-report feedback at **~3 ms** (NFR-003: ≤ 400 ms Doherty) —
+  asserted as a budget regression guard by `nfr_time_to_agent_and_feedback_within_budget`
+  in `tests/join_cli.rs`. The SPAKE2 handshake algebra + the no-false-accept
+  security property are property-tested over arbitrary verifiers/ephemerals
+  (`src/pairing/spake2.rs::proptests`), beyond the single cross-stack KAT.
 
 **Documented follow-ons (dependent on other work, surfaced not faked):** the
 REQ-005 acquisition-by-digest leg waits on the hub's SPEC-015 `roomcfg` dialect

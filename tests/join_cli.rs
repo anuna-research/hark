@@ -60,6 +60,71 @@ fn cli_join_scaffolds_config_starts_daemon_and_joins() {
     runtime.block_on(hub.wait());
 }
 
+/// SPEC-016 NFR-001 (time-to-agent) + NFR-003 (Doherty feedback), measured.
+///
+/// HP-2 puts an agent into a public channel in a SINGLE command (`hark join`),
+/// so the command budget is 1 (≤ 3). We wall-clock the whole one-shot against a
+/// real local WS hub (full config-scaffold → daemon-spawn → signed hello → ack
+/// path) and assert it lands inside the 60 s budget. We separately clock the
+/// hub's ack → the foreground reporting success: a conservative upper bound on
+/// the Doherty feedback latency (it also includes the post-ack announce and the
+/// foreground's confirmation poll), asserted within 400 ms.
+///
+/// This is a budget *regression guard*, not behaviour discovery — it is
+/// expected to pass on first run; it fails if onboarding ever regresses past
+/// the spec's interactivity envelope. Run with `--nocapture` to see the
+/// measured numbers.
+#[test]
+fn nfr_time_to_agent_and_feedback_within_budget() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+    let hub = runtime.block_on(MockChatHub::start("@demo"));
+    let env = TestEnv::new();
+
+    // NFR-001: the number of commands to get the agent into the channel.
+    let command_count = 1; // just `hark join`
+    let started = std::time::Instant::now();
+    let join = env
+        .command(["join", "@demo", "--as", "@aria", "--hub", &hub.ws_url()])
+        .output()
+        .expect("join runs");
+    let returned = std::time::Instant::now();
+    assert_success(&join);
+
+    let total = returned - started;
+    let feedback = hub
+        .ack_at()
+        .map(|ack| returned.saturating_duration_since(ack));
+
+    eprintln!(
+        "NFR-001 time-to-agent: {command_count} command(s), {:.3}s total",
+        total.as_secs_f64()
+    );
+    if let Some(feedback) = feedback {
+        eprintln!(
+            "NFR-003 Doherty feedback (ack→report, conservative): {}ms",
+            feedback.as_millis()
+        );
+    }
+
+    // NFR-001: ≤ 3 commands and ≤ 60 s.
+    assert!(command_count <= 3, "command budget: {command_count} > 3");
+    assert!(
+        total < Duration::from_secs(60),
+        "time-to-agent {:.3}s exceeds the 60s budget",
+        total.as_secs_f64()
+    );
+    // NFR-003: report success within 400 ms of the hub's ack.
+    let feedback = feedback.expect("the hub acknowledged the join");
+    assert!(
+        feedback < Duration::from_millis(400),
+        "feedback latency {}ms exceeds the 400ms Doherty budget",
+        feedback.as_millis()
+    );
+
+    assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
+    runtime.block_on(hub.wait());
+}
+
 #[test]
 fn cli_join_announces_itself_as_an_agent() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
@@ -208,6 +273,9 @@ struct MockChatHub {
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
     hello: Arc<Mutex<Option<String>>>,
     received: Arc<Mutex<Vec<String>>>,
+    /// When the hub sent the join ack (roomcfg) — the zero-point for the
+    /// NFR-003 (Doherty) feedback-latency measurement.
+    ack_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl MockChatHub {
@@ -224,6 +292,8 @@ impl MockChatHub {
         let hello_writer = hello.clone();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_writer = received.clone();
+        let ack_at = Arc::new(Mutex::new(None));
+        let ack_writer = ack_at.clone();
         let roomcfg = roomcfg.to_owned();
         let task = tokio::spawn(async move {
             let Ok((stream, _peer)) = listener.accept().await else {
@@ -245,7 +315,9 @@ impl MockChatHub {
                 };
                 *hello_writer.lock().expect("hello should lock") = Some(text);
             }
-            // Acknowledge the join.
+            // Acknowledge the join (timestamp it for the Doherty measurement).
+            *ack_writer.lock().expect("ack should lock") =
+                Some(std::time::Instant::now());
             let _ = websocket
                 .send(Message::Text(roomcfg.into()))
                 .await;
@@ -273,11 +345,17 @@ impl MockChatHub {
             task: Arc::new(Mutex::new(Some(task))),
             hello,
             received,
+            ack_at,
         }
     }
 
     fn received(&self) -> Vec<String> {
         self.received.lock().expect("received should lock").clone()
+    }
+
+    /// The instant the hub acknowledged the join, if it has.
+    fn ack_at(&self) -> Option<std::time::Instant> {
+        *self.ack_at.lock().expect("ack should lock")
     }
 
     fn ws_url(&self) -> String {
