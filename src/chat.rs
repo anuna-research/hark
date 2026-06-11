@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use cbcl_core::dialect::DialectRegistry;
 use cbcl_core::sexpr::{Atom, SExpr};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
@@ -215,7 +216,7 @@ pub async fn create_chat_agent(
     // this would hand back a "joined" handle the agent is not actually a member
     // of. On rejection or timeout the websocket drops here, before any store
     // entry exists — nothing to mark unhealthy or clean up.
-    let roomcfg = await_join_ack(&mut websocket).await?;
+    let (roomcfg, learned_hub) = await_join_ack(&mut websocket).await?;
 
     // REQ-008 (SPEC-016): the advertised set must be a subset of the channel's
     // declared menu when one is conveyed. A hub that conveys no menu (today's
@@ -254,18 +255,21 @@ pub async fn create_chat_agent(
     // the join ack — a failure here is a failed join, not a silent
     // plain-member fallback.
     let announce = build_announce_frame(channel, agent_handle, &dialects, added_by.as_deref());
-    // Enforce the announce is valid CBCL against the hub dialect (the control
-    // plane is a real dialect, not bare unknown performatives) — not merely a
-    // well-formed s-expression. Catches a malformed announce locally before it
-    // ever reaches the wire.
-    {
-        let mut store = cbcl_core::store::ThreadedMessageStore::new();
-        crate::cbcl_validation::validate_for_emit(
-            &announce,
-            crate::hub_dialect::hub_registry_cached(),
-            &mut store,
-        )
-        .map_err(|error| ChatError::Hello(format!("announce is not valid CBCL: {error}")))?;
+    // Enforce the announce is valid CBCL against the hub dialect the hub *taught*
+    // us via its `(meta (define hub …))` advertisement — a real conformance check
+    // against the grammar the peer actually declared, catching a malformed
+    // announce locally before it reaches the wire. A legacy hub that teaches no
+    // dialect degrades to a surfaced warning rather than a faked pass.
+    match &learned_hub {
+        Some(registry) => {
+            let mut store = cbcl_core::store::ThreadedMessageStore::new();
+            crate::cbcl_validation::validate_for_emit(&announce, registry, &mut store)
+                .map_err(|error| ChatError::Hello(format!("announce is not valid CBCL: {error}")))?;
+        }
+        None => warnings.push(format!(
+            "hub {channel} taught no control dialect (legacy hub); \
+             announce emitted without local CBCL self-validation"
+        )),
     }
     let announce_payload = payload_bytes(&announce).map_err(ChatError::Hello)?;
     let announce_frame = conn.sign_chat_frame(identity.as_ref(), &announce_payload);
@@ -410,8 +414,15 @@ enum ClaimTimer {
 /// one is a single `(error @room "slug")` with the socket left open. We consume
 /// only the acknowledging frame and leave any backfill/presence for the receive
 /// loop to enqueue.
-async fn await_join_ack(websocket: &mut ChatSocket) -> Result<RoomCfg, ChatError> {
+async fn await_join_ack(
+    websocket: &mut ChatSocket,
+) -> Result<(RoomCfg, Option<DialectRegistry>), ChatError> {
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+    // The hub leads the join with a `(meta (define hub …))` advertising its
+    // control dialect (SPEC-016): we learn it here, before the verdict, so the
+    // agent can validate its own control-plane frames against the grammar the
+    // hub actually declared — no baked copy.
+    let mut learned_hub: Option<DialectRegistry> = None;
     loop {
         let message = match tokio::time::timeout_at(deadline, websocket.next()).await {
             Err(_elapsed) => return Err(ChatError::JoinTimeout(JOIN_TIMEOUT)),
@@ -446,13 +457,27 @@ async fn await_join_ack(websocket: &mut ChatSocket) -> Result<RoomCfg, ChatError
             // A roomcfg carries the channel's config (enc + declared dialect
             // menu, SPEC-015 CON-001); a presence-first ack conveys neither.
             Some("roomcfg") => {
-                return Ok(parse_roomcfg(&text).unwrap_or_else(RoomCfg::absent));
+                let roomcfg = parse_roomcfg(&text).unwrap_or_else(RoomCfg::absent);
+                return Ok((roomcfg, learned_hub));
             }
-            Some("presence") => return Ok(RoomCfg::absent()),
+            Some("presence") => return Ok((RoomCfg::absent(), learned_hub)),
             Some("error") => {
                 return Err(ChatError::JoinRejected(
                     error_slug(&text).unwrap_or_else(|| "unknown".to_owned()),
                 ));
+            }
+            // The hub's control-dialect advertisement: learn it (the language's
+            // native `(meta (define …))` path) and keep waiting for the verdict.
+            // A malformed advertisement is non-fatal — the join still proceeds;
+            // the announce self-check degrades to a surfaced warning.
+            Some("meta") => {
+                match crate::hub_dialect::learn_hub_dialect(&text) {
+                    Ok(registry) => learned_hub = Some(registry),
+                    Err(error) => {
+                        tracing::warn!("could not learn the hub dialect: {error}");
+                    }
+                }
+                continue;
             }
             // Any other frame (e.g. backfill arriving before the leading roomcfg
             // on some hub ordering) is not a verdict — keep waiting.

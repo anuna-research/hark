@@ -9,35 +9,48 @@
 //! `UnknownPerformative`). Registering this dialect makes them resolve — a bare
 //! `(announce …)` becomes valid CBCL while dispatch stays by-name.
 //!
-//! The control plane is implicit in every channel, so this is a built-in the
-//! agent always carries (like the base dialect), not a channel-declared one.
-//! The definition mirrors the hub's canonical
-//! `apps/cbcl_chat/priv/dialects/hub.cbcl`.
+//! The control plane is implicit in every channel. Rather than bake a copy of
+//! the grammar (which drifts against the hub's canonical
+//! `apps/cbcl_chat/priv/dialects/hub.cbcl`), the agent **learns** it from the
+//! hub: the hub leads each join with a `(meta (define hub …))` advertisement,
+//! and [`learn_hub_dialect`] installs it — CBCL's native dialect-distribution
+//! path. The grammar is single-sourced at the hub; hark holds no copy.
 
 use cbcl_core::dialect::DialectRegistry;
-use std::sync::OnceLock;
+use cbcl_core::message::Message;
 
-/// The canonical hub-dialect definition (mirrors the hub's `hub.cbcl`).
-pub const HUB_DIALECT_SRC: &str = include_str!("dialects/hub.cbcl");
-
-/// The process-wide hub-dialect registry (parsed once). Use this to validate
-/// control-plane frames as valid CBCL.
-pub fn hub_registry_cached() -> &'static DialectRegistry {
-    static REGISTRY: OnceLock<DialectRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(hub_registry)
+/// Why hark could not learn the hub dialect from a frame.
+#[derive(Debug, thiserror::Error)]
+pub enum HubDialectError {
+    #[error("frame is not well-formed CBCL: {0}")]
+    Parse(String),
+    #[error("frame is not a (meta …) dialect-definition message")]
+    NotMeta,
+    #[error("the meta message does not carry a valid dialect: {0}")]
+    Dialect(String),
+    #[error("the learned dialect does not install (R1–R3/R5): {0}")]
+    Install(String),
 }
 
-/// A registry carrying the base dialect plus the hub control-plane dialect, so
-/// the chat control performatives resolve as valid CBCL.
-pub fn hub_registry() -> DialectRegistry {
+/// Learn the hub control dialect from the `(meta (define hub …))` message the
+/// hub sends over the wire — CBCL's native dialect-distribution path (a Meta
+/// message carries a dialect definition; the evaluator turns it into an
+/// `InstallDialect` effect). Returns a registry carrying the base dialect plus
+/// the learned hub dialect, so the agent validates its control-plane frames
+/// against the grammar the hub *actually* declared — no baked copy to drift.
+pub fn learn_hub_dialect(meta_frame: &str) -> Result<DialectRegistry, HubDialectError> {
+    let sexpr = cbcl_parser::parse(meta_frame).map_err(|e| HubDialectError::Parse(e.to_string()))?;
+    let message = cbcl_parser::parse_message(&sexpr).map_err(HubDialectError::Parse)?;
+    let Message::Meta { dialect_def } = message else {
+        return Err(HubDialectError::NotMeta);
+    };
+    let dialect = cbcl_parser::dialect_parser::parse_dialect(&dialect_def)
+        .map_err(HubDialectError::Dialect)?;
     let mut registry = DialectRegistry::new();
-    let sexpr = cbcl_parser::parser::parse(HUB_DIALECT_SRC).expect("hub.cbcl is well-formed");
-    let dialect =
-        cbcl_parser::dialect_parser::parse_dialect(&sexpr).expect("hub.cbcl is a valid dialect");
     registry
         .install(dialect)
-        .expect("the hub dialect installs (R1–R3/R5)");
-    registry
+        .map_err(|e| HubDialectError::Install(format!("{e:?}")))?;
+    Ok(registry)
 }
 
 #[cfg(test)]
@@ -46,11 +59,52 @@ mod tests {
     use crate::cbcl_validation::validate_for_emit;
     use cbcl_core::store::ThreadedMessageStore;
 
-    /// With the hub dialect registered, every control-plane frame is valid CBCL
+    /// The canonical hub dialect, as a *test fixture* only — the runtime no
+    /// longer carries it; it learns the grammar from the hub's meta frame. Used
+    /// here to synthesise a representative `(meta (define hub …))` the way the
+    /// hub sends it.
+    const HUB_DIALECT_FIXTURE: &str = include_str!("dialects/hub.cbcl");
+
+    /// The registry the agent ends up with after learning from the hub's
+    /// advertisement — synthesised the way the hub sends it: the fixture grammar
+    /// wrapped in a `(meta …)` and run through the real [`learn_hub_dialect`].
+    fn learned_registry() -> DialectRegistry {
+        let meta_frame = format!("(meta {})", HUB_DIALECT_FIXTURE.trim());
+        learn_hub_dialect(&meta_frame).expect("hark learns the hub dialect from the meta frame")
+    }
+
+    /// hark learns the hub control dialect from the CBCL Meta message the hub
+    /// sends (`(meta (define hub …))`) — the language-native dialect-distribution
+    /// path — and a control-plane frame then validates against that *learned*
+    /// grammar, with no baked copy.
+    #[test]
+    fn learns_the_hub_dialect_from_a_meta_define_frame() {
+        let registry = learned_registry();
+        let mut store = ThreadedMessageStore::new();
+        assert!(
+            validate_for_emit(
+                r#"(announce @general :from @aria :agent @aria :dialects ("cite") :added-by @mira)"#,
+                &registry,
+                &mut store,
+            )
+            .is_ok(),
+            "the announce should validate against the learned hub grammar"
+        );
+    }
+
+    /// A frame that is not a `(meta …)` dialect-definition is rejected — hark
+    /// only learns from an actual Meta message, never from arbitrary traffic.
+    #[test]
+    fn rejects_a_frame_that_is_not_a_meta_define() {
+        assert!(learn_hub_dialect(r#"(tell @aria "hi" :from @mira)"#).is_err());
+        assert!(learn_hub_dialect("not cbcl at all (((").is_err());
+    }
+
+    /// With the *learned* hub dialect, every control-plane frame is valid CBCL
     /// (resolves + passes the pipeline) — not merely a well-formed s-expression.
     #[test]
     fn hub_dialect_makes_control_frames_valid_cbcl() {
-        let registry = hub_registry();
+        let registry = learned_registry();
         let frames = [
             // SPEC-016 pairing + legibility
             r#"(announce @general :from @aria :agent @aria :dialects ("cite") :added-by @mira)"#,

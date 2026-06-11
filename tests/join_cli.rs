@@ -125,6 +125,76 @@ fn nfr_time_to_agent_and_feedback_within_budget() {
     runtime.block_on(hub.wait());
 }
 
+/// SPEC-016: the agent learns the hub control dialect from the hub's
+/// `(meta (define hub …))` advertisement (no baked copy) and validates its own
+/// announce against that learned grammar. A teaching hub ⇒ no "taught no
+/// control dialect" warning; a legacy hub that teaches none ⇒ the warning, and
+/// the announce is still emitted (degrade, not fail).
+#[test]
+fn cli_join_learns_the_hub_dialect_from_the_meta_advertisement() {
+    // The canonical grammar, wrapped as the hub sends it.
+    let meta = format!("(meta {})", include_str!("../src/dialects/hub.cbcl").trim());
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+    let hub = runtime.block_on(MockChatHub::start_teaching(
+        "(roomcfg @demo :enc false)",
+        &meta,
+    ));
+    let env = TestEnv::new();
+
+    let join = env
+        .command(["join", "@demo", "--as", "@aria", "--hub", &hub.ws_url()])
+        .output()
+        .expect("join runs");
+    assert_success(&join);
+    let stderr = String::from_utf8_lossy(&join.stderr);
+    assert!(
+        !stderr.contains("taught no control dialect"),
+        "should have learned the dialect, not warned: {}",
+        output_debug(&join)
+    );
+
+    // The announce is still emitted — now validated against the learned grammar.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if hub.received().iter().any(|f| f.contains("(announce ")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hub never received an announce; got {:?}",
+            hub.received()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
+    runtime.block_on(hub.wait());
+}
+
+/// The counterpart: a legacy hub that teaches no control dialect warns
+/// explicitly (never silently) and still completes the join.
+#[test]
+fn cli_join_warns_when_hub_teaches_no_control_dialect() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+    let hub = runtime.block_on(MockChatHub::start("@demo")); // no meta advertisement
+    let env = TestEnv::new();
+
+    let join = env
+        .command(["join", "@demo", "--as", "@aria", "--hub", &hub.ws_url()])
+        .output()
+        .expect("join runs");
+    assert_success(&join);
+    assert!(
+        String::from_utf8_lossy(&join.stderr).contains("taught no control dialect"),
+        "{}",
+        output_debug(&join)
+    );
+
+    assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
+    runtime.block_on(hub.wait());
+}
+
 #[test]
 fn cli_join_announces_itself_as_an_agent() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
@@ -284,6 +354,17 @@ impl MockChatHub {
     }
 
     async fn start_with_roomcfg(roomcfg: &str) -> Self {
+        Self::start_full(roomcfg, None).await
+    }
+
+    /// A hub that leads the join with a `(meta (define hub …))` advertising its
+    /// control dialect (SPEC-016), exactly as the real hub does — so the agent
+    /// learns the grammar from the wire.
+    async fn start_teaching(roomcfg: &str, meta: &str) -> Self {
+        Self::start_full(roomcfg, Some(meta.to_owned())).await
+    }
+
+    async fn start_full(roomcfg: &str, meta: Option<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("hub should bind");
@@ -314,6 +395,11 @@ impl MockChatHub {
                     _ => String::new(),
                 };
                 *hello_writer.lock().expect("hello should lock") = Some(text);
+            }
+            // Lead with the control-dialect advertisement, before the ack, so
+            // the agent learns the grammar before it validates its announce.
+            if let Some(meta) = meta {
+                let _ = websocket.send(Message::Text(meta.into())).await;
             }
             // Acknowledge the join (timestamp it for the Doherty measurement).
             *ack_writer.lock().expect("ack should lock") =
