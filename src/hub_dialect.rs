@@ -32,6 +32,16 @@ pub enum HubDialectError {
     NotMeta,
     #[error("the meta message does not carry a valid dialect: {0}")]
     Dialect(String),
+    /// A valid meta, but defining some other dialect — the hub distributing
+    /// e.g. `cite` over the same path, NOT its control grammar. Callers should
+    /// ignore these for hub-learning rather than treat them as malformed.
+    #[error("the meta defines dialect \"{0}\", not the hub control dialect")]
+    NotHub(String),
+    /// Named `hub` but missing the performative this agent actually emits and
+    /// self-validates (`announce`) — accepting it would make every join fail
+    /// its own announce check against a grammar that cannot express it.
+    #[error("the taught hub dialect does not define `{0}`")]
+    MissingControlPerformative(&'static str),
     #[error("the learned dialect does not install (R1–R3/R5): {0}")]
     Install(String),
 }
@@ -42,6 +52,12 @@ pub enum HubDialectError {
 /// `InstallDialect` effect). Returns a registry carrying the base dialect plus
 /// the learned hub dialect, so the agent validates its control-plane frames
 /// against the grammar the hub *actually* declared — no baked copy to drift.
+///
+/// Accepts only the dialect actually *named* `hub`, and only if it defines
+/// `announce` (the performative this agent emits and self-validates against
+/// it). Any other valid meta is [`HubDialectError::NotHub`] — a different
+/// dialect being distributed over the same path, not the control grammar
+/// (R7-001).
 pub fn learn_hub_dialect(meta_frame: &str) -> Result<DialectRegistry, HubDialectError> {
     let sexpr =
         cbcl_parser::parse(meta_frame).map_err(|e| HubDialectError::Parse(e.to_string()))?;
@@ -51,6 +67,16 @@ pub fn learn_hub_dialect(meta_frame: &str) -> Result<DialectRegistry, HubDialect
     };
     let dialect = cbcl_parser::dialect_parser::parse_dialect(&dialect_def)
         .map_err(HubDialectError::Dialect)?;
+    // Only the dialect actually named `hub` is the control grammar — a hub may
+    // legitimately distribute other dialects (cite, poll, …) over the same
+    // meta path, and installing one of those as "the hub dialect" would make
+    // the agent validate its announce against a grammar that never defines it.
+    if dialect.name != "hub" {
+        return Err(HubDialectError::NotHub(dialect.name));
+    }
+    if !dialect.defines_performative("announce") {
+        return Err(HubDialectError::MissingControlPerformative("announce"));
+    }
     let mut registry = DialectRegistry::new();
     registry
         .install(dialect)
@@ -103,6 +129,37 @@ mod tests {
     fn rejects_a_frame_that_is_not_a_meta_define() {
         assert!(learn_hub_dialect(r#"(tell @aria "hi" :from @mira)"#).is_err());
         assert!(learn_hub_dialect("not cbcl at all (((").is_err());
+    }
+
+    /// R7-001: a perfectly valid meta defining some OTHER dialect (the hub
+    /// distributing e.g. `cite` over the same path) is not the control grammar
+    /// and must not be installed as it — the error is the distinguishable
+    /// `NotHub`, which callers ignore for hub-learning.
+    #[test]
+    fn rejects_a_valid_meta_defining_a_non_hub_dialect() {
+        let cite_meta = r#"(meta (define cite (cbcl) @anuna-chat
+          (:resource-requirements ((max-depth 8) (max-expansion-size 512) (verification-time 10)))
+          (extend cite (doi url note)
+            (tell @room (citation :doi doi :url url :note note)))))"#;
+        match learn_hub_dialect(cite_meta) {
+            Err(HubDialectError::NotHub(name)) => assert_eq!(name, "cite"),
+            other => panic!("expected NotHub(cite), got {other:?}"),
+        }
+    }
+
+    /// R7-001: a dialect *named* `hub` that cannot express `announce` — the
+    /// frame this agent emits and self-validates — is rejected outright;
+    /// installing it would fail every join at its own announce check.
+    #[test]
+    fn rejects_a_hub_dialect_that_does_not_define_announce() {
+        let truncated_hub_meta = r#"(meta (define hub (cbcl) @cbcl-chat
+          (:resource-requirements ((max-depth 8) (max-expansion-size 512) (verification-time 10)))
+          (extend paircode (name id code)
+            (tell @room (pair-code :name name :id id :code code)))))"#;
+        match learn_hub_dialect(truncated_hub_meta) {
+            Err(HubDialectError::MissingControlPerformative(p)) => assert_eq!(p, "announce"),
+            other => panic!("expected MissingControlPerformative(announce), got {other:?}"),
+        }
     }
 
     /// With the *learned* hub dialect, every control-plane frame is valid CBCL

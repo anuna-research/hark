@@ -289,9 +289,14 @@ deferred to SPEC-015**, not claimed (see the follow-ons below); plan of record
   declared. **Ordering contract:** the meta precedes the join verdict
   (`roomcfg`/`presence`) — pinned hub-side by
   `join-leads-with-the-hub-dialect-meta`; a hub that taught only after its
-  verdict would degrade to the taught-nothing path. A legacy hub that teaches
-  nothing — and a hub whose advertisement cannot be learned (warning carries
-  the learn error) — degrades to a surfaced warning (announce still emitted).
+  verdict would degrade to the taught-nothing path. Only the dialect actually
+  *named* `hub` (and defining `announce`, the frame the agent self-validates)
+  counts as control-grammar teaching — other dialects distributed over the
+  same meta path (e.g. `cite`) are ignored for this purpose, and a hub
+  dialect once learned is never clobbered by a later bad frame (R7-001). A
+  legacy hub that teaches nothing — and a hub whose advertisement cannot be
+  learned (warning carries the learn error) — degrades to a surfaced warning
+  (announce still emitted).
   hark's test fixture of the grammar is drift-guarded byte-for-byte against
   the canonical hub file when a sibling `cbcl-bus` checkout is present
   (`hub_dialect_fixture_matches_the_canonical_cbcl_bus_grammar`). Verified

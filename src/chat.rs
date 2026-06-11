@@ -493,16 +493,26 @@ async fn await_join_ack(websocket: &mut ChatSocket) -> Result<(RoomCfg, HubTeach
             }
             // The hub's control-dialect advertisement: learn it (the language's
             // native `(meta (define …))` path) and keep waiting for the verdict.
+            // Only the dialect actually named `hub` counts — the same meta path
+            // can carry other dialect distributions (cite, poll, …), which are
+            // not the control grammar and must not be installed as it (R7-001).
             // A malformed advertisement is non-fatal — the join still proceeds;
             // the announce self-check degrades to a surfaced warning carrying
             // the learn error, so a teaching-but-broken hub is distinguishable
-            // from a legacy hub that teaches nothing.
+            // from a legacy hub that teaches nothing. A hub dialect already
+            // learned is never clobbered by a later bad frame.
             Some("meta") => {
+                use crate::hub_dialect::HubDialectError;
                 match crate::hub_dialect::learn_hub_dialect(&text) {
                     Ok(registry) => learned_hub = HubTeaching::Learned(registry),
+                    Err(HubDialectError::NotHub(name)) => {
+                        tracing::debug!("ignoring a non-hub dialect meta ({name})");
+                    }
                     Err(error) => {
                         tracing::warn!("could not learn the hub dialect: {error}");
-                        learned_hub = HubTeaching::Malformed(error.to_string());
+                        if !matches!(learned_hub, HubTeaching::Learned(_)) {
+                            learned_hub = HubTeaching::Malformed(error.to_string());
+                        }
                     }
                 }
                 continue;

@@ -206,6 +206,77 @@ fn cli_join_warns_with_the_learn_error_when_the_taught_dialect_is_malformed() {
     runtime.block_on(hub.wait());
 }
 
+/// R7-001, the concrete failing case: a hub that sends a perfectly VALID meta
+/// defining some other dialect (here `cite`, as the real hub distributes)
+/// before its verdict. That is dialect distribution, not control-grammar
+/// teaching — it must be ignored, not installed as "the hub dialect" (which
+/// would make the agent validate its announce against a grammar that never
+/// defines announce, failing the join).
+#[test]
+fn cli_join_ignores_a_non_hub_dialect_meta() {
+    let cite_meta = r#"(meta (define cite (cbcl) @anuna-chat
+      (:resource-requirements ((max-depth 8) (max-expansion-size 512) (verification-time 10)))
+      (extend cite (doi url note)
+        (tell @room (citation :doi doi :url url :note note)))))"#;
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+    let hub = runtime.block_on(MockChatHub::start_teaching(
+        "(roomcfg @demo :enc false)",
+        cite_meta,
+    ));
+    let env = TestEnv::new();
+
+    let join = env
+        .command(["join", "@demo", "--as", "@aria", "--hub", &hub.ws_url()])
+        .output()
+        .expect("join runs");
+    assert_success(&join);
+    // No hub grammar was taught, so the legacy-hub degrade path applies —
+    // never a validation failure against the cite grammar.
+    let stderr = String::from_utf8_lossy(&join.stderr);
+    assert!(
+        stderr.contains("taught no control dialect"),
+        "a non-hub meta is not control-grammar teaching: {}",
+        output_debug(&join)
+    );
+
+    assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
+    runtime.block_on(hub.wait());
+}
+
+/// R7-001: a hub dialect once learned is kept — later non-hub or malformed
+/// meta frames must neither clobber it nor surface a spurious warning.
+#[test]
+fn cli_join_keeps_the_learned_hub_dialect_past_later_bad_metas() {
+    let hub_meta = format!("(meta {})", include_str!("../src/dialects/hub.cbcl").trim());
+    let cite_meta = r#"(meta (define cite (cbcl) @anuna-chat
+      (:resource-requirements ((max-depth 8) (max-expansion-size 512) (verification-time 10)))
+      (extend cite (doi url note)
+        (tell @room (citation :doi doi :url url :note note)))))"#;
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+    let hub = runtime.block_on(MockChatHub::start_teaching_frames(
+        "(roomcfg @demo :enc false)",
+        &[&hub_meta, cite_meta, "(meta (not-a-dialect))"],
+    ));
+    let env = TestEnv::new();
+
+    let join = env
+        .command(["join", "@demo", "--as", "@aria", "--hub", &hub.ws_url()])
+        .output()
+        .expect("join runs");
+    assert_success(&join);
+    let stderr = String::from_utf8_lossy(&join.stderr);
+    assert!(
+        !stderr.contains("taught no control dialect") && !stderr.contains("could not learn"),
+        "the learned hub dialect should survive later bad metas: {}",
+        output_debug(&join)
+    );
+
+    assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
+    runtime.block_on(hub.wait());
+}
+
 /// Drift guard: the hub-grammar fixture these tests teach from
 /// (`src/dialects/hub.cbcl`) must stay byte-identical to the hub's canonical
 /// `apps/cbcl_chat/priv/dialects/hub.cbcl` — otherwise the meta-learning tests
@@ -439,17 +510,23 @@ impl MockChatHub {
     }
 
     async fn start_with_roomcfg(roomcfg: &str) -> Self {
-        Self::start_full(roomcfg, None).await
+        Self::start_full(roomcfg, Vec::new()).await
     }
 
     /// A hub that leads the join with a `(meta (define hub …))` advertising its
     /// control dialect (SPEC-016), exactly as the real hub does — so the agent
     /// learns the grammar from the wire.
     async fn start_teaching(roomcfg: &str, meta: &str) -> Self {
-        Self::start_full(roomcfg, Some(meta.to_owned())).await
+        Self::start_full(roomcfg, vec![meta.to_owned()]).await
     }
 
-    async fn start_full(roomcfg: &str, meta: Option<String>) -> Self {
+    /// A hub that sends SEVERAL meta frames before its verdict — exercising the
+    /// learner's state machine across non-hub and malformed advertisements.
+    async fn start_teaching_frames(roomcfg: &str, metas: &[&str]) -> Self {
+        Self::start_full(roomcfg, metas.iter().map(|m| (*m).to_owned()).collect()).await
+    }
+
+    async fn start_full(roomcfg: &str, metas: Vec<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("hub should bind");
@@ -481,9 +558,9 @@ impl MockChatHub {
                 };
                 *hello_writer.lock().expect("hello should lock") = Some(text);
             }
-            // Lead with the control-dialect advertisement, before the ack, so
-            // the agent learns the grammar before it validates its announce.
-            if let Some(meta) = meta {
+            // Lead with the control-dialect advertisement(s), before the ack,
+            // so the agent learns the grammar before it validates its announce.
+            for meta in metas {
                 let _ = websocket.send(Message::Text(meta.into())).await;
             }
             // Acknowledge the join (timestamp it for the Doherty measurement).
