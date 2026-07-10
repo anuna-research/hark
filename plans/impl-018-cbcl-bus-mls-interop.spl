@@ -125,3 +125,34 @@
 (normally r-assign-ui-claim (and ready-ui-claim agent-claude-available) assign-to-ui-claim-claude)
 (normally r-assign-interop (and ready-interop agent-claude-available) assign-to-interop-claude)
 (normally r-assign-dialect (and ready-dialect agent-claude-available) assign-to-dialect-claude)
+
+(claims agent:claude
+  :at "2026-07-10T04:03:42Z"
+  (given claim-v1-genesis)
+  (normally r-cl-state-v1-genesis claim-v1-genesis state-claimed-v1-genesis)
+  (normally r-cl-chain-v1-genesis state-claimed-v1-genesis claimed-genesis)
+)
+
+;; Propagation rules: failures in 'genesis' block downstream tasks
+(normally r-propagate-interop-from-genesis-failed failed-genesis upstream-blocked-interop)
+(normally r-propagate-interop-from-genesis-permanently-failed permanently-failed-genesis upstream-blocked-interop)
+(normally r-propagate-interop-from-genesis-stale-v1 stale-v1-genesis upstream-blocked-interop)
+(normally r-propagate-interop-from-genesis-timeout-v1 timeout-v1-genesis upstream-blocked-interop)
+(normally r-propagate-interop-from-genesis-blocked upstream-blocked-genesis upstream-blocked-interop)
+(normally r-propagate-ui-claim-from-genesis-failed failed-genesis upstream-blocked-ui-claim)
+(normally r-propagate-ui-claim-from-genesis-permanently-failed permanently-failed-genesis upstream-blocked-ui-claim)
+(normally r-propagate-ui-claim-from-genesis-stale-v1 stale-v1-genesis upstream-blocked-ui-claim)
+(normally r-propagate-ui-claim-from-genesis-timeout-v1 timeout-v1-genesis upstream-blocked-ui-claim)
+(normally r-propagate-ui-claim-from-genesis-blocked upstream-blocked-genesis upstream-blocked-ui-claim)
+
+(claims agent:claude
+  :at "2026-07-10T04:09:17Z"
+  (given decided-genesis-minted-in-crate-not-js))
+
+(claims agent:claude
+  :at "2026-07-10T04:09:17Z"
+  (given verified-web-genesis-bytes-match-hark-layout))
+
+(claims agent:claude
+  :at "2026-07-10T04:09:17Z"
+  (given completed-genesis))
