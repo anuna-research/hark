@@ -212,3 +212,15 @@
 (claims agent:claude
   :at "2026-07-10T04:47:50Z"
   (given completed-directory-validation))
+
+(claims agent:claude
+  :at "2026-07-10T06:15:08Z"
+  (given verified-removal-evidence-round-trip))
+
+(claims agent:claude
+  :at "2026-07-10T06:15:08Z"
+  (given verified-welcome-committer-auth))
+
+(claims agent:claude
+  :at "2026-07-10T06:15:08Z"
+  (given completed-welcome-grading))
