@@ -31,6 +31,11 @@
 (given task-interop)
 (given task-pin-bump)
 (given task-dialect)
+;; LG-4: residual REQ-012 Welcome grading (committer authorization + genesis
+;; trust grading + group-replacement guard), surfaced by the task-validation
+;; Principle-12 review. The teeth (leaf-vs-pin + genesis room binding) landed in
+;; join_verified; this task completes the grading.
+(given task-welcome-grading)
 
 ;; task-dialect is blocked on an external event: the fixed-and-versioned cbcl-rs release.
 (given blocked-by-cbcl-rs-versioned-release)
@@ -75,6 +80,10 @@
   (description "DR-1. Bump cbcl-bus/cbcl-rs.sha + Dockerfile ARG CBCL_RS_SHA to the revision hark builds against; add the two-recogniser chat-frame conformance corpus (SPEC-013 wire verbs round-tripped through cbcl-parser (Rust) and cbcl-erl (NIF)) as the interim guard until task-dialect.")
   (acceptance "scripts/check-cbcl-rs-pin.sh is green at the new SHA; every SPEC-013 wire verb round-trips identically through both recognisers."))
 
+(meta task-welcome-grading
+  (description "LG-4 / REQ-012 b/c. Complete the Welcome grading in join_verified: (b) authorised-committer check (the Welcome sender must be the elected owner of the PRE-add tree), (c) group-replacement guard (a Welcome must not silently replace an existing group for the room), and genesis TRUST grading (Authoritative when the creator key is pinned/matches; TofuRequiresSafetyNumber on first contact; hard reject on a pinned-but-conflicting creator key). Verify the genesis self-signature. Mirrors hark's validate_staged_welcome + GenesisAssertion::verify. The leaf-vs-pin hard reject + genesis room binding already landed (Finding D teeth).")
+  (acceptance "Negative: a Welcome from a non-owner committer is rejected; a Welcome replacing an existing room group is rejected; a pinned-but-conflicting creator key hard-rejects. Positive: a first-contact tree grades TofuRequiresSafetyNumber and requires REQ-021 confirmation. Fresh-context review passes."))
+
 (meta task-dialect
   (description "D-3 (deferred). Declare the SPEC-013 MLS wire verbs (keypub/keyget, Welcome/Commit fan frames, idkey, rekey, bye evidence, genesis) as a pinned, content-hashed CBCL dialect under cbcl-bus SPEC-015; the dialect content hash becomes the cross-stack version agreement (LangSec one-parser-per-language). IMPL-013 wire CON-### reference it as the normative grammar. Blocked on the fixed-and-versioned cbcl-rs release.")
   (acceptance "The dialect content hash matches across hark, web, and hub; the conformance corpus (task-pin-bump) is subsumed by the dialect check. Cannot start until blocked-by-cbcl-rs-versioned-release clears."))
@@ -92,8 +101,10 @@
 (normally r-ready-safety (and task-safety completed-pins-idkey) ready-safety)
 ;; validation checks objects against pins.
 (normally r-ready-validation (and task-validation completed-pins-idkey) ready-validation)
+;; welcome-grading follows the validation core (join_verified exists).
+(normally r-ready-welcome-grading (and task-welcome-grading completed-validation) ready-welcome-grading)
 ;; ui-claim only softens/restores once the backing tasks land.
-(normally r-ready-ui-claim (and task-ui-claim completed-genesis completed-pins-idkey completed-validation completed-mode-pin) ready-ui-claim)
+(normally r-ready-ui-claim (and task-ui-claim completed-genesis completed-pins-idkey completed-validation completed-mode-pin completed-welcome-grading) ready-ui-claim)
 ;; interop needs at least a formable, comparable mixed group.
 (normally r-ready-interop (and task-interop completed-genesis completed-pins-idkey completed-safety completed-validation) ready-interop)
 ;; dialect is blocked on the external release, then wants the pin bump done.
@@ -124,6 +135,7 @@
 (normally r-assign-validation (and ready-validation agent-claude-available) assign-to-validation-claude)
 (normally r-assign-ui-claim (and ready-ui-claim agent-claude-available) assign-to-ui-claim-claude)
 (normally r-assign-interop (and ready-interop agent-claude-available) assign-to-interop-claude)
+(normally r-assign-welcome-grading (and ready-welcome-grading agent-claude-available) assign-to-welcome-grading-claude)
 (normally r-assign-dialect (and ready-dialect agent-claude-available) assign-to-dialect-claude)
 
 (claims agent:claude
@@ -172,3 +184,31 @@
 (claims agent:claude
   :at "2026-07-10T04:19:36Z"
   (given completed-pins-idkey))
+
+(claims agent:claude
+  :at "2026-07-10T04:23:44Z"
+  (given verified-web-safety-number-matches-hark-vector))
+
+(claims agent:claude
+  :at "2026-07-10T04:23:44Z"
+  (given completed-safety))
+
+(claims agent:claude
+  :at "2026-07-10T04:47:50Z"
+  (given verified-principle12-review-ran-findings-fixed))
+
+(claims agent:claude
+  :at "2026-07-10T04:47:50Z"
+  (given decided-req012-grading-tracked-as-lg4))
+
+(claims agent:claude
+  :at "2026-07-10T04:47:50Z"
+  (given completed-validation))
+
+(claims agent:claude
+  :at "2026-07-10T04:47:50Z"
+  (given completed-mode-pin))
+
+(claims agent:claude
+  :at "2026-07-10T04:47:50Z"
+  (given completed-directory-validation))
