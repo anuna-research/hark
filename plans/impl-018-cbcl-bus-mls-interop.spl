@@ -156,3 +156,19 @@
 (claims agent:claude
   :at "2026-07-10T04:09:17Z"
   (given completed-genesis))
+
+(claims agent:claude
+  :at "2026-07-10T04:19:36Z"
+  (given decided-idkey-signed-in-crate))
+
+(claims agent:claude
+  :at "2026-07-10T04:19:36Z"
+  (given decided-web-pins-in-localstorage-not-idb))
+
+(claims agent:claude
+  :at "2026-07-10T04:19:36Z"
+  (given verified-web-members-pin-via-idkey))
+
+(claims agent:claude
+  :at "2026-07-10T04:19:36Z"
+  (given completed-pins-idkey))

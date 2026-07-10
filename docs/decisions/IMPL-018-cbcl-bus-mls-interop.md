@@ -49,12 +49,13 @@ Structure:
 ```
 Decisions:   [[SPEC-013-cbcl-bus-interop-gap-review#D-3]] MLS verbs ship as a content-hashed
              CBCL dialect · genesis-signing seam lives **in the crate** (it holds the
-             `SignatureKeyPair`) · the web pin store lives in IndexedDB beside the existing
-             `cbcl-e2ee` identity store.
+             `SignatureKeyPair`) — RESOLVED, task-genesis · idkey signing/verification also
+             **in the crate** for byte-parity — RESOLVED, task-pins-idkey · the web pin
+             store is a JS map persisted to **localStorage** (pins are public keys =
+             integrity state, not secret material, so not the IndexedDB secret store) —
+             RESOLVED, task-pins-idkey.
 Load-bearing: [[SPEC-013-mls-private-channels#REQ-016]] genesis · [[SPEC-013-mls-private-channels#REQ-008]]/[[SPEC-013-mls-private-channels#REQ-011]] pins · [[SPEC-013-mls-private-channels#REQ-017]] inbound validation · [[SPEC-013-mls-private-channels#REQ-021]] safety number.
-Open:        genesis-signing seam API shape (crate `sign_genesis` vs JS-supplied signed
-             bytes) — resolve in task-genesis; whether the pin store is shared wasm-side or
-             JS-side — resolve in task-pins-idkey.
+Open:        (task-genesis and task-pins-idkey design questions resolved above.)
 Detail:      [[SPEC-013-cbcl-bus-interop-gap-review]], [[SPEC-013-mls-private-channels]], [[IMPL-013-trace]].
 
 The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RECOMMENDED,
