@@ -1,0 +1,127 @@
+;; IMPL-018 — cbcl-bus MLS Interop: closing the SPEC-013 web-side gaps
+;; Plan for docs/decisions/IMPL-018-cbcl-bus-mls-interop.md.
+;; Closes the interop-breaking (IG-1..4) and lockstep (LG-1..9) gaps found in
+;; docs/decisions/SPEC-013-cbcl-bus-interop-gap-review.md. hark (IMPL-013) is the
+;; test oracle; every acceptance criterion is "the web/hub side produces/accepts
+;; exactly the bytes hark's shipped tests + vectors expect" (NFR-001).
+;; Work lands entirely in ../cbcl-bus. Design gate already CLEARED (SPEC-013-tier1-signoff).
+
+(meta plan
+  (id "IMPL-018")
+  (title "cbcl-bus MLS interop")
+  (version "0.1.0")
+  (status "draft")
+  (created "2026-07-10")
+  (author "agent:claude")
+  (spec "SPEC-013")
+  (description "Make the cbcl-bus web client, cbcl-mls-wasm crate, and hub speak SPEC-013 MLS the way hark already does: genesis-bearing groups, pinned identities, validated membership changes, authenticated removal, a comparable safety number, and fail-closed encryption-mode pinning; then live hark<->web interop, the cbcl-rs pin bump, and the SPEC-015 dialect wrapping of the wire verbs."))
+
+;; ---------------------------------------------------------------- agents
+(given agent-claude-available)
+
+;; ---------------------------------------------------------------- tasks
+(given task-genesis)
+(given task-pins-idkey)
+(given task-safety)
+(given task-validation)
+(given task-mode-pin)
+(given task-ledger)
+(given task-directory-validation)
+(given task-ui-claim)
+(given task-interop)
+(given task-pin-bump)
+(given task-dialect)
+
+;; task-dialect is blocked on an external event: the fixed-and-versioned cbcl-rs release.
+(given blocked-by-cbcl-rs-versioned-release)
+
+(meta task-genesis
+  (description "IG-1 / REQ-016. Web createGroup (apps/cbcl_chat/priv/web/mls.js:56) builds the creator-signed genesis assertion (cbcl-mls-genesis/v1 context, hark src/mls/group.rs:84 byte layout) and passes it to Group.create; cbcl-mls-wasm gains the signing seam (holds the SignatureKeyPair) and injects the genesis into the GroupContext with the 0xF013 capability. Resolve the open API-shape question: crate sign_genesis vs JS-supplied signed bytes.")
+  (acceptance "Positive: a web-created group's Welcome is accepted by hark's create_add_join_roundtrip_with_genesis shape (src/mls/group.rs:722). Negative-output: a genesis-less web create is hard-rejected by hark exactly as src/mls/group.rs:492. Genesis bytes are byte-identical to hark's genesis_signing_bytes for the same (room, creator, group_id, key)."))
+
+(meta task-pins-idkey
+  (description "IG-2 / REQ-019+REQ-011. Web emits (idkey @handle :key K :room @room :nonce N) signed under cbcl-idkey-assert/v1 on join and on new-peer presence (mirror hark's re-broadcast); verifies inbound self-signatures and pins handle->wire-key in a durable store in IndexedDB beside cbcl-e2ee. Never pin from a hub-asserted source.")
+  (acceptance "Positive: hark pins a web member from its emitted assertion and admits it (REQ-008 adder check passes). Negative-input: a hub-substituted or wrong-room assertion is rejected, not pinned. Signed-context bytes match hark's pins.rs idkey layout."))
+
+(meta task-safety
+  (description "IG-4 / REQ-021+REQ-024. Implement the identity safety number (canonical frame under cbcl-mls-identity-safety/v1: u32be-length-prefixed label || group_id || member_count || sorted (handle,key) pairs; SHA-256; 8x8 lowercase hex) plus the epoch state hash diagnostic; render both in the web UI. Reproduce hark's encoding exactly.")
+  (acceptance "The web-computed identity number is BYTE-IDENTICAL to hark's identity_safety_number_vector (src/mls/safety.rs:134) for the same membership. Stable across pure ratchet Commits; flips on membership change. Closes the last open SPEC-013 section-9 interop item."))
+
+(meta task-validation
+  (description "LG-1 + IG-3 / REQ-017+REQ-018+REQ-014. Rewrite cbcl-mls-wasm Group::process (crates/cbcl-mls-wasm/src/lib.rs:288) to inspect every leaf-changing object (Add/Update/Remove proposals + committer UpdatePath leaf) against pins + the REQ-017(a-e) fail-closed allowlist, credential immutability, and genesis immutability BEFORE merge; return the authenticated MLS sender leaf so JS enforces REQ-018 :from. Mint + verify cbcl-mls-remove/v1 removal evidence at merge by every validator (hub already fans it). Carries the Principle-12 fresh-context review.")
+  (acceptance "Negative-output: the R3-07 credential-rebinding self-Update is REJECTED web-side (hark's r3_07 oracle). Forged :from rejected. Evidence-free or stale-epoch Remove rejected at merge. ReInit/PSK/GroupContextExtensions/external-join proposals rejected. Fresh-context adversarial review passes with only cosmetic findings before this task is marked complete."))
+
+(meta task-mode-pin
+  (description "LG-5 / REQ-023. Pin enc=true from the admission path (cap/invite presence: capFromHash/capRecall in app.js) before the first frame; treat roomcfg :enc false on a pinned channel as a downgrade attack and refuse to send; fail closed on an unpinnable private mode. Stop taking mode from the unsigned roomcfg :enc bit (app.js:631-632).")
+  (acceptance "Positive: a cap-joined channel pins encrypted pre-send. Negative: a hub :enc false on a pinned channel does NOT emit plaintext (mirrors hark downgrade_refused, src/mls/session.rs:240); unpinnable private mode fails closed."))
+
+(meta task-ledger
+  (description "LG-6 / REQ-013. Durable consumed-KeyPackageRef ledger + strict decrypt->validate->join->delete ordering in the cbcl-mls-wasm provider (replace the in-memory-only provider, lib.rs:43,257). A failed Welcome leaves the init key intact.")
+  (acceptance "The one-time init key survives a Welcome that fails REQ-012/REQ-017 validation; is deleted from storage only after a successful join; a replayed Welcome to a consumed package is inert; consumed refs are durable across reload."))
+
+(meta task-directory-validation
+  (description "LG-7 / REQ-015. Hub keypub/keyget input validation in cbcl-chat-session-ws.lfe (do-keypub :449) and cbcl-chat-keypkg.lfe: size bounds, base64 well-formedness, structural KeyPackage validity BEFORE mutating mnesia directory state (LangSec trust boundary; declare the input grammar).")
+  (acceptance "Negative-input: oversized, non-base64, and structurally-invalid KeyPackage inputs are rejected before any mnesia write; valid inputs still stored. Grammar declared in the task's CON note."))
+
+(meta task-ui-claim
+  (description "LG-8 / REQ-020. The web UI (app.js:638) SHALL make no confidentiality/authenticity claim the implementation does not back; soften the 'end-to-end encrypted' wording until task-genesis..task-mode-pin land for a channel, then restore it once backed.")
+  (acceptance "No E2EE claim renders for a channel while any of REQ-012/017/018/023 is unimplemented for it; the claim returns only once the backing tasks are complete."))
+
+(meta task-interop
+  (description "REQ-010 whole-suite gate. A live hark agent + web client in one encrypted private channel: create -> add -> welcome -> encrypt/decrypt both directions -> authenticated remove, with identical REQ-021 safety numbers. Record the REQ->TEST->CODE trace table.")
+  (acceptance "The SPEC-013 REQ-010 round-trip passes end-to-end hark<->web; both sides show identical identity safety numbers; a removed member cannot decrypt subsequent traffic. This is the plan's convergence signal."))
+
+(meta task-pin-bump
+  (description "DR-1. Bump cbcl-bus/cbcl-rs.sha + Dockerfile ARG CBCL_RS_SHA to the revision hark builds against; add the two-recogniser chat-frame conformance corpus (SPEC-013 wire verbs round-tripped through cbcl-parser (Rust) and cbcl-erl (NIF)) as the interim guard until task-dialect.")
+  (acceptance "scripts/check-cbcl-rs-pin.sh is green at the new SHA; every SPEC-013 wire verb round-trips identically through both recognisers."))
+
+(meta task-dialect
+  (description "D-3 (deferred). Declare the SPEC-013 MLS wire verbs (keypub/keyget, Welcome/Commit fan frames, idkey, rekey, bye evidence, genesis) as a pinned, content-hashed CBCL dialect under cbcl-bus SPEC-015; the dialect content hash becomes the cross-stack version agreement (LangSec one-parser-per-language). IMPL-013 wire CON-### reference it as the normative grammar. Blocked on the fixed-and-versioned cbcl-rs release.")
+  (acceptance "The dialect content hash matches across hark, web, and hub; the conformance corpus (task-pin-bump) is subsumed by the dialect check. Cannot start until blocked-by-cbcl-rs-versioned-release clears."))
+
+;; ---------------------------------------------------------------- readiness
+;; task-genesis, task-pins-idkey, task-mode-pin, task-ledger, task-directory-validation,
+;; task-pin-bump have no in-plan prerequisites and can start in parallel.
+(normally r-ready-genesis task-genesis ready-genesis)
+(normally r-ready-pins-idkey task-pins-idkey ready-pins-idkey)
+(normally r-ready-mode-pin task-mode-pin ready-mode-pin)
+(normally r-ready-ledger task-ledger ready-ledger)
+(normally r-ready-directory-validation task-directory-validation ready-directory-validation)
+(normally r-ready-pin-bump task-pin-bump ready-pin-bump)
+;; safety reads membership bindings + keys — wants the pin store in place.
+(normally r-ready-safety (and task-safety completed-pins-idkey) ready-safety)
+;; validation checks objects against pins.
+(normally r-ready-validation (and task-validation completed-pins-idkey) ready-validation)
+;; ui-claim only softens/restores once the backing tasks land.
+(normally r-ready-ui-claim (and task-ui-claim completed-genesis completed-pins-idkey completed-validation completed-mode-pin) ready-ui-claim)
+;; interop needs at least a formable, comparable mixed group.
+(normally r-ready-interop (and task-interop completed-genesis completed-pins-idkey completed-safety completed-validation) ready-interop)
+;; dialect is blocked on the external release, then wants the pin bump done.
+;; The defeater blocks readiness while the external release is still pending.
+(normally r-ready-dialect (and task-dialect completed-pin-bump) ready-dialect)
+(except d-dialect-blocked blocked-by-cbcl-rs-versioned-release (not ready-dialect))
+
+(meta r-ready-genesis (description "IG-1, no in-plan dep.") (justification "Crate signing seam + web create are foundational."))
+(meta r-ready-pins-idkey (description "IG-2, no in-plan dep.") (justification "The pin store is the substrate LG-1..4 need."))
+(meta r-ready-mode-pin (description "LG-5, web-only, no dep.") (justification "Mode pin is independent of MLS group state."))
+(meta r-ready-ledger (description "LG-6, crate provider, no dep.") (justification "Provider persistence is independent of validation."))
+(meta r-ready-directory-validation (description "LG-7, hub LFE, no dep.") (justification "Input validation at the hub trust boundary is self-contained."))
+(meta r-ready-pin-bump (description "DR-1, no dep.") (justification "SHA bump + corpus are orthogonal to the crypto work."))
+(meta r-ready-safety (description "IG-4, needs pins.") (justification "The identity number reads pinned (handle,key) bindings."))
+(meta r-ready-validation (description "LG-1, needs pins.") (justification "REQ-017 validates leaves against the pin store."))
+(meta r-ready-ui-claim (description "LG-8, gated on backing tasks.") (justification "REQ-020: no claim before the implementation backs it."))
+(meta r-ready-interop (description "REQ-010, whole-suite gate.") (justification "A mixed group must form (genesis+pins), be validated, and be comparable (safety)."))
+(meta r-ready-dialect (description "D-3, deferred + needs pin bump.") (justification "Dialect declaration supersedes the SHA pin once cbcl-rs is versioned."))
+
+;; ---------------------------------------------------------------- assignment
+(normally r-assign-genesis (and ready-genesis agent-claude-available) assign-to-genesis-claude)
+(normally r-assign-pins-idkey (and ready-pins-idkey agent-claude-available) assign-to-pins-idkey-claude)
+(normally r-assign-mode-pin (and ready-mode-pin agent-claude-available) assign-to-mode-pin-claude)
+(normally r-assign-ledger (and ready-ledger agent-claude-available) assign-to-ledger-claude)
+(normally r-assign-directory-validation (and ready-directory-validation agent-claude-available) assign-to-directory-validation-claude)
+(normally r-assign-pin-bump (and ready-pin-bump agent-claude-available) assign-to-pin-bump-claude)
+(normally r-assign-safety (and ready-safety agent-claude-available) assign-to-safety-claude)
+(normally r-assign-validation (and ready-validation agent-claude-available) assign-to-validation-claude)
+(normally r-assign-ui-claim (and ready-ui-claim agent-claude-available) assign-to-ui-claim-claude)
+(normally r-assign-interop (and ready-interop agent-claude-available) assign-to-interop-claude)
+(normally r-assign-dialect (and ready-dialect agent-claude-available) assign-to-dialect-claude)
