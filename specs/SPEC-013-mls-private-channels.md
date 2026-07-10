@@ -3,12 +3,12 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: draft
 tier: 1
-version: 0.8.1
+version: 0.8.2
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off; v0.8.1 folds the round-6 spot-check, GPT-5.x — gate cleared)
-last-updated: 2026-06-10
+author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off; v0.8.1 folds the round-6 spot-check, GPT-5.x — gate cleared; v0.8.2 doc-only — affects-repos corrected after the cbcl-mls-wasm crate moved into cbcl-bus at e6fd708, see [[SPEC-013-cbcl-bus-interop-gap-review]])
+last-updated: 2026-07-10
 owner-repo: hark
-affects-repos: cbcl-bus (web client + vendored cbcl-mls-wasm artifact), cbcl-chat (cbcl-mls-wasm crate)
+affects-repos: cbcl-bus (hub + web client + in-repo cbcl-mls-wasm crate + vendored artifact — the crate moved in from cbcl-chat at e6fd708, 2026-06-10)
 review-gate: CLEARED for implementation 2026-06-10 (human sign-off: docs/decisions/SPEC-013-tier1-signoff.md — all residuals A–H explicitly accepted, D-1/D-2 ratified, ADRs APPROVED. **Condition K satisfied**: round-6 independent spot-check by GPT-5.x confirmed R5-01 (closed with the retry-cost caveat, folded as K-1), R5-02, R5-03, and endorsed D-1/D-2 — docs/decisions/SPEC-013-round6-spotcheck-findings.md; no re-block. Remaining conditions live INSIDE IMPL: A-t no-collision property test, I durable-provider delete fidelity, J cbcl_ristretto audit (IMPL-016), K-1 remove-race retry test, K-2 creator-capability guard. History: rounds 1–2 → v0.3; ADR-006 → v0.4; OQ-004/005 → v0.5; round-3 → v0.6; round-4 → v0.7; round-5 → v0.7.1/v0.7.2; sign-off → v0.8.0; round-6 → v0.8.1)
 ---
 
