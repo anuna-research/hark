@@ -56,6 +56,12 @@ pub const DS_IDKEY_ROTATE: &str = "cbcl-idkey-rotate/v1";
 pub const DS_MLS_REMOVE: &str = "cbcl-mls-remove/v1";
 /// Creator-signed group-genesis assertion label (REQ-016).
 pub const DS_MLS_GENESIS: &str = "cbcl-mls-genesis/v1";
+/// Fork-recovery resync-request label (REQ-025). Signed by the requesting
+/// member's own wire key so the untrusted hub cannot forge a `:resync` that
+/// would drive a REQ-014 Remove (the F1 eviction vector). Same field layout as
+/// [`DS_IDKEY_ASSERT`] under a distinct label; MUST equal cbcl-bus's
+/// `DS_MLS_RESYNC` (crates/cbcl-mls-wasm) for NFR-001 byte parity.
+pub const DS_MLS_RESYNC: &str = "cbcl-mls-resync/v1";
 /// Identity-safety-number frame label (REQ-021).
 pub const DS_IDENTITY_SAFETY: &str = "cbcl-mls-identity-safety/v1";
 

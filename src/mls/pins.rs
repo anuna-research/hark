@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-use super::{DS_IDKEY_ASSERT, DS_IDKEY_ROTATE, MlsError};
+use super::{DS_IDKEY_ASSERT, DS_IDKEY_ROTATE, DS_MLS_RESYNC, MlsError};
 
 const PINS_VERSION: u32 = 1;
 
@@ -279,6 +279,22 @@ pub fn idkey_signing_bytes(handle: &str, key: &[u8; 32], room: &str, nonce: u64)
     out
 }
 
+/// The `cbcl-mls-resync/v1` signed context (REQ-025, review F1): same field
+/// layout as [`idkey_signing_bytes`] under a distinct label — `lp(label) ‖
+/// lp(handle) ‖ lp(key) ‖ lp(room) ‖ u64-be(nonce)`. Signed by the requesting
+/// member's wire key; the creator verifies under that member's PINNED key before
+/// driving a Remove, so a hub-forged `:resync` is refused. MUST be byte-identical
+/// to cbcl-bus's `resync_signing_bytes` (crates/cbcl-mls-wasm) — NFR-001.
+pub fn resync_signing_bytes(handle: &str, key: &[u8; 32], room: &str, nonce: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    lp(&mut out, DS_MLS_RESYNC.as_bytes());
+    lp(&mut out, handle.as_bytes());
+    lp(&mut out, key);
+    lp(&mut out, room.as_bytes());
+    out.extend_from_slice(&nonce.to_be_bytes());
+    out
+}
+
 /// The `cbcl-idkey-rotate/v1` signed context (REQ-011): both keys sign this
 /// exact byte string.
 pub fn rekey_signing_bytes(
@@ -383,6 +399,35 @@ mod tests {
             .apply_idkey("@alice", &key, "@research", 0, &bad, "@research")
             .unwrap_err();
         assert!(matches!(err, MlsError::Rejected(_)));
+    }
+
+    /// REQ-025 (review F1) / NFR-001: the resync-request signed context is
+    /// byte-identical to cbcl-bus's `resync_signing_bytes`, and domain-separated
+    /// from the idkey assertion (a resync sig can never be replayed as an idkey).
+    #[test]
+    fn resync_signing_bytes_layout_and_domain_separation() {
+        let key = [0xABu8; 32];
+        let got = resync_signing_bytes("@alice", &key, "@research", 7);
+
+        // Independent manual construction of the pinned cross-stack vector:
+        // lp(label) ‖ lp(handle) ‖ lp(key) ‖ lp(room) ‖ u64-be(nonce).
+        let mut want = Vec::new();
+        let label = b"cbcl-mls-resync/v1"; // 18 bytes
+        want.extend_from_slice(&(label.len() as u32).to_be_bytes());
+        want.extend_from_slice(label);
+        want.extend_from_slice(&6u32.to_be_bytes());
+        want.extend_from_slice(b"@alice");
+        want.extend_from_slice(&32u32.to_be_bytes());
+        want.extend_from_slice(&key);
+        want.extend_from_slice(&9u32.to_be_bytes());
+        want.extend_from_slice(b"@research");
+        want.extend_from_slice(&7u64.to_be_bytes());
+        assert_eq!(got, want, "resync signing bytes match the cbcl-bus layout (NFR-001)");
+
+        // Domain separation: the same inputs under the idkey label differ, so a
+        // signature over one context cannot verify against the other.
+        let idkey = idkey_signing_bytes("@alice", &key, "@research", 7);
+        assert_ne!(got, idkey, "resync context must differ from idkey");
     }
 
     /// REQ-019 nonce purpose: an assertion whose nonce predates the pin
