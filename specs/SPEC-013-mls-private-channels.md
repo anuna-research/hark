@@ -3,9 +3,9 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: implementing
 tier: 1
-version: 0.9.1
+version: 0.9.2
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off; v0.8.1 folds the round-6 spot-check, GPT-5.x — gate cleared; v0.8.2 doc-only — affects-repos corrected after the cbcl-mls-wasm crate moved into cbcl-bus at e6fd708, see [[SPEC-013-cbcl-bus-interop-gap-review]]; v0.8.3 doc-only — status draft → implementing; v0.9.0 folds the two spec gaps the live REQ-010 interop run surfaced — REQ-025/REQ-026 fork-recovery (resync), ADR-007 creator-vs-owner roles, OQ-006 forged-resync residual — Claude Fable 5; v0.9.1 folds the fresh-context Principle-12 review of v0.9.0 (findings F1–F8, [[SPEC-013-resync-review-findings]]): resync-request authentication upgraded SHOULD→SHALL closing the forged-eviction vector (F1), discard scoped to the group_id preserving init keys (F8), creator∧elected-owner precondition (F3), validate-then-remove-then-add (F5), named constants + lettered atomic clauses (F7); STILL needs a cross-model Principle-12 pass before approval)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off; v0.8.1 folds the round-6 spot-check, GPT-5.x — gate cleared; v0.8.2 doc-only — affects-repos corrected after the cbcl-mls-wasm crate moved into cbcl-bus at e6fd708, see [[SPEC-013-cbcl-bus-interop-gap-review]]; v0.8.3 doc-only — status draft → implementing; v0.9.0 folds the two spec gaps the live REQ-010 interop run surfaced — REQ-025/REQ-026 fork-recovery (resync), ADR-007 creator-vs-owner roles, OQ-006 forged-resync residual — Claude Fable 5; v0.9.1 folds the fresh-context Principle-12 review of v0.9.0 (findings F1–F8, [[SPEC-013-resync-review-findings]]): resync-request authentication upgraded SHOULD→SHALL closing the forged-eviction vector (F1), discard scoped to the group_id preserving init keys (F8), creator∧elected-owner precondition (F3), validate-then-remove-then-add (F5), named constants + lettered atomic clauses (F7); v0.9.2 folds a SECOND Principle-12 re-review (#1–#5): resync nonce made strictly-monotonic + a creator freshness check closing the capture-and-replay eviction the signature alone missed (#1, fixed + deployed + tested S6), RESYNC_RATE window redefined wall-clock not per-epoch (#2), REQ-026c remove-then-add residual stated (#3), atomicity/constant-naming cleanups (#4/#5); STILL needs a cross-VENDOR Principle-12 pass before approval)
 last-updated: 2026-07-13
 owner-repo: hark
 affects-repos: cbcl-bus (hub + web client + in-repo cbcl-mls-wasm crate + vendored artifact — the crate moved in from cbcl-chat at e6fd708, 2026-06-10)
@@ -525,13 +525,14 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   headless deployment can actually follow (R4-04). Without this surface the agent cannot
   participate in the one mechanism that catches first-contact MITM, on which [[#ADR-006]]
   relies for agents. Trace: `[[#TEST-024]]`. *(Closes R3-13; workflow made practical per R4-04.)*
-> **REQ-025/REQ-026 status (v0.9.1):** normative-DRAFT, folding the fresh-context Principle-12
-> review of the v0.9.0 draft (findings F1–F8, `docs/decisions/SPEC-013-resync-review-findings.md`).
+> **REQ-025/REQ-026 status (v0.9.2):** normative-DRAFT, folding TWO fresh-context Principle-12
+> reviews (findings F1–F8 then re-review #1–#5, `docs/decisions/SPEC-013-resync-review-findings.md`).
 > Each obligation is a lettered clause so a [[#TEST-025]]/[[#TEST-026]] failure attributes to one
-> clause (atomicity). Concrete thresholds are named constants: `FORK_THRESHOLD = 3` consecutive
-> decrypt failures, `RESYNC_CAP = 3` re-request attempts, `RESYNC_RATE = 3` honored resyncs per
-> (member, epoch-window). These additions still require a **cross-model** Principle-12 pass before
-> approval (the v0.9.0 review was same-family cross-context).
+> clause (atomicity). Named constants: `FORK_THRESHOLD = 3` consecutive decrypt failures,
+> `RESYNC_CAP = 3` re-request attempts, `RESYNC_WAIT_MS` the bounded re-request interval, and
+> `RESYNC_RATE` honored resyncs per **wall-clock window** (NOT per MLS epoch — re-review #2). These
+> additions still require a **cross-vendor** Principle-12 pass before approval (both reviews so far
+> were same-family Claude; the round-6 precedent used GPT-5.x).
 
 - **REQ-025 — Fork recovery: desync self-heal (member side).** When the [[#REQ-006]]
   consecutive-decrypt-failure counter for the agent's own group reaches `FORK_THRESHOLD` — its
@@ -542,15 +543,17 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
     while **preserving** the identity keystore **and** every unconsumed [[KeyPackage]] init private
     key — those are required to decrypt the re-admission Welcome, and a whole-provider wipe would
     permanently brick recovery (review F8).
-  - **(b) Request re-admission with an *authenticated* resync request.** Re-issue the readiness
-    announce marked `:resync`, **signed** over `(room, group_id-or-channel, from, nonce)` under a
-    dedicated label — reusing the [[#REQ-019]] self-signed-assertion machinery — so the creator can
-    reject a forged `:from` before acting (review F1). An unsigned or badly-signed resync SHALL NOT
-    be honored.
+  - **(b) Request re-admission with an *authenticated, replay-resistant* resync request.** Re-issue
+    the readiness announce marked `:resync`, **signed** over `(label, from, key, room, nonce)` under
+    the dedicated `cbcl-mls-resync/v1` label — reusing the [[#REQ-019]] self-signed-assertion
+    machinery. The `nonce` SHALL be **strictly monotonic per requester** (e.g. a wall-clock
+    timestamp), NOT the pin epoch — the pin epoch is constant absent a rotation, so a captured
+    resync could be replayed to force an eviction (re-review #1). (The verifier's obligations —
+    signature check and freshness — live in [[#REQ-026]](a).)
   - **(c) Bound and surface.** After sending a resync, if no valid re-admission Welcome arrives
-    within a bounded wait, the agent MAY re-request up to `RESYNC_CAP` times, then SHALL surface the
+    within `RESYNC_WAIT_MS`, the agent MAY re-request up to `RESYNC_CAP` times, then SHALL surface the
     desync as **terminal** (an operator-visible recovery failure). The retry-then-terminal path SHALL
-    be reachable while groupless (review F4 — the shipped web code's terminal branch is unreachable
+    be reachable while groupless (review F4 — the shipped web code's terminal branch was unreachable
     because no failures accrue after discard; filed against cbcl-bus in
     [[SPEC-013-resync-review-findings#F4]], and hark's implementation SHALL NOT copy it).
   - **(d) Distinguish and reset.** A `:resync` request SHALL be distinguishable from a routine
@@ -564,10 +567,13 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   current warn-and-drop fork handling SHALL be brought up to this contract.)*
 - **REQ-026 — Authorised re-provisioning (creator side).** On an **authenticated** resync request
   ([[#REQ-025]](b)) from a handle **already a live leaf** of the group tree, the re-provisioner:
-  - **(a) Verify first.** SHALL verify the resync request signature and reject a forged, replayed,
-    or wrong-room request **before** minting any [[#REQ-014]] evidence (review F1 — an unsigned
-    hub-forged resync driving a real Remove would re-open the REQ-014 "fabricated leave → eviction"
-    vector).
+  - **(a) Verify first (signature AND freshness).** SHALL, **before** minting any [[#REQ-014]]
+    evidence: (i) verify the resync signature under the requester's **pinned** wire key (never a
+    wire-supplied key) over the `cbcl-mls-resync/v1` context bound to this room — rejecting a forged
+    or wrong-room request (review F1); AND (ii) reject a **replayed** request by requiring its nonce
+    to be **strictly greater than the last nonce honored for that handle** (re-review #1 — a signed
+    resync is otherwise capturable and replayable to evict a healthy member). An unsigned,
+    badly-signed, stale-nonce, or unpinned resync SHALL NOT be honored.
   - **(b) Creator ∧ elected-owner precondition.** SHALL re-provision ONLY IF it is **both** the
     [[#REQ-016]] genesis **creator** (only the creator may mint liveness-fallback removal evidence)
     **and** the current [[#REQ-004]] elected owner (only the owner may commit). When these principals
@@ -581,12 +587,19 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
     [[Welcome]] at the live epoch. If no pin-valid KeyPackage can be obtained — including the case
     where the member legitimately rotated ([[#REQ-011]]) but its `rekey` was dropped, so the fetched
     key mismatches the stale pin — the re-provisioner SHALL NOT remove (review F5: no eviction without
-    a completable re-add).
+    a completable re-add). *Residual (re-review #3):* the pin pre-check is not a full dry-run of the
+    MLS Add, so a Remove that merges (and fans) followed by an Add that fails for an unforeseen
+    MLS-level reason CANNOT be rolled back (the Remove is already committed); the backstop is the
+    victim's own [[#REQ-025]](c) bounded retry/terminal, and the re-provisioner SHOULD combine
+    remove+add into a single Commit where the stack supports it.
   - **(d) Non-member and routine.** A resync from a handle **not** a live leaf SHALL NOT trigger
     remove-then-add (it MAY be treated as an ordinary [[#REQ-003]] Add if the handle is otherwise
     addable — review F6); a routine (non-`:resync`) re-announce SHALL NOT churn membership.
-  - **(e) Rate-limit.** SHALL bound honored resyncs to `RESYNC_RATE` per (member, epoch-window) to
-    cap forced-fork [[KeyPackage]] drain and epoch churn (review F2).
+  - **(e) Rate-limit.** SHALL bound honored resyncs to `RESYNC_RATE` per (member, **wall-clock
+    window**) — NOT per MLS epoch: each honored resync itself bumps the epoch (a remove + an add
+    Commit), so an epoch-keyed window resets on its own trigger and the bound is vacuous (re-review
+    #2). The window SHALL be a fixed time bucket (or an epoch-independent monotonic counter) so the
+    cap actually bounds forced-fork [[KeyPackage]] drain and churn (review F2).
 
   Re-provisioning is **membership-visible** — it changes the [[#REQ-021]] identity safety number and
   is re-compared, exactly as the remove+re-add rotation path in [[#REQ-011]]. Trace: `[[#TEST-026]]`.
@@ -771,15 +784,17 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   Raised by the [[#REQ-025]]/[[#REQ-026]] fork-recovery protocol added after the 2026-06-10 gate
   (cbcl-bus shipped it web-side; [[SPEC-013-cbcl-bus-interop-gap-review]]), and sharpened by the
   v0.9.0 Principle-12 review. Two distinct vectors:
-  - **Forged eviction (was mis-scoped as "availability-only churn"; review F1) — RESOLVED by design.**
+  - **Forged AND replayed eviction (was mis-scoped as "availability-only churn"; review F1 + re-review #1) — RESOLVED by design.**
     The v0.9.0 draft's `:resync` frame was **unsigned**, so the [[Delivery Service|untrusted hub]]
     could forge one for a live victim and drive the creator into a real [[#REQ-014]] Remove Commit;
     forging the resync **and** dropping the re-admission [[Welcome]] yields a **durable committed
     eviction** of a healthy member — precisely the "active hub fabricates a leave and drives the
-    committer to evict" attack [[#REQ-014]] declares closed, re-opened through the resync door. This
-    is **closed** by making resync-request authentication a **SHALL** ([[#REQ-025]](b) signs,
-    [[#REQ-026]](a) verifies-before-acting), not the SHOULD the v0.9.0 draft used. No attacker key is
-    ever seated (the re-add is [[#REQ-008]]/[[#REQ-011]] pin-validated).
+    committer to evict" attack [[#REQ-014]] declares closed, re-opened through the resync door.
+    Signing alone was insufficient: the re-review found the hub could also **capture a genuine signed
+    resync and replay it** (the nonce was the constant pin epoch). Both are **closed** by
+    [[#REQ-025]](b) (signed, **strictly-monotonic** nonce) + [[#REQ-026]](a) (verify signature under
+    the pinned key **and** reject a nonce ≤ the last honored) — SHALLs, not the SHOULD the draft used.
+    No attacker key is ever seated (the re-add is [[#REQ-008]]/[[#REQ-011]] pin-validated).
   - **Forced-fork forward-secrecy drain (review F2) — OPEN residual.** A hub that equivocates Commit
     order forks an **honest** member (auth does not stop this — the member itself resyncs), and each
     heal consumes a fresh one-time [[KeyPackage]]; repeated forced forks drain the pool to the
@@ -923,7 +938,10 @@ Per the [[PROTO-001]] security-critical row, the test specification will select:
   - **TEST-026** (creator). *Positive:* the creator validates a fresh pinned KeyPackage, then
     remove-then-re-adds a resyncing live member, and the [[#REQ-021]] safety number flips then
     re-agrees. *Negative-input (F1):* a **forged** resync (bad/absent signature) is rejected
-    **before** any Remove is minted — no eviction. *Negative-output (F3):* an elected owner that
+    **before** any Remove is minted — no eviction. *Negative-input (re-review #1):* a **replayed**
+    genuine resync (a captured frame re-sent) is rejected by the stale-nonce check — no **second**
+    Remove is driven (the shipped cbcl-bus integration test S6 captures-and-replays and asserts
+    zero Removes). *Negative-output (F3):* an elected owner that
     is **not** the creator does **not** attempt the heal; and a creator that is **not** the current
     elected owner does not commit. *Negative-output (F5):* when no pin-valid KeyPackage is obtainable
     (incl. a legitimately-rotated member whose `rekey` was dropped), the stale leaf is **not**
