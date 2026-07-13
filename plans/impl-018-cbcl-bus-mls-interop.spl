@@ -224,3 +224,25 @@
 (claims agent:claude
   :at "2026-07-10T06:15:08Z"
   (given completed-welcome-grading))
+
+;; ---------------------------------------------------------------- IB-1 (2026-07-13)
+;; Live REQ-010 run (hark `hark pair` + real web client vs deployed hub) found the
+;; owner-add stalled on a keypkg-MISS race: onKeypkg dropped the add with a
+;; "will retry" that never retried (wantAdd was only populated on pin-errors). Fixed
+;; cbcl-bus-side (dd3b3c0): record the MISS target in wantAdd so retryWantedAdd
+;; re-drives the keyget on the target's idkey re-pin. Deployed to fly, re-run green.
+(given decided-ib1-keypkg-miss-retry-web-side)
+(claims agent:claude
+  :at "2026-07-13T07:23:44Z"
+  (given verified-ib1-add-forms-automatically-no-reload))
+
+;; task-interop (REQ-010) — the whole-suite convergence signal — PASSED live:
+;; create -> pair -> add (auto, IB-1) -> welcome -> identical REQ-021 safety numbers
+;; (byte-for-byte web==hark) -> hark->web encrypted decrypt -> authenticated evict
+;; (REQ-014) -> evicted agent's stale-epoch ciphertext rejected by the web. 11/11.
+(claims agent:claude
+  :at "2026-07-13T07:23:44Z"
+  (given verified-req010-live-hark-web-roundtrip))
+(claims agent:claude
+  :at "2026-07-13T07:23:44Z"
+  (given completed-interop))

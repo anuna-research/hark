@@ -147,10 +147,19 @@ per-task acceptance in [[impl-018-cbcl-bus-mls-interop|the SPL plan]].
    claim the implementation does not back; soften the "end-to-end encrypted" wording until
    tasks 1–5 land, then restore it. *Accept:* no confidentiality/authenticity claim renders
    while any of REQ-012/017/018/023 is unimplemented for that channel.
-9. **task-interop (REQ-010, whole-suite gate).** A live hark agent + web client in one private
-   channel: create → add → welcome → encrypt/decrypt both ways → remove, with **identical
+9. **task-interop (REQ-010, whole-suite gate). — DONE 2026-07-13, PASSED live.** A live hark
+   agent (`hark pair`) + the real web client in one private channel on the **deployed** hub:
+   create → pair → add → welcome → encrypt/decrypt → authenticated remove, with **identical
    REQ-021 safety numbers**. *Accept:* the [[SPEC-013-mls-private-channels#REQ-010]] round-trip
-   passes end-to-end; this is the plan's convergence signal.
+   passes end-to-end; this is the plan's convergence signal. **Result: 11/11.** The safety
+   numbers were byte-for-byte identical (web == `hark safety-number`), hark→web decrypted, and
+   the authenticated eviction (REQ-014) removed the agent + left its stale-epoch ciphertext
+   rejected by the web. The run surfaced one interop-liveness bug, **IB-1**: the web owner's
+   add stalled on a `keypkg` MISS whose "will retry" never retried — fixed cbcl-bus-side
+   (record the MISS target in `wantAdd` so `retryWantedAdd` re-drives the keyget on the idkey
+   re-pin), deployed, and re-verified so the channel now forms with **no manual reload**. hark
+   needed no change (its owner-path already self-heals the same race by re-keygetting on each
+   idkey-pin). Harness: `experiments`/scratch `req010.mjs` (Playwright + hark CLI).
 10. **task-pin-bump (DR-1).** Bump `cbcl-bus/cbcl-rs.sha` + Dockerfile to the revision hark
     builds against; add the two-recogniser chat-frame conformance corpus (interim guard until
     D-3). *Accept:* `scripts/check-cbcl-rs-pin.sh` green at the new SHA; the SPEC-013 verbs
