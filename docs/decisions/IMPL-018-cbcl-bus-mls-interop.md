@@ -1,12 +1,12 @@
 ---
 id: IMPL-018
 title: cbcl-bus MLS Interop — closing the SPEC-013 web-side gaps
-status: draft
+status: implementing
 tier: 1
-version: 0.1.0
+version: 0.2.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Fable 5)
-last-updated: 2026-07-10
+author: Anuna Research (drafted with Claude Fable 5; v0.2.0 post-merge review — status to implementing, pin-store architecture bullet corrected to the resolved localStorage decision)
+last-updated: 2026-07-13
 spec: SPEC-013
 owner-repo: cbcl-bus
 affects-repos: cbcl-bus (hub + web client + in-repo cbcl-mls-wasm crate + vendored artifact)
@@ -84,9 +84,12 @@ implements *against fixed targets*, not a fresh design. Concretely:
   the DS-label logic and violate "one signer context"). The signed-context byte layout is
   hark's `genesis_signing_bytes` (`src/mls/group.rs:84`).
 - **Pins (IG-2/LG-2).** A handle→wire-key pin store is the substrate LG-1..4 all need; it
-  lives in IndexedDB beside the existing `cbcl-e2ee` identity store (rung 3: the platform
-  store already exists). Pins are set only from verified `cbcl-idkey-assert/v1` self-signed
-  frames — never hub-asserted (REQ-011).
+  is a JS map persisted to **localStorage** (as resolved in task-pins-idkey — pins are
+  public keys, i.e. integrity state, not secret material, so they do not belong in the
+  `cbcl-e2ee` IndexedDB secret store; rung 3: the platform store already exists). Pins are
+  set only from verified `cbcl-idkey-assert/v1` self-signed frames — never hub-asserted
+  (REQ-011). *(v0.2.0: this bullet originally said IndexedDB — corrected to match the
+  resolved decision and the shipped code, `app.js` pin persistence.)*
 - **Validation (LG-1).** `Group::process` (`crates/cbcl-mls-wasm/src/lib.rs:288`) is
   rewritten to inspect every leaf-changing object against pins + the REQ-017(a-e) allowlist
   before merge, and to return the authenticated sender leaf so JS can enforce REQ-018. This

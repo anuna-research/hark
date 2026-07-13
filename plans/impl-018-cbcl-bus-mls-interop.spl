@@ -45,7 +45,7 @@
   (acceptance "Positive: a web-created group's Welcome is accepted by hark's create_add_join_roundtrip_with_genesis shape (src/mls/group.rs:722). Negative-output: a genesis-less web create is hard-rejected by hark exactly as src/mls/group.rs:492. Genesis bytes are byte-identical to hark's genesis_signing_bytes for the same (room, creator, group_id, key)."))
 
 (meta task-pins-idkey
-  (description "IG-2 / REQ-019+REQ-011. Web emits (idkey @handle :key K :room @room :nonce N) signed under cbcl-idkey-assert/v1 on join and on new-peer presence (mirror hark's re-broadcast); verifies inbound self-signatures and pins handle->wire-key in a durable store in IndexedDB beside cbcl-e2ee. Never pin from a hub-asserted source.")
+  (description "IG-2 / REQ-019+REQ-011. Web emits (idkey @handle :key K :room @room :nonce N) signed under cbcl-idkey-assert/v1 on join and on new-peer presence (mirror hark's re-broadcast); verifies inbound self-signatures and pins handle->wire-key in a durable store (resolved: localStorage, not IndexedDB — pins are public integrity state; see decided-web-pins-in-localstorage-not-idb). Never pin from a hub-asserted source.")
   (acceptance "Positive: hark pins a web member from its emitted assertion and admits it (REQ-008 adder check passes). Negative-input: a hub-substituted or wrong-room assertion is rejected, not pinned. Signed-context bytes match hark's pins.rs idkey layout."))
 
 (meta task-safety

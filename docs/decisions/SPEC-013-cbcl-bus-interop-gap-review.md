@@ -30,7 +30,8 @@ surface (IG-4) — and the entire [[SPEC-013-mls-private-channels#REQ-017]] vali
 layer is still absent web-side, so the [[SPEC-013-mls-private-channels#ADR-001]]
 lockstep obligation remains open. One shared-substrate risk sits underneath all of it:
 the hub parses CBCL via a cbcl-rs pin now 74 commits behind the revision hark builds
-against (DR-1, §4). **No hark-side change is required for compatibility; hark SHALL NOT
+against (DR-1, §4; *corrected 2026-07-13: 5 commits behind cbcl-rs main — the 74 counted
+a local feature branch, see the §4 correction*). **No hark-side change is required for compatibility; hark SHALL NOT
 relax its fail-closed checks to tolerate the gaps.**
 
 ## 1. Confirmed-compatible surface
@@ -189,6 +190,18 @@ the drift window that matters is the small core, and versioned releases close it
 conformance-corpus recommendation stands as the cheap regression guard for exactly that
 core subset; severity accordingly read as **Medium (accepted, mitigation scheduled)**
 rather than open High.
+
+*Correction (2026-07-13, post-merge review):* the **74-commits-behind** figure above was
+measured against the **local cbcl-rs checkout**, whose HEAD (`1e43e472`) sits on the
+`epp-correspondence-proof` feature branch — not against cbcl-rs `origin/main`. Against
+`origin/main` the hub pin `693e3c15` is only **5 commits behind**, so the drift exposure
+was overstated. The finding the original text missed is the cause of the mismeasurement
+itself: hark's `Cargo.toml` **path dependency builds against whatever the local cbcl-rs
+checkout happens to be** — currently a feature branch — which is a reproducibility gap in
+its own right and strengthens the case for the fixed-and-versioned cbcl-rs release in the
+owner disposition. As of 2026-07-13 that release has not shipped (cbcl-rs has no tags), so
+[[impl-018-cbcl-bus-mls-interop|IMPL-018]] task-dialect remains correctly blocked and
+task-pin-bump remains open (now cheap: 5 commits).
 
 ## 5. Bookkeeping corrections (spec/vault hygiene)
 
