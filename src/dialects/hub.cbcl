@@ -34,8 +34,16 @@
   ;; --- SPEC-001 rooms: presence, config, invites, directory, history ----
   (extend presence (members)
     (tell @room (roster :members members)))
-  (extend roomcfg (enc)
-    (tell @room (room-config :enc enc)))
+  (extend roomcfg (enc dialects)
+    (tell @room (room-config :enc enc :dialects dialects)))
+
+  ;; --- SPEC-015 channel dialects: declare / undeclare / acquire ---------
+  (extend adddialect (name digest def)
+    (tell @room (dialect-declare :name name :digest digest :def def)))
+  (extend removedialect (name)
+    (tell @room (dialect-undeclare :name name)))
+  (extend fetchdialect (digest)
+    (tell @room (dialect-fetch :digest digest)))
   (extend invite (ttl uses)
     (tell @room (invite-request :ttl ttl :uses uses)))
   (extend invited (token ttl uses)
