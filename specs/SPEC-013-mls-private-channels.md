@@ -3,9 +3,9 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: implementing
 tier: 1
-version: 0.8.3
+version: 0.9.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off; v0.8.1 folds the round-6 spot-check, GPT-5.x — gate cleared; v0.8.2 doc-only — affects-repos corrected after the cbcl-mls-wasm crate moved into cbcl-bus at e6fd708, see [[SPEC-013-cbcl-bus-interop-gap-review]]; v0.8.3 doc-only — status draft → implementing per the PROTO-001 lifecycle: hark side complete (IMPL-013), cbcl-bus side merged and deployed with [[impl-018-cbcl-bus-mls-interop|IMPL-018]] 8/12 tasks complete; `implemented` awaits the REQ-010 live hark↔web gate)
+author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off; v0.8.1 folds the round-6 spot-check, GPT-5.x — gate cleared; v0.8.2 doc-only — affects-repos corrected after the cbcl-mls-wasm crate moved into cbcl-bus at e6fd708, see [[SPEC-013-cbcl-bus-interop-gap-review]]; v0.8.3 doc-only — status draft → implementing; v0.9.0 folds the two spec gaps the live REQ-010 interop run surfaced — REQ-025/REQ-026 fork-recovery (resync), ADR-007 creator-vs-owner roles, OQ-006 forged-resync availability residual — Claude Fable 5, NEEDS a fresh-context Principle-12 review before these normative additions are approved)
 last-updated: 2026-07-13
 owner-repo: hark
 affects-repos: cbcl-bus (hub + web client + in-repo cbcl-mls-wasm crate + vendored artifact — the crate moved in from cbcl-chat at e6fd708, 2026-06-10)
@@ -110,8 +110,10 @@ it is orthogonal to MLS group admission ([[#OQ-002]], [[#OQ-004]]). This spec
 assumes the agent is already room-admitted and adds only **MLS group admission** on
 top.
 
-**Out of scope (deferred, tracked):** owner-churn / concurrent-owner *liveness* robustness
-beyond split-group resistance ([[#OQ-003]]); one-time-KeyPackage replenishment policy
+**Out of scope (deferred, tracked):** *concurrent-owner* / absent-creator *liveness* robustness
+beyond split-group resistance ([[#OQ-003]], [[#ADR-007]]) — the **single-member desync
+self-heal** slice is now **in scope** ([[#REQ-025]]/[[#REQ-026]] fork recovery), but concurrent
+committers and an absent bootstrap creator remain deferred; one-time-KeyPackage replenishment policy
 ([[#OQ-004]]); **key transparency** — the strong fix for the TOFU first-contact gap
 ([[#OQ-002]]); the MVP pins from observed signed frames + out-of-band fingerprint;
 metadata-privacy hardening against the hub-as-[[Delivery Service]];
@@ -523,6 +525,45 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   headless deployment can actually follow (R4-04). Without this surface the agent cannot
   participate in the one mechanism that catches first-contact MITM, on which [[#ADR-006]]
   relies for agents. Trace: `[[#TEST-024]]`. *(Closes R3-13; workflow made practical per R4-04.)*
+- **REQ-025 — Fork recovery: desync self-heal (member side).** When the [[#REQ-006]]
+  consecutive-decrypt-failure counter for the agent's own group crosses the fork threshold —
+  i.e. the agent's epoch has forked from the live group and it can no longer process inbound
+  Commits or application messages — the agent SHALL (a) **fully discard** its local group
+  state, **including** the [[OpenMLS]] provider's persisted storage (not merely an in-memory
+  handle), so a subsequent re-admission [[Welcome]] is not rejected as a duplicate/existing
+  group; and (b) request re-admission by re-issuing its readiness announce marked as a
+  **resync request** (the `:resync` marker on the `keyready`/announce frame). The agent SHALL
+  bound its resync requests to a small attempt cap per unresolved fork and, once the cap is
+  exceeded, SHALL surface the desync as **terminal** (an operator-visible recovery failure)
+  rather than continue requesting — a persistently-broken session MUST NOT emit unbounded
+  ghost re-admission requests. A resync request SHALL be distinguishable from a routine
+  re-announce (only the explicit resync marker requests re-provisioning), and the fork and
+  attempt counters SHALL reset on the next successfully processed Commit or join. Trace:
+  `[[#TEST-025]]`. *(Brings the [[#2. Scope|previously-deferred]] owner-churn/liveness
+  recovery into scope as a **bounded** self-heal; composes [[#REQ-006]] detection, [[#REQ-009]]
+  durable state, and re-admission under [[#REQ-012]]. cbcl-bus shipped this web-side ahead of
+  the spec — the [[SPEC-013-cbcl-bus-interop-gap-review|interop review]] follow-up — and hark's
+  current warn-and-drop fork handling SHALL be brought up to this contract.)*
+- **REQ-026 — Authorised re-provisioning (creator side).** On receiving a resync request
+  ([[#REQ-025]]) from a handle **already present as a live leaf** of the group tree, the
+  elected [[Owner Election|owner]] SHALL re-provision that member ONLY IF it is the [[#REQ-016]]
+  genesis **creator**: it SHALL first remove the member's stale leaf under [[#REQ-014]]
+  creator-authority removal evidence — necessary because [[RFC 9420]] §7.8 forbids two leaves
+  sharing one signature key, so a fresh leaf cannot be seated beside the stale one — then
+  re-add the member under a freshly fetched [[KeyPackage]] subject to full [[#REQ-008]] adder
+  validation (target handle **and** pinned wire key), and [[Welcome]] it at the live epoch. An
+  elected owner that is **not** the creator SHALL NOT attempt re-provisioning (it cannot mint
+  the [[#REQ-014]] evidence) and SHALL leave recovery to the member's manual re-entry. Only an
+  explicit resync request SHALL trigger the remove-then-add; a routine re-announce SHALL NOT
+  churn membership. Re-provisioning SHALL preserve every membership invariant — the removal is
+  [[#REQ-014]]-evidenced and the re-add is [[#REQ-008]]/[[#REQ-011]]-validated (never an
+  unpinned or rebound key) — so recovery is **membership-visible**: it changes the [[#REQ-021]]
+  identity safety number and is re-compared, exactly as the remove+re-add rotation path in
+  [[#REQ-011]]. *Residual (availability only):* a **forged** resync request naming a live member
+  is an epoch-churn / denial-of-service vector — it CANNOT breach confidentiality or
+  authenticity (the re-add is pin-validated and the removal is evidence-bound), but it can force
+  disruptive re-provisioning; the creator SHOULD bound honored resyncs per member per epoch
+  window. Tracked as [[#OQ-006]]. Trace: `[[#TEST-026]]`.
 
 ## 5. Non-Functional Requirements
 
@@ -619,6 +660,26 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   construction** until safety numbers are actually compared — for humans (who may never
   compare) and for agents (structurally). *Owner direction:* A, with the agent-AS claim
   re-scoped.
+- **ADR-007 — Creator and elected owner are distinct roles; group bootstrap is the creator's
+  explicit act.** [[#REQ-016]] derives membership-change authority from verifiable MLS group
+  state (the live leaves) and [[#REQ-004]] makes that election deterministic and agreed across
+  clients. This ADR makes explicit a contract those two imply: the **group creator** (the
+  [[#REQ-016]] genesis creator — the member whose channel-creation act bootstrapped the group)
+  is a **fixed** bootstrap authority, distinct from the **elected owner** (the *dynamic*
+  committer for membership changes over the current tree). A member SHALL NOT create a group
+  merely by winning an election held *before any group exists* — a presence-roster election;
+  group bootstrap is the creator's explicit genesis act ([[#REQ-016]]). *Consequence for interop
+  (the liveness gap observed in the live [[#REQ-010]] run — [[SPEC-013-cbcl-bus-interop-gap-review]]):*
+  a client that bootstraps via a pre-group presence-roster election (the web client) MUST ensure
+  only the channel creator bootstraps; electing a member that will not create leaves the channel
+  with no group. For hark the rule is concrete and already true: a paired-in or joined agent is
+  **never** the bootstrap creator — it creates a group only via explicit operator intent
+  (`hark init --mls-create`), never on being elected, and otherwise publishes keys and waits to
+  be [[Welcome]]d. *Trade-off:* fixed-creator bootstrap is simpler and matches [[#REQ-016]]'s
+  genesis root of trust, at the cost that a channel whose creator is absent forms no group until
+  the creator is present — the concurrent/absent-creator liveness case remains deferred with
+  owner-churn robustness ([[#2. Scope]], [[#OQ-003]]). *Owner direction:* creator creates;
+  elected owner commits.
 
 ## 7. Open Questions (Tier-1 — require human crypto sign-off)
 
@@ -680,6 +741,22 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   `sender_ratchet_configuration` on `MlsGroupJoinConfigBuilder`) and that pruning is reflected
   in **persisted** secret-state (~8.4 KB at `(0)` vs ~36 KB at `(12)`). **Round-4 / the durable
   provider's own test** confirms only the on-disk delete fidelity of ADR-004's provider.
+- **OQ-006 — Forged-resync epoch-churn (availability) — OPEN (post-gate, does NOT re-block).**
+  Raised by the [[#REQ-025]]/[[#REQ-026]] fork-recovery protocol added after the 2026-06-10 gate
+  (a capability cbcl-bus shipped web-side; [[SPEC-013-cbcl-bus-interop-gap-review]]). The resync
+  request is a `keyready :resync` frame carrying `:from`, which the [[Delivery Service|untrusted hub]]
+  or a member could forge for a live victim handle. It is **not a confidentiality or authenticity
+  break** — [[#REQ-026]] removes only under [[#REQ-014]] evidence and re-adds only under
+  [[#REQ-008]]/[[#REQ-011]] pin validation, so no attacker key is ever seated and the victim is
+  re-admitted at its own pinned key — but it is an **availability** vector: a spammed forged
+  resync forces the creator to churn epochs (remove+re-add the victim) and drains KeyPackages.
+  The member-side attempt cap ([[#REQ-025]]) bounds a *broken* member's own churn but not an
+  *attacker's* volume against a healthy victim. *Candidate resolutions (measurable):* the creator
+  bounds honored resyncs to ≤ N per (member, epoch-window); and/or the resync request is
+  authenticated (signed like the [[#REQ-019]] idkey assertion) so a forged `:from` is rejected
+  before any Remove. Because the residual is availability-only and the confidentiality/authenticity
+  invariants hold, this OQ **does not re-open the Tier-1 gate** ([[SPEC-013-tier1-signoff]]); it is
+  tracked for the fork-recovery hardening pass. *Owner disposition: pending.*
 
 ## 8. Tier-1 Gate
 
@@ -800,6 +877,18 @@ Per the [[PROTO-001]] security-critical row, the test specification will select:
   ([[#REQ-014]]); and the **creator-capability guard** — hark and the web client assert at
   group-creation time that the create config advertises the genesis-extension capability,
   failing **before** the first real Commit rather than at it ([[#REQ-016]]).
+- **Fork recovery (TEST-025, TEST-026)** — the [[#REQ-025]]/[[#REQ-026]] resync protocol:
+  **TEST-025** (member) — positive: a member forced to fork (an unprocessable Commit run past
+  the threshold) discards its group **including provider storage** and re-announces `:resync`,
+  and recovers to the live epoch after re-admission; negative-output: it stops after the attempt
+  cap and reports **terminal** rather than looping; negative-input: a routine (non-`:resync`)
+  re-announce does **not** trigger re-provisioning. **TEST-026** (creator) — positive: the
+  creator remove-then-re-adds a resyncing live member at its pinned key and the [[#REQ-021]]
+  safety number flips then re-agrees; negative-input: a resync `:from` a handle **not** in the
+  tree is ignored; negative-output: a **non-creator** elected owner does **not** attempt the
+  Remove; and the [[#OQ-006]] forged-resync case is an availability adversarial-test target
+  (a resync must never seat an unpinned key). The live [[#REQ-010]] interop test SHALL be
+  extended with a fork-and-heal leg.
 
 Each `REQ` gets requirement-targeted decomposition (positive / negative-input /
 negative-output) so failures attribute to a single clause.
