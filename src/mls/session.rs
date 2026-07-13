@@ -295,6 +295,9 @@ impl MlsSession {
         ));
 
         frames.push(self.own_idkey_frame()?);
+        // SPEC-013 IB-3: announce "published, add me" so a web owner has an
+        // explicit, re-drivable add trigger (not just presence timing).
+        frames.push(self.keyready_frame());
         Ok(frames)
     }
 
@@ -333,6 +336,16 @@ impl MlsSession {
     /// A `keyget` for `target` (fetch their KeyPackage to add them).
     fn keyget_frame(&self, target: &str) -> String {
         format!("(keyget @hub :for {target} :from {})", self.handle)
+    }
+
+    /// A `keyready` announce — the web owner's canonical "I've published my
+    /// KeyPackages, add me" trigger (cbcl-bus mls.js `onPeerReady`, SPEC-013
+    /// IB-3). Room-fanned with the `:from` attribution the hub requires for a
+    /// room frame, exactly like `idkey`. hark previously relied on presence
+    /// timing alone; emitting this gives a weak or late-electing owner an
+    /// explicit, re-drivable add trigger.
+    fn keyready_frame(&self) -> String {
+        format!("(keyready {} :from {})", self.room, self.handle)
     }
 
     /// If we are the elected owner, a `keyget` for each present member we
@@ -654,6 +667,10 @@ impl MlsSession {
             if let Ok(frame) = self.own_idkey_frame() {
                 outbound.push(frame);
             }
+            // Re-broadcast the keyready trigger too (SPEC-013 IB-3), so an owner
+            // that elects/joins after us gets an explicit, re-drivable add signal
+            // — the same delivery-gap fix as the idkey re-broadcast above.
+            outbound.push(self.keyready_frame());
         }
         outbound.extend(self.keygets_for_addable());
         SessionEvent::Handled { outbound }
@@ -948,10 +965,15 @@ mod tests {
         let mut session =
             MlsSession::open(&dir, "aria", "@research", "@aria", &wire, true).unwrap();
         let frames = session.join_frames().unwrap();
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 3);
         assert!(frames[0].starts_with("(keypub @hub :last \""));
         assert!(frames[0].contains(":onetime ("));
         assert!(cbcl_parser::parse(&frames[0]).is_ok(), "keypub parses");
+
+        // SPEC-013 IB-3: a keyready announce ("published, add me") for the owner.
+        assert!(frames[2].starts_with("(keyready @research"));
+        assert!(frames[2].contains(":from @aria"));
+        assert!(cbcl_parser::parse(&frames[2]).is_ok(), "keyready parses");
 
         // The idkey frame is addressed to the room (so the hub fans it) and
         // round-trips through a peer's pin store.
