@@ -246,3 +246,50 @@
 (claims agent:claude
   :at "2026-07-13T07:23:44Z"
   (given completed-interop))
+
+;; ---------------------------------------------------------------- post-interop hardening (2026-07-13)
+;; The Principle-12 review of the SPEC-013 resync additions (REQ-025/026, findings
+;; F1-F8, docs/decisions/SPEC-013-resync-review-findings.md) drove a hardening pass,
+;; all shipped to the deployed hub and re-verified live (REQ-010 11/11):
+;;  - F1: resync-request authentication (cbcl-mls-resync/v1 sign+verify) — closes the
+;;        unsigned-:resync forged-eviction vector. hark byte-parity primitive landed.
+;;  - F4/F5/F8: reachable terminal, validate-then-remove-then-add, group-scoped discard.
+;;  - LG-6/REQ-013: a failed Welcome no longer burns the one-time init key
+;;        (join_verified snapshot/restore); replay-after-consume is inert.
+(given completed-resync-auth-f1)
+(given completed-resync-hardening-f4-f5-f8)
+(claims agent:claude
+  :at "2026-07-13T11:19:00Z"
+  (given verified-resync-fixes-deployed-and-req010-green))
+(claims agent:claude
+  :at "2026-07-13T11:19:00Z"
+  (given completed-ledger))
+
+;; task-ledger: the REQ-013 single-use DISCIPLINE (ordering + replay-inert) is done
+;; within the session; cross-reload DURABLE persistence stays OQ-003b (IndexedDB
+;; StorageProvider) — moot for the in-memory web provider, a distinct architecture item.
+(given blocked-by-indexeddb-provider-oq003b)
+
+;; task-ui-claim (LG-8): SATISFIED without a code change — the UI already renders
+;; "private, end-to-end encrypted (experimental, unaudited)", the hedged-but-backed
+;; form, now that REQ-012/017/018/023 + REQ-013 land. The claim no longer outruns the
+;; implementation; "experimental, unaudited" remains honest (no formal audit yet).
+(claims agent:claude
+  :at "2026-07-13T11:19:00Z"
+  (given completed-ui-claim))
+
+;; task-pin-bump (DR-1): hark's exact openmls pins landed (=0.8.1/=0.5.0/=0.5.1/=0.5.0,
+;; matching the crate). The cbcl-rs.sha bump + conformance corpus stay deferred per the
+;; owner disposition (a versioned cbcl-rs release supersedes ad-hoc SHA pinning), and
+;; hark's cbcl-rs path dep floats on the local checkout so there is no stable SHA target.
+(given completed-openmls-exact-pins)
+(given blocked-by-cbcl-rs-versioned-release-for-sha-bump)
+
+;; FOLLOW-ONS (tracked, not done):
+;;  - hark member-side resync SELF-HEAL wiring (discard durable group + emit signed
+;;    :resync + bounded retry -> terminal, replacing warn-and-drop) — needs live
+;;    hark<->web fork testing. The byte-parity signing primitive is in place.
+;;  - CROSS-VENDOR Principle-12 pass on REQ-025/026 (the in-session review was
+;;    same-family Claude; a different-vendor pass, as round-6 used GPT-5.x, needs a human).
+(given follow-on-hark-resync-selfheal-wiring)
+(given follow-on-cross-vendor-review-req025-026)
