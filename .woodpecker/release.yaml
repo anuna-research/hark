@@ -165,4 +165,4 @@ steps:
       - echo "Release available at:"
       - echo "  https://files.anuna.io/$${PROJECT}/"
       - echo "  https://files.anuna.io/$${PROJECT}/$${CI_COMMIT_TAG}/"
-      - echo "Install:  curl https://files.anuna.io/$${PROJECT}/install.sh | sh"
+      - 'echo "Install: curl https://files.anuna.io/$${PROJECT}/install.sh | sh"'
