@@ -82,7 +82,38 @@ pub struct AgentSendChannel {
 #[derive(Debug)]
 pub struct OutboundFrame {
     pub message: String,
-    pub result_tx: oneshot::Sender<Result<(), String>>,
+    pub result_tx: oneshot::Sender<Result<(), OutboundReject>>,
+}
+
+/// Why a transport loop refused to send an outbound frame. The `retryable`
+/// bit is the load-bearing distinction: a *fatal* reject (WebSocket write
+/// failed, connection closed, malformed frame) means the handle is dead and
+/// must be marked unhealthy; a *retryable* reject (the MLS Welcome that makes
+/// us a group member has not arrived yet — SPEC-013 REQ-023 fail-closed) is a
+/// transient precondition that the very next attempt may satisfy, so it must
+/// NOT poison the handle.
+#[derive(Debug, Clone)]
+pub struct OutboundReject {
+    pub detail: String,
+    pub retryable: bool,
+}
+
+impl OutboundReject {
+    /// The handle is dead — mark it unhealthy.
+    pub fn fatal(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            retryable: false,
+        }
+    }
+
+    /// A transient precondition failed — the same send may succeed shortly.
+    pub fn retryable(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            retryable: true,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
@@ -96,6 +127,12 @@ pub enum AgentError {
         reason: String,
         detail: Option<String>,
     },
+    /// A transient precondition blocked the send but the handle is still
+    /// healthy — retry shortly. Today this is exclusively the MLS
+    /// membership-not-yet-established case (no Welcome yet, SPEC-013 REQ-023):
+    /// unlike [`AgentError::Unhealthy`], the handle is left usable.
+    #[error("agent handle is not ready yet")]
+    NotReady { detail: Option<String> },
     #[error("a receive call is already waiting for this handle")]
     RecvAlreadyWaiting,
     #[error("receive timed out")]
@@ -519,13 +556,20 @@ impl AgentStore {
 
         match result_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(detail)) => {
+            // A transient precondition (MLS membership not yet established):
+            // leave the handle healthy so the next attempt — once the Welcome
+            // lands — can succeed. Marking it unhealthy here would strand the
+            // handle over a membership race (SPEC-013 REQ-023).
+            Ok(Err(reject)) if reject.retryable => Err(AgentError::NotReady {
+                detail: Some(reject.detail),
+            }),
+            Ok(Err(reject)) => {
                 let _ = self
-                    .mark_unhealthy(handle, "local_send_failed", Some(detail.clone()))
+                    .mark_unhealthy(handle, "local_send_failed", Some(reject.detail.clone()))
                     .await;
                 Err(AgentError::Unhealthy {
                     reason: "local_send_failed".to_owned(),
-                    detail: Some(detail),
+                    detail: Some(reject.detail),
                 })
             }
             Err(_) => {
@@ -1742,6 +1786,75 @@ mod tests {
                 detail: None,
             }
         );
+    }
+
+    /// A *retryable* outbound reject (MLS membership not yet established) must
+    /// surface as [`AgentError::NotReady`] and leave the handle healthy — a
+    /// membership race must not strand the handle. A *fatal* reject still
+    /// marks it unhealthy. This is the SPEC-013 REQ-023 regression: `emit`
+    /// racing ahead of the Welcome used to poison the handle.
+    #[tokio::test]
+    async fn retryable_outbound_reject_keeps_handle_healthy() {
+        let store = agent_store(10, 100);
+
+        // A fake transport loop: reply to the first frame with a retryable
+        // reject, the second with a fatal one.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::OutboundFrame>(4);
+        tokio::spawn(async move {
+            if let Some(frame) = rx.recv().await {
+                let _ = frame
+                    .result_tx
+                    .send(Err(super::OutboundReject::retryable("not yet a member")));
+            }
+            if let Some(frame) = rx.recv().await {
+                let _ = frame
+                    .result_tx
+                    .send(Err(super::OutboundReject::fatal("socket died")));
+            }
+        });
+
+        let handle = handle();
+        store
+            .insert_connected_with_router_channels(
+                handle.clone(),
+                vec!["elf".to_owned()],
+                None,
+                Some(super::AgentSendChannel::new(tx)),
+                Some("@aria".to_owned()),
+                Some("@research".to_owned()),
+            )
+            .await
+            .expect("agent should insert");
+
+        // Retryable: NotReady, handle stays Connected.
+        let error = store
+            .send_outbound(&handle, "(deliver @research)".to_owned())
+            .await
+            .expect_err("retryable reject should error");
+        assert_eq!(
+            error,
+            super::AgentError::NotReady {
+                detail: Some("not yet a member".to_owned()),
+            }
+        );
+        let status = store.status_snapshots().await;
+        assert_eq!(
+            status[0].state,
+            super::AgentState::Connected,
+            "a transient not-ready reject must not poison the handle"
+        );
+
+        // Fatal: Unhealthy, handle poisoned as before.
+        let error = store
+            .send_outbound(&handle, "(deliver @research)".to_owned())
+            .await
+            .expect_err("fatal reject should error");
+        assert!(matches!(
+            error,
+            super::AgentError::Unhealthy { .. }
+        ));
+        let status = store.status_snapshots().await;
+        assert_eq!(status[0].state, super::AgentState::Unhealthy);
     }
 
     #[tokio::test]

@@ -88,6 +88,14 @@ pub enum MlsError {
     /// validation and was rejected. The string names the violated predicate.
     #[error("rejected: {0}")]
     Rejected(String),
+    /// A transient precondition is not yet met — most notably, this agent is
+    /// not yet a member of the room's MLS group because no Welcome has
+    /// arrived. Unlike [`MlsError::Rejected`], this is NOT a security
+    /// decision (fail closed): the *same* operation succeeds once the session
+    /// catches up, so callers must treat it as retryable rather than
+    /// health-fatal. Failing closed (no plaintext fallback) still holds.
+    #[error("not ready: {0}")]
+    NotReady(String),
     /// The underlying OpenMLS stack failed.
     #[error("mls stack: {0}")]
     Stack(String),
