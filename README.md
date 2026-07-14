@@ -335,6 +335,89 @@ hark close
 hark daemon stop
 ```
 
+### Running the daemon under launchd (macOS)
+
+To keep the daemon running across logins, supervise `hark daemon run` — the
+foreground command — with a per-user **LaunchAgent**. Use `daemon run`, not
+`daemon start`: launchd needs a process that stays in the foreground so it can
+supervise and restart it.
+
+Two things make this reliable on macOS:
+
+- The daemon's runtime state (`~/Library/Application Support/hark/runtime/`) and
+  config (`~/Library/Application Support/hark/config.toml`) are derived from your
+  home directory, not from `XDG_RUNTIME_DIR` (that is Linux-only). So a
+  launchd-started daemon and your interactive `hark` commands share the same
+  daemon, with no extra configuration.
+- launchd agents do **not** inherit your shell environment. Put router
+  configuration in the config file (see [Configuration](#configuration)); the
+  `CBCL_*` environment overrides in your shell will not reach the daemon.
+
+If you previously ran `hark daemon start` by hand, run `hark daemon stop` first
+so the singleton lock is free before launchd takes over.
+
+Write the agent (the substitutions fill in your real binary path and home):
+
+```bash
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs/hark
+cat > ~/Library/LaunchAgents/io.anuna.hark.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.anuna.hark</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(command -v hark)</string>
+    <string>daemon</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$HOME/Library/Logs/hark/daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Logs/hark/daemon.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>hark=info</string>
+  </dict>
+</dict>
+</plist>
+EOF
+```
+
+Load and start it (macOS 11+):
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.anuna.hark.plist
+launchctl kickstart gui/$(id -u)/io.anuna.hark
+hark daemon status        # confirm it is up
+```
+
+`init`, `join`, `recv`, and the rest then discover the launchd-started daemon
+normally. Manage it through launchd — because `KeepAlive` restarts the process,
+stop it with `launchctl bootout`, not `hark daemon stop` (which would just be
+restarted):
+
+```bash
+launchctl print gui/$(id -u)/io.anuna.hark            # status + last exit code
+launchctl kickstart -k gui/$(id -u)/io.anuna.hark     # restart (e.g. after a config change)
+launchctl bootout gui/$(id -u)/io.anuna.hark          # stop and unload
+tail -f ~/Library/Logs/hark/daemon.err.log            # logs (tracing writes to stderr)
+```
+
+On macOS 10 the equivalents are `launchctl load -w
+~/Library/LaunchAgents/io.anuna.hark.plist` and `launchctl unload -w …`.
+
+> Linux: run the same `hark daemon run` under a systemd **user** service
+> (`systemctl --user`). There the runtime dir follows `XDG_RUNTIME_DIR`, which
+> systemd already sets to match your interactive shell.
+
 ## Commands
 
 ### `config path`
