@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 Anuna Research
+#
+# hark release pipeline (SPEC-016 REQ-001, ADR-006).
+#
+# Triggered by pushing a tag like `v0.1.0` (see ./release.sh). Cross-compiles
+# the four prebuilt binaries that scripts/install.sh downloads
+#   hark-darwin-arm64  hark-darwin-x64  hark-linux-x64  hark-linux-arm64
+# each with a matching .sha256, then publishes them (plus install.sh) to
+# Cloudflare R2 (bucket anuna-files) so they are served at
+#   https://files.anuna.io/hark/            <- flat "latest", what install.sh reads
+#   https://files.anuna.io/hark/<tag>/      <- immutable per-release archive
+#
+# Everything builds from Linux rust:1-bookworm containers, including the darwin
+# artifacts (via osxcross + the macOS SDK) — Codeberg's hosted runners are
+# Linux-only. hark's TLS stack is rustls/ring (no openssl, no aws-lc), so the
+# cross-builds need only the target C toolchain: no libssl-dev:arm64 and no
+# vendored-openssl gymnastics. hark also has no custom [profile.release], so the
+# LTO/OOM softening zetl needs is unnecessary here.
+#
+# hark depends on the sibling cbcl-rs repo via `../cbcl-rs/...` path deps
+# (Cargo.toml). cbcl-rs is PUBLIC on Codeberg, so each build step clones it
+# anonymously as a sibling and checks out a PINNED commit (CBCL_RS_REF): Cargo's
+# `--locked` cannot pin path-dependency *contents*, so building against a moving
+# branch would let an unrelated cbcl-rs change silently alter a hark release.
+# Bump CBCL_RS_REF deliberately in the release-prep commit.
+#
+# Required Woodpecker secrets (same R2 credentials the zetl pipeline uses):
+#   cf_r2_access_key_id  cf_r2_secret_access_key  cf_account_id
+
+when:
+  - event: tag
+    branch: main
+
+variables:
+  - &rust_image rust:1-bookworm
+  # The pinned cbcl-rs commit hark releases build against. Bump per release.
+  # Clone the public sibling to ../cbcl-rs (relative to the hark checkout, which
+  # is exactly where the `../cbcl-rs` path dep resolves) and detach to the pin.
+  - &clone_cbcl |
+    CBCL_RS_REF=1c6fa8f581a69a7bcb88fb787fa37c81f5de4221
+    if [ ! -d ../cbcl-rs ]; then
+      git clone https://codeberg.org/anuna/cbcl-rs.git ../cbcl-rs
+    fi
+    git -C ../cbcl-rs checkout --detach "$CBCL_RS_REF"
+
+steps:
+  - name: build-linux-x64
+    image: *rust_image
+    commands:
+      - *clone_cbcl
+      - cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - mkdir -p dist
+      - cp target/x86_64-unknown-linux-gnu/release/hark dist/hark-linux-x64
+      - cd dist && sha256sum hark-linux-x64 > hark-linux-x64.sha256 && cd ..
+
+  - name: build-linux-arm64
+    image: *rust_image
+    commands:
+      - *clone_cbcl
+      # ring compiles a little C/asm for the target, so it needs the aarch64
+      # cross toolchain (compiler + linker). No system libraries beyond that —
+      # hark pulls no openssl-sys.
+      - apt-get update && apt-get install -y gcc-aarch64-linux-gnu
+      - rustup target add aarch64-unknown-linux-gnu
+      - export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+      - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+      - cargo build --release --locked --target aarch64-unknown-linux-gnu
+      - mkdir -p dist
+      - cp target/aarch64-unknown-linux-gnu/release/hark dist/hark-linux-arm64
+      - cd dist && sha256sum hark-linux-arm64 > hark-linux-arm64.sha256 && cd ..
+
+  - name: build-darwin-arm64
+    image: *rust_image
+    commands:
+      - *clone_cbcl
+      - apt-get update && apt-get install -y clang cmake patch xz-utils libxml2-dev
+      - rustup target add aarch64-apple-darwin
+      - |
+        # Build the osxcross toolchain against the macOS SDK (same recipe the
+        # zetl pipeline uses). Keep the SDK download, PATH/CC exports and the
+        # cargo build in one shell block so the cross env is in scope at link.
+        [ -d /tmp/osxcross ] || git clone https://github.com/tpoechtrager/osxcross /tmp/osxcross
+        cd /tmp/osxcross
+        curl -fsSL https://github.com/joseluisq/macosx-sdks/releases/download/14.5/MacOSX14.5.sdk.tar.xz -o tarballs/MacOSX14.5.sdk.tar.xz
+        UNATTENDED=1 ./build.sh
+        cd -
+        export PATH="/tmp/osxcross/target/bin:$PATH"
+        export CC_aarch64_apple_darwin=aarch64-apple-darwin23.5-clang
+        export CXX_aarch64_apple_darwin=aarch64-apple-darwin23.5-clang++
+        export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=aarch64-apple-darwin23.5-clang
+        cargo build --release --locked --target aarch64-apple-darwin
+        mkdir -p dist
+        cp target/aarch64-apple-darwin/release/hark dist/hark-darwin-arm64
+        cd dist && sha256sum hark-darwin-arm64 > hark-darwin-arm64.sha256 && cd ..
+
+  - name: build-darwin-x64
+    image: *rust_image
+    commands:
+      - *clone_cbcl
+      - apt-get update && apt-get install -y clang cmake patch xz-utils libxml2-dev
+      - rustup target add x86_64-apple-darwin
+      - |
+        [ -d /tmp/osxcross ] || git clone https://github.com/tpoechtrager/osxcross /tmp/osxcross
+        cd /tmp/osxcross
+        curl -fsSL https://github.com/joseluisq/macosx-sdks/releases/download/14.5/MacOSX14.5.sdk.tar.xz -o tarballs/MacOSX14.5.sdk.tar.xz
+        UNATTENDED=1 ./build.sh
+        cd -
+        export PATH="/tmp/osxcross/target/bin:$PATH"
+        export CC_x86_64_apple_darwin=x86_64-apple-darwin23.5-clang
+        export CXX_x86_64_apple_darwin=x86_64-apple-darwin23.5-clang++
+        export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=x86_64-apple-darwin23.5-clang
+        cargo build --release --locked --target x86_64-apple-darwin
+        mkdir -p dist
+        cp target/x86_64-apple-darwin/release/hark dist/hark-darwin-x64
+        cd dist && sha256sum hark-darwin-x64 > hark-darwin-x64.sha256 && cd ..
+
+  - name: create-metadata
+    image: alpine:3
+    commands:
+      - apk add --no-cache coreutils
+      # The installer the curl one-liner fetches, shipped alongside the binaries.
+      - cp scripts/install.sh dist/install.sh
+      # Optional machine-readable pointer (install.sh does not require it, but it
+      # mirrors the sibling repos and lets tooling resolve the latest version).
+      - |
+        cat > dist/version.json << EOF
+        {
+          "version": "${CI_COMMIT_TAG#v}",
+          "download_url": "https://files.anuna.io/hark/${CI_COMMIT_TAG}"
+        }
+        EOF
+      - ls -la dist/
+
+  - name: upload-to-cloudflare-r2
+    image: amazon/aws-cli:2.15.0
+    environment:
+      AWS_ACCESS_KEY_ID:
+        from_secret: cf_r2_access_key_id
+      AWS_SECRET_ACCESS_KEY:
+        from_secret: cf_r2_secret_access_key
+      CF_ACCOUNT_ID:
+        from_secret: cf_account_id
+    commands:
+      - export AWS_DEFAULT_REGION=auto
+      - export R2_ENDPOINT="https://$${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
+      - export BUCKET="anuna-files"
+      - export PROJECT="hark"
+
+      # Flat prefix = the "latest" the curl installer reads
+      # (https://files.anuna.io/hark/hark-<os>-<arch> and .../install.sh), plus
+      # an immutable per-tag archive at hark/<tag>/.
+      - |
+        for file in dist/hark-* dist/install.sh dist/version.json; do
+          [ -f "$$file" ] || continue
+          name=$$(basename "$$file")
+          aws s3 cp "$$file" "s3://$${BUCKET}/$${PROJECT}/$$name"                    --endpoint-url "$$R2_ENDPOINT"
+          aws s3 cp "$$file" "s3://$${BUCKET}/$${PROJECT}/$${CI_COMMIT_TAG}/$$name"  --endpoint-url "$$R2_ENDPOINT"
+          echo "Uploaded: $$name"
+        done
+
+      - echo "Files in $${PROJECT}/ (latest):"
+      - aws s3 ls "s3://$${BUCKET}/$${PROJECT}/" --endpoint-url "$$R2_ENDPOINT"
+      - echo ""
+      - echo "Release available at:"
+      - echo "  https://files.anuna.io/$${PROJECT}/"
+      - echo "  https://files.anuna.io/$${PROJECT}/$${CI_COMMIT_TAG}/"
+      - echo "Install:  curl https://files.anuna.io/$${PROJECT}/install.sh | sh"
