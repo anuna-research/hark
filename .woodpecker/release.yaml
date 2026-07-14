@@ -159,8 +159,11 @@ steps:
           echo "Uploaded: $$name"
         done
 
+      # Informational only, and non-fatal: an "Object Read & Write" R2 token can
+      # PutObject (the uploads above) but may lack bucket ListBucket, and this
+      # step runs under `set -e`.
       - echo "Files in $${PROJECT}/ (latest):"
-      - aws s3 ls "s3://$${BUCKET}/$${PROJECT}/" --endpoint-url "$$R2_ENDPOINT"
+      - aws s3 ls "s3://$${BUCKET}/$${PROJECT}/" --endpoint-url "$$R2_ENDPOINT" || echo "(list not permitted by this token; the uploads above succeeded)"
       - echo ""
       - echo "Release available at:"
       - echo "  https://files.anuna.io/$${PROJECT}/"
