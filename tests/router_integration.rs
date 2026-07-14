@@ -505,6 +505,9 @@ async fn handle_mock_connection(
     behavior: RouterBehavior,
 ) {
     let callback_shared = Arc::clone(&shared);
+    // Err type is tungstenite's ErrorResponse — fixed by the accept_hdr_async
+    // callback signature, so it can't be boxed.
+    #[allow(clippy::result_large_err)]
     let callback = move |request: &Request, response: Response| {
         if let Some(auth_header) = request
             .headers()

@@ -9,7 +9,7 @@
 //! out-of-order/duplicate frames are dropped by the hub's strict seq check.
 //!
 //! This replaces hark's old transports: the router path's `Authorization: Bearer`
-//! + unsigned text hello, and the chat path's bare-payload codec. Identity is
+//! plus unsigned text hello, and the chat path's bare-payload codec. Identity is
 //! per-frame by signature (REQ-009) — there is no bearer token.
 
 use crate::chat_frame::FrameSigner;
@@ -133,7 +133,7 @@ pub fn chat_audience(payload: &[u8]) -> Option<Vec<u8>> {
     let end = rest
         .find(|c: char| c.is_whitespace() || c == ')' || c == '(')
         .unwrap_or(rest.len());
-    Some(rest[..end].as_bytes().to_vec())
+    Some(rest.as_bytes()[..end].to_vec())
 }
 
 /// The signed-member router hello payload (replaces the old unsigned

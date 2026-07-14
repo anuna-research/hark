@@ -316,6 +316,8 @@ impl MockRouter {
             let Ok((stream, _peer)) = listener.accept().await else {
                 return;
             };
+            // Err type is fixed by the accept_hdr_async callback signature.
+            #[allow(clippy::result_large_err)]
             let callback = move |_request: &Request, response: Response| {
                 if matches!(behavior, RouterBehavior::RejectAuth) {
                     let mut response = WsErrorResponse::new(Some("unauthorized".to_owned()));
