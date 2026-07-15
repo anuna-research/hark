@@ -19,8 +19,8 @@ use crate::daemon::{
 };
 use crate::errors::{AppError, AppResult};
 use crate::local_api::{
-    ClientPingError, CreateAgentRequest, LocalApiClient, LocalApiRequestError, MetaPublishRequest,
-    MetaQueryRequest, MetaSubscribeRequest, SendMessageKind, SendRequest,
+    AgentStatus, ClientPingError, CreateAgentRequest, LocalApiClient, LocalApiRequestError,
+    MetaPublishRequest, MetaQueryRequest, MetaSubscribeRequest, SendMessageKind, SendRequest,
     serve_local_api_with_agents,
 };
 
@@ -162,7 +162,7 @@ pub struct JoinArgs {
     #[arg(
         long = "speak",
         value_delimiter = ',',
-        help = "Dialect(s) to advertise (repeat or comma-separate); omit to advertise nothing"
+        help = "Dialect(s) to advertise (repeat or comma-separate); omit to advertise nothing. Use `*` to receive EVERY channel message on `recv`, not just answerable asks"
     )]
     pub speak: Vec<String>,
     #[arg(
@@ -200,7 +200,7 @@ pub struct InitArgs {
     #[arg(
         long = "dialect",
         required = true,
-        help = "Dialect id to advertise; repeat for multiple dialects"
+        help = "Dialect id to advertise; repeat for multiple dialects. Use `*` to receive EVERY channel message on `recv`, not just answerable asks"
     )]
     pub dialects: Vec<String>,
     #[arg(
@@ -392,7 +392,12 @@ async fn join_command(args: JoinArgs) -> AppResult<()> {
         .map_err(|error| AppError::Usage(error.to_string()))?;
     let mut seen = std::collections::HashSet::new();
     for dialect in &args.speak {
-        validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        // `*` is the receive-all sentinel (deliver every channel message to
+        // `recv`), interpreted by the daemon — not a concrete dialect id, so
+        // it is exempt from the id grammar.
+        if dialect != "*" {
+            validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        }
         if !seen.insert(dialect) {
             return Err(AppError::Usage(format!("duplicate dialect: {dialect}")));
         }
@@ -573,10 +578,16 @@ async fn pair_command(args: PairArgs) -> AppResult<()> {
     } else {
         response.dialects.join(", ")
     };
-    println!(
+    // Human confirmation on stderr; the machine-readable binding on stdout, so
+    // `eval "$(hark pair …)"` pins THIS shell to the agent it just paired —
+    // addressed by the wire `@name` cbcl-bus assigned (CBCL_AGENT_HANDLE
+    // accepts it). Without this each shell falls back to the daemon's single
+    // active-handle slot and both collapse onto the last-paired agent.
+    eprintln!(
         "paired into {} as {} (added by {}) · speaking: {speaking}",
         record.channel, handle, record.adder
     );
+    println!("export CBCL_AGENT_HANDLE='{}'", shell_single_quote(&handle));
     Ok(())
 }
 
@@ -610,6 +621,9 @@ fn build_chat_config_toml(hub_url: &str) -> String {
 
 async fn init_command(args: InitArgs) -> AppResult<()> {
     validate_init_advertisement(&args.dialects)?;
+    // The wire `@name` (chat only) is the address we export below; capture it
+    // before `args.handle` is moved into the create request.
+    let wire_handle = args.handle.clone();
     let client = discover_live_client().await.map_err(|error| {
         if matches!(error, AppError::DaemonNotRunning) {
             eprintln!("daemon_not_running: run `hark daemon start` first");
@@ -644,10 +658,11 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
             )))?
         );
     } else {
-        println!(
-            "export CBCL_AGENT_HANDLE='{}'",
-            shell_single_quote(&response.agent_handle)
-        );
+        // Prefer the wire `@name` for a chat agent (human-meaningful, matches
+        // cbcl-bus, and CBCL_AGENT_HANDLE resolves it); fall back to the opaque
+        // internal handle on the router transport, which has no wire name.
+        let address = wire_handle.as_deref().unwrap_or(&response.agent_handle);
+        println!("export CBCL_AGENT_HANDLE='{}'", shell_single_quote(address));
     }
 
     Ok(())
@@ -686,7 +701,12 @@ fn validate_init_advertisement(dialects: &[String]) -> AppResult<()> {
     }
     let mut seen = std::collections::HashSet::new();
     for dialect in dialects {
-        validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        // `*` is the receive-all sentinel (deliver every channel message to
+        // `recv`), interpreted by the daemon — not a concrete dialect id, so
+        // it is exempt from the id grammar.
+        if dialect != "*" {
+            validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        }
         if !seen.insert(dialect) {
             return Err(AppError::Usage(format!("duplicate dialect: {dialect}")));
         }
@@ -919,7 +939,21 @@ fn read_message_input(message: Option<String>) -> AppResult<String> {
 /// an explicit `CBCL_AGENT_HANDLE` always wins (multi-agent scripting);
 /// otherwise fall back to the daemon-tracked active handle — no `eval`.
 async fn resolve_session_handle(client: &LocalApiClient) -> AppResult<AgentHandle> {
-    let env = std::env::var("CBCL_AGENT_HANDLE").ok();
+    let env = std::env::var("CBCL_AGENT_HANDLE")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+
+    // A wire `@name` (the invite-provided name `hark pair` prints) pins the
+    // shell to its OWN agent by the human-meaningful name cbcl-bus assigned —
+    // resolved to the daemon's opaque internal handle via the live agent list.
+    // This is what lets two agents share one machine-wide daemon and still be
+    // driven independently from separate shells, without juggling 26-char
+    // handles or racing the daemon's single active-handle slot.
+    if let Some(name) = env.as_deref().filter(|value| value.starts_with('@')) {
+        return resolve_wire_name(client, name).await;
+    }
+
     let active = if env.is_some() {
         None // don't bother the daemon; the env var decides
     } else {
@@ -930,6 +964,72 @@ async fn resolve_session_handle(client: &LocalApiClient) -> AppResult<AgentHandl
             .active_agent_handle
     };
     choose_agent_handle(env, active)
+}
+
+/// Resolve a wire `@name` to the daemon's opaque internal handle by looking it
+/// up in the live agent list. For a chat agent the wire handle is carried in
+/// `router_agent_id`; the router transport never uses an `@`-prefixed id, so a
+/// match is naturally chat-only.
+async fn resolve_wire_name(client: &LocalApiClient, name: &str) -> AppResult<AgentHandle> {
+    let agents = client
+        .agents()
+        .await
+        .map_err(|error| map_client_error(error, "daemon agents query failed"))?;
+    let selection = select_by_wire_name(&agents.agents, agents.active_agent_handle.as_deref(), name)?;
+    if let Some(warning) = selection.warning {
+        eprintln!("warning: {warning}");
+    }
+    AgentHandle::new(selection.handle).map_err(|error| AppError::Usage(error.to_string()))
+}
+
+/// The internal handle chosen for a wire `@name`, plus an optional ambiguity
+/// warning to surface. Split from the network fetch so the selection rules are
+/// unit-testable.
+#[derive(Debug)]
+struct WireNameSelection {
+    handle: String,
+    warning: Option<String>,
+}
+
+/// Pure selection over a live agent list: pick the internal handle whose wire
+/// name (`router_agent_id`) equals `name`. No match is a usage error; a single
+/// match wins cleanly; multiple matches (a re-pair sharing one identity) prefer
+/// the active handle and carry a warning so the ambiguity is never silent.
+fn select_by_wire_name(
+    agents: &[AgentStatus],
+    active: Option<&str>,
+    name: &str,
+) -> AppResult<WireNameSelection> {
+    let matches: Vec<&AgentStatus> = agents
+        .iter()
+        .filter(|agent| agent.router_agent_id == name)
+        .collect();
+    match matches.as_slice() {
+        [] => Err(AppError::Usage(format!(
+            "no live agent named {name} on this daemon; run `hark daemon status` to list them \
+             (CBCL_AGENT_HANDLE accepts a wire @name or an internal handle)"
+        ))),
+        [only] => Ok(WireNameSelection {
+            handle: only.agent_handle.clone(),
+            warning: None,
+        }),
+        many => {
+            let pick = many
+                .iter()
+                .find(|agent| Some(agent.agent_handle.as_str()) == active)
+                .copied()
+                .unwrap_or(many[0]);
+            Ok(WireNameSelection {
+                handle: pick.agent_handle.clone(),
+                warning: Some(format!(
+                    "{} agents share the wire name {name}; using {} \
+                     (re-pairing the same invite reuses one identity)",
+                    many.len(),
+                    pick.agent_handle
+                )),
+            })
+        }
+    }
 }
 
 fn choose_agent_handle(env: Option<String>, active: Option<String>) -> AppResult<AgentHandle> {
@@ -1364,14 +1464,62 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        Cli, Command, ConfigCommand, DaemonCommand, build_chat_config_toml, build_emit_message,
-        build_progress_message, choose_agent_handle, emit_input_is_cbcl_form, escape_cbcl_string,
-        parse_recv_timeout_ms, validate_init_advertisement,
+        AgentStatus, Cli, Command, ConfigCommand, DaemonCommand, build_chat_config_toml,
+        build_emit_message, build_progress_message, choose_agent_handle, emit_input_is_cbcl_form,
+        escape_cbcl_string, parse_recv_timeout_ms, select_by_wire_name,
+        validate_init_advertisement,
     };
+    use crate::errors::AppError;
 
     #[test]
     fn command_tree_matches_mvp_surface() {
         Cli::command().debug_assert();
+    }
+
+    /// A chat agent status with wire name `wire` (`router_agent_id`) and the
+    /// given internal handle. Other fields are irrelevant to name resolution.
+    fn chat_agent(internal: &str, wire: &str) -> AgentStatus {
+        AgentStatus {
+            agent_handle: internal.to_owned(),
+            router_agent_id: wire.to_owned(),
+            dialects: vec![],
+            state: "connected".to_owned(),
+            queued_messages: 0,
+            queued_bytes: 0,
+            unhealthy_reason: None,
+            unhealthy_detail: None,
+            channel: Some("@research".to_owned()),
+        }
+    }
+
+    #[test]
+    fn wire_name_resolves_to_internal_handle() {
+        let agents = [chat_agent("HANDLEA", "@hark-a"), chat_agent("HANDLEB", "@hark-b")];
+        let selection = select_by_wire_name(&agents, None, "@hark-b").expect("resolves");
+        assert_eq!(selection.handle, "HANDLEB");
+        assert!(selection.warning.is_none());
+    }
+
+    #[test]
+    fn unknown_wire_name_is_a_usage_error() {
+        let agents = [chat_agent("HANDLEA", "@hark-a")];
+        let error = select_by_wire_name(&agents, None, "@ghost").expect_err("no such name");
+        assert!(matches!(error, AppError::Usage(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn duplicate_wire_name_prefers_active_and_warns() {
+        // Two connections share one wire identity (a re-pair with the same
+        // invite): the active handle wins and the ambiguity is surfaced.
+        let agents = [chat_agent("OLDCONN", "@hark-a"), chat_agent("NEWCONN", "@hark-a")];
+        let selection =
+            select_by_wire_name(&agents, Some("NEWCONN"), "@hark-a").expect("resolves");
+        assert_eq!(selection.handle, "NEWCONN");
+        assert!(
+            selection.warning.as_deref().unwrap_or_default().contains("share the wire name"),
+            "ambiguity must warn: {:?}",
+            selection.warning
+        );
     }
 
     #[test]
