@@ -17,7 +17,9 @@ use openmls::prelude::{
 };
 use tls_codec::{DeserializeBytes as _, Serialize as _};
 
-use super::group::{GenesisAssertion, credential_handle, elect_owner, member_bindings};
+use super::group::{
+    GenesisAssertion, credential_handle, elect_committer, group_genesis_creator, member_bindings,
+};
 use super::pins::PinStore;
 use super::provider::DurableProvider;
 use super::removal::RemovalEvidence;
@@ -282,7 +284,7 @@ fn validate_staged_commit(
             .update_proposals()
             .any(|u| u.sender() != &Sender::Member(committer.index));
     if changes_membership {
-        match elect_owner(&members) {
+        match elect_committer(&members, group_genesis_creator(group).as_ref()) {
             Some((owner_handle, owner_key))
                 if owner_handle == committer_handle && owner_key == committer.signature_key => {}
             Some((owner_handle, _)) => {
