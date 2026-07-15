@@ -1759,6 +1759,21 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
             format!("agent handle is unhealthy: {reason}"),
             detail,
         ),
+        // Transient: the handle is still healthy, the send just raced ahead of
+        // MLS membership (no Welcome yet). 503 + a distinct code so the client
+        // can retry rather than treating the handle as dead.
+        AgentError::NotReady { detail } => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "mls_membership_pending",
+            "agent is not yet a member of the channel's MLS group; retry shortly",
+            detail.or_else(|| {
+                Some(
+                    "the room owner must add this agent (fetch its KeyPackage) before it can \
+                     send encrypted content — retry once the Welcome arrives"
+                        .to_owned(),
+                )
+            }),
+        ),
         AgentError::RecvAlreadyWaiting => ApiError::new(
             StatusCode::CONFLICT,
             "recv_already_waiting",

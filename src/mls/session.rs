@@ -403,7 +403,11 @@ impl MlsSession {
             )));
         }
         let group = self.group.as_mut().ok_or_else(|| {
-            MlsError::Rejected(format!(
+            // Transient, not a rejection: the Welcome that makes us a member
+            // has not arrived yet. Fail closed (no plaintext fallback,
+            // REQ-023) but signal retryable so the caller does not poison the
+            // handle over a membership race.
+            MlsError::NotReady(format!(
                 "not yet a member of {}'s MLS group; cannot send encrypted content (and will \
                  not fall back to plaintext — REQ-023)",
                 self.room
@@ -927,17 +931,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// REQ-023: an unpinned private join cannot send plaintext either — an
-    /// un-joined encrypted session refuses to emit content.
+    /// REQ-023: an encrypted session that has not yet joined the group refuses
+    /// to emit content (no plaintext fallback). Crucially the refusal is
+    /// [`MlsError::NotReady`], not [`MlsError::Rejected`]: membership can still
+    /// arrive via a Welcome, so the caller must treat it as retryable rather
+    /// than a fail-closed security decision that poisons the handle.
     #[test]
     fn no_plaintext_before_join() {
         let (dir, wire) = setup("nojoin", 82, "@aria");
         let mut session =
             MlsSession::open(&dir, "aria", "@research", "@aria", &wire, true).unwrap();
+        let err = session
+            .encrypt_outbound("(say @research :from @aria)")
+            .unwrap_err();
         assert!(
-            session
-                .encrypt_outbound("(say @research :from @aria)")
-                .is_err()
+            matches!(err, MlsError::NotReady(_)),
+            "pre-membership refusal must be transient (retryable), got {err:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }

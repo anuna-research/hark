@@ -13,6 +13,7 @@ pub enum ExitCode {
     Timeout = 10,
     LocalAuth = 11,
     Internal = 12,
+    NotReady = 13,
 }
 
 impl ExitCode {
@@ -45,6 +46,12 @@ pub enum AppError {
     Timeout,
     #[error("local daemon authentication failed")]
     LocalAuth,
+    /// A transient precondition is not yet met (e.g. the agent is not yet a
+    /// member of the channel's MLS group). The handle is still healthy —
+    /// retry shortly. Distinct exit code so scripts can tell "retry me" from a
+    /// dead handle.
+    #[error("{0}")]
+    NotReady(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -62,6 +69,7 @@ impl AppError {
             Self::RouterConnection => ExitCode::RouterConnection,
             Self::Timeout => ExitCode::Timeout,
             Self::LocalAuth => ExitCode::LocalAuth,
+            Self::NotReady(_) => ExitCode::NotReady,
             Self::Internal(_) => ExitCode::Internal,
         }
     }
@@ -92,6 +100,10 @@ mod tests {
             (AppError::RouterConnection, ExitCode::RouterConnection),
             (AppError::Timeout, ExitCode::Timeout),
             (AppError::LocalAuth, ExitCode::LocalAuth),
+            (
+                AppError::NotReady("membership pending".into()),
+                ExitCode::NotReady,
+            ),
             (AppError::Internal("boom".into()), ExitCode::Internal),
         ];
 
@@ -114,5 +126,6 @@ mod tests {
         assert_eq!(ExitCode::Timeout.as_i32(), 10);
         assert_eq!(ExitCode::LocalAuth.as_i32(), 11);
         assert_eq!(ExitCode::Internal.as_i32(), 12);
+        assert_eq!(ExitCode::NotReady.as_i32(), 13);
     }
 }

@@ -27,7 +27,7 @@ use url::Url;
 
 use crate::chat_frame::decode_payload;
 use crate::chat_responder::{Action, Responder, WindowOutcome};
-use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore};
+use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore, OutboundReject};
 use crate::identity::ChatIdentity;
 use crate::mls::session::{MlsSession, SessionEvent};
 use crate::signed_transport::{SignedConn, parse_conn_bootstrap};
@@ -644,8 +644,16 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         Some(session) if session.encrypted() => {
                             match session.encrypt_outbound(&outbound.message) {
                                 Ok(wrapped) => wrapped,
+                                // A NotReady refusal is transient (no Welcome yet):
+                                // report it retryable so the handle stays healthy.
+                                // Any other refusal (e.g. a refused downgrade) is a
+                                // fail-closed security decision — fatal.
+                                Err(error @ crate::mls::MlsError::NotReady(_)) => {
+                                    let _ = outbound.result_tx.send(Err(OutboundReject::retryable(format!("mls encrypt refused: {error}"))));
+                                    continue;
+                                }
                                 Err(error) => {
-                                    let _ = outbound.result_tx.send(Err(format!("mls encrypt refused: {error}")));
+                                    let _ = outbound.result_tx.send(Err(OutboundReject::fatal(format!("mls encrypt refused: {error}"))));
                                     continue;
                                 }
                             }
@@ -656,7 +664,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     let payload = match payload_bytes(&message_text) {
                         Ok(payload) => payload,
                         Err(error) => {
-                            let _ = outbound.result_tx.send(Err(format!("outbound not valid CBCL: {error}")));
+                            let _ = outbound.result_tx.send(Err(OutboundReject::fatal(format!("outbound not valid CBCL: {error}"))));
                             continue;
                         }
                     };
@@ -665,7 +673,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         Ok(()) => { let _ = outbound.result_tx.send(Ok(())); }
                         Err(error) => {
                             let detail = sanitize(&error.to_string());
-                            let _ = outbound.result_tx.send(Err(detail.clone()));
+                            let _ = outbound.result_tx.send(Err(OutboundReject::fatal(detail.clone())));
                             let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(detail)).await;
                             break;
                         }

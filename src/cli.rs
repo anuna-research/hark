@@ -1064,6 +1064,9 @@ fn map_local_api_request_error(error: LocalApiRequestError) -> AppError {
                 "unknown_agent_handle" | "agent_handle_unhealthy" | "recv_already_waiting" => {
                     AppError::AgentHandleUnavailable
                 }
+                // Transient: the handle is healthy, the send just raced ahead
+                // of MLS membership. Retryable, not a dead handle.
+                "mls_membership_pending" => AppError::NotReady(error.error.message),
                 "recv_timeout" | "meta_reply_timeout" => AppError::Timeout,
                 "meta_send_busy" => AppError::AgentHandleUnavailable,
                 "missing_router_ws_url"

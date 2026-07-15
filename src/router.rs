@@ -296,7 +296,9 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         }
                         Err(error) => {
                             let detail = sanitize_diagnostic(&error.to_string());
-                            let _ = outbound.result_tx.send(Err(detail.clone()));
+                            // The router transport carries no MLS encryption, so a
+                            // send failure here is always a dead socket — fatal.
+                            let _ = outbound.result_tx.send(Err(crate::daemon::OutboundReject::fatal(detail.clone())));
                             let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(detail)).await;
                             break;
                         }
