@@ -191,6 +191,41 @@ pub fn elect_owner(members: &[(String, Vec<u8>)]) -> Option<(String, Vec<u8>)> {
         .cloned()
 }
 
+/// Creator-preferred committer election (REQ-004/012b/016): the GENESIS CREATOR
+/// when it is a live leaf (matched on BOTH handle and key — duplicate-handle
+/// safety), else the lexicographically-smallest leaf (via [`elect_owner`]) for a
+/// creatorless / genesis-less group.
+///
+/// Preferring the creator makes it the single, stable committer and stops a
+/// passive AGENT leaf that merely sorts first from being elected committer —
+/// agents never commit, which would otherwise deadlock every FURTHER membership
+/// change once such an agent is admitted.
+///
+/// MUST stay byte-for-byte equivalent to cbcl-mls-wasm's `elect_committer`
+/// (the web stack), or a web-committed Add/Welcome is rejected by hark (and vice
+/// versa) — the cross-stack owner-election invariant.
+pub fn elect_committer(
+    members: &[(String, Vec<u8>)],
+    creator: Option<&(String, Vec<u8>)>,
+) -> Option<(String, Vec<u8>)> {
+    if let Some(c) = creator {
+        if members.iter().any(|m| m == c) {
+            return Some(c.clone());
+        }
+    }
+    elect_owner(members)
+}
+
+/// The genesis creator `(handle, wire key)` for a live group, when it carries a
+/// verifiable genesis extension (REQ-016). `None` for a genesis-less group, which
+/// then falls back to lex-smallest election.
+pub fn group_genesis_creator(group: &MlsGroup) -> Option<(String, Vec<u8>)> {
+    let bytes = group.extensions().unknown(GENESIS_EXT_TYPE)?.0.clone();
+    let g = GenesisAssertion::from_bytes(&bytes).ok()?;
+    let key = g.creator_key().ok()?;
+    Some((g.creator_handle, key.to_vec()))
+}
+
 /// Extract `(handle, signature_key)` pairs from a group's live leaves.
 pub fn member_bindings(group: &MlsGroup) -> Result<Vec<(String, Vec<u8>)>, MlsError> {
     group
@@ -213,7 +248,7 @@ pub fn credential_handle(credential: &Credential) -> Result<String, MlsError> {
 /// Is `identity` the elected owner of `group`'s current tree?
 pub fn is_owner(group: &MlsGroup, identity: &MlsIdentity) -> Result<bool, MlsError> {
     let members = member_bindings(group)?;
-    Ok(elect_owner(&members)
+    Ok(elect_committer(&members, group_genesis_creator(group).as_ref())
         .map(|(handle, key)| handle == identity.handle && key == identity.public_key())
         .unwrap_or(false))
 }
@@ -596,7 +631,17 @@ fn validate_staged_welcome(
         .filter(|(handle, _)| handle != joiner_handle)
         .cloned()
         .collect();
-    match elect_owner(&pre_add) {
+    // Creator-preferred election over the pre-add roster: the genesis creator
+    // (read from the staged group context; the caller separately VERIFIES the
+    // genesis signature) is the authorised committer when it is a live pre-add
+    // leaf, else the lex-smallest leaf. Mirrors the web crate's elect_committer.
+    let genesis_creator = staged
+        .group_context()
+        .extensions()
+        .unknown(GENESIS_EXT_TYPE)
+        .and_then(|ext| GenesisAssertion::from_bytes(&ext.0).ok())
+        .and_then(|g| g.creator_key().ok().map(|k| (g.creator_handle, k.to_vec())));
+    match elect_committer(&pre_add, genesis_creator.as_ref()) {
         Some((owner_handle, owner_key))
             if owner_handle == sender_handle && owner_key == sender_key => {}
         Some((owner_handle, _)) => {
@@ -678,6 +723,27 @@ mod tests {
         let dup1 = ("@x".to_string(), vec![2u8; 32]);
         let dup2 = ("@x".to_string(), vec![1u8; 32]);
         assert_eq!(elect_owner(&[dup1.clone(), dup2.clone()]), Some(dup2),);
+    }
+
+    /// REQ-004/016: creator-preferred election. The genesis creator is the
+    /// committer even when a leaf (an agent) sorts lexicographically first; it
+    /// falls back to lex-smallest only when the creator is absent or unknown.
+    #[test]
+    fn elect_committer_prefers_the_genesis_creator() {
+        let agent = ("@aaa-agent".to_string(), vec![9u8; 32]); // sorts FIRST
+        let creator = ("@person2".to_string(), vec![5u8; 32]); // sorts LAST
+        let members = vec![agent.clone(), creator.clone()];
+
+        // Creator present → creator wins despite the agent sorting first.
+        assert_eq!(elect_committer(&members, Some(&creator)), Some(creator.clone()));
+        // Match is on handle AND key: a creator handle with the wrong key does not win.
+        let imposter = ("@person2".to_string(), vec![7u8; 32]);
+        assert_eq!(elect_committer(&members, Some(&imposter)), Some(agent.clone()));
+        // No creator (genesis-less) → lex-smallest leaf (unchanged behaviour).
+        assert_eq!(elect_committer(&members, None), Some(agent.clone()));
+        // Creator not a live leaf (left the group) → fall back to lex-smallest.
+        let gone = ("@zzz-gone".to_string(), vec![1u8; 32]);
+        assert_eq!(elect_committer(&members, Some(&gone)), Some(agent));
     }
 
     /// K-2 (REQ-016): a default-capability creator of a genesis-bearing
