@@ -240,6 +240,16 @@ impl Responder {
     }
 }
 
+/// The `:from` sender of a wire message — the innermost Simple's `:from` param
+/// (the cbcl-chat convention), or `None` if the text is unparseable or carries
+/// no `:from`. Used by the receive-all (`*`) observer to skip the agent's own
+/// messages the hub fans back to it.
+pub(crate) fn message_sender(text: &str) -> Option<String> {
+    let message = parse_message(text)?;
+    let inner = message.innermost_simple()?;
+    param_str(inner, "from").map(str::to_owned)
+}
+
 /// Parse wire text into a canonical `cbcl_core::Message` (R1–R4), or `None` if
 /// it is not well-formed. The same parser the hub uses, so field semantics match.
 fn parse_message(text: &str) -> Option<Message> {
@@ -386,6 +396,20 @@ mod tests {
         let mut r = responder();
         assert!(r.on_inbound(&ask("t", "@me")).is_empty());
         assert_eq!(r.tracked(), 0);
+    }
+
+    #[test]
+    fn message_sender_reads_innermost_from() {
+        // The receive-all observer uses this to skip its own fanned-back
+        // messages: the sender is the innermost Simple's `:from`.
+        assert_eq!(message_sender(&ask("t", "@asker")).as_deref(), Some("@asker"));
+        assert_eq!(
+            message_sender("(tell @general \"hi\" :from @bob)").as_deref(),
+            Some("@bob")
+        );
+        // No `:from` and unparseable text both yield None (delivered, not skipped).
+        assert_eq!(message_sender("(tell @general \"hi\")"), None);
+        assert_eq!(message_sender("not a sexpr ("), None);
     }
 
     #[test]

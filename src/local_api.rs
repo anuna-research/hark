@@ -690,12 +690,39 @@ async fn create_agent(
 ) -> Result<Json<CreateAgentResponse>, ApiError> {
     authorize(&state, &headers)?;
     reject_if_stopping(&state)?;
+    // Receive-all sentinel: `*` in the dialect set means "deliver every channel
+    // message to `recv`", not a concrete dialect to advertise. Split it off
+    // before advertisement validation (which requires concrete letter-first
+    // ids) and carry it as a flag. Chat-only: the router transport has no
+    // channel to observe.
+    let mut request = request;
+    let receive_all = take_receive_all(&mut request.dialects);
     AgentStore::validate_advertisement(&request.dialects).map_err(agent_error_to_api)?;
     // The configured hub URL's path decides the transport (config::transport).
     match state.config.transport().map_err(config_error_to_api)? {
-        Transport::Router => create_router_transport_agent(state, request).await,
-        Transport::Chat => create_chat_transport_agent(state, request).await,
+        Transport::Router => {
+            if receive_all {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "receive_all_unsupported",
+                    "receive-all (`*`) is only supported on a chat channel, not the router transport",
+                    None,
+                ));
+            }
+            create_router_transport_agent(state, request).await
+        }
+        Transport::Chat => create_chat_transport_agent(state, request, receive_all).await,
     }
+}
+
+/// Strip the receive-all sentinel `*` from an advertised dialect set, returning
+/// whether it was present. `*` is not a concrete dialect id — it asks the daemon
+/// to deliver every channel message to `recv` — so it must be removed before the
+/// remaining ids are grammar-validated.
+fn take_receive_all(dialects: &mut Vec<String>) -> bool {
+    let present = dialects.iter().any(|dialect| dialect == "*");
+    dialects.retain(|dialect| dialect != "*");
+    present
 }
 
 /// Router transport: connect to cbcl-router, advertise dialects, and best-effort
@@ -762,6 +789,7 @@ async fn create_router_transport_agent(
 async fn create_chat_transport_agent(
     state: AppState,
     request: CreateAgentRequest,
+    receive_all: bool,
 ) -> Result<Json<CreateAgentResponse>, ApiError> {
     let chat = state.config.validate_chat().map_err(config_error_to_api)?;
     let wire_handle = request
@@ -835,7 +863,7 @@ async fn create_chat_transport_agent(
             None,
         )
     })?;
-    let (handle, warnings) = create_chat_agent(
+    let (handle, mut warnings) = create_chat_agent(
         state.agents.clone(),
         &chat.ws_url,
         &channel,
@@ -848,9 +876,17 @@ async fn create_chat_transport_agent(
         std::sync::Arc::new(identity),
         mls,
         request.mls_create.unwrap_or(false),
+        receive_all,
     )
     .await
     .map_err(chat_error_to_api)?;
+
+    if receive_all {
+        warnings.push(format!(
+            "receiving all messages in {channel} (dialect `*`); every channel message is \
+             delivered to `recv`, not only answerable asks"
+        ));
+    }
 
     Ok(Json(CreateAgentResponse {
         agent_handle: handle.as_str().to_owned(),
@@ -2017,8 +2053,25 @@ mod tests {
 
     use super::{
         AgentsResponse, ClientPingError, ErrorResponse, LocalApiClient, PingResponse,
-        chat_key_filename, serve_local_api_with_agents,
+        chat_key_filename, serve_local_api_with_agents, take_receive_all,
     };
+
+    #[test]
+    fn take_receive_all_strips_wildcard_and_reports_presence() {
+        let mut dialects = vec!["cite".to_owned(), "*".to_owned(), "vote".to_owned()];
+        assert!(take_receive_all(&mut dialects));
+        assert_eq!(dialects, vec!["cite".to_owned(), "vote".to_owned()]);
+
+        // `*` alone: receive-all with an empty (advertise-nothing) set.
+        let mut only = vec!["*".to_owned()];
+        assert!(take_receive_all(&mut only));
+        assert!(only.is_empty());
+
+        // No wildcard: unchanged, not receive-all.
+        let mut none = vec!["cite".to_owned()];
+        assert!(!take_receive_all(&mut none));
+        assert_eq!(none, vec!["cite".to_owned()]);
+    }
 
     #[test]
     fn chat_key_filename_sanitizes_handle() {

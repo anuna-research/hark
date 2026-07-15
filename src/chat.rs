@@ -191,6 +191,7 @@ pub async fn create_chat_agent(
     identity: Arc<ChatIdentity>,
     mut mls: Option<MlsSession>,
     mls_create: bool,
+    receive_all: bool,
 ) -> Result<(AgentHandle, Vec<String>), ChatError> {
     AgentStore::validate_advertisement(&dialects)
         .map_err(|error| ChatError::Store(error.to_string()))?;
@@ -358,6 +359,8 @@ pub async fn create_chat_agent(
         liveness_timeout,
         conn,
         mls,
+        receive_all,
+        wire_handle: agent_handle.to_owned(),
     });
 
     Ok((handle, warnings))
@@ -448,6 +451,14 @@ struct ReceiveLoopArgs {
     /// SPEC-013 MLS session (Some when the channel is pinned encrypted, or
     /// when prior MLS state exists for it).
     mls: Option<MlsSession>,
+    /// Receive-all (`*`): deliver every channel content message to `recv`,
+    /// not just answerable asks this agent is elected to answer. The agent's
+    /// own fanned-back messages are skipped. The responder still runs for any
+    /// concrete dialects also advertised.
+    receive_all: bool,
+    /// This agent's wire handle (`@name`) — used only by receive-all to skip
+    /// its own messages.
+    wire_handle: String,
 }
 
 /// A scheduled responder timer fired by the receive loop (SPEC-003 REQ-005/007).
@@ -609,6 +620,8 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         liveness_timeout,
         mut conn,
         mut mls,
+        receive_all,
+        wire_handle,
     } = args;
     tokio::spawn(async move {
         // Pending Δ-window and liveness-fallback timers, fired into the select.
@@ -753,6 +766,24 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         },
                     };
                     let Some(responder_text) = responder_text else { continue };
+                    // Receive-all (`*`): deliver EVERY channel content message to
+                    // `recv`, not just answerable asks — the firehose a paired
+                    // observer asked for. Skip our own messages the hub fans back
+                    // so the agent doesn't receive its own emits. The responder
+                    // still runs below for any concrete dialects also advertised.
+                    if receive_all {
+                        let own = crate::chat_responder::message_sender(&responder_text)
+                            .as_deref()
+                            == Some(wire_handle.as_str());
+                        if !own
+                            && store
+                                .enqueue_inbound(&handle, responder_text.clone())
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
                     // The responder decides: claim for answerable asks, deliver to
                     // `recv` only when elected, drop everything else (REQ-002).
                     let mut send_failed = false;

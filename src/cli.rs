@@ -162,7 +162,7 @@ pub struct JoinArgs {
     #[arg(
         long = "speak",
         value_delimiter = ',',
-        help = "Dialect(s) to advertise (repeat or comma-separate); omit to advertise nothing"
+        help = "Dialect(s) to advertise (repeat or comma-separate); omit to advertise nothing. Use `*` to receive EVERY channel message on `recv`, not just answerable asks"
     )]
     pub speak: Vec<String>,
     #[arg(
@@ -200,7 +200,7 @@ pub struct InitArgs {
     #[arg(
         long = "dialect",
         required = true,
-        help = "Dialect id to advertise; repeat for multiple dialects"
+        help = "Dialect id to advertise; repeat for multiple dialects. Use `*` to receive EVERY channel message on `recv`, not just answerable asks"
     )]
     pub dialects: Vec<String>,
     #[arg(
@@ -392,7 +392,12 @@ async fn join_command(args: JoinArgs) -> AppResult<()> {
         .map_err(|error| AppError::Usage(error.to_string()))?;
     let mut seen = std::collections::HashSet::new();
     for dialect in &args.speak {
-        validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        // `*` is the receive-all sentinel (deliver every channel message to
+        // `recv`), interpreted by the daemon — not a concrete dialect id, so
+        // it is exempt from the id grammar.
+        if dialect != "*" {
+            validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        }
         if !seen.insert(dialect) {
             return Err(AppError::Usage(format!("duplicate dialect: {dialect}")));
         }
@@ -696,7 +701,12 @@ fn validate_init_advertisement(dialects: &[String]) -> AppResult<()> {
     }
     let mut seen = std::collections::HashSet::new();
     for dialect in dialects {
-        validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        // `*` is the receive-all sentinel (deliver every channel message to
+        // `recv`), interpreted by the daemon — not a concrete dialect id, so
+        // it is exempt from the id grammar.
+        if dialect != "*" {
+            validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+        }
         if !seen.insert(dialect) {
             return Err(AppError::Usage(format!("duplicate dialect: {dialect}")));
         }
