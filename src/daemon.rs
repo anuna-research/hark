@@ -803,6 +803,46 @@ impl AgentStore {
         Ok(())
     }
 
+    /// Mark a chat agent as *reconnecting* after the hub dropped its socket.
+    /// Unlike [`AgentStore::mark_unhealthy`] this deliberately does NOT fire
+    /// the connection's close signal: the receive-loop task is still alive and
+    /// is re-establishing the connection, so consuming `close_tx` (which would
+    /// resolve the loop's `close_rx`) must not happen — that would masquerade
+    /// as an explicit stop and abort the reconnect. The handle reports
+    /// unhealthy (`reconnecting`) so `status`/`recv` reflect the outage; a
+    /// successful reconnect clears it via [`AgentStore::mark_connected`].
+    pub async fn mark_reconnecting(
+        &self,
+        handle: &AgentHandle,
+        detail: Option<String>,
+    ) -> Result<(), AgentError> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        entry.mark_unhealthy("reconnecting", detail);
+        // No `close_connection()` here (see doc): the loop keeps its `close_rx`.
+        Ok(())
+    }
+
+    /// Restore a chat agent to the connected state after a successful
+    /// reconnect + rejoin, clearing any `hub_closed`/`reconnecting` marker.
+    /// The same handle, close signal and send channel are preserved — this is
+    /// only a state transition, never a re-insert.
+    pub async fn mark_connected(&self, handle: &AgentHandle) -> Result<(), AgentError> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        entry.state = AgentState::Connected;
+        entry.unhealthy_reason = None;
+        entry.unhealthy_detail = None;
+        entry.notify.notify_waiters();
+        Ok(())
+    }
+
     pub async fn status_snapshots(&self) -> Vec<AgentStatusSnapshot> {
         let inner = self.inner.lock().await;
         let mut snapshots = inner
@@ -1849,10 +1889,7 @@ mod tests {
             .send_outbound(&handle, "(deliver @research)".to_owned())
             .await
             .expect_err("fatal reject should error");
-        assert!(matches!(
-            error,
-            super::AgentError::Unhealthy { .. }
-        ));
+        assert!(matches!(error, super::AgentError::Unhealthy { .. }));
         let status = store.status_snapshots().await;
         assert_eq!(status[0].state, super::AgentState::Unhealthy);
     }
@@ -2249,6 +2286,55 @@ mod tests {
             .await
             .expect_err("unknown handle must error");
         assert!(matches!(err, super::AgentError::UnknownHandle));
+    }
+
+    /// The chat auto-reconnect invariant: `mark_reconnecting` reports the
+    /// handle unhealthy (so `status`/`recv` reflect the outage) but must NOT
+    /// fire the connection's close signal — the receive loop is still alive and
+    /// reconnecting; firing `close_tx` would resolve its `close_rx` and abort
+    /// the reconnect. `mark_connected` then restores it in place (same handle).
+    #[tokio::test]
+    async fn reconnecting_preserves_close_signal_then_connected_restores() {
+        let store = agent_store(10, 100);
+        let handle = handle();
+        let (close_tx, mut close_rx) = super::oneshot::channel::<()>();
+        store
+            .insert_connected_with_close_signal(
+                handle.clone(),
+                vec!["elf".to_owned()],
+                Some(close_tx),
+            )
+            .await
+            .expect("agent should insert");
+
+        // Reconnecting: unhealthy, but the close signal is untouched.
+        store
+            .mark_reconnecting(&handle, Some("hub_closed".to_owned()))
+            .await
+            .expect("mark_reconnecting should succeed");
+        let status = store.status_snapshots().await;
+        assert_eq!(status[0].state, super::AgentState::Unhealthy);
+        assert_eq!(status[0].unhealthy_reason.as_deref(), Some("reconnecting"));
+        assert_eq!(
+            close_rx.try_recv(),
+            Err(super::oneshot::error::TryRecvError::Empty),
+            "mark_reconnecting must NOT fire the close signal"
+        );
+
+        // Reconnected: state restored in place, close signal still intact.
+        store
+            .mark_connected(&handle)
+            .await
+            .expect("mark_connected should succeed");
+        let status = store.status_snapshots().await;
+        assert_eq!(status[0].state, super::AgentState::Connected);
+        assert!(status[0].unhealthy_reason.is_none());
+        assert!(status[0].unhealthy_detail.is_none());
+        assert_eq!(
+            close_rx.try_recv(),
+            Err(super::oneshot::error::TryRecvError::Empty),
+            "close signal must survive a reconnect cycle"
+        );
     }
 
     fn agent_store(max_messages: usize, max_bytes: usize) -> super::AgentStore {
