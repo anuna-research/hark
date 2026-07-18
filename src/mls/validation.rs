@@ -133,6 +133,24 @@ pub fn process_inbound(
             });
         }
     };
+    // A frame from a PAST epoch is a benign duplicate — most commonly the
+    // committer's retained-transition re-drive (the session intentionally
+    // replays Commit/Welcome fans on rejoin and peer reappearance for
+    // members that missed them) or a hub re-fan. It carries no fork
+    // evidence: an equivocating hub manifests as CURRENT-epoch frames that
+    // fail to process. It must not feed the REQ-006 counter — three
+    // intentional replays would otherwise trip a false probable-fork
+    // warning with no intervening successful message to reset it.
+    if protocol.epoch().as_u64() < group.epoch().as_u64() {
+        return Ok(Inbound::Dropped {
+            reason: format!(
+                "epoch {} behind group epoch {} (benign replay/duplicate)",
+                protocol.epoch().as_u64(),
+                group.epoch().as_u64()
+            ),
+            probable_fork: fork.probable_fork(),
+        });
+    }
     let processed = match group.process_message(provider, protocol) {
         Ok(p) => p,
         Err(e) => {

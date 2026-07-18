@@ -420,15 +420,18 @@ async fn connect_and_join(
     );
     let payload = payload_bytes(&hello).map_err(ChatError::Hello)?;
     let frame = conn.sign_chat_frame(identity, &payload);
+    // Mark the cap as potentially spent BEFORE the fallible write: over TLS,
+    // `send` can fail in its final flush AFTER the hub has already received
+    // the frame and redeemed the presented invite, so an Err here does not
+    // mean unspent. The caller accounts for the renewal budget on this
+    // signal, not on overall success — over-counting merely refreshes the
+    // token early, while under-counting could select an exhausted token and
+    // strand the agent on its already-spent pairing cap.
+    *hello_sent = true;
     websocket
         .send(WsMessage::Binary(frame.into()))
         .await
         .map_err(|error| ChatError::HelloSendFailed(error.to_string()))?;
-    // The hello reached the wire: from here the hub MAY have admitted us and
-    // redeemed the presented cap (an invite use is consumed at admission),
-    // even if the join later fails retryably — the caller accounts for the
-    // spend on this signal, not on overall success.
-    *hello_sent = true;
 
     // Block until the hub acknowledges the join (`roomcfg`) or rejects it
     // (`error @room "slug"`). The hub keeps the socket open on rejection
@@ -1000,12 +1003,13 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         };
                         // Fix 12: the hub redeems an invite use at ADMISSION —
                         // a join that fails retryably after the hello (lost
-                        // roomcfg, failed keypub/announce write) has still
-                        // spent one. Account on the hello reaching the wire,
-                        // not on overall success, so the local budget never
-                        // overstates what the hub will still honour (which
-                        // could skip a due refresh and strand the agent on
-                        // the already-spent pairing cap).
+                        // roomcfg, failed keypub/announce write, or even a
+                        // hello write whose TLS flush failed after delivery)
+                        // has still spent one. Account on the hello write
+                        // being ATTEMPTED, not on overall success, so the
+                        // local budget never overstates what the hub will
+                        // still honour (which could skip a due refresh and
+                        // strand the agent on the already-spent pairing cap).
                         if presenting_renewal && hello_sent {
                             if let Some(invite) = renewal.as_mut() {
                                 invite.uses_left = invite.uses_left.saturating_sub(1);

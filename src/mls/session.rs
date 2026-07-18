@@ -27,7 +27,8 @@ use openmls::prelude::MlsGroup;
 use rand::Rng as _;
 
 use super::group::{
-    GenesisAssertion, GenesisTrust, add_member, create_group, is_owner, join_from_welcome,
+    GenesisAssertion, GenesisTrust, create_group, is_owner, join_from_welcome,
+    merge_staged_commit, stage_add_member,
 };
 use super::keypackages::{
     ConsumedLedger, LAST_RESORT_LIFETIME_SECS, ONE_TIME_POOL_TARGET, build_last_resort,
@@ -35,7 +36,7 @@ use super::keypackages::{
 };
 use super::pins::{PinStore, idkey_signing_bytes};
 use super::provider::DurableProvider;
-use super::removal::{RemovalEvidence, remove_member};
+use super::removal::{RemovalEvidence, stage_remove_member};
 use super::safety::{SafetyNumbers, group_safety_numbers};
 use super::validation::{ForkSignal, Inbound, encrypt_message, enforce_sender, process_inbound};
 use super::{MlsError, MlsIdentity};
@@ -70,14 +71,20 @@ struct SessionMeta {
     pending_broadcast: Vec<PendingBroadcast>,
 }
 
-/// One transition frame retained for re-driving, tagged with the group epoch
-/// right after its merge. The tag is the retention rule: a frame is worth
-/// re-fanning only while the group is STILL at that epoch — once any later
-/// commit lands, a straggler replaying it would end up behind the group
-/// anyway (recovery then needs a remove + re-add, not a replay).
+/// One transition frame retained for re-driving, tagged with the group id
+/// and the epoch right after its merge. The tags are the retention rule: a
+/// frame is worth re-fanning only while the SAME group is STILL at that
+/// epoch — once any later commit lands, a straggler replaying it would end
+/// up behind the group anyway (recovery then needs a remove + re-add), and
+/// after a group replacement (provider-loss recovery) an old-group Welcome
+/// would seat its target in an obsolete group and mask the current one.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PendingBroadcast {
     epoch: u64,
+    /// The minting group's id (base64). `serde(default)` fails safe: entries
+    /// persisted before this field existed load unbound and never match.
+    #[serde(default)]
+    group_id_b64: String,
     frame: String,
 }
 
@@ -392,30 +399,39 @@ impl MlsSession {
         Ok(frames)
     }
 
-    /// The retained transition frames still worth re-fanning: those whose
-    /// post-merge epoch is the group's CURRENT epoch. Replay is inert for
+    /// The retained transition frames still worth re-fanning: those minted
+    /// by the CURRENT group at its CURRENT epoch. Replay is inert for
     /// members already there (epoch-mismatch drop; a replayed Welcome is made
     /// inert by the consumed-ref ledger, REQ-013) and exactly what a member
-    /// that missed the fan needs. Entries behind the current epoch are
-    /// dropped — a straggler that far back cannot be healed by replay.
+    /// that missed the fan needs. Entries behind the current epoch — or from
+    /// another (replaced/aborted) group, or held while no group is loaded —
+    /// are never emitted: a straggler that far back cannot be healed by
+    /// replay, and an old-group Welcome would seat its target in an obsolete
+    /// group.
     fn pending_rebroadcast(&self) -> Vec<String> {
-        let Some(epoch) = self.group.as_ref().map(|g| g.epoch().as_u64()) else {
+        let Some(group) = self.group.as_ref() else {
             return Vec::new();
         };
+        let epoch = group.epoch().as_u64();
+        let group_id_b64 = B64.encode(group.group_id().as_slice());
         self.pending_broadcast
             .iter()
-            .filter(|p| p.epoch == epoch)
+            .filter(|p| p.epoch == epoch && p.group_id_b64 == group_id_b64)
             .map(|p| p.frame.clone())
             .collect()
     }
 
-    /// Record authored transition frames for re-driving, dropping entries the
-    /// epoch has moved past. Callers persist via `persist_meta` right after.
-    fn retain_for_rebroadcast(&mut self, epoch: u64, frames: &[String]) {
-        self.pending_broadcast.retain(|p| p.epoch == epoch);
+    /// Record one authored transition batch for re-driving, REPLACING any
+    /// previous batch: two batches can never be live at once (each commit
+    /// advances the epoch), and a stale write-ahead from an aborted merge
+    /// must not linger to match a future transition at the same epoch.
+    /// Callers persist via `persist_meta` right after.
+    fn retain_for_rebroadcast(&mut self, epoch: u64, group_id_b64: String, frames: &[String]) {
+        self.pending_broadcast.clear();
         self.pending_broadcast
             .extend(frames.iter().map(|frame| PendingBroadcast {
                 epoch,
+                group_id_b64: group_id_b64.clone(),
                 frame: frame.clone(),
             }));
     }
@@ -739,7 +755,13 @@ impl MlsSession {
                 .group
                 .as_mut()
                 .ok_or_else(|| MlsError::Rejected("keypkg before MLS join".into()))?;
-            let outcome = add_member(
+            // Stage — do NOT merge yet. Once the merge persists, these frames
+            // are the only copy able to advance peers past the old epoch, so
+            // they must be durable FIRST (write-ahead): a crash between the
+            // meta write and the merge loses only an unsent staged commit,
+            // while the reverse order would strand every peer at the old
+            // epoch with nothing to replay.
+            let outcome = stage_add_member(
                 &self.provider,
                 &self.identity,
                 group,
@@ -748,7 +770,12 @@ impl MlsSession {
                 &self.pins,
                 &self.ledger,
             )?;
-            let epoch = group.epoch().as_u64();
+            // Tagged with the POST-merge epoch and the group id, so entries
+            // from an aborted merge (group still behind) or an abandoned
+            // group (provider-loss recovery) can never pass the replay
+            // filter.
+            let epoch = group.epoch().as_u64() + 1;
+            let group_id_b64 = B64.encode(group.group_id().as_slice());
             let frames = vec![
                 format!(
                     "(deliver {} :enc mls :ct \"{}\" :from {})",
@@ -764,11 +791,10 @@ impl MlsSession {
                     self.handle
                 ),
             ];
-            // The merge is already persisted; retain the frames it minted in
-            // the same meta write, so neither a lost socket nor a daemon
-            // restart strands the transition (nothing can regenerate it).
-            self.retain_for_rebroadcast(epoch, &frames);
+            self.retain_for_rebroadcast(epoch, group_id_b64, &frames);
             self.persist_meta()?;
+            let group = self.group.as_mut().expect("staged above");
+            merge_staged_commit(&self.provider, group, "merge own add commit")?;
             Ok(frames)
         })();
         match result {
@@ -799,9 +825,14 @@ impl MlsSession {
         let saw_new = roster
             .iter()
             .any(|h| h != &self.handle && !self.present.contains(h));
-        for h in &roster {
-            self.present.insert(h.clone());
-        }
+        // REPLACE the tracked roster, never accumulate: the hub derives
+        // presence from live connection processes and rebroadcasts the FULL
+        // roster on joins and leaves alike, so a handle absent from this
+        // frame has disconnected. Keeping departed handles in the set would
+        // make their eventual return invisible (`saw_new` false) and skip
+        // exactly the idkey/keyready/pending re-drives a returning member
+        // needs — e.g. an invitee that dropped before its Welcome arrived.
+        self.present = roster.into_iter().collect();
 
         let mut outbound = Vec::new();
         if saw_new {
@@ -865,7 +896,9 @@ impl MlsSession {
             .group
             .as_mut()
             .ok_or_else(|| MlsError::Rejected("not in a group".into()))?;
-        let commit = remove_member(
+        // Same write-ahead split as the Add path (see `on_keypkg`): stage,
+        // durably retain the frame, THEN merge.
+        let commit = stage_remove_member(
             &self.provider,
             &self.identity,
             group,
@@ -874,7 +907,8 @@ impl MlsSession {
             &self.pins,
             &creator,
         )?;
-        let epoch = group.epoch().as_u64();
+        let epoch = group.epoch().as_u64() + 1;
+        let group_id_b64 = B64.encode(group.group_id().as_slice());
         let json = serde_json::to_vec(evidence).map_err(std::io::Error::other)?;
         let frame = format!(
             "(deliver {} :enc mls :ct \"{}\" :evidence \"{}\" :from {})",
@@ -883,10 +917,10 @@ impl MlsSession {
             B64.encode(json),
             self.handle
         );
-        // Same retention as the Add path: the removal commit is persisted
-        // state peers may never have received.
-        self.retain_for_rebroadcast(epoch, std::slice::from_ref(&frame));
+        self.retain_for_rebroadcast(epoch, group_id_b64, std::slice::from_ref(&frame));
         self.persist_meta()?;
+        let group = self.group.as_mut().expect("staged above");
+        merge_staged_commit(&self.provider, group, "merge remove commit")?;
         Ok(frame)
     }
 
@@ -1256,6 +1290,19 @@ mod tests {
             "a reappearing peer re-drives the transition: {redriven:?}"
         );
 
+        // DEPARTURE tracking: bob drops (roster omits him) and returns while
+        // alice stays connected — the return must count as newly seen and
+        // re-drive, or a member that disconnected before its Welcome arrived
+        // stays stranded until some unrelated event.
+        let _ = alice.handle_frame("(presence @research :members (@alice))");
+        let SessionEvent::Handled { outbound: returned } = alice.handle_frame(presence) else {
+            panic!("presence handled")
+        };
+        assert!(
+            returned.iter().any(|f| f.starts_with("(welcome @research")),
+            "a departed-and-returned peer re-drives the transition: {returned:?}"
+        );
+
         // A daemon restart reloads the pending set from the durable meta.
         drop(alice);
         let mut alice2 =
@@ -1274,6 +1321,26 @@ mod tests {
         ));
         assert!(bob.joined(), "the replayed welcome heals the stranded add");
 
+        // FORK-SIGNAL immunity: the re-driven commit reaches bob (now at the
+        // post-add epoch) as an old-epoch frame. Three intentional replays
+        // must NOT trip a false probable-fork warning.
+        let commit_deliver = rejoin2
+            .iter()
+            .find(|f| f.starts_with("(deliver @research"))
+            .expect("pending commit survives restart")
+            .clone();
+        for _ in 0..3 {
+            match bob.handle_frame(&commit_deliver) {
+                SessionEvent::Dropped { probable_fork, .. } => {
+                    assert!(
+                        !probable_fork,
+                        "intentional replays must not feed the fork counter"
+                    );
+                }
+                other => panic!("expected benign drop, got {other:?}"),
+            }
+        }
+
         // An epoch advance (bob's evidenced removal) prunes the stale add —
         // only the removal commit remains re-drivable.
         let bye = bob.leave_frame().unwrap();
@@ -1288,6 +1355,21 @@ mod tests {
         assert!(
             rejoin3.iter().any(|f| f == &remove_deliver),
             "the removal commit is retained: {rejoin3:?}"
+        );
+
+        // GROUP binding: an entry from another group never passes the replay
+        // filter, even at a matching epoch — the provider-loss recovery path
+        // can replace the group, and an old-group Welcome would seat its
+        // target in the obsolete group.
+        let epoch_now = alice2.safety_numbers().unwrap().epoch;
+        alice2.pending_broadcast = vec![PendingBroadcast {
+            epoch: epoch_now,
+            group_id_b64: "bm90LXRoaXMtZ3JvdXA=".into(),
+            frame: "(welcome @research :for @bob :ct \"stale\" :from @alice)".into(),
+        }];
+        assert!(
+            alice2.pending_rebroadcast().is_empty(),
+            "frames minted by a replaced group are never re-driven"
         );
 
         let _ = fs::remove_dir_all(&a_dir);
