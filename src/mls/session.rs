@@ -119,6 +119,13 @@ struct PublishedKeyPackages {
     keypub_frame: String,
     refs: Vec<String>,
     built_at: std::time::SystemTime,
+    /// Whether the keypub frame has reached the wire. The hub's directory
+    /// APPENDS `:onetime` packages on every publish (it does not dedupe), so
+    /// replaying the same frame across retries would queue duplicate refs —
+    /// a later keyget could then serve an already-consumed package and the
+    /// resulting Welcome would fail. Once delivered, a rejoin re-sends only
+    /// idkey/keyready.
+    delivered: bool,
 }
 
 impl MlsSession {
@@ -295,12 +302,13 @@ impl MlsSession {
     /// The publication set is memoized: every `build_*` call durably stores a
     /// bundle (init key) in the provider, so a reconnect loop that re-ran the
     /// builders on each attempt would grow the MLS state file without bound
-    /// under retried failures. Re-sending the SAME set is safe — the hub's
-    /// directory keeps one publication per member, and none of the advertised
-    /// refs have been consumed. The set is rebuilt only when a ref HAS been
+    /// under retried failures. The set is rebuilt only when a ref HAS been
     /// consumed (a Welcome used one — replenishment, REQ-022) or the
     /// last-resort package is past half its lifetime (so we never advertise
-    /// one the primitive would reject at add time, REQ-022's bound).
+    /// one the primitive would reject at add time, REQ-022's bound). The
+    /// keypub frame itself is included only until [`Self::keypub_delivered`]
+    /// reports it reached the wire — the hub's directory appends `:onetime`
+    /// entries per publish, so replaying it would queue duplicate refs.
     pub fn join_frames(&mut self) -> Result<Vec<String>, MlsError> {
         if !self.enc_pinned {
             return Ok(Vec::new());
@@ -333,21 +341,32 @@ impl MlsSession {
                 keypub_frame,
                 refs,
                 built_at: std::time::SystemTime::now(),
+                delivered: false,
             });
         }
-        let keypub = self
-            .published
-            .as_ref()
-            .expect("publication set built above")
-            .keypub_frame
-            .clone();
+        let set = self.published.as_ref().expect("publication set built above");
 
-        let mut frames = vec![keypub];
+        let mut frames = Vec::new();
+        if !set.delivered {
+            frames.push(set.keypub_frame.clone());
+        }
         frames.push(self.own_idkey_frame()?);
         // SPEC-013 IB-3: announce "published, add me" so a web owner has an
         // explicit, re-drivable add trigger (not just presence timing).
         frames.push(self.keyready_frame());
         Ok(frames)
+    }
+
+    /// The caller reports the current keypub frame reached the wire, so later
+    /// [`Self::join_frames`] calls stop replaying it into the hub's
+    /// append-only `:onetime` queue. Wire delivery is the best signal the
+    /// client has for "the hub processed it" — the residual mismatch (a hub
+    /// that died between read and store) errs on under- rather than
+    /// over-publication against a durable directory.
+    pub fn keypub_delivered(&mut self) {
+        if let Some(set) = self.published.as_mut() {
+            set.delivered = true;
+        }
     }
 
     /// Build this agent's self-signed `idkey` assertion frame (REQ-019),
@@ -1055,26 +1074,43 @@ mod tests {
     }
 
     /// A retried rejoin must NOT durably mint a fresh KeyPackage set per
-    /// attempt: `join_frames` memoizes the publication (same keypub frame,
-    /// same bundles, no provider growth) until a ref is consumed or the
-    /// last-resort nears expiry.
+    /// attempt (`join_frames` memoizes the publication until a ref is
+    /// consumed or the last-resort nears expiry), and must NOT replay a
+    /// delivered keypub into the hub's append-only `:onetime` queue.
     #[test]
     fn join_frames_reuses_publication_across_retries() {
         let (dir, wire) = setup("joinreuse", 88, "@aria");
         let mut session =
             MlsSession::open(&dir, "aria", "@research", "@aria", &wire, true).unwrap();
         let first = session.join_frames().unwrap();
+        assert!(first[0].starts_with("(keypub "));
         let provider_size = fs::read(dir.join("aria.mls")).unwrap().len();
 
-        let second = session.join_frames().unwrap();
+        // The keypub never reached the wire: the retry re-sends the SAME
+        // frame (same bundles — no provider growth).
+        let retry = session.join_frames().unwrap();
         assert_eq!(
-            first[0], second[0],
-            "the retried publication must republish the SAME keypub frame"
+            first[0], retry[0],
+            "an undelivered keypub is republished verbatim"
         );
         assert_eq!(
             fs::read(dir.join("aria.mls")).unwrap().len(),
             provider_size,
             "a retried join_frames must not grow the durable MLS state"
+        );
+
+        // Once delivered, a rejoin sends only idkey + keyready — the hub
+        // APPENDS :onetime entries per publish, so a replay would queue
+        // duplicate refs a keyget could serve after consumption.
+        session.keypub_delivered();
+        let after = session.join_frames().unwrap();
+        assert_eq!(after.len(), 2, "delivered keypub is not replayed");
+        assert!(after[0].starts_with("(idkey "));
+        assert!(after[1].starts_with("(keyready "));
+        assert_eq!(
+            fs::read(dir.join("aria.mls")).unwrap().len(),
+            provider_size,
+            "reuse after delivery must not grow the durable MLS state either"
         );
         let _ = fs::remove_dir_all(&dir);
     }

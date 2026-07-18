@@ -50,12 +50,54 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// `cbcl-chat-invite` already consumed by the first hello, so replaying it on
 /// reconnect would get `forbidden-room` forever; any current member may mint
 /// a fresh bounded invite (`(invite @room …)` → `(invited … :token …)`,
-/// SPEC-001 REQ-007), and that token — re-minted on every connection, durable
-/// on the hub across redeploys — is the credential presented on the next
-/// reconnect. Seven days / five uses bounds the exposure of a leaked token
-/// while comfortably outliving a hub redeploy window.
+/// SPEC-001 REQ-007), and that token — durable on the hub across redeploys —
+/// is the credential presented on the next reconnect. Seven days / five uses
+/// bounds the exposure of a leaked token while comfortably outliving a hub
+/// redeploy window.
 const RENEWAL_INVITE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const RENEWAL_INVITE_USES: u32 = 5;
+
+/// How often a live connection re-checks whether its renewal invite needs
+/// refreshing (Fix 9): an agent that stays healthy past the invite TTL would
+/// otherwise hold an expired token when the first reconnect finally comes.
+const RENEWAL_REFRESH_CHECK: Duration = Duration::from_secs(60 * 60);
+
+/// The reconnect credential minted from the hub. Reused across reconnects
+/// until its locally tracked admission budget is nearly spent or it nears
+/// expiry — the hub has no invite-revoke API, so rotating on every connection
+/// would leave a trail of still-active capabilities behind (Fix 10); instead
+/// one token is retained and replaced only when it is nearly dead.
+struct RenewalInvite {
+    token: String,
+    minted_at: std::time::Instant,
+    /// Locally tracked budget: decremented on every reconnect hello that
+    /// presented this token (the hub consumes one use per admission).
+    uses_left: u32,
+}
+
+impl RenewalInvite {
+    fn fresh(token: String) -> Self {
+        Self {
+            token,
+            minted_at: std::time::Instant::now(),
+            uses_left: RENEWAL_INVITE_USES,
+        }
+    }
+
+    /// Still presentable: has budget and has not passed the hub-side TTL.
+    fn usable(&self) -> bool {
+        self.uses_left > 0
+            && self.minted_at.elapsed() < Duration::from_millis(RENEWAL_INVITE_TTL_MS)
+    }
+
+    /// Should be replaced at the next refresh check: nearly out of budget, or
+    /// past half the TTL (so a healthy long-lived connection never finds
+    /// itself holding an expired token when a reconnect finally comes).
+    fn stale(&self) -> bool {
+        self.uses_left <= 1
+            || self.minted_at.elapsed() > Duration::from_millis(RENEWAL_INVITE_TTL_MS / 2)
+    }
+}
 
 /// The negotiated WebSocket stream type for a `/chat/v1` connection.
 type ChatSocket =
@@ -486,6 +528,11 @@ async fn connect_and_join(
                     .send(WsMessage::Binary(frame.into()))
                     .await
                     .map_err(|e| ChatError::HelloSendFailed(e.to_string()))?;
+                // The keypub frame reached the wire: stop replaying it into
+                // the hub's append-only :onetime queue on later rejoins.
+                if text.starts_with("(keypub ") {
+                    session.keypub_delivered();
+                }
             }
         }
     }
@@ -783,10 +830,19 @@ fn error_slug(text: &str) -> Option<String> {
     })
 }
 
-/// The `:token` from an `(invited @room :token "…" :ttl … :uses …)` frame —
-/// the hub's reply to a renewal-invite mint (sent only to the requesting
-/// session). `None` for any other frame.
-fn invited_token(text: &str) -> Option<String> {
+/// The `:token` from a HUB-ORIGINATED `(invited @room :token "…" :ttl …
+/// :uses …)` frame — the reply to a renewal-invite mint. `None` for any
+/// other frame.
+///
+/// Authentication (Fix 11): `invited` is not a reserved performative on the
+/// hub, so another signed member could fan a forged `(invited … :from
+/// @mallory …)` through the generic publish path and overwrite our renewal
+/// token with attacker-controlled data. The genuine hub reply is built by
+/// `cbcl-core-wire:invited` and carries NO `:from`, while the hub REFUSES to
+/// fan any member frame without one (`missing-from`) — so a `:from`-less
+/// `invited` addressed to our channel can only have come from the hub
+/// itself. The caller additionally gates on an outstanding mint request.
+fn invited_token(text: &str, channel: &str) -> Option<String> {
     let SExpr::List(items) = cbcl_parser::parse(text).ok()? else {
         return None;
     };
@@ -794,16 +850,28 @@ fn invited_token(text: &str) -> Option<String> {
         SExpr::Atom(Atom::Symbol(symbol)) if symbol == "invited" => {}
         _ => return None,
     }
+    match items.get(1)? {
+        SExpr::Atom(Atom::Symbol(room)) if room == channel => {}
+        _ => return None,
+    }
+    let mut token = None;
     let mut iter = items.iter();
     while let Some(item) = iter.next() {
-        if matches!(item, SExpr::Atom(Atom::Keyword(key)) if key == "token" || key == ":token") {
-            return match iter.next()? {
-                SExpr::Atom(Atom::Str(token)) => Some(token.clone()),
-                _ => None,
-            };
+        let SExpr::Atom(Atom::Keyword(key)) = item else {
+            continue;
+        };
+        match key.trim_start_matches(':') {
+            // A member-fanned forgery must carry `:from` (the hub rejects
+            // room frames without it); the hub's own reply never does.
+            "from" => return None,
+            "token" => match iter.next()? {
+                SExpr::Atom(Atom::Str(value)) => token = Some(value.clone()),
+                _ => return None,
+            },
+            _ => {}
         }
     }
-    None
+    token
 }
 
 fn spawn_receive_loop(args: ReceiveLoopArgs) {
@@ -828,13 +896,19 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         added_by,
     } = args;
     tokio::spawn(async move {
-        // Fix 6 (spent-invite reentry): the bounded renewal-invite token minted
-        // on the current connection, presented INSTEAD of the original cap on
-        // the next reconnect — the original may be a single-use pairing invite
-        // the first hello already consumed. Refreshed by every connection's
-        // receive loop; cleared (fall back to the original cap) when the hub
-        // rejects it.
-        let mut renewal_cap: Option<String> = None;
+        // Fix 6 (spent-invite reentry): the bounded renewal invite minted over
+        // the live connection, presented INSTEAD of the original cap on the
+        // next reconnect — the original may be a single-use pairing invite the
+        // first hello already consumed. Reused across reconnects and refreshed
+        // before it goes stale (Fix 9/10); cleared (fall back to the original
+        // cap) when the hub rejects it.
+        let mut renewal: Option<RenewalInvite> = None;
+        // Fix 8: MLS protocol frames whose transition was already merged and
+        // persisted (e.g. the Commit+Welcome of an Add) but which never
+        // reached the wire before the socket died. Replayed FIRST on the next
+        // connection — dropping them would leave peers forked or the added
+        // member stranded, with no path that ever regenerates them.
+        let mut pending_mls: Vec<String> = Vec::new();
         // Outer reconnect loop: run one connection's receive loop, then — only
         // when the *hub* dropped the socket (a single-instance redeploy) —
         // reconnect with backoff, reusing the same identity, MLS session,
@@ -857,7 +931,8 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                 wire_handle: &wire_handle,
                 channel: &channel,
                 private: cap.is_some(),
-                renewal_cap: &mut renewal_cap,
+                renewal: &mut renewal,
+                pending_mls: &mut pending_mls,
             })
             .await;
             match exit {
@@ -896,10 +971,17 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         // keyready / announce may reach the wire after the handle
                         // is gone. Dropping the `connect_and_join` future closes
                         // any partial socket it opened.
-                        // Fix 6: present the renewal token minted on the last
-                        // connection in preference to the original cap, which
-                        // (from `hark pair`) may be a spent single-use invite.
-                        let presenting_renewal = renewal_cap.is_some();
+                        // Fix 6: present the renewal token in preference to the
+                        // original cap, which (from `hark pair`) may be a spent
+                        // single-use invite. Only when it is actually usable —
+                        // an exhausted or TTL-expired token falls straight
+                        // through to the original cap.
+                        let presenting_renewal = renewal.as_ref().is_some_and(RenewalInvite::usable);
+                        let presented_cap = if presenting_renewal {
+                            renewal.as_ref().map(|invite| invite.token.as_str())
+                        } else {
+                            cap.as_deref()
+                        };
                         let attempt = tokio::select! {
                             _ = &mut close_rx => break ReconnectOutcome::Stopped,
                             result = connect_and_join(
@@ -907,7 +989,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                                 &channel,
                                 &wire_handle,
                                 &dialects,
-                                renewal_cap.as_deref().or(cap.as_deref()),
+                                presented_cap,
                                 added_by.as_deref(),
                                 identity.as_ref(),
                                 mls.as_mut(),
@@ -918,6 +1000,13 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             Ok(reconnect) => {
                                 websocket = reconnect.websocket;
                                 conn = reconnect.conn;
+                                // The admission consumed one hub-side use of
+                                // the renewal token (Fix 10's local budget).
+                                if presenting_renewal {
+                                    if let Some(invite) = renewal.as_mut() {
+                                        invite.uses_left = invite.uses_left.saturating_sub(1);
+                                    }
+                                }
                                 break ReconnectOutcome::Reconnected;
                             }
                             Err(error) if error.is_retryable() => {
@@ -930,7 +1019,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             // original cap before declaring the join dead.
                             Err(ChatError::JoinRejected(slug)) if presenting_renewal => {
                                 tracing::warn!(agent = %wire_handle, slug = %slug, "hub rejected the renewal invite; retrying with the original cap");
-                                renewal_cap = None;
+                                renewal = None;
                                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
                             }
                             // Fix 1/2: a PERMANENT verdict a retry cannot change
@@ -995,11 +1084,14 @@ struct RunLoop<'a> {
     /// The channel (`@name`) — addressed by the renewal-invite mint.
     channel: &'a str,
     /// Whether the join presented a cap (private channel): drives the
-    /// renewal-invite mint on each connection (Fix 6).
+    /// renewal-invite lifecycle (Fix 6).
     private: bool,
-    /// Where the `(invited …)` reply's token lands — the outer loop presents
-    /// it as the credential on the next reconnect (Fix 6).
-    renewal_cap: &'a mut Option<String>,
+    /// The reconnect credential, minted/refreshed over this connection and
+    /// presented by the outer loop on the next reconnect (Fix 6/9/10).
+    renewal: &'a mut Option<RenewalInvite>,
+    /// MLS protocol frames from an already-persisted transition that never
+    /// reached the wire — replayed first on this connection (Fix 8).
+    pending_mls: &'a mut Vec<String>,
 }
 
 /// Run one connection's `tokio::select!` receive loop until it exits, returning
@@ -1022,7 +1114,8 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
         wire_handle,
         channel,
         private,
-        renewal_cap,
+        renewal,
+        pending_mls,
     } = args;
     // Pending Δ-window and liveness-fallback timers, fired into the select.
     // Fresh per connection: any in-flight claims are moot once the hub restarts.
@@ -1032,34 +1125,64 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
     // AskState with no backing timer would leak and swallow a replayed ask as a
     // duplicate. Keeps the asks map in lockstep with `timers`.
     responder.reset_pending();
-    // Fix 6: on a private channel, mint the NEXT reconnect's credential now —
-    // the cap this connection joined with may have been a single-use pairing
-    // invite the hello just consumed, so replaying it would be forbidden-room
-    // forever. Any current member may mint a bounded invite (SPEC-001
-    // REQ-007); the hub's `(invited …)` reply is captured in the read arm
-    // below into `renewal_cap`. A write failure is a transport loss →
-    // reconnect (Fix 3).
-    if private {
-        let mint = format!(
-            "(invite {channel} :ttl {RENEWAL_INVITE_TTL_MS} :uses {RENEWAL_INVITE_USES} :from {wire_handle})"
-        );
-        match payload_bytes(&mint) {
-            Ok(payload) => {
-                let frame = conn.sign_chat_frame(identity, &payload);
-                if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
-                    return LoopExit::HubClosed(sanitize(&error.to_string()));
-                }
+    // Fix 8: replay protocol frames from a persisted MLS transition (e.g. the
+    // Commit+Welcome of a merged Add) that the previous socket lost. The MLS
+    // state has already advanced past them, so nothing regenerates them —
+    // without the replay peers stay forked and the added member is stranded.
+    // Sent before anything else; on failure they stay queued for next time.
+    while let Some(text) = pending_mls.first().cloned() {
+        let Ok(payload) = payload_bytes(&text) else {
+            pending_mls.remove(0);
+            continue;
+        };
+        let frame = conn.sign_chat_frame(identity, &payload);
+        match websocket.send(WsMessage::Binary(frame.into())).await {
+            Ok(()) => {
+                pending_mls.remove(0);
             }
-            Err(error) => {
-                tracing::warn!(agent = %wire_handle, error = %error, "renewal-invite mint frame invalid; reconnect will replay the original cap");
-            }
+            Err(error) => return LoopExit::HubClosed(sanitize(&error.to_string())),
         }
     }
+    // Fix 6/9: the renewal-credential lifecycle. The cap this channel joined
+    // with may have been a single-use pairing invite the first hello consumed,
+    // so a reconnect needs its own credential: any current member may mint a
+    // bounded invite (SPEC-001 REQ-007). The check timer fires immediately on
+    // connect (mints when no usable token is held) and then hourly, so a
+    // healthy long-lived connection replaces its token BEFORE the hub-side
+    // TTL can strand it (Fix 9), while a still-fresh token is kept rather
+    // than rotated per connection (Fix 10 — the hub cannot revoke invites,
+    // so every abandoned token would stay admissible until expiry).
+    let mut renewal_check = tokio::time::interval(RENEWAL_REFRESH_CHECK);
+    // True while a mint request is outstanding — the `(invited …)` capture
+    // below only accepts a reply we actually asked for (Fix 11).
+    let mut awaiting_invited = false;
     loop {
         tokio::select! {
                 _ = &mut *close_rx => {
                     let _ = websocket.close(None).await;
                     return LoopExit::Stopped;
+                }
+                // Fix 6/9: mint (or pre-expiry refresh) the reconnect
+                // credential. Re-sent on later ticks while unanswered, so a
+                // lost reply is not a lost credential.
+                _ = renewal_check.tick(), if private => {
+                    if renewal.as_ref().is_none_or(RenewalInvite::stale) {
+                        let mint = format!(
+                            "(invite {channel} :ttl {RENEWAL_INVITE_TTL_MS} :uses {RENEWAL_INVITE_USES} :from {wire_handle})"
+                        );
+                        match payload_bytes(&mint) {
+                            Ok(payload) => {
+                                let frame = conn.sign_chat_frame(identity, &payload);
+                                if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
+                                    return LoopExit::HubClosed(sanitize(&error.to_string()));
+                                }
+                                awaiting_invited = true;
+                            }
+                            Err(error) => {
+                                tracing::warn!(agent = %wire_handle, error = %error, "renewal-invite mint frame invalid; reconnect will replay the original cap");
+                            }
+                        }
+                    }
                 }
                 outbound = send_rx.recv() => {
                     let Some(outbound) = outbound else {
@@ -1103,12 +1226,16 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                         Err(error) => {
                             // Fix 3: an outbound WS write failure is a TRANSPORT
                             // loss the read arm just hasn't observed yet — fail
-                            // ONLY this in-flight send (fatal to its one waiter),
-                            // then reconnect via HubClosed. Do NOT mark_unhealthy:
-                            // that fires `close_tx` and would abort the reconnect
-                            // (same reason the read-side hub-close arms avoid it).
+                            // ONLY this in-flight send, then reconnect via
+                            // HubClosed. The reject MUST be retryable: a fatal
+                            // reject makes `send_outbound` mark the handle
+                            // unhealthy, which fires `close_tx` — the outer
+                            // loop would then read the pending close signal as
+                            // an explicit stop and never reconnect (Fix 7).
                             let detail = sanitize(&error.to_string());
-                            let _ = outbound.result_tx.send(Err(OutboundReject::fatal(detail.clone())));
+                            let _ = outbound.result_tx.send(Err(OutboundReject::retryable(format!(
+                                "connection to the hub lost; reconnecting: {detail}"
+                            ))));
                             return LoopExit::HubClosed(detail);
                         }
                     }
@@ -1165,14 +1292,16 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                             return LoopExit::HubClosed(sanitize(&error.to_string()));
                         }
                     };
-                    // Fix 6: the hub's reply to OUR renewal-invite mint (an
-                    // `invited` frame is sent only to the session that asked).
-                    // Capture the token as the next reconnect's credential;
-                    // the frame is transport-internal, never content.
-                    if private {
-                        if let Some(token) = invited_token(&payload_text) {
+                    // Fix 6/11: the hub's reply to OUR renewal-invite mint.
+                    // Gated on an outstanding request, and `invited_token`
+                    // rejects any member-fanned forgery (which must carry
+                    // `:from`; the hub's own reply never does) — so a forged
+                    // frame cannot overwrite a valid credential.
+                    if private && awaiting_invited {
+                        if let Some(token) = invited_token(&payload_text, channel) {
                             tracing::debug!(agent = %wire_handle, "captured a renewal invite for reconnect");
-                            *renewal_cap = Some(token);
+                            *renewal = Some(RenewalInvite::fresh(token));
+                            awaiting_invited = false;
                             continue;
                         }
                     }
@@ -1199,12 +1328,20 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                                 // Fix 3: an MLS/keyready protocol-frame write
                                 // failure is a transport loss — reconnect via
                                 // HubClosed (no mark_unhealthy, see above).
+                                // Fix 8: these frames may carry an ALREADY
+                                // MERGED transition (add_member persists the
+                                // Add before returning its Commit+Welcome), so
+                                // the unsent tail is queued for replay on the
+                                // next connection rather than dropped.
                                 let mut write_failure = None;
-                                for text in outbound {
+                                let mut queue = outbound.into_iter();
+                                while let Some(text) = queue.next() {
                                     let Ok(payload) = payload_bytes(&text) else { continue };
                                     let frame = conn.sign_chat_frame(identity, &payload);
                                     if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
                                         write_failure = Some(sanitize(&error.to_string()));
+                                        pending_mls.push(text);
+                                        pending_mls.extend(queue);
                                         break;
                                     }
                                 }
@@ -1435,24 +1572,54 @@ mod tests {
         assert!(error_slug("not (((valid").is_none());
     }
 
-    /// Fix 6: the renewal-invite reply parser — the token, and only from a
-    /// genuine `invited` frame (never a body substring or another performative).
+    /// Fix 6/11: the renewal-invite reply parser — the token, and ONLY from a
+    /// hub-originated `invited` frame for our channel: a member-fanned forgery
+    /// must carry `:from` (the hub rejects room frames without it) and is
+    /// refused, as is a frame addressed to a different room.
     #[test]
-    fn extracts_invited_token() {
+    fn extracts_invited_token_and_rejects_forgeries() {
         assert_eq!(
-            invited_token("(invited @priv :token \"ABC123\" :ttl 604800000 :uses 5)").as_deref(),
+            invited_token(
+                "(invited @priv :token \"ABC123\" :ttl 604800000 :uses 5)",
+                "@priv"
+            )
+            .as_deref(),
             Some("ABC123")
         );
-        // The mint request itself, other frames, and junk yield nothing.
-        assert!(invited_token("(invite @priv :ttl 1000 :uses 5 :from @aria)").is_none());
-        assert!(invited_token("(tell @x \"invited :token \\\"fake\\\"\")").is_none());
-        assert!(invited_token("(invited @priv :ttl 1000)").is_none());
-        assert!(invited_token("not (((valid").is_none());
+        // A member-fanned forgery necessarily carries :from — refused.
+        assert!(
+            invited_token(
+                "(invited @priv :token \"EVIL\" :ttl 1000 :uses 5 :from @mallory)",
+                "@priv"
+            )
+            .is_none()
+        );
+        // Wrong room, the mint request itself, other frames, and junk.
+        assert!(invited_token("(invited @other :token \"ABC\" :ttl 1)", "@priv").is_none());
+        assert!(invited_token("(invite @priv :ttl 1000 :uses 5 :from @aria)", "@priv").is_none());
+        assert!(invited_token("(tell @x \"invited :token \\\"fake\\\"\")", "@priv").is_none());
+        assert!(invited_token("(invited @priv :ttl 1000)", "@priv").is_none());
+        assert!(invited_token("not (((valid", "@priv").is_none());
         // The renewal-mint frame hark emits is itself valid CBCL.
         let mint = format!(
             "(invite @priv :ttl {RENEWAL_INVITE_TTL_MS} :uses {RENEWAL_INVITE_USES} :from @aria)"
         );
         assert!(payload_bytes(&mint).is_ok());
+    }
+
+    /// Fix 9/10: the renewal credential is reused while it has budget and is
+    /// young; refreshed when nearly spent or past half its TTL; and never
+    /// presented once exhausted.
+    #[test]
+    fn renewal_invite_budget_and_staleness() {
+        let mut invite = super::RenewalInvite::fresh("tok".into());
+        assert!(invite.usable());
+        assert!(!invite.stale(), "a fresh token is kept, not rotated");
+        invite.uses_left = 1;
+        assert!(invite.usable(), "the last use is still presentable");
+        assert!(invite.stale(), "…but the next check must refresh it");
+        invite.uses_left = 0;
+        assert!(!invite.usable(), "an exhausted token is never presented");
     }
 
     #[test]
