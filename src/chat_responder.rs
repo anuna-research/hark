@@ -233,6 +233,24 @@ impl Responder {
         if answered { None } else { Some(state.payload) }
     }
 
+    /// Drop all in-flight ask coordination (Fix 5).
+    ///
+    /// The transport builds a FRESH per-connection timer set on every
+    /// (re)connect, but REUSES this `Responder` (and its `asks` map) across
+    /// reconnects. Any `AskState` left over from a prior connection therefore
+    /// has no backing Δ-window / liveness-fallback timer that can ever resolve
+    /// it. Worse: because [`Responder::on_inbound`] treats an already-tracked
+    /// ask id as a duplicate (returns `[]`, no claim), a replay of that same
+    /// ask from public-channel backfill after the reconnect would be silently
+    /// dropped — never elected, never delivered, and tracked forever.
+    ///
+    /// The transport calls this whenever it discards a connection's timers (at
+    /// the start of each `run_receive_loop` pass) so the `asks` map stays in
+    /// lockstep with the timers that drive it.
+    pub fn reset_pending(&mut self) {
+        self.asks.clear();
+    }
+
     /// Whether any asks are still being coordinated (for tests/diagnostics).
     #[cfg(test)]
     fn tracked(&self) -> usize {
@@ -484,6 +502,29 @@ mod tests {
         let payload = ask("t1", "@asker");
         assert_eq!(r.on_inbound(&payload).len(), 1);
         assert!(r.on_inbound(&payload).is_empty()); // already contending
+    }
+
+    #[test]
+    fn reset_pending_drops_stale_asks_and_allows_replay() {
+        // Fix 5: an ask claimed on a prior connection is left tracked when that
+        // connection's timers are dropped. Without a reset, the same ask
+        // replayed from backfill after reconnect is swallowed as a duplicate
+        // (no claim) and leaked forever. `reset_pending` clears it so the
+        // replay re-claims cleanly against the fresh timer set.
+        let mut r = responder();
+        let payload = ask("t1", "@asker");
+        assert_eq!(r.on_inbound(&payload).len(), 1);
+        assert_eq!(r.tracked(), 1);
+        // Duplicate before reset: no claim (the leak that reset prevents).
+        assert!(r.on_inbound(&payload).is_empty());
+
+        // Reconnect discards the timers → reset the coordination.
+        r.reset_pending();
+        assert_eq!(r.tracked(), 0);
+
+        // The replayed ask now claims again, tracked against a fresh timer.
+        assert_eq!(r.on_inbound(&payload).len(), 1);
+        assert_eq!(r.tracked(), 1);
     }
 
     #[test]

@@ -45,6 +45,18 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// The bounded renewal invite hark mints for itself after joining a
+/// cap-bearing (private) channel. A cap from `hark pair` is a SINGLE-USE
+/// `cbcl-chat-invite` already consumed by the first hello, so replaying it on
+/// reconnect would get `forbidden-room` forever; any current member may mint
+/// a fresh bounded invite (`(invite @room …)` → `(invited … :token …)`,
+/// SPEC-001 REQ-007), and that token — re-minted on every connection, durable
+/// on the hub across redeploys — is the credential presented on the next
+/// reconnect. Seven days / five uses bounds the exposure of a leaked token
+/// while comfortably outliving a hub redeploy window.
+const RENEWAL_INVITE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const RENEWAL_INVITE_USES: u32 = 5;
+
 /// The negotiated WebSocket stream type for a `/chat/v1` connection.
 type ChatSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -72,6 +84,40 @@ pub enum ChatError {
     },
     #[error("encryption downgrade refused (REQ-023): {0}")]
     DowngradeRefused(String),
+}
+
+impl ChatError {
+    /// Whether a failed reconnect attempt is worth retrying (Fix 1: classify
+    /// reconnect errors — retry TRANSPORT, terminate on PERMANENT).
+    ///
+    /// RETRYABLE (transient hub-down / transport): the hub is a single
+    /// immediate-deploy instance, so a redeploy tears down the socket and the
+    /// TCP/upgrade/hello handshake fails until it is back — backing off and
+    /// retrying is correct.
+    ///
+    /// PERMANENT (fail-closed, terminate the reconnect loop): a verdict that a
+    /// retry cannot change, and where retrying is itself harmful —
+    /// * `JoinRejected` (forbidden-room / no-such-channel / bad-signature): the
+    ///   membership decision is final; re-running `join_frames` would durably
+    ///   publish another KeyPackage bundle that is never pruned.
+    /// * `DowngradeRefused` (REQ-023): the `MlsSession` is now permanently
+    ///   downgrade-refused; a later `:enc true` must NOT be read as recovery
+    ///   (see Fix 2).
+    /// * `UndeclaredDialect` / `Hello` (announce-invalid / MLS build): a local
+    ///   configuration/build fault a reconnect cannot fix.
+    /// * `Store`: the agent-store rejected the connection.
+    fn is_retryable(&self) -> bool {
+        match self {
+            ChatError::ConnectionFailed(_)
+            | ChatError::HelloSendFailed(_)
+            | ChatError::JoinTimeout(_) => true,
+            ChatError::JoinRejected(_)
+            | ChatError::DowngradeRefused(_)
+            | ChatError::UndeclaredDialect { .. }
+            | ChatError::Hello(_)
+            | ChatError::Store(_) => false,
+        }
+    }
 }
 
 /// One entry of a channel's declared-dialect menu (SPEC-015 CON-001):
@@ -298,9 +344,10 @@ struct JoinOutcome {
 /// * `mls_create` must be true AT MOST ONCE — only on the very first connect.
 ///   Every reconnect passes `false`: re-creating the group would mint a new
 ///   `group_id` and fork every peer (`WrongGroupId`).
-/// * `on_roomcfg` (a pure downgrade judge) and `join_frames` (freshly built
-///   KeyPackages + idkey + keyready) are safe to call again on an existing
-///   session, so a reconnect re-publishes membership to the restarted hub.
+/// * `on_roomcfg` (a pure downgrade judge) and `join_frames` (a memoized
+///   KeyPackage set + idkey + keyready) are safe to call again on an existing
+///   session, so a reconnect re-publishes membership to the restarted hub
+///   without minting fresh bundles on every attempt.
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_join(
     ws_url: &Url,
@@ -310,7 +357,7 @@ async fn connect_and_join(
     cap: Option<&str>,
     added_by: Option<&str>,
     identity: &ChatIdentity,
-    mls: Option<&mut MlsSession>,
+    mut mls: Option<&mut MlsSession>,
     mls_create: bool,
 ) -> Result<JoinOutcome, ChatError> {
     let (mut websocket, _response) = connect_async(ws_url.as_str())
@@ -344,35 +391,11 @@ async fn connect_and_join(
 
     // SPEC-013: judge the ack against the encryption-mode pin (REQ-023) —
     // a `roomcfg :enc false` on a pinned-encrypted channel is a refused
-    // downgrade and the join fails closed — then publish KeyPackages and
-    // the self-signed idkey assertion (REQ-002, REQ-019).
-    if let Some(session) = mls {
+    // downgrade and the join fails closed.
+    if let Some(session) = mls.as_deref_mut() {
         session
             .on_roomcfg(&ack)
             .map_err(|e| ChatError::DowngradeRefused(e.to_string()))?;
-        if session.encrypted() {
-            // REQ-016 operator intent: bootstrap the MLS group as the room
-            // creator before publishing, so this agent is the sole member /
-            // elected owner and will add present members on presence. Only on
-            // the first connect (`mls_create`); reconnects pass false so the
-            // group is never re-created (would fork every peer).
-            if mls_create {
-                session
-                    .create_group_as_creator()
-                    .map_err(|e| ChatError::Hello(format!("mls create group: {e}")))?;
-            }
-            let frames = session
-                .join_frames()
-                .map_err(|e| ChatError::Hello(format!("mls join frames: {e}")))?;
-            for text in frames {
-                let payload = payload_bytes(&text).map_err(ChatError::Hello)?;
-                let frame = conn.sign_chat_frame(identity, &payload);
-                websocket
-                    .send(WsMessage::Binary(frame.into()))
-                    .await
-                    .map_err(|e| ChatError::HelloSendFailed(e.to_string()))?;
-            }
-        }
     }
 
     // REQ-008 (SPEC-016): the advertised set must be a subset of the channel's
@@ -434,6 +457,39 @@ async fn connect_and_join(
         )),
     }
     let announce_payload = payload_bytes(&announce).map_err(ChatError::Hello)?;
+
+    // Publish KeyPackages and the self-signed idkey assertion (REQ-002,
+    // REQ-019) only now — AFTER every local validation above (dialect menu,
+    // announce conformance). A rejoin that would fail those permanent checks
+    // must not first durably mint KeyPackage bundles or emit control frames;
+    // the memoized publication set inside `join_frames` bounds what a
+    // *transport* failure below can cost across retries.
+    if let Some(session) = mls {
+        if session.encrypted() {
+            // REQ-016 operator intent: bootstrap the MLS group as the room
+            // creator before publishing, so this agent is the sole member /
+            // elected owner and will add present members on presence. Only on
+            // the first connect (`mls_create`); reconnects pass false so the
+            // group is never re-created (would fork every peer).
+            if mls_create {
+                session
+                    .create_group_as_creator()
+                    .map_err(|e| ChatError::Hello(format!("mls create group: {e}")))?;
+            }
+            let frames = session
+                .join_frames()
+                .map_err(|e| ChatError::Hello(format!("mls join frames: {e}")))?;
+            for text in frames {
+                let payload = payload_bytes(&text).map_err(ChatError::Hello)?;
+                let frame = conn.sign_chat_frame(identity, &payload);
+                websocket
+                    .send(WsMessage::Binary(frame.into()))
+                    .await
+                    .map_err(|e| ChatError::HelloSendFailed(e.to_string()))?;
+            }
+        }
+    }
+
     let announce_frame = conn.sign_chat_frame(identity, &announce_payload);
     websocket
         .send(WsMessage::Binary(announce_frame.into()))
@@ -565,6 +621,20 @@ enum LoopExit {
     /// The hub closed the socket / the stream ended / a transport error — the
     /// single-instance hub was (re)deployed. Reconnect with backoff.
     HubClosed(String),
+}
+
+/// How the reconnect/backoff loop in [`spawn_receive_loop`] resolved.
+enum ReconnectOutcome {
+    /// A `connect_and_join` attempt succeeded — re-enter `run_receive_loop`
+    /// with the fresh socket + signer.
+    Reconnected,
+    /// An explicit `daemon stop` fired `close_rx` during the backoff wait or
+    /// mid-attempt (Fix 4): abort reconnection, terminal.
+    Stopped,
+    /// A PERMANENT (non-retryable) error was returned by `connect_and_join`
+    /// (Fix 1): fail closed — mark the handle unhealthy and terminate the task
+    /// rather than loop forever in a false "reconnecting" state.
+    Permanent(ChatError),
 }
 
 /// A scheduled responder timer fired by the receive loop (SPEC-003 REQ-005/007).
@@ -713,6 +783,29 @@ fn error_slug(text: &str) -> Option<String> {
     })
 }
 
+/// The `:token` from an `(invited @room :token "…" :ttl … :uses …)` frame —
+/// the hub's reply to a renewal-invite mint (sent only to the requesting
+/// session). `None` for any other frame.
+fn invited_token(text: &str) -> Option<String> {
+    let SExpr::List(items) = cbcl_parser::parse(text).ok()? else {
+        return None;
+    };
+    match items.first()? {
+        SExpr::Atom(Atom::Symbol(symbol)) if symbol == "invited" => {}
+        _ => return None,
+    }
+    let mut iter = items.iter();
+    while let Some(item) = iter.next() {
+        if matches!(item, SExpr::Atom(Atom::Keyword(key)) if key == "token" || key == ":token") {
+            return match iter.next()? {
+                SExpr::Atom(Atom::Str(token)) => Some(token.clone()),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 fn spawn_receive_loop(args: ReceiveLoopArgs) {
     let ReceiveLoopArgs {
         store,
@@ -735,6 +828,13 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         added_by,
     } = args;
     tokio::spawn(async move {
+        // Fix 6 (spent-invite reentry): the bounded renewal-invite token minted
+        // on the current connection, presented INSTEAD of the original cap on
+        // the next reconnect — the original may be a single-use pairing invite
+        // the first hello already consumed. Refreshed by every connection's
+        // receive loop; cleared (fall back to the original cap) when the hub
+        // rejects it.
+        let mut renewal_cap: Option<String> = None;
         // Outer reconnect loop: run one connection's receive loop, then — only
         // when the *hub* dropped the socket (a single-instance redeploy) —
         // reconnect with backoff, reusing the same identity, MLS session,
@@ -755,6 +855,9 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                 mls: &mut mls,
                 receive_all,
                 wire_handle: &wire_handle,
+                channel: &channel,
+                private: cap.is_some(),
+                renewal_cap: &mut renewal_cap,
             })
             .await;
             match exit {
@@ -772,51 +875,100 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     // would masquerade as an explicit stop and abort us).
                     let _ = store.mark_reconnecting(&handle, Some(detail)).await;
                     // Back off (starting at BASE, doubling to MAX) between
-                    // attempts, retrying indefinitely. An explicit stop during
-                    // the wait aborts reconnection.
+                    // attempts. A RETRYABLE (transport) error keeps retrying;
+                    // a PERMANENT one (Fix 1) terminates fail-closed; an
+                    // explicit stop during the wait OR mid-attempt (Fix 4)
+                    // aborts reconnection.
                     let mut backoff = RECONNECT_BACKOFF_BASE;
-                    let reconnected = loop {
+                    let outcome = loop {
                         tokio::select! {
-                            _ = &mut close_rx => break false,
+                            _ = &mut close_rx => break ReconnectOutcome::Stopped,
                             _ = tokio::time::sleep(backoff) => {}
                         }
                         tracing::info!(agent = %wire_handle, "attempting chat reconnect");
                         // `mls_create` is FALSE on every reconnect: the group is
                         // created at most once (first connect) — re-creating it
                         // would fork every peer (WrongGroupId).
-                        match connect_and_join(
-                            &ws_url,
-                            &channel,
-                            &wire_handle,
-                            &dialects,
-                            cap.as_deref(),
-                            added_by.as_deref(),
-                            identity.as_ref(),
-                            mls.as_mut(),
-                            false,
-                        )
-                        .await
-                        {
-                            Ok(outcome) => {
-                                websocket = outcome.websocket;
-                                conn = outcome.conn;
-                                break true;
+                        //
+                        // Fix 4: race the connect→bootstrap→join→publish→announce
+                        // sequence against an explicit close so a `daemon stop`
+                        // mid-attempt aborts it immediately — no KeyPackages /
+                        // keyready / announce may reach the wire after the handle
+                        // is gone. Dropping the `connect_and_join` future closes
+                        // any partial socket it opened.
+                        // Fix 6: present the renewal token minted on the last
+                        // connection in preference to the original cap, which
+                        // (from `hark pair`) may be a spent single-use invite.
+                        let presenting_renewal = renewal_cap.is_some();
+                        let attempt = tokio::select! {
+                            _ = &mut close_rx => break ReconnectOutcome::Stopped,
+                            result = connect_and_join(
+                                &ws_url,
+                                &channel,
+                                &wire_handle,
+                                &dialects,
+                                renewal_cap.as_deref().or(cap.as_deref()),
+                                added_by.as_deref(),
+                                identity.as_ref(),
+                                mls.as_mut(),
+                                false,
+                            ) => result,
+                        };
+                        match attempt {
+                            Ok(reconnect) => {
+                                websocket = reconnect.websocket;
+                                conn = reconnect.conn;
+                                break ReconnectOutcome::Reconnected;
                             }
-                            Err(error) => {
-                                tracing::warn!(agent = %wire_handle, error = %error, "chat reconnect attempt failed; backing off");
+                            Err(error) if error.is_retryable() => {
+                                tracing::warn!(agent = %wire_handle, error = %error, "chat reconnect attempt failed (transient); backing off");
                                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
                             }
+                            // Fix 6: a rejected renewal token (expired during a
+                            // long outage, or a hub whose invite table did not
+                            // survive) is not yet terminal — fall back to the
+                            // original cap before declaring the join dead.
+                            Err(ChatError::JoinRejected(slug)) if presenting_renewal => {
+                                tracing::warn!(agent = %wire_handle, slug = %slug, "hub rejected the renewal invite; retrying with the original cap");
+                                renewal_cap = None;
+                                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                            }
+                            // Fix 1/2: a PERMANENT verdict a retry cannot change
+                            // (and where re-running join_frames would leak MLS
+                            // state / a refused downgrade would falsely "recover").
+                            Err(error) => break ReconnectOutcome::Permanent(error),
                         }
                     };
-                    if !reconnected {
-                        tracing::info!(agent = %wire_handle, "chat reconnect aborted by explicit stop");
-                        let _ = websocket.close(None).await;
-                        break;
+                    match outcome {
+                        ReconnectOutcome::Reconnected => {
+                            // Rejoined: reset health so `recv`/`send`/`status` recover.
+                            let _ = store.mark_connected(&handle).await;
+                            tracing::info!(agent = %wire_handle, "chat reconnected");
+                            // Loop back to run_receive_loop with the fresh socket + signer.
+                        }
+                        ReconnectOutcome::Stopped => {
+                            tracing::info!(agent = %wire_handle, "chat reconnect aborted by explicit stop");
+                            let _ = websocket.close(None).await;
+                            break;
+                        }
+                        ReconnectOutcome::Permanent(error) => {
+                            let reason = error.to_string();
+                            tracing::warn!(agent = %wire_handle, error = %reason, "chat reconnect rejected permanently; failing closed");
+                            // Fail closed: mark the handle unhealthy (this fires
+                            // `close_tx`, which is correct — we are terminating,
+                            // not reconnecting) and exit the task rather than
+                            // masquerade as "reconnecting" forever.
+                            let _ = store
+                                .mark_unhealthy(
+                                    &handle,
+                                    "reconnect_rejected",
+                                    Some(reason),
+                                )
+                                .await;
+                            let _ = websocket.close(None).await;
+                            break;
+                        }
                     }
-                    // Rejoined: reset health so `recv`/`send`/`status` recover.
-                    let _ = store.mark_connected(&handle).await;
-                    tracing::info!(agent = %wire_handle, "chat reconnected");
-                    // Loop back to run_receive_loop with the fresh socket + signer.
                 }
             }
         }
@@ -840,6 +992,14 @@ struct RunLoop<'a> {
     mls: &'a mut Option<MlsSession>,
     receive_all: bool,
     wire_handle: &'a str,
+    /// The channel (`@name`) — addressed by the renewal-invite mint.
+    channel: &'a str,
+    /// Whether the join presented a cap (private channel): drives the
+    /// renewal-invite mint on each connection (Fix 6).
+    private: bool,
+    /// Where the `(invited …)` reply's token lands — the outer loop presents
+    /// it as the credential on the next reconnect (Fix 6).
+    renewal_cap: &'a mut Option<String>,
 }
 
 /// Run one connection's `tokio::select!` receive loop until it exits, returning
@@ -860,10 +1020,41 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
         mls,
         receive_all,
         wire_handle,
+        channel,
+        private,
+        renewal_cap,
     } = args;
     // Pending Δ-window and liveness-fallback timers, fired into the select.
     // Fresh per connection: any in-flight claims are moot once the hub restarts.
     let mut timers: FuturesUnordered<BoxFuture<'static, ClaimTimer>> = FuturesUnordered::new();
+    // Fix 5: the timer set above is brand new, so drop any ask coordination the
+    // reused Responder carried over from a prior connection — otherwise an
+    // AskState with no backing timer would leak and swallow a replayed ask as a
+    // duplicate. Keeps the asks map in lockstep with `timers`.
+    responder.reset_pending();
+    // Fix 6: on a private channel, mint the NEXT reconnect's credential now —
+    // the cap this connection joined with may have been a single-use pairing
+    // invite the hello just consumed, so replaying it would be forbidden-room
+    // forever. Any current member may mint a bounded invite (SPEC-001
+    // REQ-007); the hub's `(invited …)` reply is captured in the read arm
+    // below into `renewal_cap`. A write failure is a transport loss →
+    // reconnect (Fix 3).
+    if private {
+        let mint = format!(
+            "(invite {channel} :ttl {RENEWAL_INVITE_TTL_MS} :uses {RENEWAL_INVITE_USES} :from {wire_handle})"
+        );
+        match payload_bytes(&mint) {
+            Ok(payload) => {
+                let frame = conn.sign_chat_frame(identity, &payload);
+                if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
+                    return LoopExit::HubClosed(sanitize(&error.to_string()));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(agent = %wire_handle, error = %error, "renewal-invite mint frame invalid; reconnect will replay the original cap");
+            }
+        }
+    }
     loop {
         tokio::select! {
                 _ = &mut *close_rx => {
@@ -910,10 +1101,15 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                     match websocket.send(WsMessage::Binary(frame.into())).await {
                         Ok(()) => { let _ = outbound.result_tx.send(Ok(())); }
                         Err(error) => {
+                            // Fix 3: an outbound WS write failure is a TRANSPORT
+                            // loss the read arm just hasn't observed yet — fail
+                            // ONLY this in-flight send (fatal to its one waiter),
+                            // then reconnect via HubClosed. Do NOT mark_unhealthy:
+                            // that fires `close_tx` and would abort the reconnect
+                            // (same reason the read-side hub-close arms avoid it).
                             let detail = sanitize(&error.to_string());
                             let _ = outbound.result_tx.send(Err(OutboundReject::fatal(detail.clone())));
-                            let _ = store.mark_unhealthy(handle, "local_send_failed", Some(detail)).await;
-                            return LoopExit::LocalClosed;
+                            return LoopExit::HubClosed(detail);
                         }
                     }
                 }
@@ -969,6 +1165,17 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                             return LoopExit::HubClosed(sanitize(&error.to_string()));
                         }
                     };
+                    // Fix 6: the hub's reply to OUR renewal-invite mint (an
+                    // `invited` frame is sent only to the session that asked).
+                    // Capture the token as the next reconnect's credential;
+                    // the frame is transport-internal, never content.
+                    if private {
+                        if let Some(token) = invited_token(&payload_text) {
+                            tracing::debug!(agent = %wire_handle, "captured a renewal invite for reconnect");
+                            *renewal_cap = Some(token);
+                            continue;
+                        }
+                    }
                     // SPEC-013: the MLS session consumes its frames first —
                     // welcome/deliver/keypkg/idkey/presence — decrypting
                     // content and emitting any protocol frames to send. In a
@@ -989,17 +1196,21 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                             }
                             SessionEvent::Plaintext { text, .. } => Some(text),
                             SessionEvent::Handled { outbound } => {
-                                let mut failed = false;
+                                // Fix 3: an MLS/keyready protocol-frame write
+                                // failure is a transport loss — reconnect via
+                                // HubClosed (no mark_unhealthy, see above).
+                                let mut write_failure = None;
                                 for text in outbound {
                                     let Ok(payload) = payload_bytes(&text) else { continue };
                                     let frame = conn.sign_chat_frame(identity, &payload);
                                     if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
-                                        let _ = store.mark_unhealthy(handle, "local_send_failed", Some(sanitize(&error.to_string()))).await;
-                                        failed = true;
+                                        write_failure = Some(sanitize(&error.to_string()));
                                         break;
                                     }
                                 }
-                                if failed { return LoopExit::LocalClosed; }
+                                if let Some(detail) = write_failure {
+                                    return LoopExit::HubClosed(detail);
+                                }
                                 None
                             }
                             SessionEvent::Dropped { reason, probable_fork } => {
@@ -1033,15 +1244,17 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                     }
                     // The responder decides: claim for answerable asks, deliver to
                     // `recv` only when elected, drop everything else (REQ-002).
-                    let mut send_failed = false;
+                    let mut write_failure = None;
                     for action in responder.on_inbound(&responder_text) {
                         let Action::Claim { ask_id, frame_text } = action;
                         match payload_bytes(&frame_text) {
                             Ok(payload) => {
                                 let frame = conn.sign_chat_frame(identity, &payload);
                                 if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
-                                    let _ = store.mark_unhealthy(handle, "local_send_failed", Some(sanitize(&error.to_string()))).await;
-                                    send_failed = true;
+                                    // Fix 3: a claim-frame write failure is a
+                                    // transport loss — reconnect via HubClosed
+                                    // (no mark_unhealthy, see above).
+                                    write_failure = Some(sanitize(&error.to_string()));
                                 }
                             }
                             // Our own claim should always be valid CBCL; skip if not.
@@ -1053,7 +1266,9 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                             ClaimTimer::Window(ask_id)
                         }.boxed());
                     }
-                    if send_failed { return LoopExit::LocalClosed; }
+                    if let Some(detail) = write_failure {
+                        return LoopExit::HubClosed(detail);
+                    }
                 }
         }
     }
@@ -1065,7 +1280,10 @@ fn sanitize(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_announce_frame, cap_part, error_slug, frame_performative, payload_bytes};
+    use super::{
+        RENEWAL_INVITE_TTL_MS, RENEWAL_INVITE_USES, build_announce_frame, cap_part, error_slug,
+        frame_performative, invited_token, payload_bytes,
+    };
 
     #[test]
     fn parses_roomcfg_with_and_without_declared_dialects() {
@@ -1217,6 +1435,26 @@ mod tests {
         assert!(error_slug("not (((valid").is_none());
     }
 
+    /// Fix 6: the renewal-invite reply parser — the token, and only from a
+    /// genuine `invited` frame (never a body substring or another performative).
+    #[test]
+    fn extracts_invited_token() {
+        assert_eq!(
+            invited_token("(invited @priv :token \"ABC123\" :ttl 604800000 :uses 5)").as_deref(),
+            Some("ABC123")
+        );
+        // The mint request itself, other frames, and junk yield nothing.
+        assert!(invited_token("(invite @priv :ttl 1000 :uses 5 :from @aria)").is_none());
+        assert!(invited_token("(tell @x \"invited :token \\\"fake\\\"\")").is_none());
+        assert!(invited_token("(invited @priv :ttl 1000)").is_none());
+        assert!(invited_token("not (((valid").is_none());
+        // The renewal-mint frame hark emits is itself valid CBCL.
+        let mint = format!(
+            "(invite @priv :ttl {RENEWAL_INVITE_TTL_MS} :uses {RENEWAL_INVITE_USES} :from @aria)"
+        );
+        assert!(payload_bytes(&mint).is_ok());
+    }
+
     #[test]
     fn payload_bytes_validates_and_passes_through() {
         // Parses and re-encodes; the output is valid canonical CBCL bytes.
@@ -1231,5 +1469,35 @@ mod tests {
     #[test]
     fn rejects_non_cbcl() {
         assert!(payload_bytes("not (((valid").is_err());
+    }
+
+    /// Fix 1/2: the reconnect classifier retries only transient transport
+    /// failures and terminates (fail-closed) on every permanent verdict.
+    /// In particular `DowngradeRefused` MUST be permanent (Fix 2): the reused
+    /// `MlsSession` is now permanently downgrade-refused, so a retry that later
+    /// saw `:enc true` would falsely "recover" a session whose `encrypt_outbound`
+    /// rejects forever — and the rejoin would already have emitted control frames.
+    #[test]
+    fn reconnect_error_classification_retries_transport_terminates_permanent() {
+        use super::ChatError;
+        use std::time::Duration;
+
+        // RETRYABLE: transient hub-down / transport.
+        assert!(ChatError::ConnectionFailed("reset".into()).is_retryable());
+        assert!(ChatError::HelloSendFailed("broken pipe".into()).is_retryable());
+        assert!(ChatError::JoinTimeout(Duration::from_secs(10)).is_retryable());
+
+        // PERMANENT: fail-closed, terminate the reconnect loop.
+        assert!(!ChatError::JoinRejected("forbidden-room".into()).is_retryable());
+        assert!(!ChatError::DowngradeRefused("enc pin".into()).is_retryable());
+        assert!(
+            !ChatError::UndeclaredDialect {
+                dialect: "cite".into(),
+                declared: vec![],
+            }
+            .is_retryable()
+        );
+        assert!(!ChatError::Hello("announce invalid".into()).is_retryable());
+        assert!(!ChatError::Store("rejected".into()).is_retryable());
     }
 }

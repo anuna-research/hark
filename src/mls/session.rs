@@ -29,7 +29,10 @@ use rand::Rng as _;
 use super::group::{
     GenesisAssertion, GenesisTrust, add_member, create_group, is_owner, join_from_welcome,
 };
-use super::keypackages::{ConsumedLedger, ONE_TIME_POOL_TARGET, build_last_resort, build_one_time};
+use super::keypackages::{
+    ConsumedLedger, LAST_RESORT_LIFETIME_SECS, ONE_TIME_POOL_TARGET, build_last_resort,
+    build_one_time,
+};
 use super::pins::{PinStore, idkey_signing_bytes};
 use super::provider::DurableProvider;
 use super::removal::{RemovalEvidence, remove_member};
@@ -103,6 +106,19 @@ pub struct MlsSession {
     /// late joiner would otherwise never receive an earlier member's key and
     /// could not pin it for the REQ-008 adder check.
     present: std::collections::HashSet<String>,
+    /// The KeyPackage publication set most recently built by [`join_frames`],
+    /// memoized so a retried rejoin republishes the SAME bundles instead of
+    /// durably minting a fresh last-resort + one-time pool on every attempt.
+    published: Option<PublishedKeyPackages>,
+}
+
+/// A memoized `keypub` publication (see [`MlsSession::join_frames`]): the
+/// frame to (re)send, the refs it advertises (for consumed-ledger checks),
+/// and when it was built (for the last-resort lifetime bound).
+struct PublishedKeyPackages {
+    keypub_frame: String,
+    refs: Vec<String>,
+    built_at: std::time::SystemTime,
 }
 
 impl MlsSession {
@@ -148,6 +164,7 @@ impl MlsSession {
             meta_path,
             wire_seed: wire.signing_seed(),
             present: std::collections::HashSet::new(),
+            published: None,
         };
 
         if let Some(meta) = meta {
@@ -274,26 +291,58 @@ impl MlsSession {
     /// The frames to send right after a successful join into a pinned
     /// encrypted channel: KeyPackage publication (REQ-002) and the
     /// self-signed `idkey` assertion (REQ-019).
+    ///
+    /// The publication set is memoized: every `build_*` call durably stores a
+    /// bundle (init key) in the provider, so a reconnect loop that re-ran the
+    /// builders on each attempt would grow the MLS state file without bound
+    /// under retried failures. Re-sending the SAME set is safe — the hub's
+    /// directory keeps one publication per member, and none of the advertised
+    /// refs have been consumed. The set is rebuilt only when a ref HAS been
+    /// consumed (a Welcome used one — replenishment, REQ-022) or the
+    /// last-resort package is past half its lifetime (so we never advertise
+    /// one the primitive would reject at add time, REQ-022's bound).
     pub fn join_frames(&mut self) -> Result<Vec<String>, MlsError> {
         if !self.enc_pinned {
             return Ok(Vec::new());
         }
-        let mut frames = Vec::new();
+        let reusable = self.published.as_ref().is_some_and(|set| {
+            let fresh = set
+                .built_at
+                .elapsed()
+                .is_ok_and(|age| age.as_secs() < LAST_RESORT_LIFETIME_SECS / 2);
+            fresh && !set.refs.iter().any(|r| self.ledger.is_consumed(r))
+        });
+        if !reusable {
+            let last = build_last_resort(&self.provider, &self.identity)?;
+            let one_time = build_one_time(&self.provider, &self.identity, ONE_TIME_POOL_TARGET)?;
+            let onetime_list = one_time
+                .iter()
+                .map(|p| format!("\"{}\"", B64.encode(&p.bytes)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let keypub_frame = format!(
+                "(keypub @hub :last \"{}\" :onetime ({}) :from {})",
+                B64.encode(&last.bytes),
+                onetime_list,
+                self.handle
+            );
+            let refs = std::iter::once(last.ref_b64)
+                .chain(one_time.into_iter().map(|p| p.ref_b64))
+                .collect();
+            self.published = Some(PublishedKeyPackages {
+                keypub_frame,
+                refs,
+                built_at: std::time::SystemTime::now(),
+            });
+        }
+        let keypub = self
+            .published
+            .as_ref()
+            .expect("publication set built above")
+            .keypub_frame
+            .clone();
 
-        let last = build_last_resort(&self.provider, &self.identity)?;
-        let one_time = build_one_time(&self.provider, &self.identity, ONE_TIME_POOL_TARGET)?;
-        let onetime_list = one_time
-            .iter()
-            .map(|p| format!("\"{}\"", B64.encode(&p.bytes)))
-            .collect::<Vec<_>>()
-            .join(" ");
-        frames.push(format!(
-            "(keypub @hub :last \"{}\" :onetime ({}) :from {})",
-            B64.encode(&last.bytes),
-            onetime_list,
-            self.handle
-        ));
-
+        let mut frames = vec![keypub];
         frames.push(self.own_idkey_frame()?);
         // SPEC-013 IB-3: announce "published, add me" so a web owner has an
         // explicit, re-drivable add trigger (not just presence timing).
@@ -1003,6 +1052,31 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&peer_dir);
+    }
+
+    /// A retried rejoin must NOT durably mint a fresh KeyPackage set per
+    /// attempt: `join_frames` memoizes the publication (same keypub frame,
+    /// same bundles, no provider growth) until a ref is consumed or the
+    /// last-resort nears expiry.
+    #[test]
+    fn join_frames_reuses_publication_across_retries() {
+        let (dir, wire) = setup("joinreuse", 88, "@aria");
+        let mut session =
+            MlsSession::open(&dir, "aria", "@research", "@aria", &wire, true).unwrap();
+        let first = session.join_frames().unwrap();
+        let provider_size = fs::read(dir.join("aria.mls")).unwrap().len();
+
+        let second = session.join_frames().unwrap();
+        assert_eq!(
+            first[0], second[0],
+            "the retried publication must republish the SAME keypub frame"
+        );
+        assert_eq!(
+            fs::read(dir.join("aria.mls")).unwrap().len(),
+            provider_size,
+            "a retried join_frames must not grow the durable MLS state"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// End-to-end over the wire-frame layer (TEST-001/003/005/006/010-shape):
