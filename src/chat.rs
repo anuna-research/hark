@@ -309,6 +309,7 @@ pub async fn create_chat_agent(
         identity.as_ref(),
         mls.as_mut(),
         mls_create,
+        &mut false, // first connect presents the operator-supplied cap; no renewal budget to account
     )
     .await?;
 
@@ -401,6 +402,7 @@ async fn connect_and_join(
     identity: &ChatIdentity,
     mut mls: Option<&mut MlsSession>,
     mls_create: bool,
+    hello_sent: &mut bool,
 ) -> Result<JoinOutcome, ChatError> {
     let (mut websocket, _response) = connect_async(ws_url.as_str())
         .await
@@ -422,6 +424,11 @@ async fn connect_and_join(
         .send(WsMessage::Binary(frame.into()))
         .await
         .map_err(|error| ChatError::HelloSendFailed(error.to_string()))?;
+    // The hello reached the wire: from here the hub MAY have admitted us and
+    // redeemed the presented cap (an invite use is consumed at admission),
+    // even if the join later fails retryably — the caller accounts for the
+    // spend on this signal, not on overall success.
+    *hello_sent = true;
 
     // Block until the hub acknowledges the join (`roomcfg`) or rejects it
     // (`error @room "slug"`). The hub keeps the socket open on rejection
@@ -903,12 +910,6 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         // before it goes stale (Fix 9/10); cleared (fall back to the original
         // cap) when the hub rejects it.
         let mut renewal: Option<RenewalInvite> = None;
-        // Fix 8: MLS protocol frames whose transition was already merged and
-        // persisted (e.g. the Commit+Welcome of an Add) but which never
-        // reached the wire before the socket died. Replayed FIRST on the next
-        // connection — dropping them would leave peers forked or the added
-        // member stranded, with no path that ever regenerates them.
-        let mut pending_mls: Vec<String> = Vec::new();
         // Outer reconnect loop: run one connection's receive loop, then — only
         // when the *hub* dropped the socket (a single-instance redeploy) —
         // reconnect with backoff, reusing the same identity, MLS session,
@@ -932,7 +933,6 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                 channel: &channel,
                 private: cap.is_some(),
                 renewal: &mut renewal,
-                pending_mls: &mut pending_mls,
             })
             .await;
             match exit {
@@ -982,6 +982,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         } else {
                             cap.as_deref()
                         };
+                        let mut hello_sent = false;
                         let attempt = tokio::select! {
                             _ = &mut close_rx => break ReconnectOutcome::Stopped,
                             result = connect_and_join(
@@ -994,19 +995,26 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                                 identity.as_ref(),
                                 mls.as_mut(),
                                 false,
+                                &mut hello_sent,
                             ) => result,
                         };
+                        // Fix 12: the hub redeems an invite use at ADMISSION —
+                        // a join that fails retryably after the hello (lost
+                        // roomcfg, failed keypub/announce write) has still
+                        // spent one. Account on the hello reaching the wire,
+                        // not on overall success, so the local budget never
+                        // overstates what the hub will still honour (which
+                        // could skip a due refresh and strand the agent on
+                        // the already-spent pairing cap).
+                        if presenting_renewal && hello_sent {
+                            if let Some(invite) = renewal.as_mut() {
+                                invite.uses_left = invite.uses_left.saturating_sub(1);
+                            }
+                        }
                         match attempt {
                             Ok(reconnect) => {
                                 websocket = reconnect.websocket;
                                 conn = reconnect.conn;
-                                // The admission consumed one hub-side use of
-                                // the renewal token (Fix 10's local budget).
-                                if presenting_renewal {
-                                    if let Some(invite) = renewal.as_mut() {
-                                        invite.uses_left = invite.uses_left.saturating_sub(1);
-                                    }
-                                }
                                 break ReconnectOutcome::Reconnected;
                             }
                             Err(error) if error.is_retryable() => {
@@ -1089,9 +1097,6 @@ struct RunLoop<'a> {
     /// The reconnect credential, minted/refreshed over this connection and
     /// presented by the outer loop on the next reconnect (Fix 6/9/10).
     renewal: &'a mut Option<RenewalInvite>,
-    /// MLS protocol frames from an already-persisted transition that never
-    /// reached the wire — replayed first on this connection (Fix 8).
-    pending_mls: &'a mut Vec<String>,
 }
 
 /// Run one connection's `tokio::select!` receive loop until it exits, returning
@@ -1115,7 +1120,6 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
         channel,
         private,
         renewal,
-        pending_mls,
     } = args;
     // Pending Δ-window and liveness-fallback timers, fired into the select.
     // Fresh per connection: any in-flight claims are moot once the hub restarts.
@@ -1125,24 +1129,6 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
     // AskState with no backing timer would leak and swallow a replayed ask as a
     // duplicate. Keeps the asks map in lockstep with `timers`.
     responder.reset_pending();
-    // Fix 8: replay protocol frames from a persisted MLS transition (e.g. the
-    // Commit+Welcome of a merged Add) that the previous socket lost. The MLS
-    // state has already advanced past them, so nothing regenerates them —
-    // without the replay peers stay forked and the added member is stranded.
-    // Sent before anything else; on failure they stay queued for next time.
-    while let Some(text) = pending_mls.first().cloned() {
-        let Ok(payload) = payload_bytes(&text) else {
-            pending_mls.remove(0);
-            continue;
-        };
-        let frame = conn.sign_chat_frame(identity, &payload);
-        match websocket.send(WsMessage::Binary(frame.into())).await {
-            Ok(()) => {
-                pending_mls.remove(0);
-            }
-            Err(error) => return LoopExit::HubClosed(sanitize(&error.to_string())),
-        }
-    }
     // Fix 6/9: the renewal-credential lifecycle. The cap this channel joined
     // with may have been a single-use pairing invite the first hello consumed,
     // so a reconnect needs its own credential: any current member may mint a
@@ -1153,8 +1139,14 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
     // than rotated per connection (Fix 10 — the hub cannot revoke invites,
     // so every abandoned token would stay admissible until expiry).
     let mut renewal_check = tokio::time::interval(RENEWAL_REFRESH_CHECK);
+    // Fix 13: the default MissedTickBehavior::Burst would fire every overdue
+    // tick back-to-back after an executor/process pause, minting one invite
+    // per tick before any reply lands — one live capability and durable hub
+    // record each. Skip collapses the backlog to a single tick.
+    renewal_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // True while a mint request is outstanding — the `(invited …)` capture
-    // below only accepts a reply we actually asked for (Fix 11).
+    // below only accepts a reply we actually asked for (Fix 11), and an
+    // unanswered mint is retried no sooner than the next (hourly) tick.
     let mut awaiting_invited = false;
     loop {
         tokio::select! {
@@ -1232,8 +1224,11 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                             // unhealthy, which fires `close_tx` — the outer
                             // loop would then read the pending close signal as
                             // an explicit stop and never reconnect (Fix 7).
+                            // `reconnecting` (not plain `retryable`) so the
+                            // API reports a transport outage, not a spurious
+                            // MLS membership wait (Fix 14).
                             let detail = sanitize(&error.to_string());
-                            let _ = outbound.result_tx.send(Err(OutboundReject::retryable(format!(
+                            let _ = outbound.result_tx.send(Err(OutboundReject::reconnecting(format!(
                                 "connection to the hub lost; reconnecting: {detail}"
                             ))));
                             return LoopExit::HubClosed(detail);
@@ -1328,20 +1323,19 @@ async fn run_receive_loop(args: RunLoop<'_>) -> LoopExit {
                                 // Fix 3: an MLS/keyready protocol-frame write
                                 // failure is a transport loss — reconnect via
                                 // HubClosed (no mark_unhealthy, see above).
-                                // Fix 8: these frames may carry an ALREADY
-                                // MERGED transition (add_member persists the
-                                // Add before returning its Commit+Welcome), so
-                                // the unsent tail is queued for replay on the
-                                // next connection rather than dropped.
+                                // A dropped batch is safe here: transition
+                                // frames (Commit/Welcome) are retained
+                                // durably inside the MlsSession, which
+                                // re-drives them on rejoin and on peer
+                                // presence (Fix 8); the rest (keyget/idkey/
+                                // keyready) are regenerated by their own
+                                // triggers.
                                 let mut write_failure = None;
-                                let mut queue = outbound.into_iter();
-                                while let Some(text) = queue.next() {
+                                for text in outbound {
                                     let Ok(payload) = payload_bytes(&text) else { continue };
                                     let frame = conn.sign_chat_frame(identity, &payload);
                                     if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
                                         write_failure = Some(sanitize(&error.to_string()));
-                                        pending_mls.push(text);
-                                        pending_mls.extend(queue);
                                         break;
                                     }
                                 }

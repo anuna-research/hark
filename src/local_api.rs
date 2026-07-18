@@ -1774,6 +1774,16 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
                 )
             }),
         ),
+        // Transient: the hub connection dropped and the transport is
+        // auto-reconnecting. Distinct from mls_membership_pending — this is a
+        // transport outage, not a membership precondition, and applies to
+        // cleartext public channels too.
+        AgentError::Reconnecting { detail } => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "transport_reconnecting",
+            "the hub connection was lost; the agent is reconnecting — retry shortly",
+            detail,
+        ),
         AgentError::RecvAlreadyWaiting => ApiError::new(
             StatusCode::CONFLICT,
             "recv_already_waiting",
