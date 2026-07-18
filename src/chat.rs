@@ -84,10 +84,18 @@ impl RenewalInvite {
         }
     }
 
-    /// Still presentable: has budget and has not passed the hub-side TTL.
+    /// Still presentable: not past the hub-side TTL. Deliberately NOT gated
+    /// on `uses_left`: the local count includes AMBIGUOUS spends (a hello
+    /// write attempt the hub may never have received), so a burst of failed
+    /// reconnects against a down hub can zero it while the hub still
+    /// honours the token. The budget is a REFRESH signal (see
+    /// [`Self::stale`]), never a reason to discard the strictly stronger
+    /// credential — presenting an actually-dead token costs one rejected
+    /// attempt before the normal original-cap fallback, while skipping a
+    /// live one would fall straight to the already-spent pairing cap and
+    /// terminate a healthy agent.
     fn usable(&self) -> bool {
-        self.uses_left > 0
-            && self.minted_at.elapsed() < Duration::from_millis(RENEWAL_INVITE_TTL_MS)
+        self.minted_at.elapsed() < Duration::from_millis(RENEWAL_INVITE_TTL_MS)
     }
 
     /// Should be replaced at the next refresh check: nearly out of budget, or
@@ -976,9 +984,10 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         // any partial socket it opened.
                         // Fix 6: present the renewal token in preference to the
                         // original cap, which (from `hark pair`) may be a spent
-                        // single-use invite. Only when it is actually usable —
-                        // an exhausted or TTL-expired token falls straight
-                        // through to the original cap.
+                        // single-use invite. Only a TTL-expired token falls
+                        // through to the original cap — a locally "exhausted"
+                        // budget does NOT disqualify it (the count includes
+                        // ambiguous spends; see RenewalInvite::usable).
                         let presenting_renewal = renewal.as_ref().is_some_and(RenewalInvite::usable);
                         let presented_cap = if presenting_renewal {
                             renewal.as_ref().map(|invite| invite.token.as_str())
@@ -1605,9 +1614,12 @@ mod tests {
         assert!(payload_bytes(&mint).is_ok());
     }
 
-    /// Fix 9/10: the renewal credential is reused while it has budget and is
-    /// young; refreshed when nearly spent or past half its TTL; and never
-    /// presented once exhausted.
+    /// Fix 9/10: the renewal credential is reused while young and refreshed
+    /// when nearly spent or past half its TTL. The use budget is a REFRESH
+    /// signal only: local decrements include ambiguous spends (hello writes
+    /// the hub may never have seen), so even a locally "exhausted" token is
+    /// still presented — discarding it would fall straight to the
+    /// already-spent pairing cap and kill a healthy agent.
     #[test]
     fn renewal_invite_budget_and_staleness() {
         let mut invite = super::RenewalInvite::fresh("tok".into());
@@ -1617,7 +1629,11 @@ mod tests {
         assert!(invite.usable(), "the last use is still presentable");
         assert!(invite.stale(), "…but the next check must refresh it");
         invite.uses_left = 0;
-        assert!(!invite.usable(), "an exhausted token is never presented");
+        assert!(
+            invite.usable(),
+            "ambiguous local exhaustion must not discard the credential"
+        );
+        assert!(invite.stale(), "…though it is overdue for a refresh");
     }
 
     #[test]

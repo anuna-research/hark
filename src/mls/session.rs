@@ -231,6 +231,13 @@ impl MlsSession {
                 }
             }
         }
+        // Reload prune (crash recovery): an entry AHEAD of the reloaded
+        // epoch is the write-ahead of a merge that never became durable —
+        // the transition never happened, and if an unrelated commit later
+        // advanced the group to that epoch, the aborted Welcome would seat
+        // its target in an alternate tree. Entries behind the epoch, from
+        // another group, or with no group loaded are equally dead.
+        session.prune_write_aheads();
         session.persist_meta()?;
         Ok(session)
     }
@@ -421,19 +428,48 @@ impl MlsSession {
             .collect()
     }
 
-    /// Record one authored transition batch for re-driving, REPLACING any
-    /// previous batch: two batches can never be live at once (each commit
-    /// advances the epoch), and a stale write-ahead from an aborted merge
-    /// must not linger to match a future transition at the same epoch.
+    /// Write-ahead one authored transition batch, APPENDING to (never
+    /// clearing) the retained set: until the new merge is durable, the
+    /// previous batch may still be the only Commit/Welcome able to heal a
+    /// peer left at the current epoch, so it must survive the write-ahead
+    /// window. Only entries already at this exact (epoch, group) — residue
+    /// of an earlier aborted attempt at the same transition — are replaced.
     /// Callers persist via `persist_meta` right after.
-    fn retain_for_rebroadcast(&mut self, epoch: u64, group_id_b64: String, frames: &[String]) {
-        self.pending_broadcast.clear();
+    fn record_write_ahead(&mut self, epoch: u64, group_id_b64: &str, frames: &[String]) {
+        self.pending_broadcast
+            .retain(|p| !(p.epoch == epoch && p.group_id_b64 == group_id_b64));
         self.pending_broadcast
             .extend(frames.iter().map(|frame| PendingBroadcast {
                 epoch,
-                group_id_b64: group_id_b64.clone(),
+                group_id_b64: group_id_b64.to_owned(),
                 frame: frame.clone(),
             }));
+    }
+
+    /// Drop the write-ahead batch of a transition whose merge FAILED: the
+    /// staged commit died with the attempt, so its frames must not lie in
+    /// wait — an unrelated commit could later advance the same group to that
+    /// epoch, at which point the aborted Welcome would seat its target in an
+    /// alternate tree (a manufactured fork).
+    fn discard_write_ahead(&mut self, epoch: u64, group_id_b64: &str) {
+        self.pending_broadcast
+            .retain(|p| !(p.epoch == epoch && p.group_id_b64 == group_id_b64));
+    }
+
+    /// Keep only the entries that match the group's durable state — called
+    /// AFTER a merge persists (superseded batches can no longer heal anyone)
+    /// and on session open (an entry AHEAD of the reloaded epoch is an
+    /// aborted write-ahead whose merge never became durable; with no group
+    /// loaded, nothing retained can ever be validly replayed).
+    fn prune_write_aheads(&mut self) {
+        let Some(group) = self.group.as_ref() else {
+            self.pending_broadcast.clear();
+            return;
+        };
+        let epoch = group.epoch().as_u64();
+        let group_id_b64 = B64.encode(group.group_id().as_slice());
+        self.pending_broadcast
+            .retain(|p| p.epoch == epoch && p.group_id_b64 == group_id_b64);
     }
 
     /// The caller reports the current keypub frame reached the wire, so later
@@ -791,10 +827,21 @@ impl MlsSession {
                     self.handle
                 ),
             ];
-            self.retain_for_rebroadcast(epoch, group_id_b64, &frames);
+            self.record_write_ahead(epoch, &group_id_b64, &frames);
             self.persist_meta()?;
             let group = self.group.as_mut().expect("staged above");
-            merge_staged_commit(&self.provider, group, "merge own add commit")?;
+            if let Err(error) = merge_staged_commit(&self.provider, group, "merge own add commit")
+            {
+                // The transition never became durable: discard its
+                // write-ahead so it cannot replay into a fork later.
+                self.discard_write_ahead(epoch, &group_id_b64);
+                let _ = self.persist_meta();
+                return Err(error);
+            }
+            // Durable: batches behind the new epoch can no longer heal
+            // anyone — this keeps exactly the batch just merged.
+            self.prune_write_aheads();
+            self.persist_meta()?;
             Ok(frames)
         })();
         match result {
@@ -917,10 +964,16 @@ impl MlsSession {
             B64.encode(json),
             self.handle
         );
-        self.retain_for_rebroadcast(epoch, group_id_b64, std::slice::from_ref(&frame));
+        self.record_write_ahead(epoch, &group_id_b64, std::slice::from_ref(&frame));
         self.persist_meta()?;
         let group = self.group.as_mut().expect("staged above");
-        merge_staged_commit(&self.provider, group, "merge remove commit")?;
+        if let Err(error) = merge_staged_commit(&self.provider, group, "merge remove commit") {
+            self.discard_write_ahead(epoch, &group_id_b64);
+            let _ = self.persist_meta();
+            return Err(error);
+        }
+        self.prune_write_aheads();
+        self.persist_meta()?;
         Ok(frame)
     }
 
@@ -1341,6 +1394,12 @@ mod tests {
             }
         }
 
+        // (Minted while bob is still a member, for the divergence check
+        // below: a valid epoch-1 application ciphertext.)
+        let bob_msg = bob
+            .encrypt_outbound("(say @research :from @bob :text \"divergent\")")
+            .unwrap();
+
         // An epoch advance (bob's evidenced removal) prunes the stale add —
         // only the removal commit remains re-drivable.
         let bye = bob.leave_frame().unwrap();
@@ -1357,11 +1416,36 @@ mod tests {
             "the removal commit is retained: {rejoin3:?}"
         );
 
+        // DIVERGENCE evidence: bob's valid epoch-1 application ciphertext
+        // arriving at alice (now epoch 2) is NOT a duplicate — it is a
+        // member sending from divergent state, and unlike the handshake
+        // replays above it MUST feed the REQ-006 fork counter.
+        for attempt in 1..=3u32 {
+            match alice2.handle_frame(&bob_msg) {
+                SessionEvent::Dropped { probable_fork, .. } => {
+                    assert_eq!(
+                        probable_fork,
+                        attempt >= 3,
+                        "past-epoch application traffic must count toward the fork signal"
+                    );
+                }
+                other => panic!("expected counted drop, got {other:?}"),
+            }
+        }
+
         // GROUP binding: an entry from another group never passes the replay
         // filter, even at a matching epoch — the provider-loss recovery path
         // can replace the group, and an old-group Welcome would seat its
         // target in the obsolete group.
         let epoch_now = alice2.safety_numbers().unwrap().epoch;
+        let real_gid = B64.encode(
+            alice2
+                .group
+                .as_ref()
+                .expect("alice2 joined")
+                .group_id()
+                .as_slice(),
+        );
         alice2.pending_broadcast = vec![PendingBroadcast {
             epoch: epoch_now,
             group_id_b64: "bm90LXRoaXMtZ3JvdXA=".into(),
@@ -1370,6 +1454,24 @@ mod tests {
         assert!(
             alice2.pending_rebroadcast().is_empty(),
             "frames minted by a replaced group are never re-driven"
+        );
+
+        // RELOAD prune: a future-epoch entry (the write-ahead of a merge
+        // that never became durable) is discarded when the session reopens —
+        // it must not lie in wait for an unrelated commit to reach that
+        // epoch and then seat its Welcome target in an alternate tree.
+        alice2.pending_broadcast = vec![PendingBroadcast {
+            epoch: epoch_now + 1,
+            group_id_b64: real_gid,
+            frame: "(welcome @research :for @bob :ct \"aborted\" :from @alice)".into(),
+        }];
+        alice2.persist_meta().unwrap();
+        drop(alice2);
+        let alice3 =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, false).unwrap();
+        assert!(
+            alice3.pending_broadcast.is_empty(),
+            "an aborted future-epoch write-ahead is pruned on reload"
         );
 
         let _ = fs::remove_dir_all(&a_dir);

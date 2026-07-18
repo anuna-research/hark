@@ -133,18 +133,29 @@ pub fn process_inbound(
             });
         }
     };
-    // A frame from a PAST epoch is a benign duplicate — most commonly the
-    // committer's retained-transition re-drive (the session intentionally
-    // replays Commit/Welcome fans on rejoin and peer reappearance for
-    // members that missed them) or a hub re-fan. It carries no fork
-    // evidence: an equivocating hub manifests as CURRENT-epoch frames that
-    // fail to process. It must not feed the REQ-006 counter — three
-    // intentional replays would otherwise trip a false probable-fork
-    // warning with no intervening successful message to reset it.
-    if protocol.epoch().as_u64() < group.epoch().as_u64() {
+    // Past-epoch frames split by content type (public metadata even on a
+    // PrivateMessage — RFC 9420 carries it in the unprotected header):
+    //
+    // * HANDSHAKE (Commit/Proposal) behind the epoch is duplicate-shaped —
+    //   the committer's retained-transition re-drive (intentionally replayed
+    //   on rejoin and peer reappearance for members that missed the fan), a
+    //   hub re-fan, or the echo of our own commit. Benign: it must not feed
+    //   the REQ-006 counter, where three intentional replays would trip a
+    //   false probable-fork with no successful message between to reset it.
+    //   (A hub equivocating commit order still surfaces: the divergent
+    //   branches cannot read each other's CURRENT-epoch traffic, which
+    //   fails processing below and counts.)
+    //
+    // * APPLICATION ciphertext behind the epoch is NOT a duplicate — it is a
+    //   live member sending from divergent state (e.g. the hub withheld a
+    //   Commit from them), which is exactly the REQ-006 evidence the
+    //   counter exists for. It falls through and is counted when it fails.
+    if protocol.epoch().as_u64() < group.epoch().as_u64()
+        && protocol.content_type() != openmls::framing::ContentType::Application
+    {
         return Ok(Inbound::Dropped {
             reason: format!(
-                "epoch {} behind group epoch {} (benign replay/duplicate)",
+                "handshake at epoch {} behind group epoch {} (benign replay/duplicate)",
                 protocol.epoch().as_u64(),
                 group.epoch().as_u64()
             ),
