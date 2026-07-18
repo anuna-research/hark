@@ -378,9 +378,31 @@ pub struct AddOutcome {
 
 /// REQ-003: add `target_handle` using their fetched KeyPackage, with full
 /// REQ-008 verification, single-use ref checking (REQ-013), and owner-only
-/// committing (REQ-016). Merges own commit and persists.
+/// committing (REQ-016). Merges own commit and persists — the one-step
+/// convenience over [`stage_add_member`] + [`merge_staged_commit`].
 #[allow(clippy::too_many_arguments)]
 pub fn add_member(
+    provider: &DurableProvider,
+    identity: &MlsIdentity,
+    group: &mut MlsGroup,
+    kp_bytes: &[u8],
+    target_handle: &str,
+    pins: &PinStore,
+    ledger: &ConsumedLedger,
+) -> Result<AddOutcome, MlsError> {
+    let outcome = stage_add_member(provider, identity, group, kp_bytes, target_handle, pins, ledger)?;
+    merge_staged_commit(provider, group, "merge own add commit")?;
+    Ok(outcome)
+}
+
+/// Validate and STAGE an Add without merging it. The split exists for
+/// crash-safety ordering: once the merge persists, the returned Commit and
+/// Welcome are the ONLY frames able to advance peers past the old epoch and
+/// nothing can regenerate them — so the caller must write-ahead those frames
+/// durably BEFORE calling [`merge_staged_commit`]. A crash between the two
+/// loses only the staged (unsent, unmerged) transition, never a merged one.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_add_member(
     provider: &DurableProvider,
     identity: &MlsIdentity,
     group: &mut MlsGroup,
@@ -427,10 +449,6 @@ pub fn add_member(
     let (commit, welcome, _group_info) = group
         .add_members(provider, &identity.signer, &[kp])
         .map_err(MlsError::stack("add members"))?;
-    group
-        .merge_pending_commit(provider)
-        .map_err(MlsError::stack("merge own add commit"))?;
-    provider.persist()?;
     Ok(AddOutcome {
         commit_bytes: commit
             .tls_serialize_detached()
@@ -439,6 +457,21 @@ pub fn add_member(
             .tls_serialize_detached()
             .map_err(MlsError::stack("serialize welcome"))?,
     })
+}
+
+/// Merge the commit staged by [`stage_add_member`] /
+/// [`stage_remove_member`](super::removal::stage_remove_member) and persist
+/// the advanced group state. Call ONLY after the transition frames have been
+/// durably write-aheaded (see `stage_add_member`).
+pub fn merge_staged_commit(
+    provider: &DurableProvider,
+    group: &mut MlsGroup,
+    context: &'static str,
+) -> Result<(), MlsError> {
+    group
+        .merge_pending_commit(provider)
+        .map_err(MlsError::stack(context))?;
+    provider.persist()
 }
 
 /// A validated, joined group plus the genesis trust grade.

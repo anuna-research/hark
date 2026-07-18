@@ -194,7 +194,27 @@ impl RemovalEvidence {
 /// re-checks at merge — and returns the Commit plus the evidence to fan with
 /// it. On an epoch race (evidence minted at an older epoch) this REJECTS;
 /// the caller re-mints fresh evidence at the live epoch and retries (K-1).
+/// Merges and persists — the one-step convenience over
+/// [`stage_remove_member`] + [`merge_staged_commit`](super::group::merge_staged_commit).
 pub fn remove_member(
+    provider: &super::provider::DurableProvider,
+    identity: &super::MlsIdentity,
+    group: &mut openmls::prelude::MlsGroup,
+    room: &str,
+    evidence: &RemovalEvidence,
+    pins: &super::pins::PinStore,
+    creator_handle: &str,
+) -> Result<Vec<u8>, MlsError> {
+    let commit = stage_remove_member(provider, identity, group, room, evidence, pins, creator_handle)?;
+    super::group::merge_staged_commit(provider, group, "merge remove commit")?;
+    Ok(commit)
+}
+
+/// Validate and STAGE a Remove without merging it — same crash-safety split
+/// as [`stage_add_member`](super::group::stage_add_member): the caller
+/// write-aheads the returned Commit before merging, because after the merge
+/// nothing can regenerate it for peers that missed the fan.
+pub fn stage_remove_member(
     provider: &super::provider::DurableProvider,
     identity: &super::MlsIdentity,
     group: &mut openmls::prelude::MlsGroup,
@@ -255,10 +275,6 @@ pub fn remove_member(
     let (commit, _welcome, _gi) = group
         .remove_members(provider, &identity.signer, &[target.index])
         .map_err(MlsError::stack("remove members"))?;
-    group
-        .merge_pending_commit(provider)
-        .map_err(MlsError::stack("merge remove commit"))?;
-    provider.persist()?;
     use tls_codec::Serialize as _;
     commit
         .tls_serialize_detached()
