@@ -65,6 +65,25 @@ struct SessionMeta {
     /// On a v1 room, owner-removal is deterministically rejected (H7) and the pull loop is active.
     #[serde(default)]
     protocol_version: u8,
+    /// Transition frames (Commit/Welcome) this member authored that peers may
+    /// not have received (see [`MlsSession::pending_rebroadcast`]). Persisted
+    /// in the same atomic meta write as the rest of the resume state, so a
+    /// daemon restart after the merge does not lose the only copy of a
+    /// transition nothing can regenerate.
+    #[serde(default)]
+    pending_broadcast: Vec<PendingBroadcast>,
+}
+
+/// One transition frame retained for re-driving, tagged with the group epoch
+/// right after its merge. The tag is the retention rule: a frame is worth
+/// re-fanning only while the group is STILL at that epoch — once any later
+/// commit lands, a straggler replaying it would end up behind the group
+/// anyway (recovery then needs a remove + re-add, not a replay).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PendingBroadcast {
+    epoch: u64,
+    frame: String,
+>>>>>>> 53b51de (fix(chat,mls): round-3 hardening — durable epoch-scoped transition replay, admission-time accounting)
 }
 
 /// What an inbound frame turned out to be.
@@ -117,6 +136,9 @@ pub struct MlsSession {
     /// memoized so a retried rejoin republishes the SAME bundles instead of
     /// durably minting a fresh last-resort + one-time pool on every attempt.
     published: Option<PublishedKeyPackages>,
+    /// Authored transition frames retained for re-driving (see
+    /// [`PendingBroadcast`] and [`Self::pending_rebroadcast`]).
+    pending_broadcast: Vec<PendingBroadcast>,
 }
 
 /// A memoized `keypub` publication (see [`MlsSession::join_frames`]): the
@@ -180,12 +202,14 @@ impl MlsSession {
             wire_seed: wire.signing_seed(),
             present: std::collections::HashSet::new(),
             published: None,
+            pending_broadcast: Vec::new(),
         };
 
         if let Some(meta) = meta {
             session.enc_pinned = session.enc_pinned || meta.enc_pinned;
             session.is_v1 = meta.protocol_version >= 1;
             session.genesis = meta.genesis;
+            session.pending_broadcast = meta.pending_broadcast;
             // Reload the persisted group (REQ-009): a missing/stale state
             // simply means re-join (logged by the provider open path).
             if let Some(group_id_b64) = meta.group_id_b64 {
@@ -253,6 +277,7 @@ impl MlsSession {
             genesis: self.genesis.clone(),
             tofu_pending: matches!(self.trust, Some(GenesisTrust::TofuRequiresSafetyNumber)),
             protocol_version: if self.is_v1 { 1 } else { 0 },
+            pending_broadcast: self.pending_broadcast.clone(),
         };
         let bytes = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
         if let Some(parent) = self.meta_path.parent() {
@@ -401,7 +426,46 @@ impl MlsSession {
         // SPEC-013 IB-3: announce "published, add me" so a web owner has an
         // explicit, re-drivable add trigger (not just presence timing).
         frames.push(self.keyready_frame());
+        // Re-drive any transition frames peers may have missed: the hub fans
+        // only to currently joined sockets (encrypted joins get no backfill),
+        // so a hub-wide drop where WE reconnect first would otherwise leave
+        // later-returning members at the old epoch — and a local write is no
+        // proof of fan-out, so these were never dequeued on send.
+        frames.extend(self.pending_rebroadcast());
+        // A rejoin means the hub restarted or dropped us: presence knowledge
+        // is stale, so forget it — the next presence fan then treats every
+        // member as newly seen, re-running the idkey/keyready/pending
+        // delivery-gap logic for peers that reconnect after us.
+        self.present.clear();
         Ok(frames)
+    }
+
+    /// The retained transition frames still worth re-fanning: those whose
+    /// post-merge epoch is the group's CURRENT epoch. Replay is inert for
+    /// members already there (epoch-mismatch drop; a replayed Welcome is made
+    /// inert by the consumed-ref ledger, REQ-013) and exactly what a member
+    /// that missed the fan needs. Entries behind the current epoch are
+    /// dropped — a straggler that far back cannot be healed by replay.
+    fn pending_rebroadcast(&self) -> Vec<String> {
+        let Some(epoch) = self.group.as_ref().map(|g| g.epoch().as_u64()) else {
+            return Vec::new();
+        };
+        self.pending_broadcast
+            .iter()
+            .filter(|p| p.epoch == epoch)
+            .map(|p| p.frame.clone())
+            .collect()
+    }
+
+    /// Record authored transition frames for re-driving, dropping entries the
+    /// epoch has moved past. Callers persist via `persist_meta` right after.
+    fn retain_for_rebroadcast(&mut self, epoch: u64, frames: &[String]) {
+        self.pending_broadcast.retain(|p| p.epoch == epoch);
+        self.pending_broadcast
+            .extend(frames.iter().map(|frame| PendingBroadcast {
+                epoch,
+                frame: frame.clone(),
+            }));
     }
 
     /// The caller reports the current keypub frame reached the wire, so later
@@ -735,8 +799,8 @@ impl MlsSession {
                 &self.pins,
                 &self.ledger,
             )?;
-            self.persist_meta()?;
-            Ok(vec![
+            let epoch = group.epoch().as_u64();
+            let frames = vec![
                 format!(
                     "(deliver {} :enc mls :ct \"{}\" :from {})",
                     self.room,
@@ -750,7 +814,13 @@ impl MlsSession {
                     B64.encode(&outcome.welcome_bytes),
                     self.handle
                 ),
-            ])
+            ];
+            // The merge is already persisted; retain the frames it minted in
+            // the same meta write, so neither a lost socket nor a daemon
+            // restart strands the transition (nothing can regenerate it).
+            self.retain_for_rebroadcast(epoch, &frames);
+            self.persist_meta()?;
+            Ok(frames)
         })();
         match result {
             Ok(outbound) => SessionEvent::Handled { outbound },
@@ -793,6 +863,10 @@ impl MlsSession {
             // that elects/joins after us gets an explicit, re-drivable add signal
             // — the same delivery-gap fix as the idkey re-broadcast above.
             outbound.push(self.keyready_frame());
+            // Re-drive retained transition frames: a member (re)appearing may
+            // have missed the Commit/Welcome fan (encrypted joins get no
+            // backfill). Inert for anyone already at the epoch.
+            outbound.extend(self.pending_rebroadcast());
         }
         outbound.extend(self.keygets_for_addable());
         SessionEvent::Handled { outbound }
@@ -851,15 +925,20 @@ impl MlsSession {
             &self.pins,
             &creator,
         )?;
+        let epoch = group.epoch().as_u64();
         let json = serde_json::to_vec(evidence).map_err(std::io::Error::other)?;
-        self.persist_meta()?;
-        Ok(format!(
+        let frame = format!(
             "(deliver {} :enc mls :ct \"{}\" :evidence \"{}\" :from {})",
             self.room,
             B64.encode(&commit),
             B64.encode(json),
             self.handle
-        ))
+        );
+        // Same retention as the Add path: the removal commit is persisted
+        // state peers may never have received.
+        self.retain_for_rebroadcast(epoch, std::slice::from_ref(&frame));
+        self.persist_meta()?;
+        Ok(frame)
     }
 
     /// REQ-024: both safety numbers for the live group.
@@ -1163,6 +1242,107 @@ mod tests {
             "reuse after delivery must not grow the durable MLS state either"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A hub-wide drop can reconnect the committer BEFORE its peers, and
+    /// encrypted joins get no backfill — so authored Commit/Welcome frames
+    /// are never dequeued on a local write: they are re-driven on every
+    /// rejoin and on peer reappearance, survive a daemon restart (persisted
+    /// with the meta), still seat the stranded member, and are pruned once
+    /// the epoch moves past them (replay could no longer heal a straggler).
+    #[test]
+    fn pending_transitions_redriven_survive_restart_and_prune_on_epoch() {
+        let (a_dir, a_wire) = setup("pending", 96, "@alice");
+        let (b_dir, b_wire) = setup("pending", 97, "@bob");
+        let mut alice =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
+        let mut bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
+
+        // Standard add flow up to the commit: pins exchanged, alice owns the
+        // group, the hub answers her keyget with bob's package.
+        let a_frames = alice.join_frames().unwrap();
+        let b_frames = bob.join_frames().unwrap();
+        let _ = bob.handle_frame(&a_frames[1]);
+        let _ = alice.handle_frame(&b_frames[1]);
+        alice.create_group_as_creator().unwrap();
+        let presence = "(presence @research :members (@alice @bob))";
+        let _ = alice.handle_frame(presence);
+        let bob_kp_b64 = {
+            let onetime = kw_value(&b_frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+        let SessionEvent::Handled { outbound } =
+            alice.handle_frame(&format!("(keypkg @hub :for @bob :kp \"{bob_kp_b64}\")"))
+        else {
+            panic!("keypkg handled")
+        };
+        assert_eq!(outbound.len(), 2, "commit fan + welcome");
+        // Simulate the hub-wide drop: bob NEVER receives this fan.
+
+        // A rejoin re-drives the retained transition.
+        alice.keypub_delivered();
+        let rejoin = alice.join_frames().unwrap();
+        assert!(
+            rejoin.iter().any(|f| f.starts_with("(deliver @research")),
+            "rejoin re-drives the commit: {rejoin:?}"
+        );
+        assert!(
+            rejoin.iter().any(|f| f.starts_with("(welcome @research")),
+            "rejoin re-drives the welcome: {rejoin:?}"
+        );
+
+        // The rejoin reset presence knowledge, so bob REAPPEARING (same
+        // roster as before) re-drives the transition again.
+        let SessionEvent::Handled { outbound: redriven } = alice.handle_frame(presence) else {
+            panic!("presence handled")
+        };
+        assert!(
+            redriven.iter().any(|f| f.starts_with("(welcome @research")),
+            "a reappearing peer re-drives the transition: {redriven:?}"
+        );
+
+        // A daemon restart reloads the pending set from the durable meta.
+        drop(alice);
+        let mut alice2 =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, false).unwrap();
+        let rejoin2 = alice2.join_frames().unwrap();
+        let welcome = rejoin2
+            .iter()
+            .find(|f| f.starts_with("(welcome @research"))
+            .expect("pending welcome survives restart")
+            .clone();
+
+        // The re-driven welcome is exactly what seats the stranded member.
+        assert!(matches!(
+            bob.handle_frame(&welcome),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(bob.joined(), "the replayed welcome heals the stranded add");
+
+        // An epoch advance (bob's evidenced removal) prunes the stale add —
+        // only the removal commit remains re-drivable.
+        let bye = bob.leave_frame().unwrap();
+        let evidence: RemovalEvidence =
+            serde_json::from_slice(&kw_b64(&bye, ":evidence").unwrap()).unwrap();
+        let remove_deliver = alice2.remove_with_evidence(&evidence).unwrap();
+        let rejoin3 = alice2.join_frames().unwrap();
+        assert!(
+            !rejoin3.iter().any(|f| f.starts_with("(welcome ")),
+            "the superseded welcome is pruned: {rejoin3:?}"
+        );
+        assert!(
+            rejoin3.iter().any(|f| f == &remove_deliver),
+            "the removal commit is retained: {rejoin3:?}"
+        );
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
     }
 
     /// End-to-end over the wire-frame layer (TEST-001/003/005/006/010-shape):

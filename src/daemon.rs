@@ -96,6 +96,12 @@ pub struct OutboundFrame {
 pub struct OutboundReject {
     pub detail: String,
     pub retryable: bool,
+    /// A retryable reject caused by TRANSPORT loss (the hub connection
+    /// dropped and the receive loop is reconnecting), as opposed to an MLS
+    /// membership precondition. Surfaced as a distinct API error so a
+    /// cleartext public-channel client is told to wait for reconnection, not
+    /// for a Welcome that will never come.
+    pub reconnecting: bool,
 }
 
 impl OutboundReject {
@@ -104,6 +110,7 @@ impl OutboundReject {
         Self {
             detail: detail.into(),
             retryable: false,
+            reconnecting: false,
         }
     }
 
@@ -112,6 +119,17 @@ impl OutboundReject {
         Self {
             detail: detail.into(),
             retryable: true,
+            reconnecting: false,
+        }
+    }
+
+    /// The hub connection was lost with this frame in flight; the transport
+    /// is reconnecting. Non-poisoning, like [`Self::retryable`].
+    pub fn reconnecting(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            retryable: true,
+            reconnecting: true,
         }
     }
 }
@@ -133,6 +151,13 @@ pub enum AgentError {
     /// unlike [`AgentError::Unhealthy`], the handle is left usable.
     #[error("agent handle is not ready yet")]
     NotReady { detail: Option<String> },
+    /// The hub connection dropped with this send in flight and the transport
+    /// is auto-reconnecting. Transient like [`AgentError::NotReady`] (the
+    /// handle stays healthy) but distinct: it says "wait for reconnection",
+    /// never "wait for an MLS Welcome" — it applies equally to cleartext
+    /// public channels.
+    #[error("hub connection lost; reconnecting")]
+    Reconnecting { detail: Option<String> },
     #[error("a receive call is already waiting for this handle")]
     RecvAlreadyWaiting,
     #[error("receive timed out")]
@@ -556,6 +581,12 @@ impl AgentStore {
 
         match result_rx.await {
             Ok(Ok(())) => Ok(()),
+            // Transport loss with the frame in flight: the receive loop is
+            // reconnecting; the handle stays healthy. Distinct from NotReady
+            // so a cleartext client is not told to wait for an MLS Welcome.
+            Ok(Err(reject)) if reject.reconnecting => Err(AgentError::Reconnecting {
+                detail: Some(reject.detail),
+            }),
             // A transient precondition (MLS membership not yet established):
             // leave the handle healthy so the next attempt — once the Welcome
             // lands — can succeed. Marking it unhealthy here would strand the
@@ -1892,6 +1923,54 @@ mod tests {
         assert!(matches!(error, super::AgentError::Unhealthy { .. }));
         let status = store.status_snapshots().await;
         assert_eq!(status[0].state, super::AgentState::Unhealthy);
+    }
+
+    /// A *reconnecting* outbound reject (the hub socket dropped with the
+    /// frame in flight) surfaces as the distinct [`AgentError::Reconnecting`]
+    /// — NOT as NotReady, whose API mapping claims an MLS membership wait
+    /// that makes no sense on a cleartext public channel — and leaves the
+    /// handle healthy so the auto-reconnect can complete.
+    #[tokio::test]
+    async fn reconnecting_outbound_reject_is_distinct_and_non_poisoning() {
+        let store = agent_store(10, 100);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::OutboundFrame>(4);
+        tokio::spawn(async move {
+            if let Some(frame) = rx.recv().await {
+                let _ = frame
+                    .result_tx
+                    .send(Err(super::OutboundReject::reconnecting("hub socket lost")));
+            }
+        });
+
+        let handle = handle();
+        store
+            .insert_connected_with_router_channels(
+                handle.clone(),
+                vec!["elf".to_owned()],
+                None,
+                Some(super::AgentSendChannel::new(tx)),
+                Some("@aria".to_owned()),
+                Some("@research".to_owned()),
+            )
+            .await
+            .expect("agent should insert");
+
+        let error = store
+            .send_outbound(&handle, "(say @research)".to_owned())
+            .await
+            .expect_err("reconnecting reject should error");
+        assert_eq!(
+            error,
+            super::AgentError::Reconnecting {
+                detail: Some("hub socket lost".to_owned()),
+            }
+        );
+        let status = store.status_snapshots().await;
+        assert_eq!(
+            status[0].state,
+            super::AgentState::Connected,
+            "a transport-loss reject must not poison the handle"
+        );
     }
 
     #[tokio::test]
