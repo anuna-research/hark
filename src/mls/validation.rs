@@ -137,35 +137,17 @@ pub fn process_inbound(
             });
         }
     };
-    // Past-epoch frames split by content type (public metadata even on a
-    // PrivateMessage — RFC 9420 carries it in the unprotected header):
-    //
-    // * HANDSHAKE (Commit/Proposal) behind the epoch is duplicate-shaped —
-    //   the committer's retained-transition re-drive (intentionally replayed
-    //   on rejoin and peer reappearance for members that missed the fan), a
-    //   hub re-fan, or the echo of our own commit. Benign: it must not feed
-    //   the REQ-006 counter, where three intentional replays would trip a
-    //   false probable-fork with no successful message between to reset it.
-    //   (A hub equivocating commit order still surfaces: the divergent
-    //   branches cannot read each other's CURRENT-epoch traffic, which
-    //   fails processing below and counts.)
-    //
-    // * APPLICATION ciphertext behind the epoch is NOT a duplicate — it is a
-    //   live member sending from divergent state (e.g. the hub withheld a
-    //   Commit from them), which is exactly the REQ-006 evidence the
-    //   counter exists for. It falls through and is counted when it fails.
-    if protocol.epoch().as_u64() < group.epoch().as_u64()
-        && protocol.content_type() != openmls::framing::ContentType::Application
-    {
-        return Ok(Inbound::Dropped {
-            reason: format!(
-                "handshake at epoch {} behind group epoch {} (benign replay/duplicate)",
-                protocol.epoch().as_u64(),
-                group.epoch().as_u64()
-            ),
-            probable_fork: fork.probable_fork(),
-        });
-    }
+    // NOTE (replay handling): benign replays — the committer's intentional
+    // retained-transition re-drives, echoes of own commits, hub re-fans —
+    // are recognized by the SESSION before this function runs, by exact
+    // ciphertext match against commits it authored or previously verified
+    // and applied. No exemption is granted here from the frame's own
+    // headers: epoch and content type ride unauthenticated on the wire
+    // (verified only when the AEAD opens below), so an active hub could
+    // relabel a divergent member's application frame as a Commit to dodge
+    // the fork counter. Everything unrecognized that fails to process is
+    // counted (REQ-006) — including past-epoch application traffic, which
+    // is a live member sending from divergent state.
     let processed = match group.process_message(provider, protocol) {
         Ok(p) => p,
         Err(e) => {
