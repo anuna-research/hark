@@ -391,7 +391,7 @@ pub fn add_member(
     ledger: &ConsumedLedger,
 ) -> Result<AddOutcome, MlsError> {
     let outcome = stage_add_member(provider, identity, group, kp_bytes, target_handle, pins, ledger)?;
-    merge_staged_commit(provider, group, "merge own add commit")?;
+    merge_staged_commit(provider, group, "merge own add commit").map_err(|failure| failure.error)?;
     Ok(outcome)
 }
 
@@ -459,6 +459,21 @@ pub fn stage_add_member(
     })
 }
 
+/// Why [`merge_staged_commit`] failed — the caller's recovery differs by
+/// phase, because the two phases leave the session in opposite states.
+pub struct StagedMergeFailure {
+    pub error: MlsError,
+    /// True when the in-memory merge SUCCEEDED and only the durable snapshot
+    /// failed: the live group is now AHEAD of disk. The caller must PRESERVE
+    /// the transition's write-ahead — a later successful persist makes the
+    /// advanced epoch durable and the retained batch re-drivable, while a
+    /// crash reloads behind and prunes it; discarding the batch here could
+    /// let the epoch become durable with its only Commit/Welcome gone.
+    /// False when the merge itself failed: nothing advanced, the staged
+    /// transition is dead, and its write-ahead must be discarded.
+    pub merged_in_memory: bool,
+}
+
 /// Merge the commit staged by [`stage_add_member`] /
 /// [`stage_remove_member`](super::removal::stage_remove_member) and persist
 /// the advanced group state. Call ONLY after the transition frames have been
@@ -467,11 +482,17 @@ pub fn merge_staged_commit(
     provider: &DurableProvider,
     group: &mut MlsGroup,
     context: &'static str,
-) -> Result<(), MlsError> {
+) -> Result<(), StagedMergeFailure> {
     group
         .merge_pending_commit(provider)
-        .map_err(MlsError::stack(context))?;
-    provider.persist()
+        .map_err(|e| StagedMergeFailure {
+            error: MlsError::stack(context)(e),
+            merged_in_memory: false,
+        })?;
+    provider.persist().map_err(|error| StagedMergeFailure {
+        error,
+        merged_in_memory: true,
+    })
 }
 
 /// A validated, joined group plus the genesis trust grade.
