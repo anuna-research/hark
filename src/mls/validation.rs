@@ -116,6 +116,7 @@ pub fn process_inbound(
     // deterministically rejected (H7) and the SPEC-013 carve-out does not apply. false =
     // legacy SPEC-013 behaviour, unchanged.
     is_v1: bool,
+    recognized_replay: bool,
 ) -> Result<Inbound, MlsError> {
     let msg = match MlsMessageIn::tls_deserialize_exact_bytes(wire) {
         Ok(msg) => msg,
@@ -137,20 +138,37 @@ pub fn process_inbound(
             });
         }
     };
-    // NOTE (replay handling): benign replays — the committer's intentional
-    // retained-transition re-drives, echoes of own commits, hub re-fans —
-    // are recognized by the SESSION before this function runs, by exact
-    // ciphertext match against commits it authored or previously verified
-    // and applied. No exemption is granted here from the frame's own
-    // headers: epoch and content type ride unauthenticated on the wire
-    // (verified only when the AEAD opens below), so an active hub could
-    // relabel a divergent member's application frame as a Commit to dodge
-    // the fork counter. Everything unrecognized that fails to process is
-    // counted (REQ-006) — including past-epoch application traffic, which
-    // is a live member sending from divergent state.
+    // NOTE (replay handling): the caller computes `recognized_replay` by
+    // exact ciphertext match against bytes this member authored or
+    // previously verified and applied — never from the frame's own headers
+    // (epoch and content type ride unauthenticated until the AEAD opens
+    // below, so an active hub could relabel a divergent member's application
+    // frame as a Commit to dodge the fork counter). Recognition suppresses
+    // only the fork COUNTING on failure; every frame is still processed, so
+    // it can never block applying a commit we still need. Everything
+    // unrecognized that fails to process is counted (REQ-006) — including
+    // past-epoch application traffic, which is a live member sending from
+    // divergent state.
     let processed = match group.process_message(provider, protocol) {
         Ok(p) => p,
         Err(e) => {
+            // A RECOGNIZED replay — the caller matched the exact ciphertext
+            // against bytes this member authored or previously verified and
+            // applied (never the frame's own unauthenticated headers) — is
+            // benign by construction: the committer's retained re-drive, a
+            // hub re-fan, or the echo of our own frame. Its expected
+            // processing failure carries no fork evidence. Recognition only
+            // SUPPRESSES the counting: the frame was still processed above,
+            // so a registered-but-not-yet-merged commit (crash recovery)
+            // can always be applied rather than skipped.
+            if recognized_replay {
+                return Ok(Inbound::Dropped {
+                    reason: format!(
+                        "recognized replay of an authored/applied ciphertext; process: {e:?}"
+                    ),
+                    probable_fork: fork.probable_fork(),
+                });
+            }
             // Undecryptable / unprocessable: drop WITHOUT aborting, but
             // count toward the fork signal (REQ-006).
             fork.record_failure();
@@ -222,6 +240,16 @@ pub fn process_inbound(
                 genesis,
                 evidence,
             )?;
+            // Register the VALIDATED commit's ciphertext as a benign-replay
+            // candidate BEFORE merging: the merge's `provider.persist()`
+            // below then makes the replay id and the advanced epoch durable
+            // in one atomic snapshot — a crash can never leave the epoch on
+            // disk while the id (needed to keep the committer's re-drives
+            // from reading as fork evidence) is missing.
+            provider.note_replay(&base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                wire,
+            ));
             // Collect TOFU pins for validated Adds before merging.
             let tofu: Vec<(String, [u8; 32])> = staged
                 .add_proposals()

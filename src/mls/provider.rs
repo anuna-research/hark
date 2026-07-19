@@ -37,13 +37,31 @@ struct StateFile {
     version: u32,
     /// base64(key) → base64(value) of the OpenMLS storage map.
     values: HashMap<String, String>,
+    /// The benign-replay registry (see [`DurableProvider::note_replay`]).
+    /// Carried in THIS file so a commit's replay id becomes durable in the
+    /// same atomic snapshot as the merged epoch it belongs to — a crash can
+    /// never persist one without the other.
+    #[serde(default)]
+    replays: Vec<String>,
 }
+
+/// How many commit ciphertexts the replay registry retains. Re-drives only
+/// ever replay the current retained transition, so recognition needs little
+/// depth; commits are rare events, so a small FIFO suffices.
+const REPLAY_REGISTRY_CAP: usize = 8;
 
 /// An [`OpenMlsProvider`] whose storage snapshots durably to one file.
 pub struct DurableProvider {
     crypto: RustCrypto,
     storage: MemoryStorage,
     path: PathBuf,
+    /// Commit ciphertexts (b64) this member authored or verified-and-applied
+    /// — the basis for treating an inbound frame as a benign replay (fork
+    /// counting is suppressed on its processing failure; the frame is still
+    /// processed, so a registered-but-unmerged commit can always be applied).
+    /// Registered BEFORE the merge so the epoch's own [`Self::persist`]
+    /// snapshot carries it (see [`StateFile::replays`]).
+    replays: std::sync::RwLock<Vec<String>>,
 }
 
 impl OpenMlsProvider for DurableProvider {
@@ -75,13 +93,15 @@ impl DurableProvider {
             crypto: RustCrypto::default(),
             storage: MemoryStorage::default(),
             path: path.to_path_buf(),
+            replays: std::sync::RwLock::new(Vec::new()),
         };
         match fs::read(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(provider),
             Err(e) => Err(MlsError::Storage(e)),
             Ok(bytes) => match Self::decode(&bytes) {
-                Ok(values) => {
+                Ok((values, replays)) => {
                     *provider.storage.values.write().unwrap() = values;
+                    *provider.replays.write().unwrap() = replays;
                     Ok(provider)
                 }
                 Err(reason) => {
@@ -97,7 +117,34 @@ impl DurableProvider {
         }
     }
 
-    fn decode(bytes: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
+    /// Register a commit ciphertext (b64) as a benign-replay candidate. Call
+    /// AFTER the commit is fully validated (or locally authored) and BEFORE
+    /// its merge, so the merge's own [`Self::persist`] makes the id and the
+    /// epoch durable atomically. Interior mutability keeps this callable
+    /// while the group is mutably borrowed. Deduplicated, bounded FIFO.
+    pub fn note_replay(&self, ct_b64: &str) {
+        let mut replays = self.replays.write().unwrap();
+        if replays.iter().any(|known| known == ct_b64) {
+            return;
+        }
+        replays.push(ct_b64.to_owned());
+        let excess = replays.len().saturating_sub(REPLAY_REGISTRY_CAP);
+        if excess > 0 {
+            replays.drain(..excess);
+        }
+    }
+
+    /// Whether `ct_b64` is a registered benign-replay candidate.
+    pub fn is_known_replay(&self, ct_b64: &str) -> bool {
+        self.replays
+            .read()
+            .unwrap()
+            .iter()
+            .any(|known| known == ct_b64)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn decode(bytes: &[u8]) -> Result<(HashMap<Vec<u8>, Vec<u8>>, Vec<String>), String> {
         let state: StateFile =
             serde_json::from_slice(bytes).map_err(|e| format!("malformed state file: {e}"))?;
         if state.version != STATE_VERSION {
@@ -112,7 +159,7 @@ impl DurableProvider {
             let value = B64.decode(v).map_err(|e| format!("bad value b64: {e}"))?;
             values.insert(key, value);
         }
-        Ok(values)
+        Ok((values, state.replays))
     }
 
     /// Snapshot the current storage map atomically: write a `0600` temp file
@@ -132,6 +179,7 @@ impl DurableProvider {
         let state = StateFile {
             version: STATE_VERSION,
             values,
+            replays: self.replays.read().unwrap().clone(),
         };
         Ok(serde_json::to_vec(&state).map_err(std::io::Error::other)?)
     }
@@ -171,14 +219,16 @@ impl DurableProvider {
     /// leaving the init key intact in memory AND on disk. Only a successful
     /// join persists, which is what finally deletes the consumed key.
     pub fn rollback_to_disk(&self) -> Result<(), MlsError> {
-        let values = match fs::read(&self.path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        let (values, replays) = match fs::read(&self.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), Vec::new()),
             Err(e) => return Err(MlsError::Storage(e)),
             Ok(bytes) => {
                 Self::decode(&bytes).map_err(|r| MlsError::Storage(std::io::Error::other(r)))?
             }
         };
         *self.storage.values.write().unwrap() = values;
+        // The replay registry rolls back with the state it annotates.
+        *self.replays.write().unwrap() = replays;
         Ok(())
     }
 
@@ -281,6 +331,7 @@ mod tests {
             serde_json::to_vec(&StateFile {
                 version: STATE_VERSION + 1,
                 values: HashMap::from([(B64.encode(b"k"), B64.encode(b"v"))]),
+                replays: Vec::new(),
             })
             .unwrap(),
         )
