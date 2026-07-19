@@ -27,8 +27,8 @@ use openmls::prelude::MlsGroup;
 use rand::Rng as _;
 
 use super::group::{
-    GenesisAssertion, GenesisTrust, create_group, is_owner, join_from_welcome,
-    merge_staged_commit, stage_add_member,
+    GenesisAssertion, GenesisTrust, create_group, is_owner, join_from_welcome, merge_staged_commit,
+    stage_add_member,
 };
 use super::keypackages::{
     ConsumedLedger, LAST_RESORT_LIFETIME_SECS, ONE_TIME_POOL_TARGET, build_last_resort,
@@ -154,13 +154,30 @@ pub struct MlsSession {
     /// only — echoes arrive within the connection's lifetime, and encrypted
     /// channels get no backfill across restarts. Bounded FIFO.
     own_echoes: std::collections::VecDeque<String>,
-    /// Fail-closed latch (see [`Self::snapshot_recovered`]): the in-memory
-    /// group merged an epoch whose durable provider snapshot FAILED. While
-    /// set, transition re-drives and further MLS mutation are blocked — a
-    /// fan before disk has the epoch would let a crash reload the sender
-    /// behind its peers, and a later mutation could persist a NEWER epoch
-    /// while pruning the still-unfanned batch.
-    snapshot_dirty: bool,
+    /// Whether the durable provider snapshot matches the in-memory group —
+    /// an explicit state, not an implicit flag (see [`DurabilityState`]).
+    durability: DurabilityState,
+    /// Handles with a `keyget` in flight (request emitted, no `keypkg` reply
+    /// yet). Without this, repeated presence/idkey frames would each emit
+    /// another keyget and the hub would serve — and thereby consume —
+    /// multiple one-time KeyPackages before the first reply is processed.
+    /// In-memory; cleared on (re)join, since replies die with the socket.
+    keyget_inflight: std::collections::HashSet<String>,
+}
+
+/// The relationship between the in-memory MLS group and its durable provider
+/// snapshot. `SnapshotPending` is entered when a merge advanced the group in
+/// memory but the snapshot write failed: until a snapshot succeeds, the
+/// retained transition must not be fanned (a crash would reload this sender
+/// behind peers that applied it) and no further MLS mutation may run (its
+/// own persist could make a NEWER epoch durable while pruning the
+/// still-unfanned batch). Recovery is an explicit command
+/// ([`MlsSession::recover_durability`]) issued at the event boundaries —
+/// never a side effect hidden inside a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurabilityState {
+    Durable,
+    SnapshotPending,
 }
 
 /// How many of this member's own outbound application ciphertexts are kept
@@ -175,13 +192,6 @@ struct PublishedKeyPackages {
     keypub_frame: String,
     refs: Vec<String>,
     built_at: std::time::SystemTime,
-    /// Whether the keypub frame has reached the wire. The hub's directory
-    /// APPENDS `:onetime` packages on every publish (it does not dedupe), so
-    /// replaying the same frame across retries would queue duplicate refs —
-    /// a later keyget could then serve an already-consumed package and the
-    /// resulting Welcome would fail. Once delivered, a rejoin re-sends only
-    /// idkey/keyready.
-    delivered: bool,
 }
 
 impl MlsSession {
@@ -231,7 +241,8 @@ impl MlsSession {
             published: None,
             pending_broadcast: Vec::new(),
             own_echoes: std::collections::VecDeque::new(),
-            snapshot_dirty: false,
+            durability: DurabilityState::Durable,
+            keyget_inflight: std::collections::HashSet::new(),
         };
 
         if let Some(meta) = meta {
@@ -414,13 +425,19 @@ impl MlsSession {
     /// consumed (a Welcome used one — replenishment, REQ-022) or the
     /// last-resort package is past half its lifetime (so we never advertise
     /// one the primitive would reject at add time, REQ-022's bound). The
-    /// keypub frame itself is included only until [`Self::keypub_delivered`]
-    /// reports it reached the wire — the hub's directory appends `:onetime`
-    /// entries per publish, so replaying it would queue duplicate refs.
+    /// keypub frame is re-driven on EVERY (re)join with no delivered
+    /// heuristic — the hub's directory upsert is idempotent (byte-deduped
+    /// against both the queue and the served history), so an exact replay is
+    /// a no-op and a lost write is healed by the next rejoin.
     pub fn join_frames(&mut self) -> Result<Vec<String>, MlsError> {
         if !self.enc_pinned {
             return Ok(Vec::new());
         }
+        // Event boundary (a public mutator not reached via `handle_frame`).
+        self.recover_durability();
+        // Keyget replies die with the old socket: a request left in flight
+        // must become re-issuable on the fresh connection.
+        self.keyget_inflight.clear();
         let reusable = self.published.as_ref().is_some_and(|set| {
             let fresh = set
                 .built_at
@@ -449,15 +466,14 @@ impl MlsSession {
                 keypub_frame,
                 refs,
                 built_at: std::time::SystemTime::now(),
-                delivered: false,
             });
         }
-        let set = self.published.as_ref().expect("publication set built above");
+        let set = self
+            .published
+            .as_ref()
+            .expect("publication set built above");
 
-        let mut frames = Vec::new();
-        if !set.delivered {
-            frames.push(set.keypub_frame.clone());
-        }
+        let mut frames = vec![set.keypub_frame.clone()];
         frames.push(self.own_idkey_frame()?);
         // SPEC-013 IB-3: announce "published, add me" so a web owner has an
         // explicit, re-drivable add trigger (not just presence timing).
@@ -469,7 +485,7 @@ impl MlsSession {
         // proof of fan-out, so these were never dequeued on send. Gated on a
         // durable snapshot: fanning an epoch disk does not yet have would
         // let a crash reload this sender behind its peers.
-        if self.snapshot_recovered() {
+        if self.is_durable() {
             frames.extend(self.pending_rebroadcast());
         }
         // A rejoin means the hub restarted or dropped us: presence knowledge
@@ -546,18 +562,6 @@ impl MlsSession {
             .retain(|p| p.epoch == epoch && p.group_id_b64 == group_id_b64);
     }
 
-    /// The caller reports the current keypub frame reached the wire, so later
-    /// [`Self::join_frames`] calls stop replaying it into the hub's
-    /// append-only `:onetime` queue. Wire delivery is the best signal the
-    /// client has for "the hub processed it" — the residual mismatch (a hub
-    /// that died between read and store) errs on under- rather than
-    /// over-publication against a durable directory.
-    pub fn keypub_delivered(&mut self) {
-        if let Some(set) = self.published.as_mut() {
-            set.delivered = true;
-        }
-    }
-
     /// Build this agent's self-signed `idkey` assertion frame (REQ-019),
     /// bound to the current pin epoch. Broadcast at join and re-broadcast
     /// whenever a new member appears in `presence`, so late joiners can pin
@@ -608,8 +612,12 @@ impl MlsSession {
     /// If we are the elected owner, a `keyget` for each present member we
     /// have a verified pin for but who is not yet in the group — the Add is
     /// gated on having the pin (REQ-008), so this fires only once the
-    /// target's `idkey` has landed.
-    fn keygets_for_addable(&self) -> Vec<String> {
+    /// target's `idkey` has landed. At most ONE request is in flight per
+    /// handle: every keyget the hub answers serves (consumes) a one-time
+    /// KeyPackage, so repeated presence/idkey frames must not each burn one
+    /// before the first reply is processed. The in-flight mark is cleared by
+    /// the `keypkg` reply (hit or miss) and on (re)join.
+    fn keygets_for_addable(&mut self) -> Vec<String> {
         let Some(group) = self.group.as_ref() else {
             return Vec::new();
         };
@@ -620,12 +628,23 @@ impl MlsSession {
             .members()
             .filter_map(|m| super::group::credential_handle(&m.credential).ok())
             .collect();
-        self.present
+        let targets: Vec<String> = self
+            .present
             .iter()
             .filter(|h| {
-                **h != self.handle && !members.contains(*h) && self.pins.pinned(h).is_some()
+                **h != self.handle
+                    && !members.contains(*h)
+                    && self.pins.pinned(h).is_some()
+                    && !self.keyget_inflight.contains(*h)
             })
-            .map(|h| self.keyget_frame(h))
+            .cloned()
+            .collect();
+        targets
+            .into_iter()
+            .map(|h| {
+                self.keyget_inflight.insert(h.clone());
+                self.keyget_frame(&h)
+            })
             .collect()
     }
 
@@ -659,11 +678,13 @@ impl MlsSession {
                 self.room
             )));
         }
-        // Fail closed (retryably) while a merged epoch is still undurable:
+        // Event boundary (a public mutator not reached via `handle_frame`),
+        // then fail closed (retryably) while a merged epoch is undurable:
         // sending would ratchet MLS state further ahead of disk, and its
         // internal persist could make a NEWER epoch durable while the
-        // unfanned transition batch gets pruned (see `snapshot_recovered`).
-        if !self.snapshot_recovered() {
+        // unfanned transition batch gets pruned (see `DurabilityState`).
+        self.recover_durability();
+        if !self.is_durable() {
             return Err(MlsError::NotReady(
                 "mls snapshot pending; retry once the epoch is durable".into(),
             ));
@@ -700,6 +721,9 @@ impl MlsSession {
     /// `idkey`, `presence` when owner) are consumed here; anything else is
     /// `NotMls` for the existing plaintext path.
     pub fn handle_frame(&mut self, text: &str) -> SessionEvent {
+        // Event boundary: attempt durability recovery once per inbound event,
+        // so the gates below are pure reads of the resulting state.
+        self.recover_durability();
         let Some(performative) = head_symbol(text) else {
             return SessionEvent::NotMls;
         };
@@ -793,31 +817,110 @@ impl MlsSession {
         }
     }
 
-    /// Recover from a failed post-merge provider snapshot ([`Self::snapshot_dirty`]):
-    /// retry the persist; on success, complete the deferred write-ahead
-    /// prune and clear the latch. Returns whether the durable state is in
-    /// sync — callers that would fan the retained transition or mutate MLS
-    /// state must not proceed on `false` (the in-memory epoch is ahead of
-    /// disk: fanning would let a crash reload the sender behind its peers,
-    /// and a further mutation could persist a newer epoch while pruning the
-    /// still-unfanned batch).
-    fn snapshot_recovered(&mut self) -> bool {
-        if !self.snapshot_dirty {
-            return true;
+    /// The pure durability query — every gate reads this; none of them
+    /// performs recovery as a side effect.
+    fn is_durable(&self) -> bool {
+        self.durability == DurabilityState::Durable
+    }
+
+    /// The explicit recovery COMMAND for [`DurabilityState::SnapshotPending`]:
+    /// retry the provider persist; on success, complete the deferred
+    /// write-ahead prune and return to Durable. Issued at the event
+    /// boundaries — the top of [`Self::handle_frame`] and of every public
+    /// mutator — so no code path can forget it and no query hides it.
+    fn recover_durability(&mut self) {
+        if self.durability == DurabilityState::Durable {
+            return;
         }
         match self.provider.persist() {
             Ok(()) => {
-                self.snapshot_dirty = false;
+                self.durability = DurabilityState::Durable;
                 tracing::info!("mls provider snapshot recovered; epoch durable again");
                 self.prune_write_aheads();
                 let _ = self.persist_meta();
-                true
             }
             Err(error) => {
                 tracing::warn!(error = %error, "mls provider snapshot still failing; replay and mutation stay blocked");
-                false
             }
         }
+    }
+
+    /// The single transaction through which every AUTHORED transition (Add,
+    /// Remove) advances the group. The caller stages the commit (openmls
+    /// pending-commit state, no merge) and hands over the wire frames; this
+    /// function owns every durability step and every cleanup path:
+    ///
+    /// 1. **Write-ahead**: register the commit's replay id and retain the
+    ///    frames (tagged with the post-merge epoch + group id) in the atomic
+    ///    meta write — after the merge they are the only copy able to
+    ///    advance peers. WAL failure → full [`Self::rollback_staged`]:
+    ///    nothing advanced anywhere.
+    /// 2. **Merge + snapshot** ([`merge_staged_commit`]): the snapshot also
+    ///    carries the replay id (same file). Merge-phase failure → full
+    ///    rollback. Snapshot-phase failure → the in-memory group is ahead of
+    ///    disk: keep the write-ahead, fan nothing, enter
+    ///    [`DurabilityState::SnapshotPending`] (re-drives and mutation stay
+    ///    blocked until [`Self::recover_durability`] succeeds; a crash
+    ///    instead reloads behind and the open-time prune discards the WAL).
+    /// 3. **Prune** superseded write-aheads. A cleanup persist failure never
+    ///    suppresses the frames — the transition is already durable, and
+    ///    withholding the fan would leave the group sending traffic peers
+    ///    cannot decrypt; the stale meta is re-pruned on reload.
+    fn apply_authored_transition(
+        &mut self,
+        frames: Vec<String>,
+        commit_ct: &str,
+        merge_context: &'static str,
+    ) -> Result<Vec<String>, MlsError> {
+        let group = self
+            .group
+            .as_mut()
+            .expect("an authored transition requires a joined group");
+        let epoch = group.epoch().as_u64() + 1;
+        let group_id_b64 = B64.encode(group.group_id().as_slice());
+
+        self.provider.note_replay(commit_ct);
+        self.record_write_ahead(epoch, &group_id_b64, &frames);
+        if let Err(error) = self.persist_meta() {
+            self.rollback_staged(epoch, &group_id_b64);
+            return Err(error);
+        }
+
+        let group = self.group.as_mut().expect("staged above");
+        if let Err(failure) = merge_staged_commit(&self.provider, group, merge_context) {
+            if failure.merged_in_memory {
+                self.durability = DurabilityState::SnapshotPending;
+                tracing::warn!(error = %failure.error, "transition merged in memory but the durable snapshot failed; retaining its write-ahead, blocking replay and mutation");
+            } else {
+                self.rollback_staged(epoch, &group_id_b64);
+            }
+            return Err(failure.error);
+        }
+
+        self.prune_write_aheads();
+        if let Err(error) = self.persist_meta() {
+            tracing::warn!(error = %error, "pruned write-ahead meta failed to persist; continuing (reload re-prunes)");
+        }
+        Ok(frames)
+    }
+
+    /// Undo a staged-but-unmerged transition completely: clear the openmls
+    /// pending commit, restore the provider's in-memory keystore from the
+    /// durable file (which also rolls the replay registry back with the
+    /// state it annotates), discard the write-ahead, and persist the
+    /// restored meta. After this, memory, disk, and the outbox all describe
+    /// the pre-transition group — the aborted commit leaves no trace that
+    /// could later replay into a fork.
+    fn rollback_staged(&mut self, epoch: u64, group_id_b64: &str) {
+        if let Some(group) = self.group.as_mut() {
+            use openmls_traits::OpenMlsProvider as _;
+            let _ = group.clear_pending_commit(self.provider.storage());
+        }
+        if let Err(error) = self.provider.rollback_to_disk() {
+            tracing::warn!(error = %error, "provider rollback after an aborted transition failed; state re-syncs on next successful persist or reload");
+        }
+        self.discard_write_ahead(epoch, group_id_b64);
+        let _ = self.persist_meta();
     }
 
     /// REQ-006/REQ-017/REQ-018: an encrypted room frame.
@@ -913,14 +1016,20 @@ impl MlsSession {
     }
 
     /// REQ-003/REQ-008: the hub answered our `keyget` — add the member if we
-    /// are the elected owner.
+    /// are the elected owner. The durability of the resulting transition is
+    /// owned entirely by [`Self::apply_authored_transition`].
     fn on_keypkg(&mut self, text: &str) -> SessionEvent {
+        // The reply (hit or miss) closes this handle's in-flight keyget —
+        // BEFORE any gate, so a deferred add remains re-requestable.
+        if let Some(target) = kw_symbol(text, ":for") {
+            self.keyget_inflight.remove(&target);
+        }
         let result = (|| -> Result<Vec<String>, MlsError> {
             // Fail closed while a merged epoch is still undurable: staging
             // ANOTHER transition could persist a newer epoch while pruning
-            // the still-unfanned batch (see `snapshot_recovered`). The
-            // presence-driven keyget re-fires the add once recovered.
-            if !self.snapshot_recovered() {
+            // the still-unfanned batch. The presence-driven keyget re-fires
+            // the add once recovered.
+            if !self.is_durable() {
                 return Err(MlsError::NotReady(
                     "mls snapshot pending; deferring the add until the epoch is durable".into(),
                 ));
@@ -937,12 +1046,7 @@ impl MlsSession {
                 .group
                 .as_mut()
                 .ok_or_else(|| MlsError::Rejected("keypkg before MLS join".into()))?;
-            // Stage — do NOT merge yet. Once the merge persists, these frames
-            // are the only copy able to advance peers past the old epoch, so
-            // they must be durable FIRST (write-ahead): a crash between the
-            // meta write and the merge loses only an unsent staged commit,
-            // while the reverse order would strand every peer at the old
-            // epoch with nothing to replay.
+            // Stage only — the transition transaction owns merge + durability.
             let outcome = stage_add_member(
                 &self.provider,
                 &self.identity,
@@ -952,12 +1056,6 @@ impl MlsSession {
                 &self.pins,
                 &self.ledger,
             )?;
-            // Tagged with the POST-merge epoch and the group id, so entries
-            // from an aborted merge (group still behind) or an abandoned
-            // group (provider-loss recovery) can never pass the replay
-            // filter.
-            let epoch = group.epoch().as_u64() + 1;
-            let group_id_b64 = B64.encode(group.group_id().as_slice());
             let commit_ct = B64.encode(&outcome.commit_bytes);
             let frames = vec![
                 format!(
@@ -972,49 +1070,7 @@ impl MlsSession {
                     self.handle
                 ),
             ];
-            // Our own commit: the hub echoes room fans back to the sender,
-            // and re-drives replay these exact bytes — register the replay
-            // id in the PROVIDER before the merge, so the merge's snapshot
-            // carries the id and the epoch atomically.
-            self.provider.note_replay(&commit_ct);
-            self.record_write_ahead(epoch, &group_id_b64, &frames);
-            self.persist_meta()?;
-            let group = self.group.as_mut().expect("staged above");
-            if let Err(failure) =
-                merge_staged_commit(&self.provider, group, "merge own add commit")
-            {
-                if failure.merged_in_memory {
-                    // The live group advanced but the durable snapshot did
-                    // not: KEEP the write-ahead, fan nothing, and LATCH the
-                    // session (`snapshot_dirty`) — re-drives and further
-                    // MLS mutation stay blocked until a snapshot succeeds
-                    // (see `snapshot_recovered`), so neither a fan-before-
-                    // durable nor a newer epoch pruning this batch can
-                    // occur. A crash instead reloads behind and prunes.
-                    self.snapshot_dirty = true;
-                    tracing::warn!(error = %failure.error, "mls add merged in memory but the durable snapshot failed; latching until a snapshot succeeds");
-                } else {
-                    // The merge itself failed: nothing advanced — the staged
-                    // transition is dead, discard its write-ahead so it
-                    // cannot replay into a fork later. (Its registry entry
-                    // is harmless: recognition only suppresses counting on
-                    // failure, never the processing itself.)
-                    self.discard_write_ahead(epoch, &group_id_b64);
-                    let _ = self.persist_meta();
-                }
-                return Err(failure.error);
-            }
-            // Durable: batches behind the new epoch can no longer heal
-            // anyone — this keeps exactly the batch just merged. A FAILED
-            // cleanup persist must not suppress the fan: the transition is
-            // already durable, and returning Err here would leave the group
-            // at the new epoch with peers never receiving its
-            // Commit/Welcome. The superseded meta is re-pruned on reload.
-            self.prune_write_aheads();
-            if let Err(error) = self.persist_meta() {
-                tracing::warn!(error = %error, "pruned write-ahead meta failed to persist; continuing (reload re-prunes)");
-            }
-            Ok(frames)
+            self.apply_authored_transition(frames, &commit_ct, "merge own add commit")
         })();
         match result {
             Ok(outbound) => SessionEvent::Handled { outbound },
@@ -1066,7 +1122,7 @@ impl MlsSession {
             // have missed the Commit/Welcome fan (encrypted joins get no
             // backfill). Inert for anyone already at the epoch. Gated on a
             // durable snapshot (see `join_frames`).
-            if self.snapshot_recovered() {
+            if self.is_durable() {
                 outbound.extend(self.pending_rebroadcast());
             }
         }
@@ -1107,11 +1163,14 @@ impl MlsSession {
     }
 
     /// Remove a member as the elected owner, given verified evidence
-    /// (REQ-014). Returns the deliver frame carrying commit + evidence.
+    /// (REQ-014). Returns the deliver frame carrying commit + evidence. The
+    /// durability of the transition is owned by
+    /// [`Self::apply_authored_transition`].
     pub fn remove_with_evidence(&mut self, evidence: &RemovalEvidence) -> Result<String, MlsError> {
-        // Fail closed while a merged epoch is still undurable (see
-        // `snapshot_recovered` / `on_keypkg`).
-        if !self.snapshot_recovered() {
+        // Event boundary (a public mutator not reached via `handle_frame`),
+        // then fail closed while a merged epoch is undurable.
+        self.recover_durability();
+        if !self.is_durable() {
             return Err(MlsError::NotReady(
                 "mls snapshot pending; deferring the removal until the epoch is durable".into(),
             ));
@@ -1125,8 +1184,7 @@ impl MlsSession {
             .group
             .as_mut()
             .ok_or_else(|| MlsError::Rejected("not in a group".into()))?;
-        // Same write-ahead split as the Add path (see `on_keypkg`): stage,
-        // durably retain the frame, THEN merge.
+        // Stage only — the transition transaction owns merge + durability.
         let commit = stage_remove_member(
             &self.provider,
             &self.identity,
@@ -1136,8 +1194,6 @@ impl MlsSession {
             &self.pins,
             &creator,
         )?;
-        let epoch = group.epoch().as_u64() + 1;
-        let group_id_b64 = B64.encode(group.group_id().as_slice());
         let commit_ct = B64.encode(&commit);
         let json = serde_json::to_vec(evidence).map_err(std::io::Error::other)?;
         let frame = format!(
@@ -1146,26 +1202,9 @@ impl MlsSession {
             B64.encode(json),
             self.handle
         );
-        self.provider.note_replay(&commit_ct);
-        self.record_write_ahead(epoch, &group_id_b64, std::slice::from_ref(&frame));
-        self.persist_meta()?;
-        let group = self.group.as_mut().expect("staged above");
-        // Same phase-split recovery as the Add path (see `on_keypkg`).
-        if let Err(failure) = merge_staged_commit(&self.provider, group, "merge remove commit") {
-            if failure.merged_in_memory {
-                self.snapshot_dirty = true;
-                tracing::warn!(error = %failure.error, "mls remove merged in memory but the durable snapshot failed; latching until a snapshot succeeds");
-            } else {
-                self.discard_write_ahead(epoch, &group_id_b64);
-                let _ = self.persist_meta();
-            }
-            return Err(failure.error);
-        }
-        self.prune_write_aheads();
-        if let Err(error) = self.persist_meta() {
-            tracing::warn!(error = %error, "pruned write-ahead meta failed to persist; continuing (reload re-prunes)");
-        }
-        Ok(frame)
+        let mut frames =
+            self.apply_authored_transition(vec![frame], &commit_ct, "merge remove commit")?;
+        Ok(frames.remove(0))
     }
 
     /// REQ-024: both safety numbers for the live group.
@@ -1395,7 +1434,10 @@ mod tests {
                     reason,
                     probable_fork,
                 } => {
-                    assert!(!probable_fork, "own echoes must not accumulate fork evidence");
+                    assert!(
+                        !probable_fork,
+                        "own echoes must not accumulate fork evidence"
+                    );
                     assert!(reason.contains("recognized replay"), "got: {reason}");
                 }
                 other => panic!("expected recognized-replay drop, got {other:?}"),
@@ -1459,9 +1501,10 @@ mod tests {
     }
 
     /// A retried rejoin must NOT durably mint a fresh KeyPackage set per
-    /// attempt (`join_frames` memoizes the publication until a ref is
-    /// consumed or the last-resort nears expiry), and must NOT replay a
-    /// delivered keypub into the hub's append-only `:onetime` queue.
+    /// attempt: `join_frames` memoizes the publication (until a ref is
+    /// consumed or the last-resort nears expiry) and replays the SAME keypub
+    /// frame verbatim on every (re)join — safe because the hub's directory
+    /// upsert is idempotent, and required so a lost write heals itself.
     #[test]
     fn join_frames_reuses_publication_across_retries() {
         let (dir, wire) = setup("joinreuse", 88, "@aria");
@@ -1471,31 +1514,16 @@ mod tests {
         assert!(first[0].starts_with("(keypub "));
         let provider_size = fs::read(dir.join("aria.mls")).unwrap().len();
 
-        // The keypub never reached the wire: the retry re-sends the SAME
-        // frame (same bundles — no provider growth).
-        let retry = session.join_frames().unwrap();
-        assert_eq!(
-            first[0], retry[0],
-            "an undelivered keypub is republished verbatim"
-        );
-        assert_eq!(
-            fs::read(dir.join("aria.mls")).unwrap().len(),
-            provider_size,
-            "a retried join_frames must not grow the durable MLS state"
-        );
-
-        // Once delivered, a rejoin sends only idkey + keyready — the hub
-        // APPENDS :onetime entries per publish, so a replay would queue
-        // duplicate refs a keyget could serve after consumption.
-        session.keypub_delivered();
-        let after = session.join_frames().unwrap();
-        assert_eq!(after.len(), 2, "delivered keypub is not replayed");
-        assert!(after[0].starts_with("(idkey "));
-        assert!(after[1].starts_with("(keyready "));
+        // Every retry/rejoin republishes the SAME memoized frame (same
+        // bundles — no provider growth, no fresh init keys).
+        for _ in 0..3 {
+            let retry = session.join_frames().unwrap();
+            assert_eq!(first[0], retry[0], "the keypub is replayed verbatim");
+        }
         assert_eq!(
             fs::read(dir.join("aria.mls")).unwrap().len(),
             provider_size,
-            "reuse after delivery must not grow the durable MLS state either"
+            "retried join_frames must not grow the durable MLS state"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1542,7 +1570,6 @@ mod tests {
         // Simulate the hub-wide drop: bob NEVER receives this fan.
 
         // A rejoin re-drives the retained transition.
-        alice.keypub_delivered();
         let rejoin = alice.join_frames().unwrap();
         assert!(
             rejoin.iter().any(|f| f.starts_with("(deliver @research")),
@@ -1723,6 +1750,211 @@ mod tests {
         assert!(
             alice3.pending_broadcast.is_empty(),
             "an aborted future-epoch write-ahead is pruned on reload"
+        );
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+    }
+
+    /// At most one keyget in flight per handle: every answered keyget serves
+    /// (consumes) a one-time KeyPackage, so repeated presence/idkey frames
+    /// must not each burn one before the first reply is processed. A reply
+    /// (here a directory miss) re-arms the request, as does a reconnect
+    /// (replies die with the socket).
+    #[test]
+    fn keyget_deduplicated_while_in_flight() {
+        let (a_dir, a_wire) = setup("kgdedup", 98, "@alice");
+        let (b_dir, b_wire) = setup("kgdedup", 99, "@bob");
+        let mut alice =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
+        let mut bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
+        let b_frames = bob.join_frames().unwrap();
+        let _ = alice.handle_frame(&b_frames[1]); // pin bob (idkey)
+        alice.create_group_as_creator().unwrap();
+        let presence = "(presence @research :members (@alice @bob))";
+        let keygets = |out: &[String]| out.iter().filter(|f| f.starts_with("(keyget ")).count();
+
+        let SessionEvent::Handled { outbound } = alice.handle_frame(presence) else {
+            panic!("presence handled")
+        };
+        assert_eq!(keygets(&outbound), 1, "first sighting requests the package");
+
+        // While the reply is outstanding, neither a repeated presence fan nor
+        // an idkey re-broadcast may issue another request.
+        let SessionEvent::Handled { outbound } = alice.handle_frame(presence) else {
+            panic!("presence handled")
+        };
+        assert_eq!(
+            keygets(&outbound),
+            0,
+            "in-flight keyget suppresses presence re-requests"
+        );
+        let SessionEvent::Handled { outbound } = alice.handle_frame(&b_frames[1]) else {
+            panic!("idkey handled")
+        };
+        assert_eq!(
+            keygets(&outbound),
+            0,
+            "in-flight keyget suppresses idkey re-requests"
+        );
+
+        // A directory MISS closes the request and re-arms it.
+        assert!(matches!(
+            alice.handle_frame("(keypkg @hub :for @bob :kp \"\")"),
+            SessionEvent::Handled { .. }
+        ));
+        let SessionEvent::Handled { outbound } = alice.handle_frame(presence) else {
+            panic!("presence handled")
+        };
+        assert_eq!(keygets(&outbound), 1, "a reply re-arms the request");
+
+        // A reconnect re-arms too: the old socket's reply can never arrive.
+        let _ = alice.join_frames().unwrap();
+        let SessionEvent::Handled { outbound } = alice.handle_frame(presence) else {
+            panic!("presence handled")
+        };
+        assert_eq!(keygets(&outbound), 1, "a rejoin re-arms in-flight requests");
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+    }
+
+    /// Fault injection — WRITE-AHEAD failure: when the meta write fails
+    /// before the merge, the whole staged transition rolls back (group not
+    /// advanced, no retained frames, no staged commit), and once the fault
+    /// clears the same add succeeds cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn write_ahead_failure_rolls_back_the_staged_transition() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (a_dir, a_wire) = setup("walfault", 100, "@alice");
+        let (b_dir, b_wire) = setup("walfault", 101, "@bob");
+        let mut alice =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
+        let mut bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
+        let b_frames = bob.join_frames().unwrap();
+        let _ = alice.handle_frame(&b_frames[1]);
+        alice.create_group_as_creator().unwrap();
+        let _ = alice.handle_frame("(presence @research :members (@alice @bob))");
+        let bob_kp_b64 = {
+            let onetime = kw_value(&b_frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+        let keypkg = format!("(keypkg @hub :for @bob :kp \"{bob_kp_b64}\")");
+        let epoch_before = alice.safety_numbers().unwrap().epoch;
+
+        // Inject: the identity dir becomes unwritable, so the write-ahead
+        // persist fails before the merge.
+        fs::set_permissions(&a_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        match alice.handle_frame(&keypkg) {
+            SessionEvent::Dropped { .. } => {}
+            other => panic!("expected the add to fail under the WAL fault, got {other:?}"),
+        }
+        fs::set_permissions(&a_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Full rollback: nothing advanced, nothing retained, nothing staged.
+        assert_eq!(
+            alice.safety_numbers().unwrap().epoch,
+            epoch_before,
+            "a failed write-ahead must not advance the group"
+        );
+        assert!(
+            alice.pending_rebroadcast().is_empty(),
+            "a failed write-ahead retains no frames"
+        );
+
+        // The same add succeeds once the fault clears (the staged commit was
+        // cleared, the KeyPackage ref was never consumed).
+        let SessionEvent::Handled { outbound } = alice.handle_frame(&keypkg) else {
+            panic!("the add must succeed after the fault clears")
+        };
+        assert_eq!(outbound.len(), 2, "commit fan + welcome");
+        assert!(matches!(
+            bob.handle_frame(&outbound[1]),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(bob.joined(), "the post-recovery welcome seats the member");
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+    }
+
+    /// Fault injection — POST-MERGE snapshot failure: the in-memory group is
+    /// ahead of disk, so the session latches (no fan, no re-drive, sends
+    /// refuse retryably) until a snapshot succeeds — at which point the
+    /// retained transition re-drives and heals the peer.
+    #[test]
+    fn post_merge_snapshot_failure_latches_until_recovered() {
+        let (a_dir, a_wire) = setup("snapfault", 102, "@alice");
+        let (b_dir, b_wire) = setup("snapfault", 103, "@bob");
+        let mut alice =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
+        let mut bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
+        let b_frames = bob.join_frames().unwrap();
+        let _ = alice.handle_frame(&b_frames[1]);
+        alice.create_group_as_creator().unwrap();
+        // Alice joins normally BEFORE the fault, memoizing her keypub set —
+        // the latched rejoin below must reuse it rather than rebuild.
+        let _ = alice.join_frames().unwrap();
+        let _ = alice.handle_frame("(presence @research :members (@alice @bob))");
+        let bob_kp_b64 = {
+            let onetime = kw_value(&b_frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+
+        // Inject: a DIRECTORY at the provider's snapshot temp path makes
+        // provider.persist fail while the meta write-ahead (a different
+        // temp path) succeeds — exactly the post-merge failure phase.
+        fs::create_dir(a_dir.join("alice.tmp")).unwrap();
+        match alice.handle_frame(&format!("(keypkg @hub :for @bob :kp \"{bob_kp_b64}\")")) {
+            SessionEvent::Dropped { .. } => {}
+            other => panic!("expected the add to fail under the snapshot fault, got {other:?}"),
+        }
+
+        // Latched: nothing may fan (a crash would reload the sender behind
+        // its peers) and sends refuse retryably.
+        let rejoin = alice.join_frames().unwrap();
+        assert!(
+            !rejoin.iter().any(|f| f.starts_with("(welcome ")),
+            "an undurable transition must not be fanned: {rejoin:?}"
+        );
+        assert!(
+            matches!(
+                alice.encrypt_outbound("(say @research :from @alice)"),
+                Err(MlsError::NotReady(_))
+            ),
+            "sends while undurable must refuse retryably"
+        );
+
+        // Fault clears → the next event boundary recovers, and the retained
+        // transition re-drives to heal the stranded peer.
+        fs::remove_dir(a_dir.join("alice.tmp")).unwrap();
+        let rejoin = alice.join_frames().unwrap();
+        let welcome = rejoin
+            .iter()
+            .find(|f| f.starts_with("(welcome @research"))
+            .expect("recovered snapshot re-drives the retained welcome")
+            .clone();
+        assert!(matches!(
+            bob.handle_frame(&welcome),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(bob.joined(), "the re-driven welcome heals the stranded add");
+        assert!(
+            alice.encrypt_outbound("(say @research :from @alice)").is_ok(),
+            "sends resume once durable"
         );
 
         let _ = fs::remove_dir_all(&a_dir);

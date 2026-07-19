@@ -233,7 +233,7 @@ impl Responder {
         if answered { None } else { Some(state.payload) }
     }
 
-    /// Drop all in-flight ask coordination (Fix 5).
+    /// Drop all in-flight ask coordination.
     ///
     /// The transport builds a FRESH per-connection timer set on every
     /// (re)connect, but REUSES this `Responder` (and its `asks` map) across
@@ -420,7 +420,10 @@ mod tests {
     fn message_sender_reads_innermost_from() {
         // The receive-all observer uses this to skip its own fanned-back
         // messages: the sender is the innermost Simple's `:from`.
-        assert_eq!(message_sender(&ask("t", "@asker")).as_deref(), Some("@asker"));
+        assert_eq!(
+            message_sender(&ask("t", "@asker")).as_deref(),
+            Some("@asker")
+        );
         assert_eq!(
             message_sender("(tell @general \"hi\" :from @bob)").as_deref(),
             Some("@bob")
@@ -506,7 +509,7 @@ mod tests {
 
     #[test]
     fn reset_pending_drops_stale_asks_and_allows_replay() {
-        // Fix 5: an ask claimed on a prior connection is left tracked when that
+        // An ask claimed on a prior connection is left tracked when that
         // connection's timers are dropped. Without a reset, the same ask
         // replayed from backfill after reconnect is swallowed as a duplicate
         // (no claim) and leaked forever. `reset_pending` clears it so the
