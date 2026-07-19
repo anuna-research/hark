@@ -205,7 +205,15 @@ pub fn remove_member(
     pins: &super::pins::PinStore,
     creator_handle: &str,
 ) -> Result<Vec<u8>, MlsError> {
-    let commit = stage_remove_member(provider, identity, group, room, evidence, pins, creator_handle)?;
+    let commit = stage_remove_member(
+        provider,
+        identity,
+        group,
+        room,
+        evidence,
+        pins,
+        creator_handle,
+    )?;
     super::group::merge_staged_commit(provider, group, "merge remove commit")
         .map_err(|failure| failure.error)?;
     Ok(commit)

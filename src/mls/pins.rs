@@ -422,7 +422,10 @@ mod tests {
         want.extend_from_slice(&9u32.to_be_bytes());
         want.extend_from_slice(b"@research");
         want.extend_from_slice(&7u64.to_be_bytes());
-        assert_eq!(got, want, "resync signing bytes match the cbcl-bus layout (NFR-001)");
+        assert_eq!(
+            got, want,
+            "resync signing bytes match the cbcl-bus layout (NFR-001)"
+        );
 
         // Domain separation: the same inputs under the idkey label differ, so a
         // signature over one context cannot verify against the other.

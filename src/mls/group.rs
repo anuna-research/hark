@@ -248,9 +248,11 @@ pub fn credential_handle(credential: &Credential) -> Result<String, MlsError> {
 /// Is `identity` the elected owner of `group`'s current tree?
 pub fn is_owner(group: &MlsGroup, identity: &MlsIdentity) -> Result<bool, MlsError> {
     let members = member_bindings(group)?;
-    Ok(elect_committer(&members, group_genesis_creator(group).as_ref())
-        .map(|(handle, key)| handle == identity.handle && key == identity.public_key())
-        .unwrap_or(false))
+    Ok(
+        elect_committer(&members, group_genesis_creator(group).as_ref())
+            .map(|(handle, key)| handle == identity.handle && key == identity.public_key())
+            .unwrap_or(false),
+    )
 }
 
 /// Create the room's group: random group id, genesis assertion in the
@@ -390,8 +392,17 @@ pub fn add_member(
     pins: &PinStore,
     ledger: &ConsumedLedger,
 ) -> Result<AddOutcome, MlsError> {
-    let outcome = stage_add_member(provider, identity, group, kp_bytes, target_handle, pins, ledger)?;
-    merge_staged_commit(provider, group, "merge own add commit").map_err(|failure| failure.error)?;
+    let outcome = stage_add_member(
+        provider,
+        identity,
+        group,
+        kp_bytes,
+        target_handle,
+        pins,
+        ledger,
+    )?;
+    merge_staged_commit(provider, group, "merge own add commit")
+        .map_err(|failure| failure.error)?;
     Ok(outcome)
 }
 
@@ -789,10 +800,16 @@ mod tests {
         let members = vec![agent.clone(), creator.clone()];
 
         // Creator present → creator wins despite the agent sorting first.
-        assert_eq!(elect_committer(&members, Some(&creator)), Some(creator.clone()));
+        assert_eq!(
+            elect_committer(&members, Some(&creator)),
+            Some(creator.clone())
+        );
         // Match is on handle AND key: a creator handle with the wrong key does not win.
         let imposter = ("@person2".to_string(), vec![7u8; 32]);
-        assert_eq!(elect_committer(&members, Some(&imposter)), Some(agent.clone()));
+        assert_eq!(
+            elect_committer(&members, Some(&imposter)),
+            Some(agent.clone())
+        );
         // No creator (genesis-less) → lex-smallest leaf (unchanged behaviour).
         assert_eq!(elect_committer(&members, None), Some(agent.clone()));
         // Creator not a live leaf (left the group) → fall back to lex-smallest.

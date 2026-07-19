@@ -28,9 +28,15 @@ use crate::{
     local_api::PingResponse,
 };
 
+/// The agent-handle lifecycle. Reconnecting is a REAL state, not an
+/// unhealthy flavour: the transport is re-establishing the hub connection
+/// with backoff and the handle will recover on its own — commands against it
+/// fail with the retryable [`AgentError::Reconnecting`], never with the
+/// terminal-looking Unhealthy.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AgentState {
     Connected,
+    Reconnecting,
     Unhealthy,
 }
 
@@ -38,6 +44,7 @@ impl AgentState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Connected => "connected",
+            Self::Reconnecting => "reconnecting",
             Self::Unhealthy => "unhealthy",
         }
     }
@@ -92,45 +99,37 @@ pub struct OutboundFrame {
 /// us a group member has not arrived yet — SPEC-013 REQ-023 fail-closed) is a
 /// transient precondition that the very next attempt may satisfy, so it must
 /// NOT poison the handle.
+/// Why a transport loop refused to send an outbound frame. Each variant maps
+/// to exactly one lifecycle outcome in [`AgentStore::send_outbound`] — no
+/// invalid combination is representable.
 #[derive(Debug, Clone)]
-pub struct OutboundReject {
-    pub detail: String,
-    pub retryable: bool,
-    /// A retryable reject caused by TRANSPORT loss (the hub connection
-    /// dropped and the receive loop is reconnecting), as opposed to an MLS
-    /// membership precondition. Surfaced as a distinct API error so a
-    /// cleartext public-channel client is told to wait for reconnection, not
-    /// for a Welcome that will never come.
-    pub reconnecting: bool,
+pub enum OutboundReject {
+    /// The send failed in a way reconnection cannot heal (malformed frame,
+    /// closed local channel): the handle is dead and is marked unhealthy.
+    Fatal(String),
+    /// A transient precondition failed — today exclusively "the MLS Welcome
+    /// that makes us a member has not arrived yet" (SPEC-013 REQ-023
+    /// fail-closed). The very next attempt may succeed; the handle stays
+    /// healthy.
+    NotReady(String),
+    /// The hub connection was lost with this frame in flight; the transport
+    /// is auto-reconnecting. Non-poisoning like NotReady, but reported
+    /// distinctly so a cleartext public-channel client is told to wait for
+    /// reconnection, never for an MLS Welcome.
+    Reconnecting(String),
 }
 
 impl OutboundReject {
-    /// The handle is dead — mark it unhealthy.
     pub fn fatal(detail: impl Into<String>) -> Self {
-        Self {
-            detail: detail.into(),
-            retryable: false,
-            reconnecting: false,
-        }
+        Self::Fatal(detail.into())
     }
 
-    /// A transient precondition failed — the same send may succeed shortly.
-    pub fn retryable(detail: impl Into<String>) -> Self {
-        Self {
-            detail: detail.into(),
-            retryable: true,
-            reconnecting: false,
-        }
+    pub fn not_ready(detail: impl Into<String>) -> Self {
+        Self::NotReady(detail.into())
     }
 
-    /// The hub connection was lost with this frame in flight; the transport
-    /// is reconnecting. Non-poisoning, like [`Self::retryable`].
     pub fn reconnecting(detail: impl Into<String>) -> Self {
-        Self {
-            detail: detail.into(),
-            retryable: true,
-            reconnecting: true,
-        }
+        Self::Reconnecting(detail.into())
     }
 }
 
@@ -584,23 +583,23 @@ impl AgentStore {
             // Transport loss with the frame in flight: the receive loop is
             // reconnecting; the handle stays healthy. Distinct from NotReady
             // so a cleartext client is not told to wait for an MLS Welcome.
-            Ok(Err(reject)) if reject.reconnecting => Err(AgentError::Reconnecting {
-                detail: Some(reject.detail),
+            Ok(Err(OutboundReject::Reconnecting(detail))) => Err(AgentError::Reconnecting {
+                detail: Some(detail),
             }),
             // A transient precondition (MLS membership not yet established):
             // leave the handle healthy so the next attempt — once the Welcome
             // lands — can succeed. Marking it unhealthy here would strand the
             // handle over a membership race (SPEC-013 REQ-023).
-            Ok(Err(reject)) if reject.retryable => Err(AgentError::NotReady {
-                detail: Some(reject.detail),
+            Ok(Err(OutboundReject::NotReady(detail))) => Err(AgentError::NotReady {
+                detail: Some(detail),
             }),
-            Ok(Err(reject)) => {
+            Ok(Err(OutboundReject::Fatal(detail))) => {
                 let _ = self
-                    .mark_unhealthy(handle, "local_send_failed", Some(reject.detail.clone()))
+                    .mark_unhealthy(handle, "local_send_failed", Some(detail.clone()))
                     .await;
                 Err(AgentError::Unhealthy {
                     reason: "local_send_failed".to_owned(),
-                    detail: Some(reject.detail),
+                    detail: Some(detail),
                 })
             }
             Err(_) => {
@@ -839,8 +838,9 @@ impl AgentStore {
     /// the connection's close signal: the receive-loop task is still alive and
     /// is re-establishing the connection, so consuming `close_tx` (which would
     /// resolve the loop's `close_rx`) must not happen — that would masquerade
-    /// as an explicit stop and abort the reconnect. The handle reports
-    /// unhealthy (`reconnecting`) so `status`/`recv` reflect the outage; a
+    /// as an explicit stop and abort the reconnect. The handle enters the
+    /// explicit [`AgentState::Reconnecting`] state so `status` reflects the
+    /// outage and commands fail with the retryable transport error; a
     /// successful reconnect clears it via [`AgentStore::mark_connected`].
     pub async fn mark_reconnecting(
         &self,
@@ -852,7 +852,11 @@ impl AgentStore {
             .agents
             .get_mut(handle)
             .ok_or(AgentError::UnknownHandle)?;
-        entry.mark_unhealthy("reconnecting", detail);
+        entry.state = AgentState::Reconnecting;
+        entry.unhealthy_reason = None;
+        entry.unhealthy_detail = detail;
+        // Reconnecting must not arm meta waiters against a dead socket.
+        entry.pending_meta_reply = None;
         // No `close_connection()` here (see doc): the loop keeps its `close_rx`.
         Ok(())
     }
@@ -1034,16 +1038,21 @@ impl AgentEntry {
     }
 
     fn ensure_healthy(&self) -> Result<(), AgentError> {
-        if self.state == AgentState::Unhealthy {
-            Err(AgentError::Unhealthy {
+        match self.state {
+            AgentState::Connected => Ok(()),
+            // Transient by definition: the reconnect loop owns recovery, so
+            // the caller gets the retryable transport error, never a
+            // terminal-looking Unhealthy that erases the distinction.
+            AgentState::Reconnecting => Err(AgentError::Reconnecting {
+                detail: self.unhealthy_detail.clone(),
+            }),
+            AgentState::Unhealthy => Err(AgentError::Unhealthy {
                 reason: self
                     .unhealthy_reason
                     .clone()
                     .unwrap_or_else(|| "unknown".to_owned()),
                 detail: self.unhealthy_detail.clone(),
-            })
-        } else {
-            Ok(())
+            }),
         }
     }
 
@@ -1875,7 +1884,7 @@ mod tests {
             if let Some(frame) = rx.recv().await {
                 let _ = frame
                     .result_tx
-                    .send(Err(super::OutboundReject::retryable("not yet a member")));
+                    .send(Err(super::OutboundReject::not_ready("not yet a member")));
             }
             if let Some(frame) = rx.recv().await {
                 let _ = frame
@@ -2368,10 +2377,11 @@ mod tests {
     }
 
     /// The chat auto-reconnect invariant: `mark_reconnecting` reports the
-    /// handle unhealthy (so `status`/`recv` reflect the outage) but must NOT
-    /// fire the connection's close signal — the receive loop is still alive and
-    /// reconnecting; firing `close_tx` would resolve its `close_rx` and abort
-    /// the reconnect. `mark_connected` then restores it in place (same handle).
+    /// handle into the explicit Reconnecting state (so `status` reflects the
+    /// outage as transient) but must NOT fire the connection's close signal —
+    /// the receive loop is still alive and reconnecting; firing `close_tx`
+    /// would resolve its `close_rx` and abort the reconnect. `mark_connected`
+    /// then restores it in place (same handle).
     #[tokio::test]
     async fn reconnecting_preserves_close_signal_then_connected_restores() {
         let store = agent_store(10, 100);
@@ -2386,14 +2396,14 @@ mod tests {
             .await
             .expect("agent should insert");
 
-        // Reconnecting: unhealthy, but the close signal is untouched.
+        // Reconnecting: the explicit transient state, close signal untouched.
         store
             .mark_reconnecting(&handle, Some("hub_closed".to_owned()))
             .await
             .expect("mark_reconnecting should succeed");
         let status = store.status_snapshots().await;
-        assert_eq!(status[0].state, super::AgentState::Unhealthy);
-        assert_eq!(status[0].unhealthy_reason.as_deref(), Some("reconnecting"));
+        assert_eq!(status[0].state, super::AgentState::Reconnecting);
+        assert_eq!(status[0].unhealthy_detail.as_deref(), Some("hub_closed"));
         assert_eq!(
             close_rx.try_recv(),
             Err(super::oneshot::error::TryRecvError::Empty),
@@ -2414,6 +2424,58 @@ mod tests {
             Err(super::oneshot::error::TryRecvError::Empty),
             "close signal must survive a reconnect cycle"
         );
+    }
+
+    /// Sends issued THROUGHOUT the backoff window fail fast with the
+    /// retryable transport error — never a terminal-looking Unhealthy, never
+    /// a hang against the dead socket's channel — and the path heals the
+    /// moment the reconnect completes.
+    #[tokio::test]
+    async fn sends_during_backoff_fail_fast_with_reconnecting() {
+        let store = agent_store(10, 100);
+        let handle = handle();
+        let (tx, _keep_rx) = tokio::sync::mpsc::channel::<super::OutboundFrame>(4);
+        store
+            .insert_connected_with_router_channels(
+                handle.clone(),
+                vec!["elf".to_owned()],
+                None,
+                Some(super::AgentSendChannel::new(tx)),
+                Some("@aria".to_owned()),
+                Some("@research".to_owned()),
+            )
+            .await
+            .expect("agent should insert");
+        store
+            .mark_reconnecting(&handle, Some("hub redeploy".to_owned()))
+            .await
+            .expect("mark_reconnecting should succeed");
+
+        for _ in 0..3 {
+            let error = store
+                .send_outbound(&handle, "(say @research)".to_owned())
+                .await
+                .expect_err("sends during backoff must not pretend to succeed");
+            assert_eq!(
+                error,
+                super::AgentError::Reconnecting {
+                    detail: Some("hub redeploy".to_owned()),
+                }
+            );
+        }
+        let status = store.status_snapshots().await;
+        assert_eq!(
+            status[0].state,
+            super::AgentState::Reconnecting,
+            "failed sends during backoff must not poison the handle"
+        );
+
+        store
+            .mark_connected(&handle)
+            .await
+            .expect("mark_connected should succeed");
+        let status = store.status_snapshots().await;
+        assert_eq!(status[0].state, super::AgentState::Connected);
     }
 
     fn agent_store(max_messages: usize, max_bytes: usize) -> super::AgentStore {

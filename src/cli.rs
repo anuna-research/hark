@@ -975,7 +975,8 @@ async fn resolve_wire_name(client: &LocalApiClient, name: &str) -> AppResult<Age
         .agents()
         .await
         .map_err(|error| map_client_error(error, "daemon agents query failed"))?;
-    let selection = select_by_wire_name(&agents.agents, agents.active_agent_handle.as_deref(), name)?;
+    let selection =
+        select_by_wire_name(&agents.agents, agents.active_agent_handle.as_deref(), name)?;
     if let Some(warning) = selection.warning {
         eprintln!("warning: {warning}");
     }
@@ -1497,7 +1498,10 @@ mod tests {
 
     #[test]
     fn wire_name_resolves_to_internal_handle() {
-        let agents = [chat_agent("HANDLEA", "@hark-a"), chat_agent("HANDLEB", "@hark-b")];
+        let agents = [
+            chat_agent("HANDLEA", "@hark-a"),
+            chat_agent("HANDLEB", "@hark-b"),
+        ];
         let selection = select_by_wire_name(&agents, None, "@hark-b").expect("resolves");
         assert_eq!(selection.handle, "HANDLEB");
         assert!(selection.warning.is_none());
@@ -1514,12 +1518,18 @@ mod tests {
     fn duplicate_wire_name_prefers_active_and_warns() {
         // Two connections share one wire identity (a re-pair with the same
         // invite): the active handle wins and the ambiguity is surfaced.
-        let agents = [chat_agent("OLDCONN", "@hark-a"), chat_agent("NEWCONN", "@hark-a")];
-        let selection =
-            select_by_wire_name(&agents, Some("NEWCONN"), "@hark-a").expect("resolves");
+        let agents = [
+            chat_agent("OLDCONN", "@hark-a"),
+            chat_agent("NEWCONN", "@hark-a"),
+        ];
+        let selection = select_by_wire_name(&agents, Some("NEWCONN"), "@hark-a").expect("resolves");
         assert_eq!(selection.handle, "NEWCONN");
         assert!(
-            selection.warning.as_deref().unwrap_or_default().contains("share the wire name"),
+            selection
+                .warning
+                .as_deref()
+                .unwrap_or_default()
+                .contains("share the wire name"),
             "ambiguity must warn: {:?}",
             selection.warning
         );
