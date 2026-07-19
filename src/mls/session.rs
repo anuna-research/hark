@@ -69,11 +69,6 @@ struct SessionMeta {
     /// transition nothing can regenerate.
     #[serde(default)]
     pending_broadcast: Vec<PendingBroadcast>,
-    /// Commit ciphertexts (`:ct` b64) this member authored or verified and
-    /// applied (see [`MlsSession::register_known_replay`]) — persisted so a
-    /// re-drive arriving after a daemon restart is still recognized.
-    #[serde(default)]
-    known_replays: Vec<String>,
 }
 
 /// One transition frame retained for re-driving, tagged with the group id
@@ -143,21 +138,27 @@ pub struct MlsSession {
     /// Authored transition frames retained for re-driving (see
     /// [`PendingBroadcast`] and [`Self::pending_rebroadcast`]).
     pending_broadcast: Vec<PendingBroadcast>,
-    /// Exact ciphertexts this member AUTHORED (commits and its own
-    /// application messages — the hub echoes room fans back to the sender)
-    /// or VERIFIED-and-applied — the only basis on which an inbound frame
-    /// may be treated as a benign replay. Membership is unforgeable by
-    /// construction (the bytes were either produced locally or already
-    /// passed AEAD verification), unlike the wire header's
-    /// epoch/content-type, which an active hub could relabel to dodge the
-    /// fork counter. Bounded FIFO.
-    known_replays: Vec<String>,
+    /// Ciphertexts of this member's OWN outbound application messages, kept
+    /// so the hub's echo of each fan is recognized as benign (MLS cannot
+    /// decrypt one's own message). Deliberately SEPARATE from the durable
+    /// commit registry in the provider: application churn must never evict
+    /// a commit whose author still legitimately re-drives it. In-memory
+    /// only — echoes arrive within the connection's lifetime, and encrypted
+    /// channels get no backfill across restarts. Bounded FIFO.
+    own_echoes: std::collections::VecDeque<String>,
+    /// Fail-closed latch (see [`Self::snapshot_recovered`]): the in-memory
+    /// group merged an epoch whose durable provider snapshot FAILED. While
+    /// set, transition re-drives and further MLS mutation are blocked — a
+    /// fan before disk has the epoch would let a crash reload the sender
+    /// behind its peers, and a later mutation could persist a NEWER epoch
+    /// while pruning the still-unfanned batch.
+    snapshot_dirty: bool,
 }
 
-/// How many commit ciphertexts [`MlsSession::register_known_replay`] keeps.
-/// Re-drives only ever replay the CURRENT retained batch, so recognition
-/// needs little depth; the bound caps meta growth.
-const KNOWN_REPLAY_CAP: usize = 32;
+/// How many of this member's own outbound application ciphertexts are kept
+/// for echo recognition. Echoes return promptly, so this only needs to cover
+/// the in-flight window.
+const OWN_ECHO_CAP: usize = 128;
 
 /// A memoized `keypub` publication (see [`MlsSession::join_frames`]): the
 /// frame to (re)send, the refs it advertises (for consumed-ledger checks),
@@ -220,14 +221,14 @@ impl MlsSession {
             present: std::collections::HashSet::new(),
             published: None,
             pending_broadcast: Vec::new(),
-            known_replays: Vec::new(),
+            own_echoes: std::collections::VecDeque::new(),
+            snapshot_dirty: false,
         };
 
         if let Some(meta) = meta {
             session.enc_pinned = session.enc_pinned || meta.enc_pinned;
             session.genesis = meta.genesis;
             session.pending_broadcast = meta.pending_broadcast;
-            session.known_replays = meta.known_replays;
             // Reload the persisted group (REQ-009): a missing/stale state
             // simply means re-join (logged by the provider open path).
             if let Some(group_id_b64) = meta.group_id_b64 {
@@ -302,7 +303,6 @@ impl MlsSession {
             genesis: self.genesis.clone(),
             tofu_pending: matches!(self.trust, Some(GenesisTrust::TofuRequiresSafetyNumber)),
             pending_broadcast: self.pending_broadcast.clone(),
-            known_replays: self.known_replays.clone(),
         };
         let bytes = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
         if let Some(parent) = self.meta_path.parent() {
@@ -418,8 +418,12 @@ impl MlsSession {
         // only to currently joined sockets (encrypted joins get no backfill),
         // so a hub-wide drop where WE reconnect first would otherwise leave
         // later-returning members at the old epoch — and a local write is no
-        // proof of fan-out, so these were never dequeued on send.
-        frames.extend(self.pending_rebroadcast());
+        // proof of fan-out, so these were never dequeued on send. Gated on a
+        // durable snapshot: fanning an epoch disk does not yet have would
+        // let a crash reload this sender behind its peers.
+        if self.snapshot_recovered() {
+            frames.extend(self.pending_rebroadcast());
+        }
         // A rejoin means the hub restarted or dropped us: presence knowledge
         // is stale, so forget it — the next presence fan then treats every
         // member as newly seen, re-running the idkey/keyready/pending
@@ -607,6 +611,15 @@ impl MlsSession {
                 self.room
             )));
         }
+        // Fail closed (retryably) while a merged epoch is still undurable:
+        // sending would ratchet MLS state further ahead of disk, and its
+        // internal persist could make a NEWER epoch durable while the
+        // unfanned transition batch gets pruned (see `snapshot_recovered`).
+        if !self.snapshot_recovered() {
+            return Err(MlsError::NotReady(
+                "mls snapshot pending; retry once the epoch is durable".into(),
+            ));
+        }
         let group = self.group.as_mut().ok_or_else(|| {
             // Transient, not a rejection: the Welcome that makes us a member
             // has not arrived yet. Fail closed (no plaintext fallback,
@@ -625,7 +638,10 @@ impl MlsSession {
         // echo, an agent that only sends (no inbound between) would count
         // its own echoes as consecutive process failures and trip a false
         // probable-fork warning after three messages.
-        self.register_known_replay(&ct_b64);
+        self.own_echoes.push_back(ct_b64.clone());
+        while self.own_echoes.len() > OWN_ECHO_CAP {
+            self.own_echoes.pop_front();
+        }
         Ok(format!(
             "(deliver {} :enc mls :ct \"{ct_b64}\" :from {})",
             self.room, self.handle
@@ -729,42 +745,47 @@ impl MlsSession {
         }
     }
 
-    /// Remember a commit ciphertext (`:ct` b64) as a benign-replay candidate:
-    /// called when this member AUTHORS a commit (emit + retained re-drive)
-    /// and when it VERIFIES and applies one from a peer. `on_deliver` then
-    /// recognizes a re-fan of those exact bytes without processing — and
-    /// without feeding the REQ-006 fork counter, which three intentional
-    /// re-drives would otherwise trip. Recognition is by exact ciphertext
-    /// only; nothing is ever exempted on the frame's unauthenticated
-    /// epoch/content-type headers.
-    fn register_known_replay(&mut self, ct_b64: &str) {
-        if self.known_replays.iter().any(|known| known == ct_b64) {
-            return;
+    /// Recover from a failed post-merge provider snapshot ([`Self::snapshot_dirty`]):
+    /// retry the persist; on success, complete the deferred write-ahead
+    /// prune and clear the latch. Returns whether the durable state is in
+    /// sync — callers that would fan the retained transition or mutate MLS
+    /// state must not proceed on `false` (the in-memory epoch is ahead of
+    /// disk: fanning would let a crash reload the sender behind its peers,
+    /// and a further mutation could persist a newer epoch while pruning the
+    /// still-unfanned batch).
+    fn snapshot_recovered(&mut self) -> bool {
+        if !self.snapshot_dirty {
+            return true;
         }
-        self.known_replays.push(ct_b64.to_owned());
-        let excess = self.known_replays.len().saturating_sub(KNOWN_REPLAY_CAP);
-        if excess > 0 {
-            self.known_replays.drain(..excess);
+        match self.provider.persist() {
+            Ok(()) => {
+                self.snapshot_dirty = false;
+                tracing::info!("mls provider snapshot recovered; epoch durable again");
+                self.prune_write_aheads();
+                let _ = self.persist_meta();
+                true
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "mls provider snapshot still failing; replay and mutation stay blocked");
+                false
+            }
         }
     }
 
     /// REQ-006/REQ-017/REQ-018: an encrypted room frame.
     fn on_deliver(&mut self, text: &str) -> SessionEvent {
-        // A re-fan of a ciphertext we authored or already verified-and-applied
-        // (the retained-transition re-drive, the hub echoing our own fan, or
-        // our own application message coming back) is benign by construction
-        // — drop it before processing, without counting (see
-        // `register_known_replay`). The retained batch is also matched by
-        // exact frame text, so re-drive recognition survives registry churn.
-        let recognized = kw_symbol(text, ":ct")
-            .is_some_and(|ct_b64| self.known_replays.iter().any(|known| known == &ct_b64))
-            || self.pending_broadcast.iter().any(|p| p.frame == text);
-        if recognized {
-            return SessionEvent::Dropped {
-                reason: "recognized replay of an authored/applied ciphertext".into(),
-                probable_fork: self.fork.probable_fork(),
-            };
-        }
+        // Benign-replay recognition — by exact bytes only, never the frame's
+        // unauthenticated headers: the durable commit registry (authored or
+        // verified-and-applied, carried in the provider snapshot), our own
+        // outbound echoes, and the retained transition batch matched by
+        // exact frame text. Recognition does not skip processing; it only
+        // suppresses fork counting if processing fails (see
+        // `process_inbound`), so a registered-but-unmerged commit can still
+        // be applied.
+        let recognized = kw_symbol(text, ":ct").is_some_and(|ct_b64| {
+            self.provider.is_known_replay(&ct_b64)
+                || self.own_echoes.iter().any(|echo| echo == &ct_b64)
+        }) || self.pending_broadcast.iter().any(|p| p.frame == text);
         let Some(group) = self.group.as_mut() else {
             return SessionEvent::Dropped {
                 reason: "deliver before MLS join".into(),
@@ -798,6 +819,7 @@ impl MlsSession {
             &genesis,
             evidence.as_ref(),
             &mut self.fork,
+            recognized,
         ) {
             Ok(Inbound::App {
                 plaintext,
@@ -819,11 +841,9 @@ impl MlsSession {
                 }
             }
             Ok(Inbound::Handshake) => {
-                // Verified and merged: remember the exact ciphertext so a
-                // later re-fan/re-drive of it is recognized as benign.
-                if let Some(ct_b64) = kw_symbol(text, ":ct") {
-                    self.register_known_replay(&ct_b64);
-                }
+                // (The replay id of a verified commit is registered inside
+                // `process_inbound`, pre-merge, so the merge snapshot
+                // carries it atomically.)
                 let _ = self.persist_meta();
                 SessionEvent::Handled { outbound: vec![] }
             }
@@ -845,6 +865,15 @@ impl MlsSession {
     /// are the elected owner.
     fn on_keypkg(&mut self, text: &str) -> SessionEvent {
         let result = (|| -> Result<Vec<String>, MlsError> {
+            // Fail closed while a merged epoch is still undurable: staging
+            // ANOTHER transition could persist a newer epoch while pruning
+            // the still-unfanned batch (see `snapshot_recovered`). The
+            // presence-driven keyget re-fires the add once recovered.
+            if !self.snapshot_recovered() {
+                return Err(MlsError::NotReady(
+                    "mls snapshot pending; deferring the add until the epoch is durable".into(),
+                ));
+            }
             let target = kw_symbol(text, ":for")
                 .ok_or_else(|| MlsError::Rejected("keypkg missing :for".into()))?;
             let kp = kw_b64(text, ":kp")
@@ -893,8 +922,10 @@ impl MlsSession {
                 ),
             ];
             // Our own commit: the hub echoes room fans back to the sender,
-            // and re-drives replay these exact bytes — recognize them.
-            self.register_known_replay(&commit_ct);
+            // and re-drives replay these exact bytes — register the replay
+            // id in the PROVIDER before the merge, so the merge's snapshot
+            // carries the id and the epoch atomically.
+            self.provider.note_replay(&commit_ct);
             self.record_write_ahead(epoch, &group_id_b64, &frames);
             self.persist_meta()?;
             let group = self.group.as_mut().expect("staged above");
@@ -903,19 +934,21 @@ impl MlsSession {
             {
                 if failure.merged_in_memory {
                     // The live group advanced but the durable snapshot did
-                    // not: KEEP the write-ahead (a later successful persist
-                    // makes the epoch durable and the batch re-drivable; a
-                    // crash reloads behind and prunes it) and fan nothing
-                    // yet — peers stay level with disk either way.
-                    tracing::warn!(error = %failure.error, "mls add merged in memory but the durable snapshot failed; retaining its write-ahead");
+                    // not: KEEP the write-ahead, fan nothing, and LATCH the
+                    // session (`snapshot_dirty`) — re-drives and further
+                    // MLS mutation stay blocked until a snapshot succeeds
+                    // (see `snapshot_recovered`), so neither a fan-before-
+                    // durable nor a newer epoch pruning this batch can
+                    // occur. A crash instead reloads behind and prunes.
+                    self.snapshot_dirty = true;
+                    tracing::warn!(error = %failure.error, "mls add merged in memory but the durable snapshot failed; latching until a snapshot succeeds");
                 } else {
                     // The merge itself failed: nothing advanced — the staged
-                    // transition is dead, discard its write-ahead (so it
-                    // cannot replay into a fork later) and its registry
-                    // entry (the bytes never fanned; nothing benign can
-                    // ever legitimately carry them).
+                    // transition is dead, discard its write-ahead so it
+                    // cannot replay into a fork later. (Its registry entry
+                    // is harmless: recognition only suppresses counting on
+                    // failure, never the processing itself.)
                     self.discard_write_ahead(epoch, &group_id_b64);
-                    self.known_replays.retain(|known| known != &commit_ct);
                     let _ = self.persist_meta();
                 }
                 return Err(failure.error);
@@ -980,8 +1013,11 @@ impl MlsSession {
             outbound.push(self.keyready_frame());
             // Re-drive retained transition frames: a member (re)appearing may
             // have missed the Commit/Welcome fan (encrypted joins get no
-            // backfill). Inert for anyone already at the epoch.
-            outbound.extend(self.pending_rebroadcast());
+            // backfill). Inert for anyone already at the epoch. Gated on a
+            // durable snapshot (see `join_frames`).
+            if self.snapshot_recovered() {
+                outbound.extend(self.pending_rebroadcast());
+            }
         }
         outbound.extend(self.keygets_for_addable());
         SessionEvent::Handled { outbound }
@@ -1022,6 +1058,13 @@ impl MlsSession {
     /// Remove a member as the elected owner, given verified evidence
     /// (REQ-014). Returns the deliver frame carrying commit + evidence.
     pub fn remove_with_evidence(&mut self, evidence: &RemovalEvidence) -> Result<String, MlsError> {
+        // Fail closed while a merged epoch is still undurable (see
+        // `snapshot_recovered` / `on_keypkg`).
+        if !self.snapshot_recovered() {
+            return Err(MlsError::NotReady(
+                "mls snapshot pending; deferring the removal until the epoch is durable".into(),
+            ));
+        }
         let creator = self
             .genesis
             .as_ref()
@@ -1052,17 +1095,17 @@ impl MlsSession {
             B64.encode(json),
             self.handle
         );
-        self.register_known_replay(&commit_ct);
+        self.provider.note_replay(&commit_ct);
         self.record_write_ahead(epoch, &group_id_b64, std::slice::from_ref(&frame));
         self.persist_meta()?;
         let group = self.group.as_mut().expect("staged above");
         // Same phase-split recovery as the Add path (see `on_keypkg`).
         if let Err(failure) = merge_staged_commit(&self.provider, group, "merge remove commit") {
             if failure.merged_in_memory {
-                tracing::warn!(error = %failure.error, "mls remove merged in memory but the durable snapshot failed; retaining its write-ahead");
+                self.snapshot_dirty = true;
+                tracing::warn!(error = %failure.error, "mls remove merged in memory but the durable snapshot failed; latching until a snapshot succeeds");
             } else {
                 self.discard_write_ahead(epoch, &group_id_b64);
-                self.known_replays.retain(|known| known != &commit_ct);
                 let _ = self.persist_meta();
             }
             return Err(failure.error);
@@ -1527,9 +1570,17 @@ mod tests {
         }
 
         // The COMMITTER recognizes its own retained commit bytes (registered
-        // at emit, persisted across the restart): the hub echo / re-drive
-        // replay is benign and never touches her counter — which the
-        // divergence check below depends on starting from zero.
+        // at emit, carried in the provider snapshot across the restart): the
+        // hub echo / re-drive replay is benign and never touches her counter
+        // — which the divergence check below depends on starting from zero.
+        // Heavy application-message churn first: own echoes live in a
+        // separate in-memory FIFO, so they can never evict the commit's
+        // registry entry.
+        for n in 0..40 {
+            let _ = alice2
+                .encrypt_outbound(&format!("(say @research :from @alice :text \"churn {n}\")"))
+                .unwrap();
+        }
         for _ in 0..3 {
             match alice2.handle_frame(&commit_deliver) {
                 SessionEvent::Dropped {
