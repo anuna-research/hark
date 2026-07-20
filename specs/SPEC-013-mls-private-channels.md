@@ -3,10 +3,10 @@ id: SPEC-013
 title: hark MLS — Agents in Encrypted Private Channels
 status: implementing
 tier: 1
-version: 0.9.2
+version: 0.10.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off; v0.8.1 folds the round-6 spot-check, GPT-5.x — gate cleared; v0.8.2 doc-only — affects-repos corrected after the cbcl-mls-wasm crate moved into cbcl-bus at e6fd708, see [[SPEC-013-cbcl-bus-interop-gap-review]]; v0.8.3 doc-only — status draft → implementing; v0.9.0 folds the two spec gaps the live REQ-010 interop run surfaced — REQ-025/REQ-026 fork-recovery (resync), ADR-007 creator-vs-owner roles, OQ-006 forged-resync residual — Claude Fable 5; v0.9.1 folds the fresh-context Principle-12 review of v0.9.0 (findings F1–F8, [[SPEC-013-resync-review-findings]]): resync-request authentication upgraded SHOULD→SHALL closing the forged-eviction vector (F1), discard scoped to the group_id preserving init keys (F8), creator∧elected-owner precondition (F3), validate-then-remove-then-add (F5), named constants + lettered atomic clauses (F7); v0.9.2 folds a SECOND Principle-12 re-review (#1–#5): resync nonce made strictly-monotonic + a creator freshness check closing the capture-and-replay eviction the signature alone missed (#1, fixed + deployed + tested S6), RESYNC_RATE window redefined wall-clock not per-epoch (#2), REQ-026c remove-then-add residual stated (#3), atomicity/constant-naming cleanups (#4/#5); STILL needs a cross-VENDOR Principle-12 pass before approval)
-last-updated: 2026-07-13
+author: Anuna Research (drafted with Claude Opus 4.8; v0.6 folds round-3 findings + §10 spike evidence; v0.7 folds round-4 findings, Claude Fable 5; v0.7.1 folds round-5 tightenings; v0.7.2 threads the executed R5-03 probe evidence; v0.8.0 records the Tier-1 sign-off; v0.8.1 folds the round-6 spot-check, GPT-5.x — gate cleared; v0.8.2 doc-only — affects-repos corrected after the cbcl-mls-wasm crate moved into cbcl-bus at e6fd708, see [[SPEC-013-cbcl-bus-interop-gap-review]]; v0.8.3 doc-only — status draft → implementing; v0.9.0 folds the two spec gaps the live REQ-010 interop run surfaced — REQ-025/REQ-026 fork-recovery (resync), ADR-007 creator-vs-owner roles, OQ-006 forged-resync residual — Claude Fable 5; v0.9.1 folds the fresh-context Principle-12 review of v0.9.0 (findings F1–F8, [[SPEC-013-resync-review-findings]]): resync-request authentication upgraded SHOULD→SHALL closing the forged-eviction vector (F1), discard scoped to the group_id preserving init keys (F8), creator∧elected-owner precondition (F3), validate-then-remove-then-add (F5), named constants + lettered atomic clauses (F7); v0.9.2 folds a SECOND Principle-12 re-review (#1–#5): resync nonce made strictly-monotonic + a creator freshness check closing the capture-and-replay eviction the signature alone missed (#1, fixed + deployed + tested S6), RESYNC_RATE window redefined wall-clock not per-epoch (#2), REQ-026c remove-then-add residual stated (#3), atomicity/constant-naming cleanups (#4/#5); STILL needs a cross-VENDOR Principle-12 pass before approval; v0.10.0 folds the TWO coordinated amendments [[SPEC-024-mls-delivery-service]] §7.4 requires — (i) the owner-renamer committer-authorization carve-out in [[SPEC-013-mls-private-channels#REQ-016]]/[[SPEC-013-mls-private-channels#REQ-017]] (next-elected owner commits the current owner's covered self-Remove), (ii) the supersession-authorized exception to [[SPEC-013-mls-private-channels#REQ-012]](c) no-silent-replacement — both Tier-1 surface, reviewed in the same SPEC-024 Tier-1 pass)
+last-updated: 2026-07-20
 owner-repo: hark
 affects-repos: cbcl-bus (hub + web client + in-repo cbcl-mls-wasm crate + vendored artifact — the crate moved in from cbcl-chat at e6fd708, 2026-06-10)
 review-gate: CLEARED for implementation 2026-06-10 (human sign-off: docs/decisions/SPEC-013-tier1-signoff.md — all residuals A–H explicitly accepted, D-1/D-2 ratified, ADRs APPROVED. **Condition K satisfied**: round-6 independent spot-check by GPT-5.x confirmed R5-01 (closed with the retry-cost caveat, folded as K-1), R5-02, R5-03, and endorsed D-1/D-2 — docs/decisions/SPEC-013-round6-spotcheck-findings.md; no re-block. Remaining conditions live INSIDE IMPL: A-t no-collision property test, I durable-provider delete fidelity, J cbcl_ristretto audit (IMPL-016), K-1 remove-race retry test, K-2 creator-capability guard. History: rounds 1–2 → v0.3; ADR-006 → v0.4; OQ-004/005 → v0.5; round-3 → v0.6; round-4 → v0.7; round-5 → v0.7.1/v0.7.2; sign-off → v0.8.0; round-6 → v0.8.1)
@@ -251,7 +251,26 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   leaf-vs-pin check (d) is the predicate with teeth. For an all-first-contact tree (no pins
   yet), the joiner SHALL pin TOFU and **require [[#REQ-021]] safety-number confirmation**
   before treating the group as authentic. An unbound/unauthorised/pin-violating Welcome
-  SHALL be rejected. Trace: `[[#TEST-012]]`. *(Closes BUG-002; closes R3-08 Welcome path.)*
+  SHALL be rejected. **Supersession exception to (c) (v0.10.0 — coordinated
+  [[SPEC-024-mls-delivery-service#REQ-007]](d) amendment):** clause (c)'s
+  no-silent-replacement rule admits exactly ONE exception — a genesis-supersession chain
+  link that the client has verified against **the creator wire key bound inside its own held
+  copy of the superseded group's in-group genesis extension** (NOT the [[#REQ-011]] handle→key
+  pin store: a returning holder of the superseded group provably holds that group's
+  MLS-authenticated genesis, so the creator key is always available there even if the client
+  never observed a creator-signed idkey and thus holds no REQ-011 pin — the REQ-011 reading
+  would wedge exactly the returning holder this exception exists to unwedge) — the
+  [[SPEC-024-mls-delivery-service#REQ-007]](a) domain-separated
+  envelope: DS label ‖ room ‖ hash of the superseded blob ‖ monotonic counter ‖ new blob)
+  authorises discarding the superseded group locally and treating the successor genesis
+  under first-contact rules — i.e. TOFU with the **mandatory [[#REQ-021]] safety-number
+  prompt**, never an automatic silent join. Anything short of that verified chain link —
+  hub fiat, an unverifiable envelope, a link signed by a key other than the pinned
+  superseded creator's — remains a hard (c) reject. Without this exception every returning
+  holder of a legitimately superseded group (the sole-member rename ceremony,
+  [[SPEC-024-mls-delivery-service#REQ-006]](c)) wedges fail-closed with no exit.
+  Trace: `[[#TEST-012]]`. *(Closes BUG-002; closes R3-08 Welcome path; supersession
+  exception added v0.10.0 for [[SPEC-024-mls-delivery-service]].)*
 - **REQ-013 — Single-use KeyPackages (client-enforced, delete-after-successful-join).**
   Single-use SHALL be enforced **client-side** (the directory is the untrusted hub). The
   consume sequence SHALL be strictly ordered: **(1) decrypt the Welcome → (2) pass full
@@ -290,7 +309,21 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
     single-party membership-shrink authority only because the evidence is signed by the
     creator's pinned key, attributable to that creator, and membership-visible via the
     [[#REQ-021]] identity safety number; it does not let the creator add attacker keys or
-    break confidentiality by itself. *(Residuals, documented: if the creator is itself gone,
+    break confidentiality by itself.
+    **(v0.10.0 — adder-of-record generalisation, coordinated [[SPEC-024-mls-delivery-service#REQ-002]](d2)
+    amendment, Tier-1 surface.)** The `added_by` adder authority above was scoped in the text to a
+    SPEC-016 *agent's* `added_by`; it is hereby generalised to **any member whose committed Add seated
+    the target's current leaf** — the "adder of record" — for ANY target (human or agent). This is
+    required by the [[SPEC-024-mls-delivery-service]] admitted-but-stateless recovery: a member whose
+    Welcome was dropped is a live leaf that never joined and can never sign its own `bye`, so the member
+    that added it must be able to remove-and-re-add it. The adder-of-record proves its authority with the
+    same `cbcl-mls-remove/v1` evidence object, additionally binding **the seq of the welcome event whose
+    `:to` named the target** ([[SPEC-024-mls-delivery-service#CON-001]]) so every validator can confirm
+    (against the hub-sequenced log, or the evidence's self-contained fields) that the signer is indeed the
+    adder of that leaf. Where the adder-of-record is itself unavailable, the **creator fallback** above
+    already covers the removal (a superset authority), so recovery is never a dead end. The residual
+    (a malicious adder can evict a member it added) is strictly narrower than the already-accepted
+    malicious-creator residual and is bounded by the same [[#REQ-021]] membership-visibility. *(Residuals, documented: if the creator is itself gone,
     an unresponsive member persists in the group until an authorized remover is available —
     availability-class; a malicious creator can unilaterally evict live members —
     authority/integrity-class. Both ACCEPTED by the 2026-06-10 sign-off —
@@ -361,6 +394,30 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   the capability or the group bricks on first use; implementations SHALL therefore
   **assert the capability at group-creation time** (fail before the first real Commit —
   round-6 K-2, §9).
+  **Owner-departure carve-out to committer authorization (v0.10.0 — coordinated
+  [[SPEC-024-mls-delivery-service#REQ-006]](a) amendment, Tier-1 surface).** As stated
+  above, only the elected owner commits — but [[RFC 9420]] §12.2 forbids a member
+  committing its own removal, so an elected owner that must leave (the
+  [[SPEC-024-mls-delivery-service#REQ-006]] rename ceremony, or any voluntary owner
+  departure) deadlocks: while its leaf stands it remains the elected owner, and nobody
+  else is authorised to commit. Validators SHALL therefore accept a
+  **remove-the-current-owner Commit** from the member that would be the [[#REQ-004]]
+  elected owner **over the tree minus the proposed-removed leaf**, if and only if ALL of:
+  (i) the Commit covers the current owner's own **self-Remove proposal** (proposed by the
+  owner, targeting the owner's own leaf); and (ii) that proposal carries or references the
+  owner's **[[#REQ-014]](a) self-signed `bye` evidence** at the validator's current epoch
+  (the normal REQ-014/[[#REQ-017]](d) evidence check, unchanged). A remove-the-owner Commit
+  from any other member, or one lacking the covered self-Remove proposal or its evidence,
+  SHALL be rejected exactly as before. This changes ONLY the committer-authorization
+  predicate for this one Commit shape (matching [[SPEC-024-mls-delivery-service#REQ-006]](a)
+  exactly — two conditions, no more). It does **NOT** exempt any *other* proposal the Commit
+  happens to cover from its own validation: because [[#REQ-017]] independently validates
+  **every** covered proposal (an Add still needs its REQ-008/REQ-011 pin+key checks, a
+  Remove still needs its own REQ-014 evidence), the borrowed committer-authority cannot
+  smuggle an unauthorised membership change — so no "no other proposals" restriction is
+  needed (and imposing one would wrongly reject the standard OpenMLS commit path, which
+  covers all pending proposals). The carve-out substitutes the *who-may-commit* check alone;
+  leaf/pin checks and every other [[#REQ-017]] clause apply unchanged to the whole Commit.
   At channel `claim` the hub SHALL record a **creator handle**
   (today `cbcl-room` stores none — affected-repo change), but that record is **bookkeeping,
   not trust** — it is hub-asserted. The hub cannot fabricate MLS membership inside an
@@ -418,8 +475,10 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
   extension as a member capability requirement. The current wasm glue merges/stores protocol
   messages with **no** app checks
   (`cbcl-mls-wasm/src/lib.rs`) — a defect this REQ corrects (R4-05). Commits SHALL originate
-  from an **authorised committer** ([[#REQ-016]]); unauthorised or unvalidated proposals SHALL
-  NOT be stored or merged. Trace: `[[#TEST-017]]`. *(Closes BUG-008; closes R3-07 — reopened
+  from an **authorised committer** ([[#REQ-016]]) — which, since v0.10.0, includes exactly one
+  additional shape: the [[#REQ-016]] owner-departure carve-out (next-elected owner committing
+  the current owner's evidence-covered self-Remove, and nothing else); unauthorised or
+  unvalidated proposals SHALL NOT be stored or merged. Trace: `[[#TEST-017]]`. *(Closes BUG-008; closes R3-07 — reopened
   `:from` forgery via the Update path; closes R4-02 at the validator and R4-05's open
   proposal surface.)*
 - **REQ-018 — Sender-authenticated `:from`.** The agent SHALL obtain the **authenticated
