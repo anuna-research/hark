@@ -98,7 +98,12 @@ impl ChatError {
     /// * `JoinRejected` (forbidden-room / no-such-channel / bad-signature):
     ///   the membership decision is final. With the hub's identity-bound
     ///   resume admission, a legitimately re-admissible agent is never
-    ///   rejected, so a rejection is authoritative.
+    ///   rejected, so a rejection is authoritative — EXCEPT the hub's
+    ///   `admission-store-unavailable` slug, which it emits when the
+    ///   admission transaction aborted (e.g. its resume store is down
+    ///   mid-restart): that is a storage fault, not a verdict, and the hub
+    ///   keeps it distinct from `forbidden-room` precisely so reconnecting
+    ///   clients retry instead of terminating.
     /// * `DowngradeRefused` (REQ-023): the `MlsSession` is now permanently
     ///   downgrade-refused; a later `:enc true` must NOT be read as recovery.
     /// * `UndeclaredDialect` / `Hello` (announce-invalid / MLS build): a local
@@ -109,8 +114,8 @@ impl ChatError {
             ChatError::ConnectionFailed(_)
             | ChatError::HelloSendFailed(_)
             | ChatError::JoinTimeout(_) => true,
-            ChatError::JoinRejected(_)
-            | ChatError::DowngradeRefused(_)
+            ChatError::JoinRejected(slug) => slug == "admission-store-unavailable",
+            ChatError::DowngradeRefused(_)
             | ChatError::UndeclaredDialect { .. }
             | ChatError::Hello(_)
             | ChatError::Store(_) => false,
@@ -1352,9 +1357,14 @@ mod tests {
         assert!(ChatError::ConnectionFailed("reset".into()).is_retryable());
         assert!(ChatError::HelloSendFailed("broken pipe".into()).is_retryable());
         assert!(ChatError::JoinTimeout(Duration::from_secs(10)).is_retryable());
+        // The hub's admission-store fault slug is a storage outage, not a
+        // membership verdict — the hub emits it distinctly from
+        // forbidden-room so the reconnect loop retries once storage recovers.
+        assert!(ChatError::JoinRejected("admission-store-unavailable".into()).is_retryable());
 
         // PERMANENT: fail-closed, terminate the reconnect loop.
         assert!(!ChatError::JoinRejected("forbidden-room".into()).is_retryable());
+        assert!(!ChatError::JoinRejected("no-such-channel".into()).is_retryable());
         assert!(!ChatError::DowngradeRefused("enc pin".into()).is_retryable());
         assert!(
             !ChatError::UndeclaredDialect {
