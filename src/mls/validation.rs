@@ -673,6 +673,7 @@ mod tests {
             &mut bob.pins,
             &mut bob.ledger,
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(joined.trust, GenesisTrust::Authoritative);
@@ -1035,6 +1036,7 @@ mod tests {
             &mut charlie.pins,
             &mut charlie.ledger,
             None,
+            &[],
         )
         .unwrap();
         let charlie_group = joined.group;

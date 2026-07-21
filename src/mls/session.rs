@@ -167,10 +167,20 @@ pub struct MlsSession {
 /// still-unfanned batch). Recovery is an explicit command
 /// ([`MlsSession::recover_durability`]) issued at the event boundaries —
 /// never a side effect hidden inside a query.
+///
+/// A successful recovery moves to `FanPending`, NOT straight to `Durable`:
+/// the batch merged during the failure window has never been returned for
+/// fan-out, so mutation must stay blocked until
+/// [`MlsSession::take_rebroadcast`] hands the batch to a caller that emits
+/// frames. Unlocking on the bare persist would let the very next queued
+/// event (e.g. a `keypkg`) merge another transition whose prune deletes the
+/// still-unfanned batch — stranding the peers and the invitee it alone can
+/// advance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DurabilityState {
     Durable,
     SnapshotPending,
+    FanPending,
 }
 
 /// How many of this member's own outbound application ciphertexts are kept
@@ -437,10 +447,9 @@ impl MlsSession {
         // later-returning members at the old epoch — and a local write is no
         // proof of fan-out, so these were never dequeued on send. Gated on a
         // durable snapshot: fanning an epoch disk does not yet have would
-        // let a crash reload this sender behind its peers.
-        if self.is_durable() {
-            frames.extend(self.pending_rebroadcast());
-        }
+        // let a crash reload this sender behind its peers. This hand-off also
+        // completes a `FanPending` recovery (see `take_rebroadcast`).
+        frames.extend(self.take_rebroadcast());
         // A rejoin means the hub restarted or dropped us: presence knowledge
         // is stale, so forget it — the next presence fan then treats every
         // member as newly seen, re-running the idkey/keyready/pending
@@ -680,7 +689,7 @@ impl MlsSession {
         let Some(performative) = head_symbol(text) else {
             return SessionEvent::NotMls;
         };
-        match performative.as_str() {
+        let mut event = match performative.as_str() {
             "roomcfg" => match self.on_roomcfg(text) {
                 Ok(()) => SessionEvent::NotMls, // also a join ack; let the loop see it
                 Err(e) => SessionEvent::Dropped {
@@ -694,7 +703,20 @@ impl MlsSession {
             "keypkg" => self.on_keypkg(text),
             "presence" if self.enc_pinned => self.on_presence(text),
             _ => SessionEvent::NotMls,
+        };
+        // A `FanPending` recovery completes at the first outbound-capable
+        // event: the batch merged during the snapshot-failure window rides
+        // out ahead of this event's own frames, and only that hand-off
+        // unlocks mutation — so no later transition can prune the batch
+        // before it was ever offered to peers.
+        if self.durability == DurabilityState::FanPending {
+            if let SessionEvent::Handled { outbound } = &mut event {
+                let mut frames = self.take_rebroadcast();
+                frames.append(outbound);
+                *outbound = frames;
+            }
         }
+        event
     }
 
     /// REQ-019: verify and pin from a fanned `idkey` assertion. Pinning a
@@ -739,7 +761,8 @@ impl MlsSession {
         // `:for` may be a single handle OR a list — one Welcome serves every
         // member a commit added (RFC 9420 §12.4.3.1); a list-valued `:for`
         // naming us must not read as "not for us".
-        if !kw_symbols(text, ":for").iter().any(|t| t == &self.handle) {
+        let addressees = kw_symbols(text, ":for");
+        if !addressees.iter().any(|t| t == &self.handle) {
             return SessionEvent::Handled { outbound: vec![] };
         }
         // SPEC-024 REQ-002(a): the hub stamps the fanned welcome with its log
@@ -769,6 +792,7 @@ impl MlsSession {
                 &mut self.pins,
                 &mut self.ledger,
                 existing.as_deref(),
+                &addressees,
             )?;
             self.group = Some(outcome.group);
             self.genesis = Some(outcome.genesis);
@@ -786,6 +810,16 @@ impl MlsSession {
                 tracing::debug!(error = %e, "welcome while a group exists (redelivery or rival) — refused, acked");
                 SessionEvent::Handled { outbound: ack }
             }
+            Err(e) if !ack.is_empty() => {
+                // SPEC-024 REQ-002(a): the queue is receipt-acked regardless
+                // of join success. A first-contact welcome that fails to join
+                // (malformed ciphertext, a pin conflict) is refused — but
+                // dropping the ack too would leave the hub retaining and
+                // redelivering the same dead entry until TTL, occupying
+                // per-addressee queue capacity on every reconnect.
+                tracing::warn!(error = %e, "welcome addressed to us failed to join — refused, receipt acked");
+                SessionEvent::Handled { outbound: ack }
+            }
             Err(e) => SessionEvent::Dropped {
                 reason: e.to_string(),
                 probable_fork: false,
@@ -793,32 +827,58 @@ impl MlsSession {
         }
     }
 
-    /// The pure durability query — every gate reads this; none of them
-    /// performs recovery as a side effect.
+    /// The pure durability query — every mutation gate reads this; none of
+    /// them performs recovery as a side effect. Strictly `Durable`: a
+    /// `FanPending` session is snapshot-durable but still mutation-blocked
+    /// until its recovered batch is handed out (see [`Self::take_rebroadcast`]).
     fn is_durable(&self) -> bool {
         self.durability == DurabilityState::Durable
     }
 
     /// The explicit recovery COMMAND for [`DurabilityState::SnapshotPending`]:
     /// retry the provider persist; on success, complete the deferred
-    /// write-ahead prune and return to Durable. Issued at the event
-    /// boundaries — the top of [`Self::handle_frame`] and of every public
-    /// mutator — so no code path can forget it and no query hides it.
+    /// write-ahead prune and move to [`DurabilityState::FanPending`] —
+    /// mutation unlocks only when [`Self::take_rebroadcast`] returns the
+    /// recovered batch for fan-out. Issued at the event boundaries — the top
+    /// of [`Self::handle_frame`] and of every public mutator — so no code
+    /// path can forget it and no query hides it.
     fn recover_durability(&mut self) {
-        if self.durability == DurabilityState::Durable {
+        if self.durability != DurabilityState::SnapshotPending {
             return;
         }
         match self.provider.persist() {
             Ok(()) => {
-                self.durability = DurabilityState::Durable;
-                tracing::info!("mls provider snapshot recovered; epoch durable again");
                 self.prune_write_aheads();
+                // The batch merged during the failure window was never
+                // returned to a caller, so it has not been fanned: stay
+                // mutation-blocked until it is (see `DurabilityState`).
+                self.durability = if self.pending_rebroadcast().is_empty() {
+                    DurabilityState::Durable
+                } else {
+                    DurabilityState::FanPending
+                };
+                tracing::info!("mls provider snapshot recovered; epoch durable again");
                 let _ = self.persist_meta();
             }
             Err(error) => {
                 tracing::warn!(error = %error, "mls provider snapshot still failing; replay and mutation stay blocked");
             }
         }
+    }
+
+    /// Hand the retained current-epoch transition frames to a caller that
+    /// will emit them — the act that completes a [`DurabilityState::FanPending`]
+    /// recovery and unlocks mutation. While the snapshot is still failing
+    /// nothing may fan, so this returns empty and the state is untouched.
+    fn take_rebroadcast(&mut self) -> Vec<String> {
+        if self.durability == DurabilityState::SnapshotPending {
+            return Vec::new();
+        }
+        if self.durability == DurabilityState::FanPending {
+            tracing::info!("recovered mls transition batch handed off for fan-out; mutation unlocked");
+            self.durability = DurabilityState::Durable;
+        }
+        self.pending_rebroadcast()
     }
 
     /// The single transaction through which every AUTHORED transition (Add,
@@ -836,7 +896,8 @@ impl MlsSession {
     ///    rollback. Snapshot-phase failure → the in-memory group is ahead of
     ///    disk: keep the write-ahead, fan nothing, enter
     ///    [`DurabilityState::SnapshotPending`] (re-drives and mutation stay
-    ///    blocked until [`Self::recover_durability`] succeeds; a crash
+    ///    blocked until [`Self::recover_durability`] succeeds AND
+    ///    [`Self::take_rebroadcast`] hands the batch out for fan-out; a crash
     ///    instead reloads behind and the open-time prune discards the WAL).
     /// 3. **Prune** superseded write-aheads. A cleanup persist failure never
     ///    suppresses the frames — the transition is already durable, and
@@ -2278,6 +2339,140 @@ mod tests {
 
         let _ = fs::remove_dir_all(&a_dir);
         let _ = fs::remove_dir_all(&b_dir);
+    }
+
+    /// Fault injection — recovery must NOT unlock mutation before the batch
+    /// merged during the failure window is handed out for fan-out: a queued
+    /// `keypkg` arriving right after the snapshot recovers is deferred (its
+    /// merge would prune the still-unfanned batch, stranding the first
+    /// invitee), the batch rides the next outbound-capable event, and only
+    /// then does the second add proceed — both invitees end up seated.
+    #[test]
+    fn recovered_batch_fans_before_mutation_unlocks() {
+        let (a_dir, a_wire) = setup("fanpend", 106, "@alice");
+        let (b_dir, b_wire) = setup("fanpend", 107, "@bob");
+        let (c_dir, c_wire) = setup("fanpend", 108, "@carol");
+        let mut alice =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
+        let mut bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
+        let mut carol =
+            MlsSession::open(&c_dir, "carol", "@research", "@carol", &c_wire, true).unwrap();
+        let b_frames = bob.join_frames().unwrap();
+        let c_frames = carol.join_frames().unwrap();
+        let _ = alice.handle_frame(&b_frames[1]);
+        let _ = alice.handle_frame(&c_frames[1]);
+        alice.create_group_as_creator().unwrap();
+        let _ = alice.handle_frame("(presence @research :members (@alice @bob @carol))");
+        let kp_b64 = |frames: &[String]| {
+            let onetime = kw_value(&frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+        let bob_keypkg = format!("(keypkg @hub :for @bob :kp \"{}\")", kp_b64(&b_frames));
+        let carol_keypkg = format!("(keypkg @hub :for @carol :kp \"{}\")", kp_b64(&c_frames));
+
+        // Bob's add merges in memory but its snapshot fails: the batch that
+        // alone can seat bob is retained, unfanned.
+        fs::create_dir(a_dir.join("alice.tmp")).unwrap();
+        match alice.handle_frame(&bob_keypkg) {
+            SessionEvent::Dropped { .. } => {}
+            other => panic!("expected the add to fail under the snapshot fault, got {other:?}"),
+        }
+        fs::remove_dir(a_dir.join("alice.tmp")).unwrap();
+
+        // The fault has cleared, so this event's boundary recovers the
+        // snapshot — but carol's add must STILL be deferred: merging it here
+        // would prune bob's unfanned batch.
+        match alice.handle_frame(&carol_keypkg) {
+            SessionEvent::Dropped { .. } => {}
+            other => panic!("an add right after recovery must stay deferred, got {other:?}"),
+        }
+        assert!(
+            alice
+                .pending_rebroadcast()
+                .iter()
+                .any(|f| f.starts_with("(welcome @research")),
+            "bob's unfanned welcome must survive the deferred add"
+        );
+
+        // The next outbound-capable event carries the recovered batch out;
+        // bob is seated from it, and mutation unlocks.
+        let SessionEvent::Handled { outbound } =
+            alice.handle_frame("(presence @research :members (@alice @bob @carol))")
+        else {
+            panic!("presence is handled")
+        };
+        let welcome = outbound
+            .iter()
+            .find(|f| f.starts_with("(welcome @research"))
+            .expect("the recovered batch rides the first outbound event")
+            .clone();
+        assert!(matches!(
+            bob.handle_frame(&welcome),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(bob.joined(), "the recovered welcome seats the first invitee");
+        assert!(
+            alice.encrypt_outbound("(say @research :from @alice)").is_ok(),
+            "mutation unlocks once the batch was handed out"
+        );
+
+        // Carol's add now proceeds; both invitees end up members.
+        let SessionEvent::Handled { outbound } = alice.handle_frame(&carol_keypkg) else {
+            panic!("the deferred add succeeds after the fan hand-off")
+        };
+        assert_eq!(outbound.len(), 2, "commit fan + welcome");
+        assert!(matches!(
+            bob.handle_frame(&outbound[0]),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(matches!(
+            carol.handle_frame(&outbound[1]),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(carol.joined(), "the second invitee is seated after the first");
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+        let _ = fs::remove_dir_all(&c_dir);
+    }
+
+    /// SPEC-024 REQ-002(a): the per-addressee welcome queue is receipt-acked
+    /// regardless of join success — a stamped welcome that FAILS to join
+    /// while no group exists (malformed ciphertext, a pin conflict) is
+    /// refused but still acked, so the hub prunes the dead entry instead of
+    /// redelivering it until TTL on every reconnect.
+    #[test]
+    fn rejected_first_contact_welcome_still_acks_receipt() {
+        let (dir, wire) = setup("wack", 109, "@bella");
+        let mut bella =
+            MlsSession::open(&dir, "bella", "@research", "@bella", &wire, true).unwrap();
+        let garbage = B64.encode(b"not a welcome");
+        let stamped =
+            format!("(welcome @research :seq 9 :for @bella :ct \"{garbage}\" :from @alice)");
+        let SessionEvent::Handled { outbound } = bella.handle_frame(&stamped) else {
+            panic!("a stamped invalid welcome is refused but acked")
+        };
+        assert_eq!(
+            outbound,
+            vec!["(mlsack @research :seq 9 :from @bella)".to_string()],
+            "receipt is acked so the queue prunes"
+        );
+        assert!(!bella.joined(), "the invalid welcome must not join");
+
+        // An UNSTAMPED invalid welcome has no queue entry to prune: Dropped.
+        let unstamped = format!("(welcome @research :for @bella :ct \"{garbage}\" :from @alice)");
+        assert!(matches!(
+            bella.handle_frame(&unstamped),
+            SessionEvent::Dropped { .. }
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// End-to-end over the wire-frame layer (TEST-001/003/005/006/010-shape):

@@ -594,6 +594,11 @@ pub struct JoinOutcome {
 /// pin-checked validation. On ANY rejection the provider is rolled back to
 /// its durable state, leaving the one-time init key intact (REQ-013); only
 /// a successful join persists (which deletes the consumed key from disk).
+///
+/// `co_added` is the frame's `:for` addressee list — every member the
+/// Welcome's commit added (SPEC-024 REQ-002(a)); the joiner itself is
+/// excluded from the pre-add roster regardless of its presence here.
+#[allow(clippy::too_many_arguments)]
 pub fn join_from_welcome(
     provider: &DurableProvider,
     identity: &MlsIdentity,
@@ -602,6 +607,7 @@ pub fn join_from_welcome(
     pins: &mut PinStore,
     ledger: &mut ConsumedLedger,
     existing_group: Option<&[u8]>,
+    co_added: &[String],
 ) -> Result<JoinOutcome, MlsError> {
     // (c) No silent replacement of an existing group for this room.
     if existing_group.is_some() {
@@ -644,7 +650,7 @@ pub fn join_from_welcome(
         }
     };
 
-    match validate_staged_welcome(&staged, room, pins, &identity.handle) {
+    match validate_staged_welcome(&staged, room, pins, &identity.handle, co_added) {
         Ok(()) => {}
         Err(e) => {
             provider.rollback_to_disk()?;
@@ -730,6 +736,7 @@ fn validate_staged_welcome(
     _room: &str,
     pins: &PinStore,
     joiner_handle: &str,
+    co_added: &[String],
 ) -> Result<(), MlsError> {
     // (d) Full-tree leaf-vs-pin: every leaf whose handle is pinned must
     // carry exactly the pinned key; an unpinned key for a pinned handle is a
@@ -751,15 +758,21 @@ fn validate_staged_welcome(
 
     // (b) Authorised committer: the Welcome's sender must be the elected
     // owner of the membership BEFORE this Add — i.e. the delivered tree minus
-    // the joiner being added by this commit. This is what makes REQ-016
-    // bootstrap work: when the room creator (sole member) adds the first
-    // member, the post-Add tree's elected owner may be the newcomer, but the
-    // committer's authority comes from owning the *pre-Add* group (just the
-    // creator). For a steady-state add the pre-Add set is every prior member,
-    // so the current elected owner is the only authorised committer. NOT
-    // sufficient alone (circular over a fabricated tree — REQ-012 documents
-    // this); (d) is the predicate with teeth, plus the caller's genesis check.
-    // (Assumes one joiner per Welcome, which is hark's add flow.)
+    // EVERY leaf the commit added. This is what makes REQ-016 bootstrap work:
+    // when the room creator (sole member) adds the first member, the post-Add
+    // tree's elected owner may be the newcomer, but the committer's authority
+    // comes from owning the *pre-Add* group (just the creator). For a
+    // steady-state add the pre-Add set is every prior member, so the current
+    // elected owner is the only authorised committer. A multi-add Welcome
+    // (SPEC-024 REQ-002(a): one Welcome per commit, a list-valued `:for`)
+    // names its whole added set in `co_added` — removing only the joiner
+    // would treat a co-added handle that sorts before the true owner as a
+    // pre-existing member and reject the valid owner-authored Welcome.
+    // `co_added` is hub/sender-supplied and unauthenticated, but that grants
+    // no new power: the whole tree this roster derives from is
+    // committer-supplied too, which is why (b) is NOT sufficient alone
+    // (circular over a fabricated tree — REQ-012 documents this); (d) is the
+    // predicate with teeth, plus the caller's genesis check.
     let sender = staged
         .welcome_sender()
         .map_err(MlsError::stack("welcome sender"))?;
@@ -767,7 +780,7 @@ fn validate_staged_welcome(
     let sender_key = sender.signature_key().as_slice().to_vec();
     let pre_add: Vec<(String, Vec<u8>)> = bindings
         .iter()
-        .filter(|(handle, _)| handle != joiner_handle)
+        .filter(|(handle, _)| handle != joiner_handle && !co_added.contains(handle))
         .cloned()
         .collect();
     // Creator-preferred election over the pre-add roster: the genesis creator
@@ -968,6 +981,7 @@ mod tests {
             &mut bob.pins,
             &mut bob.ledger,
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(joined.trust, GenesisTrust::Authoritative);
@@ -994,6 +1008,7 @@ mod tests {
             &mut bob.pins,
             &mut { ledger },
             None,
+            &[],
         );
         assert!(
             replay.is_err(),
@@ -1130,6 +1145,7 @@ mod tests {
             &mut bob.pins,
             &mut bob.ledger,
             None,
+            &[],
         ) else {
             panic!("pin-violating welcome must reject");
         };
@@ -1157,6 +1173,7 @@ mod tests {
             &mut bob.pins,
             &mut bob.ledger,
             None,
+            &[],
         )
         .expect("honest welcome must still join after the junk one was rejected");
 
@@ -1199,6 +1216,7 @@ mod tests {
             &mut bob.pins,
             &mut bob.ledger,
             None,
+            &[],
         ) else {
             panic!("wrong-room welcome must reject");
         };
@@ -1213,6 +1231,7 @@ mod tests {
             &mut bob.pins,
             &mut bob.ledger,
             Some(b"existing-group-id"),
+            &[],
         ) else {
             panic!("existing group must refuse replacement");
         };
@@ -1220,6 +1239,127 @@ mod tests {
 
         let _ = fs::remove_dir_all(&alice.dir);
         let _ = fs::remove_dir_all(&bob.dir);
+    }
+
+    /// REQ-012 (b) over a MULTI-ADD Welcome (SPEC-024 REQ-002(a) — one
+    /// Welcome serves every member a commit added): the pre-add roster must
+    /// exclude EVERY leaf the commit added, not just the joiner itself.
+    /// After the genesis creator leaves, the owner commits ONE Add of two
+    /// members where the co-added handle sorts before the owner: without the
+    /// co-added set the co-added leaf is mistaken for a pre-existing owner
+    /// and the valid owner-authored Welcome is rejected.
+    #[test]
+    fn multi_add_welcome_validates_the_true_pre_add_roster() {
+        use super::super::keypackages::build_one_time;
+        use tls_codec::Serialize as _;
+
+        let mut alice = party("madd", 50, "@alice"); // genesis creator, will leave
+        let mut owen = party("madd", 51, "@owen"); // the true owner post-departure
+        let mut bob = party("madd", 52, "@bob"); // co-added; sorts before @owen
+        let mut carol = party("madd", 53, "@carol"); // the validating joiner
+        pin_each_other(&mut [&mut alice, &mut owen, &mut bob, &mut carol]);
+
+        let (mut a_group, _genesis) =
+            create_group(&alice.provider, &alice.identity, "@research").unwrap();
+        let owen_kp = build_one_time(&owen.provider, &owen.identity, 1)
+            .unwrap()
+            .remove(0);
+        let outcome = add_member(
+            &alice.provider,
+            &alice.identity,
+            &mut a_group,
+            &owen_kp.bytes,
+            "@owen",
+            &alice.pins,
+            &alice.ledger,
+        )
+        .unwrap();
+        let mut o_group = join_from_welcome(
+            &owen.provider,
+            &owen.identity,
+            &outcome.welcome_bytes,
+            "@research",
+            &mut owen.pins,
+            &mut owen.ledger,
+            None,
+            &[],
+        )
+        .unwrap()
+        .group;
+
+        // The creator departs (raw openmls — the REQ-014 evidence machinery
+        // is out of scope here): owen is now the sole member, elected by the
+        // lex fallback since the genesis creator is no longer a live leaf.
+        let alice_index = o_group
+            .members()
+            .find(|m| credential_handle(&m.credential).unwrap() == "@alice")
+            .unwrap()
+            .index;
+        o_group
+            .remove_members(&owen.provider, &owen.identity.signer, &[alice_index])
+            .unwrap();
+        o_group.merge_pending_commit(&owen.provider).unwrap();
+
+        // ONE commit adds both @bob and @carol; one Welcome serves both.
+        let bob_kp = validate_key_package_bytes(
+            &owen.provider,
+            &build_one_time(&bob.provider, &bob.identity, 1)
+                .unwrap()
+                .remove(0)
+                .bytes,
+        )
+        .unwrap();
+        let carol_kp = validate_key_package_bytes(
+            &owen.provider,
+            &build_one_time(&carol.provider, &carol.identity, 1)
+                .unwrap()
+                .remove(0)
+                .bytes,
+        )
+        .unwrap();
+        let (_commit, welcome, _group_info) = o_group
+            .add_members(&owen.provider, &owen.identity.signer, &[bob_kp, carol_kp])
+            .unwrap();
+        o_group.merge_pending_commit(&owen.provider).unwrap();
+        let welcome_bytes = welcome.tls_serialize_detached().unwrap();
+
+        // Without the co-added set, @bob lands in the reconstructed pre-add
+        // roster, sorts before @owen, and the VALID Welcome is rejected.
+        let err = join_from_welcome(
+            &carol.provider,
+            &carol.identity,
+            &welcome_bytes,
+            "@research",
+            &mut carol.pins,
+            &mut carol.ledger,
+            None,
+            &[],
+        );
+        assert!(
+            matches!(&err, Err(MlsError::Rejected(m)) if m.contains("REQ-012b")),
+            "expected the mis-elected pre-add rejection"
+        );
+
+        // With the frame's `:for` set threaded through, the pre-add roster
+        // is exactly {@owen} and the owner-authored Welcome is accepted —
+        // REQ-013 kept the init key intact across the rejection above.
+        let joined = join_from_welcome(
+            &carol.provider,
+            &carol.identity,
+            &welcome_bytes,
+            "@research",
+            &mut carol.pins,
+            &mut carol.ledger,
+            None,
+            &["@bob".to_string(), "@carol".to_string()],
+        )
+        .unwrap();
+        assert_eq!(joined.group.members().count(), 3);
+
+        let _ = fs::remove_dir_all(&alice.dir);
+        let _ = fs::remove_dir_all(&owen.dir);
+        let _ = fs::remove_dir_all(&bob.dir);
+        let _ = fs::remove_dir_all(&carol.dir);
     }
 
     /// REQ-016: an all-first-contact tree joins as TOFU and reports the
@@ -1260,6 +1400,7 @@ mod tests {
             &mut bob.pins,
             &mut bob.ledger,
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(joined.trust, GenesisTrust::TofuRequiresSafetyNumber);

@@ -435,6 +435,7 @@ mod tests {
                 &mut bob.pins,
                 &mut bob.ledger,
                 None,
+            &[],
             )
             .unwrap()
             .group;
