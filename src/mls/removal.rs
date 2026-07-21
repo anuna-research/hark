@@ -482,7 +482,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            assert!(matches!(merged, Inbound::Handshake));
+            assert!(matches!(merged, Inbound::Handshake { .. }));
             assert_eq!(alice_group.epoch().as_u64(), epoch_n + 1);
 
             // The stale evidence is correctly REJECTED — by the committer.
@@ -543,7 +543,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            assert!(matches!(merged, Inbound::Handshake));
+            assert!(matches!(merged, Inbound::Handshake { .. }));
             assert_eq!(bob_group.members().count(), 1);
 
             let _ = fs::remove_dir_all(&alice.dir);

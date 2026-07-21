@@ -27,8 +27,9 @@ use openmls::prelude::MlsGroup;
 use rand::Rng as _;
 
 use super::group::{
-    GenesisAssertion, GenesisTrust, create_group, is_owner, join_from_welcome, merge_staged_commit,
-    stage_add_member,
+    GenesisAssertion, GenesisTrust, carveout_next_owner, covers_owner_self_remove, create_group,
+    elect_committer, group_genesis_creator, is_owner, join_from_welcome, member_bindings,
+    member_index_of, merge_staged_commit, stage_add_member,
 };
 use super::keypackages::{
     ConsumedLedger, LAST_RESORT_LIFETIME_SECS, ONE_TIME_POOL_TARGET, build_last_resort,
@@ -734,11 +735,25 @@ impl MlsSession {
 
     /// REQ-001/REQ-012: a Welcome addressed to us.
     fn on_welcome(&mut self, text: &str) -> SessionEvent {
-        // Room-fanned: only consume a welcome :for us.
-        match kw_symbol(text, ":for") {
-            Some(target) if target == self.handle => {}
-            _ => return SessionEvent::Handled { outbound: vec![] },
+        // Room-fanned: only consume a welcome :for us. SPEC-024 REQ-002(a):
+        // `:for` may be a single handle OR a list — one Welcome serves every
+        // member a commit added (RFC 9420 §12.4.3.1); a list-valued `:for`
+        // naming us must not read as "not for us".
+        if !kw_symbols(text, ":for").iter().any(|t| t == &self.handle) {
+            return SessionEvent::Handled { outbound: vec![] };
         }
+        // SPEC-024 REQ-002(a): the hub stamps the fanned welcome with its log
+        // `:seq` and RAM-queues the payload per addressee until acked. Ack on
+        // RECEIPT — whether or not the join below succeeds, we received the
+        // payload — so the queue prunes instead of redelivering until TTL.
+        let ack: Vec<String> = kw_u64(text, ":seq")
+            .map(|seq| {
+                vec![format!(
+                    "(mlsack {} :seq {seq} :from {})",
+                    self.room, self.handle
+                )]
+            })
+            .unwrap_or_default();
         let result = (|| -> Result<(), MlsError> {
             let ct = kw_b64(text, ":ct")
                 .ok_or_else(|| MlsError::Rejected("welcome missing :ct".into()))?;
@@ -761,7 +776,16 @@ impl MlsSession {
             self.persist_meta()
         })();
         match result {
-            Ok(()) => SessionEvent::Handled { outbound: vec![] },
+            Ok(()) => SessionEvent::Handled { outbound: ack },
+            Err(e) if self.group.is_some() => {
+                // The REQ-012c no-silent-replacement guard: with a group
+                // established, a hub REDELIVERY of the welcome we already
+                // consumed (SPEC-024 queue, on reconnect) lands here — benign;
+                // ack it so the queue prunes. A rival welcome is equally
+                // refused; the ack only acknowledges receipt.
+                tracing::debug!(error = %e, "welcome while a group exists (redelivery or rival) — refused, acked");
+                SessionEvent::Handled { outbound: ack }
+            }
             Err(e) => SessionEvent::Dropped {
                 reason: e.to_string(),
                 probable_fork: false,
@@ -929,6 +953,21 @@ impl MlsSession {
                 sender_handle,
             }) => {
                 let text = String::from_utf8_lossy(&plaintext).into_owned();
+                // SPEC-024 REQ-008 (ADR-I4): web members send log-head
+                // attestations as in-channel app messages with a typed JSON
+                // body. hark does not yet compare them (that lands with the
+                // OQ-003 DS adoption — it has no (seq,digest) tuples to chain)
+                // but MUST recognise and drop them deliberately: they are not
+                // chat, not CBCL, and their rejection must never read as a
+                // malformed-frame event.
+                if text.starts_with('{') && text.contains("\"cbcl-mls-attest/v1\"") {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if v.get("t").and_then(|t| t.as_str()) == Some("cbcl-mls-attest/v1") {
+                            tracing::debug!(sender = %sender_handle, "dropping web log-head attestation (comparison lands with OQ-003)");
+                            return SessionEvent::Handled { outbound: vec![] };
+                        }
+                    }
+                }
                 // REQ-018: the inner :from must match the MLS sender.
                 if let Some(from) = kw_symbol(&text, ":from") {
                     if let Err(e) = enforce_sender(&from, &sender_handle) {
@@ -943,12 +982,22 @@ impl MlsSession {
                     sender: sender_handle,
                 }
             }
-            Ok(Inbound::Handshake) => {
+            Ok(Inbound::Handshake { stored_proposal }) => {
                 // (The replay id of a verified commit is registered inside
                 // `process_inbound`, pre-merge, so the merge snapshot
                 // carries it atomically.)
                 let _ = self.persist_meta();
-                SessionEvent::Handled { outbound: vec![] }
+                // SPEC-024 REQ-006(a) counterparty (v0.10.0 carve-out): a
+                // stored self-Remove of the current owner (a web member's
+                // rename ceremony) is committed by the NEXT-elected owner —
+                // which may be this agent. Without this, a room whose
+                // next-elected owner is a hark agent wedges every web rename.
+                let outbound = if stored_proposal {
+                    self.maybe_commit_owner_departure(evidence.as_ref())
+                } else {
+                    vec![]
+                };
+                SessionEvent::Handled { outbound }
             }
             Ok(Inbound::Dropped {
                 reason,
@@ -1156,6 +1205,77 @@ impl MlsSession {
         Ok(frames.remove(0))
     }
 
+    /// SPEC-024 REQ-006(a) / SPEC-013 v0.10.0 carve-out, counterparty side:
+    /// after a self-Remove proposal of the CURRENT elected owner is stored,
+    /// the member that would be elected owner over the tree minus that leaf
+    /// commits it — RFC 9420 §12.2 forbids the owner committing its own
+    /// removal, so without this the departure deadlocks. Returns the deliver
+    /// frame(s) fanning the commit + the owner's bye `:evidence` (validators
+    /// re-check it under REQ-017(d)); empty when the conditions do not hold.
+    /// The transition rides [`Self::apply_authored_transition`] like every
+    /// authored commit (write-ahead → merge → prune).
+    fn maybe_commit_owner_departure(&mut self, evidence: Option<&RemovalEvidence>) -> Vec<String> {
+        let result = (|| -> Result<Vec<String>, MlsError> {
+            if !self.is_durable() {
+                return Ok(vec![]); // presence re-drives re-deliver the proposal once durable
+            }
+            let Some(group) = self.group.as_mut() else {
+                return Ok(vec![]);
+            };
+            let members = member_bindings(group)?;
+            let creator = group_genesis_creator(group);
+            let Some(owner) = elect_committer(&members, creator.as_ref()) else {
+                return Ok(vec![]);
+            };
+            let Some(owner_index) = member_index_of(group, &owner) else {
+                return Ok(vec![]);
+            };
+            if !covers_owner_self_remove(group.pending_proposals(), owner_index) {
+                return Ok(vec![]);
+            }
+            let me = (
+                self.identity.handle.clone(),
+                self.identity.public_key().to_vec(),
+            );
+            if !carveout_next_owner(&members, creator.as_ref(), true, &me) {
+                return Ok(vec![]); // another member is the next-elected owner
+            }
+            // Stage the commit over the pending proposals; the transition
+            // transaction owns merge + durability.
+            use tls_codec::Serialize as _;
+            let (commit, _welcome, _gi) = group
+                .commit_to_pending_proposals(&self.provider, &self.identity.signer)
+                .map_err(MlsError::stack("commit pending proposals"))?;
+            let commit_bytes = commit
+                .tls_serialize_detached()
+                .map_err(MlsError::stack("serialize pending commit"))?;
+            let commit_ct = B64.encode(&commit_bytes);
+            let ev_field = match evidence {
+                Some(ev) => {
+                    let json = serde_json::to_vec(ev).map_err(std::io::Error::other)?;
+                    format!(" :evidence \"{}\"", B64.encode(json))
+                }
+                None => String::new(),
+            };
+            let frame = format!(
+                "(deliver {} :enc mls :ct \"{commit_ct}\"{ev_field} :from {})",
+                self.room, self.handle
+            );
+            self.apply_authored_transition(
+                vec![frame],
+                &commit_ct,
+                "merge owner-departure carve-out commit",
+            )
+        })();
+        match result {
+            Ok(frames) => frames,
+            Err(e) => {
+                tracing::warn!(error = %e, "owner-departure carve-out commit failed; awaiting the proposer's re-signal");
+                vec![]
+            }
+        }
+    }
+
     /// REQ-024: both safety numbers for the live group.
     pub fn safety_numbers(&self) -> Result<SafetyNumbers, MlsError> {
         let group = self
@@ -1255,6 +1375,23 @@ fn kw_symbol(text: &str, key: &str) -> Option<String> {
         SExpr::Atom(Atom::Symbol(s)) => Some(s),
         SExpr::Atom(Atom::Str(s)) => Some(s),
         _ => None,
+    }
+}
+
+/// Every symbol/string named by keyword `key`: a scalar value yields one, a
+/// list value yields each element — `(welcome … :for (@a @b))` addresses two
+/// members (SPEC-024 REQ-002(a) multi-add Welcome).
+fn kw_symbols(text: &str, key: &str) -> Vec<String> {
+    match kw_value(text, key) {
+        Some(SExpr::Atom(Atom::Symbol(s))) | Some(SExpr::Atom(Atom::Str(s))) => vec![s],
+        Some(SExpr::List(items)) => items
+            .into_iter()
+            .filter_map(|i| match i {
+                SExpr::Atom(Atom::Symbol(s)) | SExpr::Atom(Atom::Str(s)) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
     }
 }
 
@@ -1763,6 +1900,239 @@ mod tests {
             panic!("presence handled")
         };
         assert_eq!(keygets(&outbound), 1, "a rejoin re-arms in-flight requests");
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+    }
+
+    /// SPEC-024 REQ-006(a) / SPEC-013 v0.10.0 counterparty WIRING: a fanned
+    /// self-Remove proposal of the current owner (a web member's rename
+    /// ceremony) is stored by this session and — being the next-elected
+    /// owner — immediately committed, fanning the carve-out commit with the
+    /// owner's bye evidence. Without this, a web rename wedges in any room
+    /// whose next-elected owner is a hark agent.
+    #[test]
+    fn owner_departure_proposal_drives_the_counterparty_commit() {
+        use super::super::group::{add_member, create_group, credential_handle};
+        use super::super::keypackages::ConsumedLedger;
+        use super::super::pins::PinStore;
+        use super::super::removal::RemovalEvidence;
+        use tls_codec::Serialize as _;
+
+        let (b_dir, b_wire) = setup("odcp", 103, "@bella");
+        let mut bella =
+            MlsSession::open(&b_dir, "bella", "@research", "@bella", &b_wire, true).unwrap();
+        let b_frames = bella.join_frames().unwrap();
+
+        // @alice: a raw (web-like) creator/owner party.
+        let a_dir = std::env::temp_dir().join(format!("hark-mls-odcp-alice-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&a_dir);
+        fs::create_dir_all(&a_dir).unwrap();
+        let a_wire = ChatIdentity::from_seed([102u8; 32]);
+        let a_provider = DurableProvider::open(&a_dir.join("agent.mls")).unwrap();
+        let a_identity = MlsIdentity::from_wire_identity(&a_wire, "@alice");
+        let mut a_pins = PinStore::open(&a_dir.join("agent.pins")).unwrap();
+        let a_ledger = ConsumedLedger::open(&a_dir.join("agent.kpledger")).unwrap();
+        a_pins
+            .observe_verified("@alice", &a_wire.verifying_key_bytes())
+            .unwrap();
+        a_pins
+            .observe_verified("@bella", &b_wire.verifying_key_bytes())
+            .unwrap();
+
+        let (mut a_group, genesis) = create_group(&a_provider, &a_identity, "@research").unwrap();
+        let bella_kp_b64 = {
+            let onetime = kw_value(&b_frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+        let kp_bytes = B64.decode(&bella_kp_b64).unwrap();
+        let outcome = add_member(
+            &a_provider,
+            &a_identity,
+            &mut a_group,
+            &kp_bytes,
+            "@bella",
+            &a_pins,
+            &a_ledger,
+        )
+        .unwrap();
+        let welcome = format!(
+            "(welcome @research :for @bella :ct \"{}\" :from @alice)",
+            B64.encode(&outcome.welcome_bytes)
+        );
+        assert!(matches!(
+            bella.handle_frame(&welcome),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(bella.joined());
+
+        // @alice proposes her OWN self-Remove + REQ-014(a) bye evidence, fans it.
+        let me = a_group
+            .members()
+            .find(|m| credential_handle(&m.credential).unwrap() == "@alice")
+            .unwrap();
+        let a_key = <[u8; 32]>::try_from(me.signature_key.as_slice()).unwrap();
+        let ev = RemovalEvidence::mint(
+            &a_wire,
+            "@alice",
+            "@research",
+            a_group.group_id().as_slice(),
+            a_group.epoch().as_u64(),
+            "@alice",
+            me.index.u32(),
+            &a_key,
+        );
+        let (prop, _pref) = a_group
+            .propose_remove_member(&a_provider, &a_identity.signer, me.index)
+            .unwrap();
+        let prop_ct = B64.encode(&prop.tls_serialize_detached().unwrap());
+        let ev_b64 = B64.encode(serde_json::to_vec(&ev).unwrap());
+        let frame = format!(
+            "(deliver @research :enc mls :ct \"{prop_ct}\" :evidence \"{ev_b64}\" :from @alice)"
+        );
+
+        // bella stores the proposal AND, as next-elected owner, commits it.
+        let SessionEvent::Handled { outbound } = bella.handle_frame(&frame) else {
+            panic!("the proposal must be stored")
+        };
+        assert_eq!(
+            outbound.len(),
+            1,
+            "the counterparty commit fans immediately: {outbound:?}"
+        );
+        assert!(outbound[0].starts_with("(deliver @research :enc mls :ct \""));
+        assert!(
+            outbound[0].contains(":evidence"),
+            "the owner's bye evidence rides the carve-out commit"
+        );
+
+        // @alice (validator AND proposer) merges the carve-out commit → removed.
+        let commit_ct = kw_b64(&outbound[0], ":ct").unwrap();
+        let mut fork = ForkSignal::default();
+        let merged = process_inbound(
+            &a_provider,
+            &mut a_group,
+            &commit_ct,
+            "@research",
+            &mut a_pins,
+            &genesis,
+            Some(&ev),
+            &mut fork,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(merged, Inbound::Handshake { .. }));
+        assert!(
+            !a_group
+                .members()
+                .any(|m| credential_handle(&m.credential).unwrap() == "@alice"),
+            "the departing owner's leaf is removed on every validator"
+        );
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+    }
+
+    /// SPEC-024 web-interop inbound shapes: (1) a LIST-valued `:for` naming us
+    /// (a multi-add Welcome, REQ-002(a)) joins — a scalar-only reader would
+    /// silently skip it; (2) the hub-stamped `:seq` is acknowledged with an
+    /// `mlsack` so the hub's RAM Welcome queue prunes instead of redelivering
+    /// until TTL; (3) a redelivered welcome is refused benignly (REQ-012c) but
+    /// still acked; (4) a web member's `cbcl-mls-attest/v1` log-head
+    /// attestation decrypts as an app message and is DROPPED deliberately —
+    /// never surfaced as chat, never a malformed-frame event.
+    #[test]
+    fn web_interop_multi_for_welcome_ack_and_attestation_drop() {
+        use super::super::group::{add_member, create_group};
+        use super::super::keypackages::ConsumedLedger;
+        use super::super::pins::PinStore;
+        use super::super::validation::encrypt_message;
+
+        let (b_dir, b_wire) = setup("webio", 105, "@bella");
+        let mut bella =
+            MlsSession::open(&b_dir, "bella", "@research", "@bella", &b_wire, true).unwrap();
+        let b_frames = bella.join_frames().unwrap();
+
+        let a_dir = std::env::temp_dir().join(format!("hark-mls-webio-alice-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&a_dir);
+        fs::create_dir_all(&a_dir).unwrap();
+        let a_wire = ChatIdentity::from_seed([104u8; 32]);
+        let a_provider = DurableProvider::open(&a_dir.join("agent.mls")).unwrap();
+        let a_identity = MlsIdentity::from_wire_identity(&a_wire, "@alice");
+        let mut a_pins = PinStore::open(&a_dir.join("agent.pins")).unwrap();
+        let a_ledger = ConsumedLedger::open(&a_dir.join("agent.kpledger")).unwrap();
+        a_pins
+            .observe_verified("@alice", &a_wire.verifying_key_bytes())
+            .unwrap();
+        a_pins
+            .observe_verified("@bella", &b_wire.verifying_key_bytes())
+            .unwrap();
+        let (mut a_group, _genesis) = create_group(&a_provider, &a_identity, "@research").unwrap();
+        let bella_kp_b64 = {
+            let onetime = kw_value(&b_frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+        let kp_bytes = B64.decode(&bella_kp_b64).unwrap();
+        let outcome = add_member(
+            &a_provider,
+            &a_identity,
+            &mut a_group,
+            &kp_bytes,
+            "@bella",
+            &a_pins,
+            &a_ledger,
+        )
+        .unwrap();
+
+        // (1)+(2): a hub-stamped MULTI-addressee welcome naming us in a list.
+        let welcome = format!(
+            "(welcome @research :seq 7 :for (@bella @carol) :ct \"{}\" :from @alice)",
+            B64.encode(&outcome.welcome_bytes)
+        );
+        let SessionEvent::Handled { outbound } = bella.handle_frame(&welcome) else {
+            panic!("the multi-:for welcome must be consumed")
+        };
+        assert!(bella.joined(), "a list-valued :for naming us joins");
+        assert_eq!(
+            outbound,
+            vec!["(mlsack @research :seq 7 :from @bella)".to_string()],
+            "receipt is acked so the hub queue prunes"
+        );
+
+        // (3): a hub REDELIVERY of the same stamped welcome — refused (the
+        // REQ-012c guard), still acked, never a Dropped/fork event.
+        let SessionEvent::Handled { outbound } = bella.handle_frame(&welcome) else {
+            panic!("a redelivered welcome is benign")
+        };
+        assert_eq!(outbound.len(), 1, "the redelivery is acked too");
+        assert!(bella.joined());
+
+        // (4): a web attestation app message is dropped deliberately.
+        let attest =
+            br#"{"t":"cbcl-mls-attest/v1","room":"@research","floor":0,"head":3,"hash":"aGFzaA=="}"#;
+        let ct = encrypt_message(&a_provider, &a_identity, &mut a_group, attest).unwrap();
+        let frame = format!(
+            "(deliver @research :enc mls :ct \"{}\" :from @alice)",
+            B64.encode(&ct)
+        );
+        match bella.handle_frame(&frame) {
+            SessionEvent::Handled { outbound } => {
+                assert!(outbound.is_empty(), "an attestation drives nothing outbound")
+            }
+            other => panic!("an attestation must be silently handled, got {other:?}"),
+        }
 
         let _ = fs::remove_dir_all(&a_dir);
         let _ = fs::remove_dir_all(&b_dir);

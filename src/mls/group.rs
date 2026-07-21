@@ -216,6 +216,80 @@ pub fn elect_committer(
     elect_owner(members)
 }
 
+/// PURE owner-departure carve-out decision (SPEC-013 v0.10.0 [[#REQ-016]]
+/// amendment / SPEC-024 REQ-006(a)). Given the current member bindings +
+/// creator, whether the commit/pending set covers the CURRENT elected owner's
+/// OWN self-Remove, and a `candidate` committer: is `candidate` exactly the
+/// member that would be elected owner over the tree MINUS the removed owner
+/// leaf? False unless BOTH conditions hold — the two conditions, nothing
+/// wider. MUST stay equivalent to cbcl-mls-wasm's `carveout_next_owner`
+/// (the web stack), or a web rename's carve-out commit forks the stacks.
+pub fn carveout_next_owner(
+    members: &[(String, Vec<u8>)],
+    creator: Option<&(String, Vec<u8>)>,
+    owner_self_remove_covered: bool,
+    candidate: &(String, Vec<u8>),
+) -> bool {
+    if !owner_self_remove_covered {
+        return false;
+    }
+    let owner = match elect_committer(members, creator) {
+        Some(o) => o,
+        None => return false,
+    };
+    let reduced: Vec<(String, Vec<u8>)> =
+        members.iter().filter(|m| **m != owner).cloned().collect();
+    match elect_committer(&reduced, creator) {
+        Some(next) => &next == candidate,
+        None => false,
+    }
+}
+
+/// PURE committer-authorization decision for a membership-changing commit
+/// (SPEC-013 REQ-016 + the v0.10.0 owner-departure carve-out): the committer
+/// may drive a membership change IFF it is the current elected owner, OR the
+/// carve-out holds. Equivalent to cbcl-mls-wasm's
+/// `committer_authorized_for_membership`.
+pub fn committer_authorized_for_membership(
+    members: &[(String, Vec<u8>)],
+    creator: Option<&(String, Vec<u8>)>,
+    committer: &(String, Vec<u8>),
+    owner_self_remove_covered: bool,
+) -> bool {
+    match elect_committer(members, creator) {
+        Some(owner) if &owner == committer => true,
+        Some(_) => carveout_next_owner(members, creator, owner_self_remove_covered, committer),
+        None => false,
+    }
+}
+
+/// Does `proposals` cover the OWNER's own self-Remove — a Remove of
+/// `owner_index` PROPOSED BY `owner_index`? The tree-fact half of the
+/// owner-departure carve-out (condition (i)); shared by the staged-commit and
+/// pending-proposal paths so they can never diverge.
+pub fn covers_owner_self_remove<'a>(
+    mut proposals: impl Iterator<Item = &'a openmls::prelude::QueuedProposal>,
+    owner_index: u32,
+) -> bool {
+    use openmls::prelude::{LeafNodeIndex, Proposal, Sender};
+    proposals.any(|q| {
+        matches!(q.proposal(), Proposal::Remove(r) if r.removed().u32() == owner_index)
+            && q.sender() == &Sender::Member(LeafNodeIndex::new(owner_index))
+    })
+}
+
+/// The leaf index at which `member` (handle AND key — never handle alone) is
+/// seated in `group`, if it is.
+pub fn member_index_of(group: &MlsGroup, member: &(String, Vec<u8>)) -> Option<u32> {
+    group
+        .members()
+        .find(|m| {
+            credential_handle(&m.credential).ok().as_deref() == Some(member.0.as_str())
+                && m.signature_key == member.1
+        })
+        .map(|m| m.index.u32())
+}
+
 /// The genesis creator `(handle, wire key)` for a live group, when it carries a
 /// verifiable genesis extension (REQ-016). `None` for a genesis-less group, which
 /// then falls back to lex-smallest election.

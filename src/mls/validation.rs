@@ -18,7 +18,8 @@ use openmls::prelude::{
 use tls_codec::{DeserializeBytes as _, Serialize as _};
 
 use super::group::{
-    GenesisAssertion, credential_handle, elect_committer, group_genesis_creator, member_bindings,
+    GenesisAssertion, committer_authorized_for_membership, covers_owner_self_remove,
+    credential_handle, elect_committer, group_genesis_creator, member_bindings, member_index_of,
 };
 use super::pins::PinStore;
 use super::provider::DurableProvider;
@@ -64,8 +65,12 @@ pub enum Inbound {
         plaintext: Vec<u8>,
         sender_handle: String,
     },
-    /// A validated, merged Commit or stored proposal.
-    Handshake,
+    /// A validated, merged Commit or stored proposal. `stored_proposal` is
+    /// true for the standalone-proposal case — the caller uses it to run the
+    /// v0.10.0 owner-departure counterparty check (SPEC-024 REQ-006(a)): a
+    /// stored self-Remove of the current owner is committed by the
+    /// next-elected owner, which may be THIS member.
+    Handshake { stored_proposal: bool },
     /// An undecryptable/unprocessable frame — dropped, counted (REQ-006).
     Dropped { reason: String, probable_fork: bool },
 }
@@ -261,7 +266,9 @@ pub fn process_inbound(
                 pins.observe_verified(&handle, &key)?;
             }
             provider.persist()?;
-            Ok(Inbound::Handshake)
+            Ok(Inbound::Handshake {
+                stored_proposal: false,
+            })
         }
         ProcessedMessageContent::ProposalMessage(proposal) => {
             // Standalone proposals get the same per-object validation BEFORE
@@ -274,7 +281,9 @@ pub fn process_inbound(
                 )
                 .map_err(MlsError::stack("store proposal"))?;
             provider.persist()?;
-            Ok(Inbound::Handshake)
+            Ok(Inbound::Handshake {
+                stored_proposal: true,
+            })
         }
         ProcessedMessageContent::ExternalJoinProposalMessage(_) => Err(MlsError::Rejected(
             "external join proposal rejected (REQ-017e fail-closed allowlist)".into(),
@@ -314,25 +323,47 @@ fn validate_staged_commit(
         .ok_or_else(|| MlsError::Rejected("commit from unknown leaf".into()))?;
     let committer_handle = credential_handle(&committer.credential)?;
 
-    // Authorised committer (REQ-016): membership-changing commits come from
-    // the elected owner; a self-update-only commit (key rotation / ratchet
-    // hygiene) is allowed from any member because it changes no membership.
+    // Authorised committer (REQ-016 + the v0.10.0 owner-departure carve-out):
+    // membership-changing commits come from the elected owner — EXCEPT that
+    // RFC 9420 §12.2 forbids a member committing its own removal, so a
+    // remove-the-current-owner Commit is accepted from the member that would
+    // be elected owner over the tree minus the removed leaf, iff the Commit
+    // covers the owner's OWN self-Remove proposal (condition (i); its REQ-014
+    // bye evidence is checked by clause (d) below exactly as any Remove).
+    // Every other covered proposal is still validated independently, so the
+    // borrowed authority cannot smuggle a membership change. A self-update-
+    // only commit (key rotation) stays allowed from any member. The decision
+    // is the pure `committer_authorized_for_membership` — byte-equivalent to
+    // cbcl-mls-wasm's, or a web rename forks the stacks.
     let changes_membership = staged.add_proposals().next().is_some()
         || staged.remove_proposals().next().is_some()
         || staged
             .update_proposals()
             .any(|u| u.sender() != &Sender::Member(committer.index));
     if changes_membership {
-        match elect_committer(&members, group_genesis_creator(group).as_ref()) {
-            Some((owner_handle, owner_key))
-                if owner_handle == committer_handle && owner_key == committer.signature_key => {}
-            Some((owner_handle, _)) => {
-                return Err(MlsError::Rejected(format!(
-                    "membership-changing commit from {committer_handle}, but the elected \
-                     owner is {owner_handle} (REQ-016)"
-                )));
-            }
-            None => return Err(MlsError::Rejected("group has no members".into())),
+        let creator = group_genesis_creator(group);
+        let committer_binding = (committer_handle.clone(), committer.signature_key.clone());
+        // condition (i): does this commit cover the current owner's OWN
+        // self-Remove? (a tree fact over the staged proposals).
+        let self_remove_covered = match elect_committer(&members, creator.as_ref())
+            .and_then(|owner| member_index_of(group, &owner))
+        {
+            Some(owner_index) => covers_owner_self_remove(staged.queued_proposals(), owner_index),
+            None => false,
+        };
+        if !committer_authorized_for_membership(
+            &members,
+            creator.as_ref(),
+            &committer_binding,
+            self_remove_covered,
+        ) {
+            let owner = elect_committer(&members, creator.as_ref())
+                .map(|(h, _)| h)
+                .unwrap_or_else(|| "<none>".into());
+            return Err(MlsError::Rejected(format!(
+                "membership-changing commit from {committer_handle}, but the elected \
+                 owner is {owner} (REQ-016)"
+            )));
         }
     }
 
@@ -767,7 +798,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(matches!(inbound, Inbound::Handshake));
+        assert!(matches!(inbound, Inbound::Handshake { .. }));
         assert_eq!(alice_group.epoch(), bob_group.epoch());
         let _ = fs::remove_dir_all(&alice.dir);
         let _ = fs::remove_dir_all(&bob.dir);
@@ -887,7 +918,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(matches!(inbound, Inbound::Handshake));
+        assert!(matches!(inbound, Inbound::Handshake { .. }));
         assert_eq!(bob_group.members().count(), 1, "bob sees himself removed");
         let _ = fs::remove_dir_all(&alice.dir);
         let _ = fs::remove_dir_all(&bob.dir);
@@ -939,6 +970,204 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&alice.dir);
         let _ = fs::remove_dir_all(&bob.dir);
+    }
+
+    /// Three-member fixture for the v0.10.0 owner-departure carve-out: alice
+    /// (creator/owner) + bob + charlie, everyone pinned and converged, plus
+    /// alice's serialized self-Remove PROPOSAL and matching bye evidence.
+    #[allow(clippy::type_complexity)]
+    fn owner_departure_fixture(
+        tag: &str,
+    ) -> (
+        Party,
+        Party,
+        Party,
+        openmls::prelude::MlsGroup, // bob's group
+        openmls::prelude::MlsGroup, // charlie's group
+        GenesisAssertion,
+        Vec<u8>,         // alice's self-Remove proposal wire
+        RemovalEvidence, // alice's bye evidence
+    ) {
+        let (mut alice, mut bob, mut alice_group, mut bob_group, genesis) = two_member_group(tag);
+        let mut charlie = party(tag, 53, "@charlie");
+        let ckey = ("@charlie".to_string(), charlie.wire.verifying_key_bytes());
+        for p in [&mut alice, &mut bob, &mut charlie] {
+            p.pins.observe_verified(&ckey.0, &ckey.1).unwrap();
+        }
+        for (h, k) in [
+            ("@alice", alice.wire.verifying_key_bytes()),
+            ("@bob", bob.wire.verifying_key_bytes()),
+        ] {
+            charlie.pins.observe_verified(h, &k).unwrap();
+        }
+        let kp = build_one_time(&charlie.provider, &charlie.identity, 1)
+            .unwrap()
+            .remove(0);
+        let outcome = add_member(
+            &alice.provider,
+            &alice.identity,
+            &mut alice_group,
+            &kp.bytes,
+            "@charlie",
+            &alice.pins,
+            &alice.ledger,
+        )
+        .unwrap();
+        let mut fork = ForkSignal::default();
+        let merged = process_inbound(
+            &bob.provider,
+            &mut bob_group,
+            &outcome.commit_bytes,
+            "@research",
+            &mut bob.pins,
+            &genesis,
+            None,
+            &mut fork,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(merged, Inbound::Handshake { .. }));
+        let joined = join_from_welcome(
+            &charlie.provider,
+            &charlie.identity,
+            &outcome.welcome_bytes,
+            "@research",
+            &mut charlie.pins,
+            &mut charlie.ledger,
+            None,
+        )
+        .unwrap();
+        let charlie_group = joined.group;
+
+        // alice proposes her OWN self-Remove + REQ-014(a) bye evidence.
+        let me = alice_group
+            .members()
+            .find(|m| credential_handle(&m.credential).unwrap() == "@alice")
+            .unwrap();
+        let alice_key = <[u8; 32]>::try_from(me.signature_key.as_slice()).unwrap();
+        let evidence = RemovalEvidence::mint(
+            &alice.wire,
+            "@alice",
+            "@research",
+            alice_group.group_id().as_slice(),
+            alice_group.epoch().as_u64(),
+            "@alice",
+            me.index.u32(),
+            &alice_key,
+        );
+        let (proposal, _pref) = alice_group
+            .propose_remove_member(&alice.provider, &alice.identity.signer, me.index)
+            .unwrap();
+        let proposal_wire = proposal.tls_serialize_detached().unwrap();
+        (
+            alice,
+            bob,
+            charlie,
+            bob_group,
+            charlie_group,
+            genesis,
+            proposal_wire,
+            evidence,
+        )
+    }
+
+    /// SPEC-013 v0.10.0 / SPEC-024 REQ-006(a): the owner's covered self-Remove
+    /// is committed by the NEXT-elected owner (@bob over {@bob,@charlie}) and
+    /// every validator merges it — the ceremony a web member's rename runs.
+    #[test]
+    fn owner_departure_carveout_accepts_next_owner_commit() {
+        let (alice, mut bob, mut charlie, mut bob_group, mut charlie_group, genesis, prop, ev) =
+            owner_departure_fixture("od-ok");
+        let mut fork = ForkSignal::default();
+        // both remaining members store the proposal (validated with evidence).
+        for (p, g) in [(&mut bob, &mut bob_group), (&mut charlie, &mut charlie_group)] {
+            let inbound = process_inbound(
+                &p.provider, g, &prop, "@research", &mut p.pins, &genesis, Some(&ev), &mut fork,
+                false,
+            )
+            .unwrap();
+            assert!(matches!(
+                inbound,
+                Inbound::Handshake {
+                    stored_proposal: true
+                }
+            ));
+        }
+        // @bob (next-elected owner) commits the pending self-Remove…
+        let (commit, _w, _gi) = bob_group
+            .commit_to_pending_proposals(&bob.provider, &bob.identity.signer)
+            .unwrap();
+        bob_group.merge_pending_commit(&bob.provider).unwrap();
+        let commit_wire = commit.tls_serialize_detached().unwrap();
+        // …and @charlie ACCEPTS the carve-out commit.
+        let inbound = process_inbound(
+            &charlie.provider,
+            &mut charlie_group,
+            &commit_wire,
+            "@research",
+            &mut charlie.pins,
+            &genesis,
+            Some(&ev),
+            &mut fork,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(inbound, Inbound::Handshake { .. }));
+        assert_eq!(charlie_group.members().count(), 2);
+        assert!(
+            !charlie_group
+                .members()
+                .any(|m| credential_handle(&m.credential).unwrap() == "@alice"),
+            "the departing owner's leaf is gone"
+        );
+        for p in [&alice, &bob, &charlie] {
+            let _ = fs::remove_dir_all(&p.dir);
+        }
+    }
+
+    /// The carve-out's borrowed authority belongs to the next-elected owner
+    /// ALONE: @charlie committing the same covered self-Remove is rejected by
+    /// @bob exactly as any unauthorized membership change (REQ-016).
+    #[test]
+    fn owner_departure_carveout_rejects_wrong_committer() {
+        let (alice, mut bob, mut charlie, mut bob_group, mut charlie_group, genesis, prop, ev) =
+            owner_departure_fixture("od-bad");
+        let mut fork = ForkSignal::default();
+        for (p, g) in [(&mut bob, &mut bob_group), (&mut charlie, &mut charlie_group)] {
+            process_inbound(
+                &p.provider, g, &prop, "@research", &mut p.pins, &genesis, Some(&ev), &mut fork,
+                false,
+            )
+            .unwrap();
+        }
+        // @charlie (NOT the next-elected owner) commits locally…
+        let (bad, _w, _gi) = charlie_group
+            .commit_to_pending_proposals(&charlie.provider, &charlie.identity.signer)
+            .unwrap();
+        charlie_group
+            .merge_pending_commit(&charlie.provider)
+            .unwrap();
+        let bad_wire = bad.tls_serialize_detached().unwrap();
+        // …and @bob rejects it.
+        let err = process_inbound(
+            &bob.provider,
+            &mut bob_group,
+            &bad_wire,
+            "@research",
+            &mut bob.pins,
+            &genesis,
+            Some(&ev),
+            &mut fork,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("REQ-016"),
+            "must reject the wrong committer, got: {err}"
+        );
+        for p in [&alice, &bob, &charlie] {
+            let _ = fs::remove_dir_all(&p.dir);
+        }
     }
 
     /// TEST-006 (REQ-006): undecryptable frames are dropped-but-counted; a
