@@ -644,6 +644,47 @@ enum LoopExit {
     HubClosed(String),
 }
 
+/// Sign and send a batch of MLS protocol frames, returning the sanitized
+/// write-failure detail if the transport drops mid-batch — the caller exits
+/// via [`LoopExit::HubClosed`] (never `mark_unhealthy`; see the write-failure
+/// invariant on [`ChatAgentTask::run_connection`]). Dropping the rest of the
+/// batch is safe: transition frames are retained durably in the `MlsSession`
+/// and re-driven on rejoin and peer presence; the rest regenerate from their
+/// own triggers.
+async fn send_mls_frames(
+    websocket: &mut ChatSocket,
+    conn: &mut SignedConn,
+    identity: &ChatIdentity,
+    frames: Vec<String>,
+) -> Option<String> {
+    for text in frames {
+        let Ok(payload) = payload_bytes(&text) else {
+            continue;
+        };
+        let frame = conn.sign_chat_frame(identity, &payload);
+        if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
+            return Some(sanitize(&error.to_string()));
+        }
+    }
+    None
+}
+
+/// Resolve every frame currently queued in `send_rx` with the retryable
+/// Reconnecting reject (round-9 P2): once a connection's receive loop has
+/// exited, nothing polls the channel until the NEXT connection's loop runs,
+/// so an unresolved `result_tx` would hold its `/send` caller through the
+/// whole outage instead of telling it the transport is reconnecting.
+fn reject_queued_sends(
+    send_rx: &mut mpsc::Receiver<crate::daemon::OutboundFrame>,
+    detail: &str,
+) {
+    while let Ok(outbound) = send_rx.try_recv() {
+        let _ = outbound.result_tx.send(Err(OutboundReject::reconnecting(format!(
+            "connection to the hub lost; reconnecting: {detail}"
+        ))));
+    }
+}
+
 /// A scheduled responder timer fired by the receive loop (SPEC-003 REQ-005/007).
 enum ClaimTimer {
     /// The Δ claim window for `ask_id` has closed — elect a winner.
@@ -850,8 +891,16 @@ impl ChatAgentTask {
         // (that would masquerade as an explicit stop and abort us).
         let _ = self
             .store
-            .mark_reconnecting(&self.handle, Some(detail))
+            .mark_reconnecting(&self.handle, Some(detail.clone()))
             .await;
+        // Round-9 P2: frames already queued into `send_rx` when the socket
+        // closed (their enqueue raced the read arm's exit) would otherwise
+        // wait unresolved through the entire outage — the receive loop is
+        // gone and nothing else polls the channel. Resolve them with the
+        // same retryable Reconnecting verdict new sends now get from the
+        // store state; re-drained each backoff iteration for the enqueue
+        // races the state flip cannot close.
+        reject_queued_sends(&mut self.send_rx, &detail);
         let mut backoff = RECONNECT_BACKOFF_BASE;
         loop {
             tokio::select! {
@@ -861,6 +910,7 @@ impl ChatAgentTask {
                 }
                 _ = tokio::time::sleep(backoff) => {}
             }
+            reject_queued_sends(&mut self.send_rx, &detail);
             tracing::info!(agent = %self.wire_handle, "attempting chat reconnect");
             let attempt = tokio::select! {
                 _ = &mut self.close_rx => {
@@ -968,6 +1018,15 @@ impl ChatAgentTask {
                                 // fail-closed security decision — fatal.
                                 Err(error @ crate::mls::MlsError::NotReady(_)) => {
                                     let _ = outbound.result_tx.send(Err(OutboundReject::not_ready(format!("mls encrypt refused: {error}"))));
+                                    // A FanPending session refuses NotReady
+                                    // until its recovered batch fans — this
+                                    // send attempt is an outbound-capable
+                                    // event, so drain here too instead of
+                                    // waiting for inbound traffic.
+                                    let recovered = session.take_recovered_fanout();
+                                    if let Some(detail) = send_mls_frames(websocket, conn, identity, recovered).await {
+                                        return LoopExit::HubClosed(detail);
+                                    }
                                     continue;
                                 }
                                 Err(error) => {
@@ -1078,25 +1137,7 @@ impl ChatAgentTask {
                             }
                             SessionEvent::Plaintext { text, .. } => Some(text),
                             SessionEvent::Handled { outbound } => {
-                                // An MLS protocol-frame write failure is a
-                                // transport loss — exit via HubClosed (never
-                                // mark_unhealthy; see the write-failure
-                                // invariant above). Dropping the rest of the
-                                // batch is safe: transition frames are
-                                // retained durably in the MlsSession and
-                                // re-driven on rejoin and peer presence; the
-                                // rest (keyget/idkey/keyready) regenerate
-                                // from their own triggers.
-                                let mut write_failure = None;
-                                for text in outbound {
-                                    let Ok(payload) = payload_bytes(&text) else { continue };
-                                    let frame = conn.sign_chat_frame(identity, &payload);
-                                    if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
-                                        write_failure = Some(sanitize(&error.to_string()));
-                                        break;
-                                    }
-                                }
-                                if let Some(detail) = write_failure {
+                                if let Some(detail) = send_mls_frames(websocket, conn, identity, outbound).await {
                                     return LoopExit::HubClosed(detail);
                                 }
                                 None
@@ -1111,6 +1152,19 @@ impl ChatAgentTask {
                             }
                         },
                     };
+                    // A FanPending recovery completes at the first inbound
+                    // event of ANY outcome, not only Handled: after snapshot
+                    // recovery peers are still on the old epoch, so their
+                    // frames commonly yield Dropped — waiting for a Handled
+                    // event could hold sends at NotReady indefinitely. Empty
+                    // outside FanPending (a Handled event above already
+                    // carried the batch, batch-first).
+                    if let Some(session) = mls.as_mut() {
+                        let recovered = session.take_recovered_fanout();
+                        if let Some(detail) = send_mls_frames(websocket, conn, identity, recovered).await {
+                            return LoopExit::HubClosed(detail);
+                        }
+                    }
                     let Some(responder_text) = responder_text else { continue };
                     // Receive-all (`*`): deliver EVERY channel content message to
                     // `recv`, not just answerable asks — the firehose a paired
@@ -1375,5 +1429,35 @@ mod tests {
         );
         assert!(!ChatError::Hello("announce invalid".into()).is_retryable());
         assert!(!ChatError::Store("rejected".into()).is_retryable());
+    }
+
+    /// Round-9 P2 regression: a frame that reached `send_rx` just as the
+    /// socket closed must be resolved with the retryable Reconnecting
+    /// verdict when the reconnect loop drains the channel — not left holding
+    /// its `/send` caller through the whole outage.
+    #[tokio::test]
+    async fn queued_sends_are_rejected_reconnecting_when_the_socket_closes() {
+        use crate::daemon::{OutboundFrame, OutboundReject};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundFrame>(8);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tx.send(OutboundFrame {
+            message: "(say @demo :from @a)".into(),
+            result_tx,
+        })
+        .await
+        .unwrap();
+
+        super::reject_queued_sends(&mut rx, "hub gone");
+        match result_rx.await.expect("the queued send must be resolved") {
+            Err(OutboundReject::Reconnecting(detail)) => {
+                assert!(detail.contains("hub gone"), "outage detail rides along: {detail}");
+            }
+            Err(_) => panic!("expected the Reconnecting reject"),
+            Ok(()) => panic!("the queued send must not report success"),
+        }
+
+        // An empty channel drains to a no-op (each backoff iteration calls this).
+        super::reject_queued_sends(&mut rx, "hub gone");
     }
 }

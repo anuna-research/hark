@@ -156,6 +156,14 @@ pub struct MlsSession {
     /// multiple one-time KeyPackages before the first reply is processed.
     /// In-memory; cleared on (re)join, since replies die with the socket.
     keyget_inflight: std::collections::HashSet<String>,
+    /// The owner's verified bye evidence retained for the v0.10.0
+    /// owner-departure carve-out: the frame that triggers the carve-out
+    /// commit may not be the frame that carried the self-Remove (round-9),
+    /// and the fanned commit MUST ride with this exact object or every peer
+    /// rejects it (REQ-017d). Epoch-checked at use; in-memory (the pending
+    /// proposal it accompanies is epoch-scoped and dies with the socket's
+    /// group state anyway).
+    owner_bye_evidence: Option<RemovalEvidence>,
 }
 
 /// The relationship between the in-memory MLS group and its durable provider
@@ -245,6 +253,7 @@ impl MlsSession {
             own_echoes: std::collections::VecDeque::new(),
             durability: DurabilityState::Durable,
             keyget_inflight: std::collections::HashSet::new(),
+            owner_bye_evidence: None,
         };
 
         if let Some(meta) = meta {
@@ -810,15 +819,30 @@ impl MlsSession {
                 tracing::debug!(error = %e, "welcome while a group exists (redelivery or rival) — refused, acked");
                 SessionEvent::Handled { outbound: ack }
             }
-            Err(e) if !ack.is_empty() => {
-                // SPEC-024 REQ-002(a): the queue is receipt-acked regardless
-                // of join success. A first-contact welcome that fails to join
-                // (malformed ciphertext, a pin conflict) is refused — but
-                // dropping the ack too would leave the hub retaining and
-                // redelivering the same dead entry until TTL, occupying
-                // per-addressee queue capacity on every reconnect.
-                tracing::warn!(error = %e, "welcome addressed to us failed to join — refused, receipt acked");
+            Err(e @ MlsError::Rejected(_)) if !ack.is_empty() => {
+                // SPEC-024 REQ-002(a): a DETERMINISTIC validation refusal
+                // (malformed ciphertext, a pin conflict) is acked — the same
+                // payload can never join, and dropping the ack would leave
+                // the hub retaining and redelivering the dead entry until
+                // TTL, occupying per-addressee queue capacity on every
+                // reconnect.
+                tracing::warn!(error = %e, "welcome addressed to us failed validation — refused, receipt acked");
                 SessionEvent::Handled { outbound: ack }
+            }
+            Err(e) if !ack.is_empty() => {
+                // Round-9 P2: a TRANSIENT failure (storage, the MLS stack, a
+                // not-ready precondition) must NOT ack — the hub's RAM queue
+                // holds the ONLY copy of a first-contact Welcome, and acking
+                // deletes it while self.group stays unset, stranding this
+                // member with no stateless-resync recovery. Left unacked,
+                // the queue redelivers once the transient clears (REQ-013
+                // kept the init key intact, so the retry can still consume
+                // it).
+                tracing::warn!(error = %e, "welcome addressed to us hit a transient failure — unacked, awaiting redelivery");
+                SessionEvent::Dropped {
+                    reason: e.to_string(),
+                    probable_fork: false,
+                }
             }
             Err(e) => SessionEvent::Dropped {
                 reason: e.to_string(),
@@ -879,6 +903,22 @@ impl MlsSession {
             self.durability = DurabilityState::Durable;
         }
         self.pending_rebroadcast()
+    }
+
+    /// Round-9 P1: the [`DurabilityState::FanPending`] batch, for a caller
+    /// that will emit it — on ANY event, not only a `Handled` one. After
+    /// snapshot recovery peers are still on the OLD epoch, so the next
+    /// inbound commonly yields `Dropped` (their deliver is undecryptable) or
+    /// `NotMls`; waiting for a `Handled` event to fan could leave the session
+    /// `FanPending` — every send and mutation refusing `NotReady` —
+    /// indefinitely. Empty (and state untouched) outside `FanPending`, so
+    /// callers may drain unconditionally without re-fanning the retained
+    /// batch a rejoin re-drive owns.
+    pub(crate) fn take_recovered_fanout(&mut self) -> Vec<String> {
+        if self.durability != DurabilityState::FanPending {
+            return Vec::new();
+        }
+        self.take_rebroadcast()
     }
 
     /// The single transaction through which every AUTHORED transition (Add,
@@ -1301,32 +1341,95 @@ impl MlsSession {
             if !carveout_next_owner(&members, creator.as_ref(), true, &me) {
                 return Ok(vec![]); // another member is the next-elected owner
             }
-            // Stage the commit over the pending proposals; the transition
-            // transaction owns merge + durability.
+            // Round-9 P1 (evidence): the fanned frame carries exactly ONE
+            // `:evidence` object and peers validate it against EVERY Remove
+            // the commit covers (REQ-017d) — so the commit is scoped below
+            // to the owner's own self-Remove, and it must ride with the
+            // owner's bye evidence for THIS epoch. That object may have
+            // arrived on an earlier frame than the one triggering this
+            // commit, so the last matching one is retained across events;
+            // without it, committing would fan an evidence-less (or
+            // wrong-target) frame every peer rejects while we merged — a
+            // fork. Wait for the proposer's re-signal instead.
+            let epoch = group.epoch().as_u64();
+            if let Some(ev) = evidence {
+                if ev.target_leaf_index == owner_index && ev.epoch == epoch {
+                    self.owner_bye_evidence = Some(ev.clone());
+                }
+            }
+            let Some(bye) = self
+                .owner_bye_evidence
+                .as_ref()
+                .filter(|ev| ev.target_leaf_index == owner_index && ev.epoch == epoch)
+                .cloned()
+            else {
+                return Ok(vec![]);
+            };
+            // Round-9 P1 (scoping): commit_to_pending_proposals covers every
+            // pending proposal, but a covered foreign Remove forks on the
+            // single evidence object above, and a covered Add returns the
+            // only Welcome able to initialize the new leaf — which this path
+            // cannot address (a permanently stranded member). Drop every
+            // pending proposal that is NOT the owner's own self-Remove:
+            // uncovered proposals are epoch-scoped and die at this merge on
+            // every peer regardless, and their proposers re-drive at the new
+            // epoch (REQ-014 retry; presence/keyready re-drives).
+            {
+                use openmls::prelude::{LeafNodeIndex, Proposal, Sender};
+                let owner_sender = Sender::Member(LeafNodeIndex::new(owner_index));
+                let foreign: Vec<_> = group
+                    .pending_proposals()
+                    .filter(|q| {
+                        !(matches!(q.proposal(), Proposal::Remove(r) if r.removed().u32() == owner_index)
+                            && q.sender() == &owner_sender)
+                    })
+                    .map(|q| q.proposal_reference_ref().clone())
+                    .collect();
+                for proposal_ref in &foreign {
+                    group
+                        .remove_pending_proposal(
+                            openmls_traits::OpenMlsProvider::storage(&self.provider),
+                            proposal_ref,
+                        )
+                        .map_err(MlsError::stack("scope carve-out commit"))?;
+                }
+            }
+            // Stage the commit over the (now owner-self-Remove-only) pending
+            // proposals; the transition transaction owns merge + durability.
             use tls_codec::Serialize as _;
-            let (commit, _welcome, _gi) = group
+            let (commit, welcome, _gi) = group
                 .commit_to_pending_proposals(&self.provider, &self.identity.signer)
                 .map_err(MlsError::stack("commit pending proposals"))?;
+            if welcome.is_some() {
+                // Unreachable with the store scoped to Removes — but a
+                // Welcome this path cannot address must never advance the
+                // group (its holder would be stranded forever).
+                let _ = group
+                    .clear_pending_commit(openmls_traits::OpenMlsProvider::storage(&self.provider));
+                return Err(MlsError::Rejected(
+                    "carve-out commit unexpectedly produced a Welcome; refusing to strand its \
+                     addressee"
+                        .into(),
+                ));
+            }
             let commit_bytes = commit
                 .tls_serialize_detached()
                 .map_err(MlsError::stack("serialize pending commit"))?;
             let commit_ct = B64.encode(&commit_bytes);
-            let ev_field = match evidence {
-                Some(ev) => {
-                    let json = serde_json::to_vec(ev).map_err(std::io::Error::other)?;
-                    format!(" :evidence \"{}\"", B64.encode(json))
-                }
-                None => String::new(),
-            };
+            let json = serde_json::to_vec(&bye).map_err(std::io::Error::other)?;
             let frame = format!(
-                "(deliver {} :enc mls :ct \"{commit_ct}\"{ev_field} :from {})",
-                self.room, self.handle
+                "(deliver {} :enc mls :ct \"{commit_ct}\" :evidence \"{}\" :from {})",
+                self.room,
+                B64.encode(json),
+                self.handle
             );
-            self.apply_authored_transition(
+            let frames = self.apply_authored_transition(
                 vec![frame],
                 &commit_ct,
                 "merge owner-departure carve-out commit",
-            )
+            )?;
+            self.owner_bye_evidence = None;
+            Ok(frames)
         })();
         match result {
             Ok(frames) => frames,
@@ -2052,7 +2155,7 @@ mod tests {
         let (prop, _pref) = a_group
             .propose_remove_member(&a_provider, &a_identity.signer, me.index)
             .unwrap();
-        let prop_ct = B64.encode(&prop.tls_serialize_detached().unwrap());
+        let prop_ct = B64.encode(prop.tls_serialize_detached().unwrap());
         let ev_b64 = B64.encode(serde_json::to_vec(&ev).unwrap());
         let frame = format!(
             "(deliver @research :enc mls :ct \"{prop_ct}\" :evidence \"{ev_b64}\" :from @alice)"
@@ -2098,6 +2201,362 @@ mod tests {
 
         let _ = fs::remove_dir_all(&a_dir);
         let _ = fs::remove_dir_all(&b_dir);
+    }
+
+    /// Round-9 P1 regression: an Add proposal pending when the owner's
+    /// self-Remove arrives must NOT be swept into the carve-out commit —
+    /// OpenMLS would return the only Welcome able to initialize the added
+    /// leaf, and this path cannot address it (a permanently stranded
+    /// member). The commit is scoped to the owner's self-Remove: exactly one
+    /// evidence-carrying deliver frame fans (no half-baked welcome), the
+    /// proposer accepts it, and the added member is simply never seated (its
+    /// proposer re-drives at the new epoch).
+    #[test]
+    fn carveout_commit_never_sweeps_a_pending_add() {
+        use super::super::group::{add_member, create_group, credential_handle};
+        use super::super::keypackages::{ConsumedLedger, build_one_time, validate_key_package_bytes};
+        use super::super::pins::PinStore;
+        use super::super::removal::RemovalEvidence;
+        use tls_codec::Serialize as _;
+
+        let (b_dir, b_wire) = setup("odscope", 107, "@bella");
+        let mut bella =
+            MlsSession::open(&b_dir, "bella", "@research", "@bella", &b_wire, true).unwrap();
+        let b_frames = bella.join_frames().unwrap();
+
+        let a_dir =
+            std::env::temp_dir().join(format!("hark-mls-odscope-alice-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&a_dir);
+        fs::create_dir_all(&a_dir).unwrap();
+        let a_wire = ChatIdentity::from_seed([106u8; 32]);
+        let a_provider = DurableProvider::open(&a_dir.join("agent.mls")).unwrap();
+        let a_identity = MlsIdentity::from_wire_identity(&a_wire, "@alice");
+        let mut a_pins = PinStore::open(&a_dir.join("agent.pins")).unwrap();
+        let a_ledger = ConsumedLedger::open(&a_dir.join("agent.kpledger")).unwrap();
+        a_pins
+            .observe_verified("@alice", &a_wire.verifying_key_bytes())
+            .unwrap();
+        a_pins
+            .observe_verified("@bella", &b_wire.verifying_key_bytes())
+            .unwrap();
+
+        let (mut a_group, genesis) = create_group(&a_provider, &a_identity, "@research").unwrap();
+        let bella_kp_b64 = {
+            let onetime = kw_value(&b_frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+        let kp_bytes = B64.decode(&bella_kp_b64).unwrap();
+        let outcome = add_member(
+            &a_provider,
+            &a_identity,
+            &mut a_group,
+            &kp_bytes,
+            "@bella",
+            &a_pins,
+            &a_ledger,
+        )
+        .unwrap();
+        let welcome = format!(
+            "(welcome @research :for @bella :ct \"{}\" :from @alice)",
+            B64.encode(&outcome.welcome_bytes)
+        );
+        assert!(matches!(
+            bella.handle_frame(&welcome),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(bella.joined());
+
+        // A standalone Add of @dave lands in bella's proposal store first.
+        let d_dir =
+            std::env::temp_dir().join(format!("hark-mls-odscope-dave-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d_dir);
+        fs::create_dir_all(&d_dir).unwrap();
+        let d_wire = ChatIdentity::from_seed([108u8; 32]);
+        let d_provider = DurableProvider::open(&d_dir.join("agent.mls")).unwrap();
+        let d_identity = MlsIdentity::from_wire_identity(&d_wire, "@dave");
+        let dave_kp = validate_key_package_bytes(
+            &a_provider,
+            &build_one_time(&d_provider, &d_identity, 1)
+                .unwrap()
+                .remove(0)
+                .bytes,
+        )
+        .unwrap();
+        let (add_prop, _ref) = a_group
+            .propose_add_member(&a_provider, &a_identity.signer, &dave_kp)
+            .unwrap();
+        let add_frame = format!(
+            "(deliver @research :enc mls :ct \"{}\" :from @alice)",
+            B64.encode(add_prop.tls_serialize_detached().unwrap())
+        );
+        let SessionEvent::Handled { outbound } = bella.handle_frame(&add_frame) else {
+            panic!("the add proposal must be stored")
+        };
+        assert!(outbound.is_empty(), "no commit before the self-Remove");
+
+        // The owner's self-Remove + bye evidence arrives; bella commits the
+        // carve-out — scoped to the self-Remove alone.
+        let me = a_group
+            .members()
+            .find(|m| credential_handle(&m.credential).unwrap() == "@alice")
+            .unwrap();
+        let a_key = <[u8; 32]>::try_from(me.signature_key.as_slice()).unwrap();
+        let ev = RemovalEvidence::mint(
+            &a_wire,
+            "@alice",
+            "@research",
+            a_group.group_id().as_slice(),
+            a_group.epoch().as_u64(),
+            "@alice",
+            me.index.u32(),
+            &a_key,
+        );
+        let (prop, _pref) = a_group
+            .propose_remove_member(&a_provider, &a_identity.signer, me.index)
+            .unwrap();
+        let frame = format!(
+            "(deliver @research :enc mls :ct \"{}\" :evidence \"{}\" :from @alice)",
+            B64.encode(prop.tls_serialize_detached().unwrap()),
+            B64.encode(serde_json::to_vec(&ev).unwrap())
+        );
+        let SessionEvent::Handled { outbound } = bella.handle_frame(&frame) else {
+            panic!("the self-Remove must be stored and committed")
+        };
+        assert_eq!(
+            outbound.len(),
+            1,
+            "exactly one carve-out deliver — never a half-addressed welcome: {outbound:?}"
+        );
+        assert!(outbound[0].starts_with("(deliver @research :enc mls :ct \""));
+        assert!(outbound[0].contains(":evidence"));
+
+        // The proposer (holding BOTH pending proposals) accepts the scoped
+        // commit; @dave is never seated by it.
+        let commit_ct = kw_b64(&outbound[0], ":ct").unwrap();
+        let mut fork = ForkSignal::default();
+        let merged = process_inbound(
+            &a_provider,
+            &mut a_group,
+            &commit_ct,
+            "@research",
+            &mut a_pins,
+            &genesis,
+            Some(&ev),
+            &mut fork,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(merged, Inbound::Handshake { .. }));
+        let roster: Vec<String> = a_group
+            .members()
+            .map(|m| credential_handle(&m.credential).unwrap())
+            .collect();
+        assert_eq!(
+            roster,
+            vec!["@bella".to_string()],
+            "the owner departed and the pending Add was NOT swept into the commit"
+        );
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+        let _ = fs::remove_dir_all(&d_dir);
+    }
+
+    /// Round-9 P1 regression: a second evidenced Remove pending alongside
+    /// the owner's self-Remove must not be swept into the carve-out commit —
+    /// the frame carries ONE evidence object and peers validate it against
+    /// every covered Remove (REQ-017d), so sweeping forks the group. The
+    /// scoped commit removes only the owner; the other target stays seated.
+    #[test]
+    fn carveout_commit_covers_only_the_owner_self_remove() {
+        use super::super::group::{add_member, create_group, credential_handle};
+        use super::super::keypackages::{ConsumedLedger, build_one_time};
+        use super::super::pins::PinStore;
+        use super::super::removal::RemovalEvidence;
+        use tls_codec::Serialize as _;
+
+        let (b_dir, b_wire) = setup("odmulti", 110, "@bella");
+        let mut bella =
+            MlsSession::open(&b_dir, "bella", "@research", "@bella", &b_wire, true).unwrap();
+        let b_frames = bella.join_frames().unwrap();
+
+        let a_dir =
+            std::env::temp_dir().join(format!("hark-mls-odmulti-alice-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&a_dir);
+        fs::create_dir_all(&a_dir).unwrap();
+        let a_wire = ChatIdentity::from_seed([109u8; 32]);
+        let a_provider = DurableProvider::open(&a_dir.join("agent.mls")).unwrap();
+        let a_identity = MlsIdentity::from_wire_identity(&a_wire, "@alice");
+        let mut a_pins = PinStore::open(&a_dir.join("agent.pins")).unwrap();
+        let a_ledger = ConsumedLedger::open(&a_dir.join("agent.kpledger")).unwrap();
+        let c_wire = ChatIdentity::from_seed([111u8; 32]);
+        a_pins
+            .observe_verified("@alice", &a_wire.verifying_key_bytes())
+            .unwrap();
+        a_pins
+            .observe_verified("@bella", &b_wire.verifying_key_bytes())
+            .unwrap();
+        a_pins
+            .observe_verified("@carol", &c_wire.verifying_key_bytes())
+            .unwrap();
+
+        let (mut a_group, genesis) = create_group(&a_provider, &a_identity, "@research").unwrap();
+        let bella_kp_b64 = {
+            let onetime = kw_value(&b_frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+        let kp_bytes = B64.decode(&bella_kp_b64).unwrap();
+        let outcome = add_member(
+            &a_provider,
+            &a_identity,
+            &mut a_group,
+            &kp_bytes,
+            "@bella",
+            &a_pins,
+            &a_ledger,
+        )
+        .unwrap();
+        let welcome = format!(
+            "(welcome @research :for @bella :ct \"{}\" :from @alice)",
+            B64.encode(&outcome.welcome_bytes)
+        );
+        assert!(matches!(
+            bella.handle_frame(&welcome),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(bella.joined());
+
+        // @carol is seated by the creator; bella processes the add commit.
+        let c_dir =
+            std::env::temp_dir().join(format!("hark-mls-odmulti-carol-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&c_dir);
+        fs::create_dir_all(&c_dir).unwrap();
+        let c_provider = DurableProvider::open(&c_dir.join("agent.mls")).unwrap();
+        let c_identity = MlsIdentity::from_wire_identity(&c_wire, "@carol");
+        let carol_kp_bytes = build_one_time(&c_provider, &c_identity, 1)
+            .unwrap()
+            .remove(0)
+            .bytes;
+        let carol_outcome = add_member(
+            &a_provider,
+            &a_identity,
+            &mut a_group,
+            &carol_kp_bytes,
+            "@carol",
+            &a_pins,
+            &a_ledger,
+        )
+        .unwrap();
+        let add_commit_frame = format!(
+            "(deliver @research :enc mls :ct \"{}\" :from @alice)",
+            B64.encode(&carol_outcome.commit_bytes)
+        );
+        assert!(matches!(
+            bella.handle_frame(&add_commit_frame),
+            SessionEvent::Handled { .. }
+        ));
+
+        // A creator-evidenced Remove of @carol lands in bella's store…
+        let carol_leaf = a_group
+            .members()
+            .find(|m| credential_handle(&m.credential).unwrap() == "@carol")
+            .unwrap();
+        let carol_key = <[u8; 32]>::try_from(carol_leaf.signature_key.as_slice()).unwrap();
+        let carol_ev = RemovalEvidence::mint(
+            &a_wire,
+            "@alice",
+            "@research",
+            a_group.group_id().as_slice(),
+            a_group.epoch().as_u64(),
+            "@carol",
+            carol_leaf.index.u32(),
+            &carol_key,
+        );
+        let (carol_prop, _ref) = a_group
+            .propose_remove_member(&a_provider, &a_identity.signer, carol_leaf.index)
+            .unwrap();
+        let carol_frame = format!(
+            "(deliver @research :enc mls :ct \"{}\" :evidence \"{}\" :from @alice)",
+            B64.encode(carol_prop.tls_serialize_detached().unwrap()),
+            B64.encode(serde_json::to_vec(&carol_ev).unwrap())
+        );
+        let SessionEvent::Handled { outbound } = bella.handle_frame(&carol_frame) else {
+            panic!("the carol remove proposal must be stored")
+        };
+        assert!(outbound.is_empty(), "no commit before the self-Remove");
+
+        // …then the owner's self-Remove + bye. The carve-out commit must
+        // cover ONLY the self-Remove: one frame, one evidence, and validators
+        // holding both proposals accept it with @carol still seated.
+        let me = a_group
+            .members()
+            .find(|m| credential_handle(&m.credential).unwrap() == "@alice")
+            .unwrap();
+        let a_key = <[u8; 32]>::try_from(me.signature_key.as_slice()).unwrap();
+        let bye = RemovalEvidence::mint(
+            &a_wire,
+            "@alice",
+            "@research",
+            a_group.group_id().as_slice(),
+            a_group.epoch().as_u64(),
+            "@alice",
+            me.index.u32(),
+            &a_key,
+        );
+        let (self_prop, _pref) = a_group
+            .propose_remove_member(&a_provider, &a_identity.signer, me.index)
+            .unwrap();
+        let self_frame = format!(
+            "(deliver @research :enc mls :ct \"{}\" :evidence \"{}\" :from @alice)",
+            B64.encode(self_prop.tls_serialize_detached().unwrap()),
+            B64.encode(serde_json::to_vec(&bye).unwrap())
+        );
+        let SessionEvent::Handled { outbound } = bella.handle_frame(&self_frame) else {
+            panic!("the self-Remove must be stored and committed")
+        };
+        assert_eq!(outbound.len(), 1, "one scoped carve-out deliver: {outbound:?}");
+
+        let commit_ct = kw_b64(&outbound[0], ":ct").unwrap();
+        let mut fork = ForkSignal::default();
+        let merged = process_inbound(
+            &a_provider,
+            &mut a_group,
+            &commit_ct,
+            "@research",
+            &mut a_pins,
+            &genesis,
+            Some(&bye),
+            &mut fork,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(merged, Inbound::Handshake { .. }));
+        let mut roster: Vec<String> = a_group
+            .members()
+            .map(|m| credential_handle(&m.credential).unwrap())
+            .collect();
+        roster.sort();
+        assert_eq!(
+            roster,
+            vec!["@bella".to_string(), "@carol".to_string()],
+            "only the owner's self-Remove was committed; the other evidenced Remove was not swept"
+        );
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+        let _ = fs::remove_dir_all(&c_dir);
     }
 
     /// SPEC-024 web-interop inbound shapes: (1) a LIST-valued `:for` naming us
@@ -2442,6 +2901,78 @@ mod tests {
         let _ = fs::remove_dir_all(&c_dir);
     }
 
+    /// Round-9 P1 regression: after snapshot recovery, peers are still on
+    /// the OLD epoch, so the next inbound frames commonly yield `Dropped` —
+    /// which never carries outbound frames. The recovered batch must be
+    /// drainable on ANY event via `take_recovered_fanout` (what the chat
+    /// loop now calls after every `handle_frame`), or the session stays
+    /// `FanPending` — every send refusing `NotReady` — until an unrelated
+    /// Handled event happens along.
+    #[test]
+    fn recovered_batch_drains_on_dropped_events() {
+        let (a_dir, a_wire) = setup("drainfp", 112, "@alice");
+        let (b_dir, b_wire) = setup("drainfp", 113, "@bob");
+        let mut alice =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
+        let mut bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
+        let b_frames = bob.join_frames().unwrap();
+        let _ = alice.handle_frame(&b_frames[1]);
+        alice.create_group_as_creator().unwrap();
+        let _ = alice.handle_frame("(presence @research :members (@alice @bob))");
+        let bob_kp_b64 = {
+            let onetime = kw_value(&b_frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+
+        // Bob's add merges in memory but its snapshot fails; the fault then
+        // clears, so the NEXT event boundary recovers into FanPending.
+        fs::create_dir(a_dir.join("alice.tmp")).unwrap();
+        match alice.handle_frame(&format!("(keypkg @hub :for @bob :kp \"{bob_kp_b64}\")")) {
+            SessionEvent::Dropped { .. } => {}
+            other => panic!("expected the add to fail under the snapshot fault, got {other:?}"),
+        }
+        fs::remove_dir(a_dir.join("alice.tmp")).unwrap();
+
+        // The only traffic is an undecryptable deliver — a Dropped event.
+        let garbage = B64.encode(b"stale-epoch ciphertext");
+        match alice.handle_frame(&format!(
+            "(deliver @research :enc mls :ct \"{garbage}\" :from @bob)"
+        )) {
+            SessionEvent::Dropped { .. } => {}
+            other => panic!("expected the garbage deliver to drop, got {other:?}"),
+        }
+
+        // The caller-side drain hands the batch out and unlocks mutation.
+        let recovered = alice.take_recovered_fanout();
+        let welcome = recovered
+            .iter()
+            .find(|f| f.starts_with("(welcome @research"))
+            .expect("the recovered batch drains on a Dropped event")
+            .clone();
+        assert!(matches!(
+            bob.handle_frame(&welcome),
+            SessionEvent::Handled { .. }
+        ));
+        assert!(bob.joined(), "the drained welcome seats the invitee");
+        assert!(
+            alice.encrypt_outbound("(say @research :from @alice)").is_ok(),
+            "mutation unlocks once the batch was handed out"
+        );
+        assert!(
+            alice.take_recovered_fanout().is_empty(),
+            "the drain is one-shot; a Durable session never re-fans the retained batch"
+        );
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
+    }
+
     /// SPEC-024 REQ-002(a): the per-addressee welcome queue is receipt-acked
     /// regardless of join success — a stamped welcome that FAILS to join
     /// while no group exists (malformed ciphertext, a pin conflict) is
@@ -2473,6 +3004,90 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round-9 P2 regression: a VALID first-contact welcome that fails on a
+    /// TRANSIENT storage error must NOT be receipt-acked — the hub's RAM
+    /// queue holds the only copy, and acking deletes it while `self.group`
+    /// is still unset (with no stateless-resync recovery, the member could
+    /// never join). Left unacked, the hub's redelivery after the fault
+    /// clears joins normally with the init key intact.
+    #[test]
+    fn transient_welcome_failure_is_unacked_and_redelivery_joins() {
+        use super::super::group::{add_member, create_group};
+        use super::super::keypackages::ConsumedLedger;
+        use super::super::pins::PinStore;
+
+        let (b_dir, b_wire) = setup("wtrans", 115, "@bella");
+        let mut bella =
+            MlsSession::open(&b_dir, "bella", "@research", "@bella", &b_wire, true).unwrap();
+        let b_frames = bella.join_frames().unwrap();
+
+        let a_dir =
+            std::env::temp_dir().join(format!("hark-mls-wtrans-alice-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&a_dir);
+        fs::create_dir_all(&a_dir).unwrap();
+        let a_wire = ChatIdentity::from_seed([114u8; 32]);
+        let a_provider = DurableProvider::open(&a_dir.join("agent.mls")).unwrap();
+        let a_identity = MlsIdentity::from_wire_identity(&a_wire, "@alice");
+        let mut a_pins = PinStore::open(&a_dir.join("agent.pins")).unwrap();
+        let a_ledger = ConsumedLedger::open(&a_dir.join("agent.kpledger")).unwrap();
+        a_pins
+            .observe_verified("@alice", &a_wire.verifying_key_bytes())
+            .unwrap();
+        a_pins
+            .observe_verified("@bella", &b_wire.verifying_key_bytes())
+            .unwrap();
+        let (mut a_group, _genesis) = create_group(&a_provider, &a_identity, "@research").unwrap();
+        let bella_kp_b64 = {
+            let onetime = kw_value(&b_frames[0], ":onetime").unwrap();
+            match onetime {
+                SExpr::List(items) => match &items[0] {
+                    SExpr::Atom(Atom::Str(s)) => s.clone(),
+                    _ => panic!("onetime entry"),
+                },
+                _ => panic!("onetime list"),
+            }
+        };
+        let kp_bytes = B64.decode(&bella_kp_b64).unwrap();
+        let outcome = add_member(
+            &a_provider,
+            &a_identity,
+            &mut a_group,
+            &kp_bytes,
+            "@bella",
+            &a_pins,
+            &a_ledger,
+        )
+        .unwrap();
+        let stamped = format!(
+            "(welcome @research :seq 4 :for @bella :ct \"{}\" :from @alice)",
+            B64.encode(&outcome.welcome_bytes)
+        );
+
+        // Inject: a DIRECTORY at the provider's snapshot temp path makes the
+        // join's final persist fail — a storage-class transient.
+        fs::create_dir(b_dir.join("bella.tmp")).unwrap();
+        assert!(
+            matches!(bella.handle_frame(&stamped), SessionEvent::Dropped { .. }),
+            "a transient welcome failure must be Dropped, not acked"
+        );
+        assert!(!bella.joined());
+
+        // The fault clears; the hub redelivers the retained entry. The join
+        // now succeeds AND acks the receipt.
+        fs::remove_dir(b_dir.join("bella.tmp")).unwrap();
+        let SessionEvent::Handled { outbound } = bella.handle_frame(&stamped) else {
+            panic!("the redelivered welcome must join")
+        };
+        assert!(bella.joined(), "redelivery after the transient joins");
+        assert!(
+            outbound.contains(&"(mlsack @research :seq 4 :from @bella)".to_string()),
+            "the successful join acks the queue entry: {outbound:?}"
+        );
+
+        let _ = fs::remove_dir_all(&a_dir);
+        let _ = fs::remove_dir_all(&b_dir);
     }
 
     /// End-to-end over the wire-frame layer (TEST-001/003/005/006/010-shape):

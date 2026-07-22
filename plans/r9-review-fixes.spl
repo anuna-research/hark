@@ -1,0 +1,285 @@
+; =============================================================================
+; R9 review fixes — authorization bypass + stranding/fork paths from the
+; round-9 adversarial review of feat/auto-reconnect (PROTO-001 Principle 12).
+; =============================================================================
+;
+; Findings under repair (reviewer IDs → tasks):
+;
+;   P1 group.rs:783    sender-controlled :for roster can filter the true owner
+;                      out of the REQ-012b pre-add election      → task-f1
+;   P1 session.rs:1307 carve-out commit discards the Welcome for pending Adds,
+;                      stranding the added leaf                  → task-f23
+;   P1 session.rs:1314 carve-out frame carries one evidence object while the
+;                      commit covers every pending Remove → fork → task-f23
+;   P1 session.rs:712  FanPending drains only on Handled events; Dropped-only
+;                      traffic wedges sends at NotReady forever  → task-f4
+;   P2 session.rs:813  transient (Storage) welcome failures are receipt-acked;
+;                      hub deletes its only RAM copy → stranded  → task-f5
+;   P2 chat.rs:1051    socket close leaves queued send_rx frames unresolved
+;                      through the whole outage                  → task-f6
+;
+; Fix designs (agreed against SPEC-013 v0.10.0 + SPEC-024):
+;
+;   f1  The joiner can never verify which leaves a commit added (the :for list
+;       is sender-supplied metadata; SPEC-024 REQ-010 gives the cross-check to
+;       MEMBERS, who see the commit — never to the joiner). So authority must
+;       not derive from it: (i) when the genesis creator is a live leaf of the
+;       delivered tree (minus the joiner's own leaf), the Welcome sender MUST
+;       be the creator (handle AND key) — co-added claims are irrelevant to
+;       the election, since Adds only grow the tree and creator-preferred
+;       election ignores extra leaves; (ii) when the creator is NOT a live
+;       pre-add leaf (owner-departure world), a multi-add Welcome (:for
+;       naming anyone besides the joiner) is REJECTED fail-closed — the
+;       co-added roster is unverifiable exactly where it would decide the
+;       election — and a single add elects lex-smallest over tree-minus-joiner,
+;       which IS the pre-add roster. Closes the bypass with zero trust in :for.
+;
+;   f23 Scope the owner-departure carve-out commit to the owner's OWN
+;       self-Remove proposal(s): remove every other pending proposal from the
+;       local store (openmls remove_pending_proposal) before
+;       commit_to_pending_proposals. Uncovered proposals are epoch-scoped and
+;       die at the merge on every peer anyway; their proposers re-drive at the
+;       new epoch (REQ-014 retry semantics, presence/keyready re-drives). The
+;       scoped commit produces no Welcome (nothing is added — no stranded
+;       leaf) and covers exactly the Remove its single :evidence validates
+;       (no fork). Defensively refuse to fan if a Welcome is still produced.
+;
+;   f4  Hand the recovered FanPending batch to the caller on EVERY event, not
+;       only Handled: new public MlsSession::take_recovered_fanout() drained
+;       by chat.rs after every handle_frame outcome and after a NotReady
+;       encrypt_outbound refusal; the existing Handled prepend keeps batch-
+;       before-own-frames ordering (drain is idempotent — second take empty).
+;
+;   f5  Ack a failed first-contact welcome ONLY on MlsError::Rejected (a
+;       deterministic validation refusal — redelivery can never succeed).
+;       Storage/Stack/NotReady failures return Dropped un-acked so the hub
+;       queue redelivers once the transient clears (REQ-013 leaves the init
+;       key intact on failed joins, so the retry can still consume it).
+;
+;   f6  On entering reconnect (and on every backoff iteration), drain send_rx
+;       with try_recv and resolve each queued OutboundFrame with
+;       OutboundReject::reconnecting — the same verdict new sends already get
+;       from the store's Reconnecting state; closes the enqueue race.
+
+(meta plan
+  (title "R9 review fixes — welcome election authority, carve-out scoping, drain paths")
+  (status "active")
+  (description
+    "Repair the six round-9 review findings: REQ-012b election over a "
+    "sender-controlled roster, carve-out commits that strand added leaves or "
+    "fork on multi-Remove evidence, FanPending wedging on Dropped-only "
+    "traffic, transient welcome failures being receipt-acked, and queued "
+    "sends left unresolved across a socket close.")
+  (created "2026-07-22")
+  (branch "feat/auto-reconnect"))
+
+(given agent-hugo-available)
+
+(given task-f1)     ; group.rs — REQ-012b election without sender-controlled roster
+(given task-f23)    ; session.rs — scope the carve-out commit to the owner self-Remove
+(given task-f4)     ; session.rs + chat.rs — drain FanPending on every event
+(given task-f5)     ; session.rs — ack only deterministic welcome rejections
+(given task-f6)     ; chat.rs — resolve queued sends on socket close
+(given task-verify) ; regression tests + build + clippy + full suite + commit
+
+(meta task-f1
+  (description
+    "Rewrite validate_staged_welcome (src/mls/group.rs): never filter the "
+    "pre-add roster by the sender-supplied co_added list. Creator-live → "
+    "sender must be the creator by handle+key; creator not a live pre-add "
+    "leaf → reject multi-add welcomes fail-closed, elect lex-smallest over "
+    "tree-minus-joiner for a single add. Drop the co_added parameter from "
+    "validate_staged_welcome/join_from_welcome if it becomes authority-unused "
+    "(the :for list stays load-bearing for addressing/acks in session.rs). "
+    "Update the round-8 multi-add test to the new rule and add the attack "
+    "regression: a non-owner member authors a valid Add and lists the true "
+    "owner in :for — the join MUST be rejected.")
+  (acceptance
+    "1. cargo test -p hark mls::group passes. 2. New regression test: "
+    "attacker-authored welcome naming the owner as co-added is rejected with "
+    "the REQ-012b reason. 3. Bootstrap add, steady-state creator add, and "
+    "creator-live multi-add still join. 4. Post-departure single add by the "
+    "interim owner still joins; post-departure multi-add is rejected."))
+
+(meta task-f23
+  (description
+    "In MlsSession::maybe_commit_owner_departure (src/mls/session.rs): before "
+    "commit_to_pending_proposals, remove every pending proposal that is NOT a "
+    "Remove of the owner's leaf proposed by the owner (reuse the "
+    "covers_owner_self_remove predicate shape); refuse to proceed (warn + "
+    "empty) if the scoped commit still returns Some(welcome). The single "
+    ":evidence then validates every Remove the commit covers.")
+  (acceptance
+    "1. Regression test: with a pending foreign Add + the owner self-Remove "
+    "stored, the carve-out commit removes ONLY the owner; peers accept the "
+    "frame and the added-leaf welcome is never fanned half-baked (the Add "
+    "dies with the epoch). 2. Test: with a second evidenced Remove pending, "
+    "the carve-out commit covers only the owner self-Remove and every peer "
+    "accepts it against the bye evidence."))
+
+(meta task-f4
+  (description
+    "session.rs: make take_rebroadcast reachable from the caller on every "
+    "event — pub(crate) take_recovered_fanout(). chat.rs run_connection: "
+    "after handle_frame outcomes other than Handled, and after a NotReady "
+    "encrypt refusal on the send arm, drain and transmit the recovered batch "
+    "(shared send-batch helper; write failure exits HubClosed as everywhere).")
+  (acceptance
+    "1. Regression test at the session level: a FanPending session receiving "
+    "only a Dropped-producing frame hands the batch out and unlocks mutation "
+    "(encrypt_outbound succeeds afterwards). 2. Existing round-8 FanPending "
+    "tests still pass (Handled ordering preserved)."))
+
+(meta task-f5
+  (description
+    "session.rs on_welcome: split the error arm — ack + Handled only for "
+    "MlsError::Rejected; Storage/Stack/NotReady return Dropped with no ack "
+    "so the hub redelivers after the transient clears. The group-established "
+    "redelivery/rival arm keeps acking as today.")
+  (acceptance
+    "1. Test: a first-contact welcome failing with Rejected (garbage ct) "
+    "still acks (round-8 behaviour). 2. Test: a Storage-class failure does "
+    "NOT ack and returns Dropped."))
+
+(meta task-f6
+  (description
+    "chat.rs reconnect(): after mark_reconnecting and again inside each "
+    "backoff iteration, drain self.send_rx via try_recv, resolving every "
+    "queued OutboundFrame's result_tx with OutboundReject::reconnecting and "
+    "the outage detail.")
+  (acceptance
+    "1. Test: a frame queued into send_rx before/while the socket closes is "
+    "resolved with the Reconnecting reject once reconnect() runs, not left "
+    "pending. 2. Existing reconnect tests unaffected."))
+
+(meta task-verify
+  (description
+    "Red-gate check per fix (each new regression test observed failing "
+    "against the pre-fix code where practical), then cargo build, cargo "
+    "clippy --all-targets, cargo test. Commit as round-9 hardening with the "
+    "finding-by-finding summary.")
+  (acceptance
+    "Clean build, clean clippy, full suite green, one commit on "
+    "feat/auto-reconnect describing all six repairs."))
+
+; Dependencies: the five fixes are independent; verification needs them all.
+(given verify-needs-fixes)
+
+(normally r-ready-f1 task-f1 ready-f1)
+(normally r-ready-f23 task-f23 ready-f23)
+(normally r-ready-f4 task-f4 ready-f4)
+(normally r-ready-f5 task-f5 ready-f5)
+(normally r-ready-f6 task-f6 ready-f6)
+
+(normally r-ready-verify
+  (and task-verify verify-needs-fixes
+       completed-f1 completed-f23 completed-f4 completed-f5 completed-f6)
+  ready-verify)
+
+(normally r-assign-f1 (and ready-f1 agent-hugo-available) assign-to-f1-hugo)
+(normally r-assign-f23 (and ready-f23 agent-hugo-available) assign-to-f23-hugo)
+(normally r-assign-f4 (and ready-f4 agent-hugo-available) assign-to-f4-hugo)
+(normally r-assign-f5 (and ready-f5 agent-hugo-available) assign-to-f5-hugo)
+(normally r-assign-f6 (and ready-f6 agent-hugo-available) assign-to-f6-hugo)
+(normally r-assign-verify (and ready-verify agent-hugo-available) assign-to-verify-hugo)
+
+(claims agent:hugo
+  :at "2026-07-22T06:21:46Z"
+  (given claim-v1-f1)
+  (normally r-cl-state-v1-f1 claim-v1-f1 state-claimed-v1-f1)
+  (normally r-cl-chain-v1-f1 state-claimed-v1-f1 claimed-f1)
+)
+
+;; Propagation rules: failures in 'f1' block downstream tasks
+(normally r-propagate-verify-from-f1-failed failed-f1 upstream-blocked-verify)
+(normally r-propagate-verify-from-f1-permanently-failed permanently-failed-f1 upstream-blocked-verify)
+(normally r-propagate-verify-from-f1-stale-v1 stale-v1-f1 upstream-blocked-verify)
+(normally r-propagate-verify-from-f1-timeout-v1 timeout-v1-f1 upstream-blocked-verify)
+(normally r-propagate-verify-from-f1-blocked upstream-blocked-f1 upstream-blocked-verify)
+
+(claims agent:hugo
+  :at "2026-07-22T06:25:11Z"
+  (given completed-f1))
+
+(claims agent:hugo
+  :at "2026-07-22T06:25:11Z"
+  (given claim-v1-f23)
+  (normally r-cl-state-v1-f23 claim-v1-f23 state-claimed-v1-f23)
+  (normally r-cl-chain-v1-f23 state-claimed-v1-f23 claimed-f23)
+)
+
+;; Propagation rules: failures in 'f23' block downstream tasks
+(normally r-propagate-verify-from-f23-failed failed-f23 upstream-blocked-verify)
+(normally r-propagate-verify-from-f23-permanently-failed permanently-failed-f23 upstream-blocked-verify)
+(normally r-propagate-verify-from-f23-stale-v1 stale-v1-f23 upstream-blocked-verify)
+(normally r-propagate-verify-from-f23-timeout-v1 timeout-v1-f23 upstream-blocked-verify)
+(normally r-propagate-verify-from-f23-blocked upstream-blocked-f23 upstream-blocked-verify)
+
+(claims agent:hugo
+  :at "2026-07-22T06:36:49Z"
+  (given completed-f23))
+
+(claims agent:hugo
+  :at "2026-07-22T06:36:49Z"
+  (given claim-v1-f4)
+  (normally r-cl-state-v1-f4 claim-v1-f4 state-claimed-v1-f4)
+  (normally r-cl-chain-v1-f4 state-claimed-v1-f4 claimed-f4)
+)
+
+;; Propagation rules: failures in 'f4' block downstream tasks
+(normally r-propagate-verify-from-f4-failed failed-f4 upstream-blocked-verify)
+(normally r-propagate-verify-from-f4-permanently-failed permanently-failed-f4 upstream-blocked-verify)
+(normally r-propagate-verify-from-f4-stale-v1 stale-v1-f4 upstream-blocked-verify)
+(normally r-propagate-verify-from-f4-timeout-v1 timeout-v1-f4 upstream-blocked-verify)
+(normally r-propagate-verify-from-f4-blocked upstream-blocked-f4 upstream-blocked-verify)
+
+(claims agent:hugo
+  :at "2026-07-22T06:40:10Z"
+  (given completed-f4))
+
+(claims agent:hugo
+  :at "2026-07-22T06:40:10Z"
+  (given claim-v1-f5)
+  (normally r-cl-state-v1-f5 claim-v1-f5 state-claimed-v1-f5)
+  (normally r-cl-chain-v1-f5 state-claimed-v1-f5 claimed-f5)
+)
+
+;; Propagation rules: failures in 'f5' block downstream tasks
+(normally r-propagate-verify-from-f5-failed failed-f5 upstream-blocked-verify)
+(normally r-propagate-verify-from-f5-permanently-failed permanently-failed-f5 upstream-blocked-verify)
+(normally r-propagate-verify-from-f5-stale-v1 stale-v1-f5 upstream-blocked-verify)
+(normally r-propagate-verify-from-f5-timeout-v1 timeout-v1-f5 upstream-blocked-verify)
+(normally r-propagate-verify-from-f5-blocked upstream-blocked-f5 upstream-blocked-verify)
+
+(claims agent:hugo
+  :at "2026-07-22T06:42:11Z"
+  (given completed-f5))
+
+(claims agent:hugo
+  :at "2026-07-22T06:42:11Z"
+  (given claim-v1-f6)
+  (normally r-cl-state-v1-f6 claim-v1-f6 state-claimed-v1-f6)
+  (normally r-cl-chain-v1-f6 state-claimed-v1-f6 claimed-f6)
+)
+
+;; Propagation rules: failures in 'f6' block downstream tasks
+(normally r-propagate-verify-from-f6-failed failed-f6 upstream-blocked-verify)
+(normally r-propagate-verify-from-f6-permanently-failed permanently-failed-f6 upstream-blocked-verify)
+(normally r-propagate-verify-from-f6-stale-v1 stale-v1-f6 upstream-blocked-verify)
+(normally r-propagate-verify-from-f6-timeout-v1 timeout-v1-f6 upstream-blocked-verify)
+(normally r-propagate-verify-from-f6-blocked upstream-blocked-f6 upstream-blocked-verify)
+
+(claims agent:hugo
+  :at "2026-07-22T06:43:47Z"
+  (given completed-f6))
+
+(claims agent:hugo
+  :at "2026-07-22T06:43:47Z"
+  (given claim-v1-verify)
+  (normally r-cl-state-v1-verify claim-v1-verify state-claimed-v1-verify)
+  (normally r-cl-chain-v1-verify state-claimed-v1-verify claimed-verify)
+)
+
+(claims agent:hugo
+  :at "2026-07-22T06:46:09Z"
+  (given completed-verify))
