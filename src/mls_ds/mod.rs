@@ -101,7 +101,36 @@ pub enum Verdict {
     Violation(&'static str),
 }
 
+/// CON-005 record-component binding — the immutable-anchor step the JS reference reducer
+/// (`recordComponentBinding`) runs BEFORE positional admission, decomposed here as its own
+/// composable pure core (as Add-authorization is decomposed into [`boundary`]). Every intact
+/// record names the room incarnation's IMMUTABLE genesis anchor (REQ-127): a client with no
+/// saved anchor yet has missing evidence (schedule `genesis-get`, NOT a violation); a record
+/// naming a DIFFERENT anchor is DS equivocation (the DS paired this header with a foreign room
+/// incarnation). Composed ahead of [`transition_record`] to complete CON-005's admission.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AnchorBinding {
+    /// The record names the saved immutable anchor — proceed to positional admission.
+    Bound,
+    /// No saved anchor yet — schedule `genesis-get`; the cursor holds (missing evidence).
+    AwaitingGenesis,
+    /// A different anchor — ds-equivocation; cursor + group held, bytes retained as evidence.
+    Violation(&'static str),
+}
+
+/// The CON-005 immutable-anchor binding decision. `record_genesis_ref` is the anchor the served
+/// record header names; `saved_anchor` is the client's persisted immutable anchor (if any).
+pub fn bind_record_anchor(record_genesis_ref: &str, saved_anchor: Option<&str>) -> AnchorBinding {
+    match saved_anchor {
+        None => AnchorBinding::AwaitingGenesis,
+        Some(saved) if record_genesis_ref == saved => AnchorBinding::Bound,
+        Some(_) => AnchorBinding::Violation("ds-equivocation:genesis-anchor-mismatch"),
+    }
+}
+
 /// `transition_client` record-admission core (CON-005 / REQ-034). `ds_vk` is the pinned DS key.
+/// The immutable-anchor binding ([`bind_record_anchor`]) composes AHEAD of this (REQ-127); this
+/// core owns the header authenticity (hash + DS signature) and positional exact-next clauses.
 pub fn transition_record(log: &ClientLog, ds_vk: &[u8; 32], resp: &RecordResponse) -> Verdict {
     if record_hash(&resp.log_record) != resp.record_hash {
         return Verdict::Violation("ds-equivocation:record-hash-mismatch");
@@ -200,6 +229,18 @@ mod tests {
         assert_eq!(
             transition_record(&log, &vk, &signed_record(1, H0, &forger)),
             Verdict::Violation("ds-equivocation:record-signature-invalid")
+        );
+    }
+
+    #[test]
+    fn record_anchor_binding_decides_bound_await_violation() {
+        // match -> Bound (proceed); absent -> AwaitingGenesis (missing evidence, not a violation);
+        // different -> ds-equivocation (foreign incarnation).
+        assert_eq!(bind_record_anchor("sha256:anchor", Some("sha256:anchor")), AnchorBinding::Bound);
+        assert_eq!(bind_record_anchor("sha256:anchor", None), AnchorBinding::AwaitingGenesis);
+        assert_eq!(
+            bind_record_anchor("sha256:foreign", Some("sha256:anchor")),
+            AnchorBinding::Violation("ds-equivocation:genesis-anchor-mismatch")
         );
     }
 }

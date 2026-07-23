@@ -111,20 +111,19 @@
       "name": "commit-genesis-anchor-mismatch-violation",
       "oracle": "reducer",
       "norm": "REJECT",
-      "harkModule": "none",
-      "harkComparable": false,
+      "harkModule": "anchor",
+      "harkComparable": true,
       "jsVerdict": {
         "tag": "violation",
         "code": "ds-equivocation"
-      },
-      "divergence": "js-reducer-stricter: hark transition_record does not bind commit genesis_ref (see boundary/MLS-apply layering)"
+      }
     },
     {
       "name": "commit-awaiting-genesis",
       "oracle": "reducer",
-      "norm": "JS-ONLY",
-      "harkModule": "none",
-      "harkComparable": false,
+      "norm": "AWAITING",
+      "harkModule": "anchor",
+      "harkComparable": true,
       "jsVerdict": {
         "tag": "awaitingGenesis"
       }

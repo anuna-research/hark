@@ -31,7 +31,10 @@ use cbcl_core::sexpr::{Atom, SExpr};
 
 use hark::mls_ds::boundary::{self, AddAuth, Commit};
 use hark::mls_ds::genesis::{self, Candidate};
-use hark::mls_ds::{record_hash, transition_record, ClientLog, RecordResponse, Verdict};
+use hark::mls_ds::{
+    bind_record_anchor, record_hash, transition_record, AnchorBinding, ClientLog, RecordResponse,
+    Verdict,
+};
 
 // ── SExpr constructors (mirror cbcl_core::sexpr) ────────────────────────────────
 fn sym(s: &str) -> SExpr { SExpr::Atom(Atom::Symbol(s.into())) }
@@ -272,6 +275,13 @@ fn norm_of_genesis(v: &genesis::Verdict) -> &'static str {
         genesis::Verdict::Conflict(_) => "CONFLICT",
     }
 }
+fn norm_of_anchor(v: &AnchorBinding) -> &'static str {
+    match v {
+        AnchorBinding::Bound => "BOUND",
+        AnchorBinding::AwaitingGenesis => "AWAITING",
+        AnchorBinding::Violation(_) => "REJECT",
+    }
+}
 
 // -- record-core native builders (hark transition_record) --
 fn signed_record(seq: i64, prev: &str, ds: &Ed25519Keypair) -> RecordResponse {
@@ -359,6 +369,17 @@ fn genesis_scenario(name: &str) -> &'static str {
     norm_of_genesis(&v)
 }
 
+// -- immutable-anchor native builders (hark bind_record_anchor, CON-005 record-component) --
+fn anchor_scenario(name: &str) -> &'static str {
+    let saved = "sha256:anchor";
+    let v = match name {
+        "commit-genesis-anchor-mismatch-violation" => bind_record_anchor("sha256:foreign", Some(saved)),
+        "commit-awaiting-genesis" => bind_record_anchor(saved, None),
+        other => panic!("unknown anchor scenario {other}"),
+    };
+    norm_of_anchor(&v)
+}
+
 #[test]
 fn oracle3_semantic_parity_against_js_manifest() {
     let manifest: serde_json::Value =
@@ -386,13 +407,14 @@ fn oracle3_semantic_parity_against_js_manifest() {
             "record" => record_scenario(name),
             "boundary" => boundary_scenario(name),
             "genesis" => genesis_scenario(name),
+            "anchor" => anchor_scenario(name),
             other => panic!("scenario {name} marked comparable but harkModule={other} has no native driver"),
         };
         assert_eq!(hark_norm, js_norm, "semantic parity {name}: hark {hark_norm} != JS {js_norm}");
         compared += 1;
         println!("[oracle3] parity {name}: {js_norm} [{hark_module}]");
     }
-    assert_eq!(compared, 13, "13 hark-comparable scenarios cross-checked (5 record + 3 boundary + 5 genesis)");
-    assert_eq!(divergences, 1, "the one js-reducer-stricter divergence is documented");
-    println!("[oracle3] {compared}/13 semantic scenarios in cross-runtime parity; {divergences} divergence surfaced");
+    assert_eq!(compared, 15, "15 hark-comparable scenarios (5 record + 3 boundary + 5 genesis + 2 anchor)");
+    assert_eq!(divergences, 0, "H4 anchor-binding (bind_record_anchor) closed the js-reducer-stricter divergence");
+    println!("[oracle3] {compared}/15 semantic scenarios in cross-runtime parity; {divergences} divergence remaining");
 }
