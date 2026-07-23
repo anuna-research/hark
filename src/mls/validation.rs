@@ -112,6 +112,10 @@ pub fn process_inbound(
     genesis: &GenesisAssertion,
     evidence: Option<&RemovalEvidence>,
     fork: &mut ForkSignal,
+    // SPEC-024 per-room protocol version (ADR-034): on a mls-ds/v1 room, owner removal is
+    // deterministically rejected (H7) and the SPEC-013 carve-out does not apply. false =
+    // legacy SPEC-013 behaviour, unchanged.
+    is_v1: bool,
 ) -> Result<Inbound, MlsError> {
     let msg = match MlsMessageIn::tls_deserialize_exact_bytes(wire) {
         Ok(msg) => msg,
@@ -192,6 +196,12 @@ pub fn process_inbound(
             })
         }
         ProcessedMessageContent::StagedCommitMessage(staged) => {
+            // H7 (SPEC-024 v1): on a v1 room, deterministically reject owner removal BEFORE any
+            // further validation or merge (REQ-098). Legacy rooms keep the SPEC-013 carve-out
+            // inside validate_staged_commit.
+            if is_v1 {
+                reject_v1_owner_removal(group, &staged)?;
+            }
             validate_staged_commit(
                 group,
                 &staged,
@@ -657,6 +667,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap();
         match inbound {
@@ -710,6 +721,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -747,6 +759,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap();
         assert!(matches!(inbound, Inbound::Handshake));
@@ -811,6 +824,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap_err();
         assert!(format!("{err}").contains("evidence"), "{err}");
@@ -840,6 +854,7 @@ mod tests {
             &genesis,
             Some(&stale),
             &mut fork,
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, MlsError::Rejected(_)), "{err}");
@@ -864,6 +879,7 @@ mod tests {
             &genesis,
             Some(&evidence),
             &mut fork,
+            false,
         )
         .unwrap();
         assert!(matches!(inbound, Inbound::Handshake));
@@ -909,6 +925,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -940,6 +957,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap();
         assert!(matches!(ok, Inbound::App { .. }));
@@ -955,6 +973,7 @@ mod tests {
                 &genesis,
                 None,
                 &mut fork,
+                false,
             )
             .unwrap();
             match inbound {
@@ -982,6 +1001,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap();
         assert!(matches!(ok, Inbound::App { .. }));

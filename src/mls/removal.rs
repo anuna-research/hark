@@ -454,6 +454,7 @@ mod tests {
                 &genesis,
                 None,
                 &mut fork,
+                false,
             )
             .unwrap();
             assert!(matches!(merged, Inbound::Handshake));
@@ -514,6 +515,7 @@ mod tests {
                 &genesis,
                 Some(&fresh_evidence),
                 &mut fork,
+                false,
             )
             .unwrap();
             assert!(matches!(merged, Inbound::Handshake));

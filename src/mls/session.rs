@@ -554,6 +554,9 @@ impl MlsSession {
             &genesis,
             evidence.as_ref(),
             &mut self.fork,
+            // ADR-034 per-room protocol version: legacy SPEC-013 today. Becomes the room's v1
+            // flag (activating H7 owner-removal rejection) once mls-ds/v1 room creation is wired.
+            false,
         ) {
             Ok(Inbound::App {
                 plaintext,
