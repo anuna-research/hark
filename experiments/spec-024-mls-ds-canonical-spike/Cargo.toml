@@ -28,8 +28,15 @@ license = "Apache-2.0"
 # form (`../cbcl-rs/crates/...`). From this crate that is `../../../cbcl-rs/...`;
 # it resolves to the same /Users/.../Code/cbcl-rs whether checked out as the
 # `spike/mls-ds-canonical` worktree or the primary hark dir (both siblings of cbcl-rs).
-cbcl-core = { path = "../../../cbcl-rs-epp/crates/cbcl-core" }
-cbcl-parser = { path = "../../../cbcl-rs-epp/crates/cbcl-parser" }
+# The DS-branch worktree (fd8f034 = epp `febc669` + the 5 mls-ds commits): it carries
+# epp's role layer AND `mls_ds.rs` (the corrected DomainTuple crypto). Canonical/H1 results
+# are inherited from epp unchanged; H3 consumes the SOUND crypto primitives only (NOT the
+# subset recogniser). Pre-pin experiment (ADR-021).
+# `mls-ds-proof` (non-default, author-gated) compiles `mod mls_ds` + the strict
+# Ed25519 profile — the DomainTuple crypto H3 consumes. The name says it: a proof
+# artifact, enabled here for the pre-pin H3 crypto-admission validation only.
+cbcl-core = { path = "../../../cbcl-rs-dsfix/crates/cbcl-core", features = ["mls-ds-proof"] }
+cbcl-parser = { path = "../../../cbcl-rs-dsfix/crates/cbcl-parser" }
 # sha2 0.10 — the version hark and cbcl-mls-wasm pin; the dialect hash is
 # `sha256:<hex(Sha256(dialect_canonical_bytes(d)))>` (cbcl-wasm/src/lib.rs:293).
 sha2 = "0.10"
