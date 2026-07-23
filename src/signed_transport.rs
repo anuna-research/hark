@@ -153,9 +153,52 @@ pub fn build_router_hello(agent_id: &str, pubkey_b64: &str, dialects: &[String])
     )
 }
 
+/// CON-012 read-frame allocator (ADR-036): assigns each read request a `(session_id, frame_id)`
+/// BEFORE inner read-signing, so the `READ-CONTEXT` the request signs binds to a frame the
+/// transport retains and can match against the response. `session_id` is the connection nonce
+/// (base64); `frame_id` is a per-connection monotonic counter. The duplicate-frame classifier,
+/// exact-response cache, and consumed-frame watermark stay server-side (ADR-036) — this is only
+/// the client-side allocation.
+pub struct ReadFrameAllocator {
+    session_id: String,
+    next_frame: i64,
+}
+
+impl ReadFrameAllocator {
+    /// Bind a session id to the connection nonce captured at bootstrap.
+    pub fn for_connection(conn_nonce: &[u8]) -> Self {
+        Self {
+            session_id: B64.encode(conn_nonce),
+            next_frame: 0,
+        }
+    }
+
+    /// Allocate the next `(session_id, frame_id)` for a read request (monotonic).
+    pub fn allocate_read_frame(&mut self) -> (String, i64) {
+        let frame_id = self.next_frame;
+        self.next_frame += 1;
+        (self.session_id.clone(), frame_id)
+    }
+
+    /// The bound session id.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_frame_allocation_is_monotonic_and_session_bound() {
+        let mut a = ReadFrameAllocator::for_connection(b"conn-nonce-bytes");
+        let (s0, f0) = a.allocate_read_frame();
+        let (s1, f1) = a.allocate_read_frame();
+        assert_eq!(s0, s1, "same session id across the connection");
+        assert_eq!((f0, f1), (0, 1), "frame ids are monotonic");
+        assert_eq!(a.session_id(), s0);
+    }
     use crate::signed_frame::decode_frame;
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
