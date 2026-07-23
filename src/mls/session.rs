@@ -274,6 +274,31 @@ impl MlsSession {
         self.is_v1
     }
 
+    /// CON-013 (ADR-033): persist the v1 client-state tuple AND the OpenMLS provider snapshot in
+    /// ONE atomic commit (the `store.rs` manifest-flip), so a crash never exposes a group-vs-cursor
+    /// mix (REQ-083). v1 rooms use this INSTEAD of the separate `persist_meta` + provider renames;
+    /// legacy rooms keep their format — no on-disk migration, since v1 rooms are new.
+    pub fn persist_v1_state(
+        &self,
+        generation: u64,
+        log: &crate::mls_ds::ClientLog,
+    ) -> Result<(), MlsError> {
+        let snapshot = self.provider.snapshot_bytes()?;
+        let store =
+            crate::mls_ds::store::DurableStore::open(self.meta_path.with_extension("v1store"));
+        store
+            .commit_client_state(generation, &snapshot, log)
+            .map_err(MlsError::Storage)
+    }
+
+    /// Reload the v1 client state committed by [`Self::persist_v1_state`] — whole-old or whole-new,
+    /// never mixed (CON-013). `(generation, provider_snapshot, ClientLog)` or None if absent.
+    pub fn load_v1_state(&self) -> Option<(u64, Vec<u8>, crate::mls_ds::ClientLog)> {
+        let store =
+            crate::mls_ds::store::DurableStore::open(self.meta_path.with_extension("v1store"));
+        store.load_client_state()
+    }
+
     /// REQ-023: judge a `roomcfg` frame against the pin. `:enc false` on a
     /// pinned channel is a downgrade attack → fail closed. `:enc true` on an
     /// unpinned channel may bootstrap MLS (never the downgrade direction)

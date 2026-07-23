@@ -119,7 +119,10 @@ impl DurableProvider {
     /// in the same directory, fsync, rename over `path`. Entries OpenMLS has
     /// deleted are absent from the snapshot — that is the delete fidelity
     /// NFR-004 requires of this provider (IMPL condition I).
-    pub fn persist(&self) -> Result<(), MlsError> {
+    /// The serialized storage snapshot bytes — the exact content `persist` writes. Exposed so a
+    /// caller can commit the provider snapshot ATOMICALLY together with the v1 client-state tuple
+    /// in ONE commit (CON-013 single-commit boundary, ADR-033), instead of two separate renames.
+    pub fn snapshot_bytes(&self) -> Result<Vec<u8>, MlsError> {
         let values = {
             let map = self.storage.values.read().unwrap();
             map.iter()
@@ -130,7 +133,11 @@ impl DurableProvider {
             version: STATE_VERSION,
             values,
         };
-        let bytes = serde_json::to_vec(&state).map_err(std::io::Error::other)?;
+        Ok(serde_json::to_vec(&state).map_err(std::io::Error::other)?)
+    }
+
+    pub fn persist(&self) -> Result<(), MlsError> {
+        let bytes = self.snapshot_bytes()?;
 
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
