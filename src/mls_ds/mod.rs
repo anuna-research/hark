@@ -10,6 +10,12 @@
 //! `experiments/spec-024-mls-ds-canonical-spike/` (57 tests). Wiring into the live receive
 //! path (`chat.rs` pull loop, ADR-035) is layered on top of this module.
 
+pub mod attestation;
+pub mod boundary;
+pub mod closure;
+pub mod genesis;
+pub mod store;
+
 use cbcl_core::dialect::DialectRegistry;
 use cbcl_core::mls_ds::{DomainTuple, ReadContext};
 use cbcl_core::sexpr::{Atom, SExpr};
@@ -18,7 +24,7 @@ use cbcl_parser::{parse, parse_dialect, run_pipeline_full, PipelineContext, Pipe
 use sha2::{Digest, Sha256};
 
 /// The normative `mls-ds/v1` dialect source (byte-authority; hash `sha256:922ba8…`).
-const MLS_DS_V1: &str = include_str!("../priv/dialects/mls-ds-v1.cbcl");
+const MLS_DS_V1: &str = include_str!("../../priv/dialects/mls-ds-v1.cbcl");
 
 /// Install the closed-world `mls-ds/v1` dialect into a fresh registry (CON-011). The registry
 /// IS the recogniser's language: `run_pipeline_full` validates every inbound payload against it.
