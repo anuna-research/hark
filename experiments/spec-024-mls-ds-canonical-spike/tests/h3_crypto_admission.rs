@@ -109,3 +109,51 @@ fn ed25519_strict_profile_rejects_out_of_range_scalar() {
     );
     println!("[H3 crypto] canonical-scalar gate: 0=OK, 0xff*32=REJECTED");
 }
+
+/// The closure-pin hashes are deterministic, domain-tagged, and mutation-sensitive —
+/// the specifically-flagged [[IMPL-025-hark-mls-ds-client#TEST-025]] closure-preimage
+/// mutation case (review R-01): a mutated `bridge_hash` / `closure_package_hash` must not
+/// collide with the original, and the two hash domains must not collide on the same value.
+#[test]
+fn closure_preimage_hashes_are_domain_tagged_and_mutation_sensitive() {
+    let value = SExpr::List(vec![
+        SExpr::Atom(Atom::Str("successor-alpha".into())),
+        SExpr::Atom(Atom::Num(7)),
+    ]);
+    let bridge = DomainTuple::BridgeHash { successor_value: value.clone() };
+    let package = DomainTuple::ClosurePackageHash { closure_package: value.clone() };
+
+    // domain tags are the corrected CON-002 ones
+    assert_eq!(bridge.domain_tag(), "mls-ds-successor-hash-v1");
+    assert_eq!(package.domain_tag(), "mls-ds-closure-package-hash-v1");
+
+    // deterministic
+    assert_eq!(
+        bridge.content_hash(),
+        DomainTuple::BridgeHash { successor_value: value.clone() }.content_hash()
+    );
+
+    // domain separation: SAME value under the two hash domains must not collide
+    assert_ne!(
+        bridge.content_hash(),
+        package.content_hash(),
+        "bridge_hash and closure_package_hash must not collide on the same value"
+    );
+
+    // mutation sensitivity: one changed field -> a different hash, for both domains
+    let mutated = SExpr::List(vec![
+        SExpr::Atom(Atom::Str("successor-BETA".into())),
+        SExpr::Atom(Atom::Num(7)),
+    ]);
+    assert_ne!(
+        bridge.content_hash(),
+        DomainTuple::BridgeHash { successor_value: mutated.clone() }.content_hash(),
+        "a mutated bridge_hash preimage must produce a different hash"
+    );
+    assert_ne!(
+        package.content_hash(),
+        DomainTuple::ClosurePackageHash { closure_package: mutated }.content_hash(),
+        "a mutated closure_package_hash preimage must produce a different hash"
+    );
+    println!("[H3 crypto] closure hashes: deterministic + domain-tagged + mutation-sensitive = OK");
+}
