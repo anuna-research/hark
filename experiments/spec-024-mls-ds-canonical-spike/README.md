@@ -1,6 +1,6 @@
 # SPEC-024 / IMPL-025 — pre-pin decision-core suite
 
-**Status:** complete — **53/53 green** against the mls-ds substrate (`epp` + 5). Covers the
+**Status:** complete — **55/55 green** against the mls-ds substrate (`epp` + 5). Covers the
 pure decision cores of **every** major CON: CON-002 (canonical + dialect), CON-003 (role
 verifier, H1), CON-005 (reducer exact-next, H4), CON-008 (genesis, H8), CON-009 (attestation,
 H9), CON-010 (successor closure, H10), plus the H3 crypto-admission domain-separation proof.
@@ -39,7 +39,7 @@ cargo test --manifest-path experiments/spec-024-mls-ds-canonical-spike/Cargo.tom
 ```
 
 Every check prints a `[CON-002 …]` / `[H1 role]` / `[H3 crypto]` line — the stdout **is** the
-evidence. `53 passed`.
+evidence. `55 passed`.
 
 ## Provenance
 
