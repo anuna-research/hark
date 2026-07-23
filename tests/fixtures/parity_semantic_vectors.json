@@ -1,0 +1,153 @@
+{
+  "spec": "IMPL-025 TEST-024",
+  "oracle": "semantic-transition",
+  "note": "Contract of {named-scenario -> normalized outcome}. The JS reducer is a MONOLITH; hark DECOMPOSES CON-005 into record/boundary/genesis modules, so parity is compared in the normalized space {ADMIT,HOLD,REJECT} via harkModule. harkComparable=false ⇒ JS-only verdict outside hark cores, OR a documented divergence (js-reducer-stricter).",
+  "normalizedSpace": [
+    "ADMIT",
+    "HOLD",
+    "REJECT"
+  ],
+  "harkModules": {
+    "record": "transition_record",
+    "boundary": "validate_v1_commit",
+    "genesis": "validate_genesis",
+    "none": "not-in-a-hark-core"
+  },
+  "scenarios": [
+    {
+      "name": "commit-exact-next-applied",
+      "norm": "ADMIT",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "applied",
+        "cursor": 1
+      }
+    },
+    {
+      "name": "commit-wrong-seq-notNext",
+      "norm": "HOLD",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "notNext"
+      }
+    },
+    {
+      "name": "commit-wrong-prev-notNext",
+      "norm": "HOLD",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "notNext"
+      }
+    },
+    {
+      "name": "commit-bad-ds-sig-violation",
+      "norm": "REJECT",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "ds-equivocation"
+      }
+    },
+    {
+      "name": "commit-record-hash-mismatch-violation",
+      "norm": "REJECT",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "ds-equivocation"
+      }
+    },
+    {
+      "name": "add-valid-auth-admit",
+      "norm": "ADMIT",
+      "harkModule": "boundary",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "applied",
+        "cursor": 1
+      }
+    },
+    {
+      "name": "add-invalid-auth-violation",
+      "norm": "REJECT",
+      "harkModule": "boundary",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "invalid-add-authorization"
+      }
+    },
+    {
+      "name": "commit-non-add-carries-auth-violation",
+      "norm": "REJECT",
+      "harkModule": "boundary",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "ds-equivocation"
+      }
+    },
+    {
+      "name": "commit-genesis-anchor-mismatch-violation",
+      "norm": "REJECT",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "ds-equivocation"
+      },
+      "divergence": "js-reducer-stricter: hark transition_record does not bind commit genesis_ref (see boundary/MLS-apply layering)"
+    },
+    {
+      "name": "commit-awaiting-genesis",
+      "norm": "JS-ONLY",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "awaitingGenesis"
+      }
+    },
+    {
+      "name": "commit-deterministic-reject",
+      "norm": "JS-ONLY",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "deterministicReject",
+        "cursor": 1
+      }
+    },
+    {
+      "name": "commit-retryable",
+      "norm": "JS-ONLY",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "retrySame"
+      }
+    },
+    {
+      "name": "add-nontarget-stateless-skip",
+      "norm": "JS-ONLY",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "statelessSkip"
+      }
+    },
+    {
+      "name": "add-target-stateless-pendingWelcome",
+      "norm": "JS-ONLY",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "pendingWelcome"
+      }
+    }
+  ]
+}
