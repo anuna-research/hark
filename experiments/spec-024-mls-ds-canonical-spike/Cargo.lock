@@ -16,6 +16,7 @@ name = "cbcl-core"
 version = "0.1.0"
 dependencies = [
  "hashbrown",
+ "sha2",
 ]
 
 [[package]]
