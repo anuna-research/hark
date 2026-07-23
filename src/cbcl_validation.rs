@@ -462,7 +462,7 @@ fn validate_kind(message: &Message, expected_kind: MessageKind) -> Result<(), Cb
     }
 
     if expected_kind == MessageKind::Progress {
-        if recipient.as_deref() != Some("@router") {
+        if recipient.as_ref().and_then(|r| r.as_single()) != Some("@router") {
             return Err(CbclValidationError::InvalidProgressRecipient);
         }
         if !matches!(content, SExpr::Atom(Atom::Str(text)) if text == "progress") {
@@ -802,10 +802,13 @@ mod tests {
         let mut registry = DialectRegistry::new();
         registry
             .install(Dialect {
+                roles: Vec::new(),
+                causal_locality: Default::default(),
                 name: String::from("shape-dialect"),
                 extends: vec![String::from("cbcl")],
                 author: None,
                 performatives: vec![PerformativeDef {
+                    role: None,
                     name: String::from("track"),
                     params: vec![],
                     template: effect_template("track-action"),
@@ -863,16 +866,20 @@ mod tests {
         let mut registry = DialectRegistry::new();
         registry
             .install(Dialect {
+                roles: Vec::new(),
+                causal_locality: Default::default(),
                 name: String::from("causal-dialect"),
                 extends: vec![String::from("cbcl")],
                 author: None,
                 performatives: vec![
                     PerformativeDef {
+                        role: None,
                         name: String::from("begin"),
                         params: vec![],
                         template: effect_template("begin-action"),
                     },
                     PerformativeDef {
+                        role: None,
                         name: String::from("notify"),
                         params: vec![],
                         template: effect_template("notify-action"),

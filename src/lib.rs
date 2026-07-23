@@ -12,6 +12,7 @@ pub mod hub_dialect;
 pub mod identity;
 pub mod local_api;
 pub mod mls;
+pub mod mls_ds;
 pub mod pairing;
 pub mod router;
 pub mod selector;
