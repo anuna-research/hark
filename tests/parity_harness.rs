@@ -26,10 +26,11 @@
 //!   cargo test --test parity_harness -- --nocapture
 
 use cbcl_core::canonical::canonical_encode;
-use cbcl_core::mls_ds::{DomainTuple, Ed25519Keypair, ReadContext};
+use cbcl_core::mls_ds::{b64url_encode, DomainTuple, Ed25519Keypair, ReadContext};
 use cbcl_core::sexpr::{Atom, SExpr};
 
 use hark::mls_ds::boundary::{self, AddAuth, Commit};
+use hark::mls_ds::genesis::{self, Candidate};
 use hark::mls_ds::{record_hash, transition_record, ClientLog, RecordResponse, Verdict};
 
 // ── SExpr constructors (mirror cbcl_core::sexpr) ────────────────────────────────
@@ -248,32 +249,27 @@ fn oracle2_crypto_domain_separation_and_field_mutation() {
 
 const H0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-/// Normalized cross-runtime outcome — the shared space over the monolith↔module boundary.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum Norm {
-    Admit,
-    Hold,
-    Reject,
-}
-fn norm_of_record(v: &Verdict) -> Norm {
+/// Normalized cross-runtime outcome LABEL — a per-oracle shared space over the
+/// monolith↔module boundary (reducer: ADMIT/HOLD/REJECT; genesis: FIRST/EXISTING/
+/// CONFLICT). Each runtime maps its NATIVE verdict to the SAME label; parity = equal.
+fn norm_of_record(v: &Verdict) -> &'static str {
     match v {
-        Verdict::Applied { .. } => Norm::Admit,
-        Verdict::NotNext => Norm::Hold,
-        Verdict::Violation(_) => Norm::Reject,
+        Verdict::Applied { .. } => "ADMIT",
+        Verdict::NotNext => "HOLD",
+        Verdict::Violation(_) => "REJECT",
     }
 }
-fn norm_of_boundary(v: &boundary::Verdict) -> Norm {
+fn norm_of_boundary(v: &boundary::Verdict) -> &'static str {
     match v {
-        boundary::Verdict::Accept => Norm::Admit,
-        boundary::Verdict::Reject(_) => Norm::Reject,
+        boundary::Verdict::Accept => "ADMIT",
+        boundary::Verdict::Reject(_) => "REJECT",
     }
 }
-fn parse_norm(s: &str) -> Norm {
-    match s {
-        "ADMIT" => Norm::Admit,
-        "HOLD" => Norm::Hold,
-        "REJECT" => Norm::Reject,
-        other => panic!("manifest norm {other} outside {{ADMIT,HOLD,REJECT}}"),
+fn norm_of_genesis(v: &genesis::Verdict) -> &'static str {
+    match v {
+        genesis::Verdict::FirstAccepted { .. } => "FIRST",
+        genesis::Verdict::Existing { .. } => "EXISTING",
+        genesis::Verdict::Conflict(_) => "CONFLICT",
     }
 }
 
@@ -284,7 +280,7 @@ fn signed_record(seq: i64, prev: &str, ds: &Ed25519Keypair) -> RecordResponse {
     let sig = DomainTuple::Record { log_record: rec.clone() }.sign(ds);
     RecordResponse { seq, prev_hash: prev.into(), record_hash: rh, record_signature: sig, log_record: rec }
 }
-fn record_scenario(name: &str) -> Norm {
+fn record_scenario(name: &str) -> &'static str {
     let ds = Ed25519Keypair::from_seed(&[5u8; 32]);
     let vk = ds.public_bytes();
     let log = ClientLog { cursor: 0, cursor_hash: H0.into() };
@@ -307,7 +303,7 @@ fn record_scenario(name: &str) -> Norm {
 }
 
 // -- add-authorization native builders (hark boundary::validate_v1_commit) --
-fn boundary_scenario(name: &str) -> Norm {
+fn boundary_scenario(name: &str) -> &'static str {
     let creator = Ed25519Keypair::from_seed(&[2u8; 32]);
     let vk = creator.public_bytes();
     let owner = "@owner";
@@ -327,6 +323,40 @@ fn boundary_scenario(name: &str) -> Norm {
         other => panic!("unknown boundary scenario {other}"),
     };
     norm_of_boundary(&v)
+}
+
+// -- genesis native builders (hark genesis::validate_genesis, CON-008) --
+fn genesis_scenario(name: &str) -> &'static str {
+    let creator = Ed25519Keypair::from_seed(&[3u8; 32]);
+    let ds = Ed25519Keypair::from_seed(&[5u8; 32]);
+    let (cvk, dvk) = (creator.public_bytes(), ds.public_bytes());
+    let room = "room-alpha";
+    let build = |grade: &'static str, link_room: &str, bad_claim: bool| -> Candidate {
+        let creator_key = creator.key_id();
+        let core = list(vec![sym("room-claim-v1"), st(room), st("L"), sym(&creator_key), num(1), st("m")]);
+        let creator_sig = if bad_claim {
+            DomainTuple::Claim { room_claim_core: core.clone() }.sign(&Ed25519Keypair::from_seed(&[99u8; 32]))
+        } else {
+            DomainTuple::Claim { room_claim_core: core.clone() }.sign(&creator)
+        };
+        let ds_sig = DomainTuple::ClaimDs { room_claim_core: core.clone(), creator_signature: b64url_encode(&creator_sig) }.sign(&ds);
+        let blob_ref = list(vec![sym("blob-ref-v1"), sym("genesis"), st(&digest("a")), num(64)]);
+        let genesis_sig = DomainTuple::Genesis { room: room.into(), genesis_blob_ref: blob_ref.clone(), creator_key: creator_key.clone() }.sign(&creator);
+        Candidate { room: room.into(), grade, creator_key: creator_key.clone(), link_room: link_room.into(), link_creator_key: creator_key, room_claim_core: core, creator_sig, ds_sig, genesis_blob_ref: blob_ref, genesis_sig }
+    };
+    let v = match name {
+        "genesis-valid-first-tofu" => genesis::validate_genesis(None, room, &cvk, &dvk, &build("tofu", room, false)),
+        "genesis-existing-verified" => {
+            let c = build("verified", room, false);
+            let anchor = genesis::anchor_hash(&c.room_claim_core, &c.genesis_blob_ref);
+            genesis::validate_genesis(Some(&anchor), room, &cvk, &dvk, &c)
+        }
+        "genesis-grade-lie-conflict" => genesis::validate_genesis(None, room, &cvk, &dvk, &build("verified", room, false)),
+        "genesis-room-transplant-conflict" => genesis::validate_genesis(None, room, &cvk, &dvk, &build("tofu", "room-evil", false)),
+        "genesis-bad-claim-sig-conflict" => genesis::validate_genesis(None, room, &cvk, &dvk, &build("tofu", room, true)),
+        other => panic!("unknown genesis scenario {other}"),
+    };
+    norm_of_genesis(&v)
 }
 
 #[test]
@@ -351,17 +381,18 @@ fn oracle3_semantic_parity_against_js_manifest() {
             }
             continue;
         }
-        let js_norm = parse_norm(sc["norm"].as_str().unwrap());
+        let js_norm = sc["norm"].as_str().unwrap();
         let hark_norm = match hark_module {
             "record" => record_scenario(name),
             "boundary" => boundary_scenario(name),
+            "genesis" => genesis_scenario(name),
             other => panic!("scenario {name} marked comparable but harkModule={other} has no native driver"),
         };
-        assert_eq!(hark_norm, js_norm, "semantic parity {name}: hark {hark_norm:?} != JS {js_norm:?}");
+        assert_eq!(hark_norm, js_norm, "semantic parity {name}: hark {hark_norm} != JS {js_norm}");
         compared += 1;
-        println!("[oracle3] parity {name}: {js_norm:?} [{hark_module}]");
+        println!("[oracle3] parity {name}: {js_norm} [{hark_module}]");
     }
-    assert_eq!(compared, 8, "8 hark-comparable scenarios cross-checked (5 record + 3 boundary)");
+    assert_eq!(compared, 13, "13 hark-comparable scenarios cross-checked (5 record + 3 boundary + 5 genesis)");
     assert_eq!(divergences, 1, "the one js-reducer-stricter divergence is documented");
-    println!("[oracle3] {compared}/8 semantic scenarios in cross-runtime parity; {divergences} divergence surfaced");
+    println!("[oracle3] {compared}/13 semantic scenarios in cross-runtime parity; {divergences} divergence surfaced");
 }
