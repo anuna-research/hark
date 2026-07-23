@@ -50,9 +50,43 @@ pub fn decode_payload(frame: &[u8]) -> Option<&[u8]> {
     Some(&frame[LEN_PREFIX..LEN_PREFIX + len])
 }
 
+/// A `/chat/v1` receive frame that RETAINS the outer signature (CON-012 / ADR-036).
+///
+/// `decode_payload` above discards the trailing 64-byte signature — fine for the SPEC-013
+/// relay-trust path, but the SPEC-024 `mls-ds/v1` client MUST retain and verify the DS
+/// response frame's outer signature under the pinned DS key before the payload reaches the
+/// reducer (a discarded signature can never be checked — [[IMPL-025 CON-012]]). This typed
+/// decode is that receive-frame.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiveFrame<'a> {
+    /// The CBCL payload bytes.
+    pub payload: &'a [u8],
+    /// The retained 64-byte outer Ed25519 signature, verified under the pinned DS key.
+    pub signature: [u8; SIG_LEN],
+}
+
+/// Decode `len(4) ‖ payload(len) ‖ sig(64)`, RETAINING the signature. Same framing/rejection
+/// rules as `decode_payload`; `None` for a malformed frame.
+pub fn decode_frame(frame: &[u8]) -> Option<ReceiveFrame<'_>> {
+    if frame.len() < LEN_PREFIX {
+        return None;
+    }
+    let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    let expected = LEN_PREFIX.checked_add(len)?.checked_add(SIG_LEN)?;
+    if frame.len() != expected {
+        return None;
+    }
+    let mut signature = [0u8; SIG_LEN];
+    signature.copy_from_slice(&frame[LEN_PREFIX + len..]); // RETAINED, not discarded
+    Some(ReceiveFrame {
+        payload: &frame[LEN_PREFIX..LEN_PREFIX + len],
+        signature,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LEN_PREFIX, SIG_LEN, decode_payload};
+    use super::{decode_frame, decode_payload, LEN_PREFIX, SIG_LEN};
 
     /// Build a hub-shaped frame by hand: `len(4, big-endian) ‖ payload ‖ sig(64)`.
     /// Test-local on purpose — production has no bare-payload encoder (R4-06).
@@ -68,6 +102,16 @@ mod tests {
     fn round_trips_payload() {
         let payload = b"(tell @research \"hi\" :from @aria)";
         assert_eq!(decode_payload(&frame(payload, 0)), Some(&payload[..]));
+    }
+
+    #[test]
+    fn decode_frame_retains_the_outer_signature() {
+        let payload = b"(ds-response :op record-commit)";
+        let raw = frame(payload, 0xC7);
+        let f = decode_frame(&raw).expect("well-formed frame decodes");
+        assert_eq!(f.payload, &payload[..]);
+        assert_eq!(f.signature, [0xC7u8; SIG_LEN]); // RETAINED, not discarded (CON-012)
+        assert!(decode_frame(&[0, 0]).is_none()); // malformed rejected, same as decode_payload
     }
 
     #[test]
