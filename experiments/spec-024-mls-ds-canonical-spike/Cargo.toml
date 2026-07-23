@@ -1,0 +1,35 @@
+# SPEC-024 / IMPL-025 §2 proof gate — canonical-vector proof-of-fit spike.
+#
+# ISOLATED, gate-permitted: this crate is detached from hark's package (its own
+# empty [workspace]) and touches NO production code. It is the *one* work item
+# IMPL-025 §2 permits while SPEC-024 is `draft` and the production cbcl-rs role
+# layer is unpinned (see README).
+#
+# It links the production `cbcl-core` encoder EXACTLY as hark links it (same path
+# dependency, same feature unification across hark's real graph would apply once
+# folded in) and asserts CON-002 byte-identity against the SPEC-024 byte-authority
+# vectors + the canonical `mls-ds/v1` dialect hash. It proves the CON-002
+# foundation ONLY — it MUST NOT be reported as role-runtime binding (IMPL-025 H1 /
+# ADR-031). The role verifier, recogniser, and reducers are out of scope until the
+# integration gate opens.
+[package]
+name = "spec-024-mls-ds-canonical-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+# Detached from any parent workspace (hark is a standalone package; this must not
+# join its build). Mirrors experiments/spec-013-mls-spike's isolation.
+[workspace]
+
+[dependencies]
+# The production encoder + recogniser primitives, via hark's OWN path dependency
+# form (`../cbcl-rs/crates/...`). From this crate that is `../../../cbcl-rs/...`;
+# it resolves to the same /Users/.../Code/cbcl-rs whether checked out as the
+# `spike/mls-ds-canonical` worktree or the primary hark dir (both siblings of cbcl-rs).
+cbcl-core = { path = "../../../cbcl-rs/crates/cbcl-core" }
+cbcl-parser = { path = "../../../cbcl-rs/crates/cbcl-parser" }
+# sha2 0.10 — the version hark and cbcl-mls-wasm pin; the dialect hash is
+# `sha256:<hex(Sha256(dialect_canonical_bytes(d)))>` (cbcl-wasm/src/lib.rs:293).
+sha2 = "0.10"

@@ -1,0 +1,4 @@
+/target
+# Cargo.lock IS committed — this is an evidence-producing spike; the lock pins the
+# exact cbcl-core / cbcl-parser / sha2 the recorded canonical-parity result was
+# observed against (same rule as experiments/spec-013-mls-spike).
