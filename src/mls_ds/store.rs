@@ -61,6 +61,32 @@ impl DurableStore {
         let client = fs::read(self.dir.join(format!("gen-{generation}.client"))).ok()?;
         Some((generation, group, client))
     }
+
+    /// CON-013 `C-APPLIED`: commit the OpenMLS provider snapshot AND the v1 client-state tuple
+    /// (cursor + cursor_hash) in ONE atomic commit — reload exposes whole-old or whole-new, never
+    /// a group-vs-cursor mix (REQ-083). This is the CON-013 boundary hark's v1 session persist
+    /// replaces its two separate renames with (ADR-033).
+    pub fn commit_client_state(
+        &self,
+        generation: u64,
+        provider_snapshot: &[u8],
+        log: &super::ClientLog,
+    ) -> io::Result<()> {
+        let client = format!("{}\n{}", log.cursor, log.cursor_hash);
+        self.commit(generation, provider_snapshot, client.as_bytes(), CrashAt::None)
+    }
+
+    /// Reload the committed `(generation, provider_snapshot, ClientLog)` — no network fetch.
+    pub fn load_client_state(&self) -> Option<(u64, Vec<u8>, super::ClientLog)> {
+        let (generation, group, client) = self.load()?;
+        let text = String::from_utf8(client).ok()?;
+        let (cursor, cursor_hash) = text.split_once('\n')?;
+        Some((
+            generation,
+            group,
+            super::ClientLog { cursor: cursor.parse().ok()?, cursor_hash: cursor_hash.to_string() },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -89,5 +115,17 @@ mod tests {
             let expected = if generation == 2 { (b"G2".to_vec(), b"C2".to_vec()) } else { (b"G1".to_vec(), b"C1".to_vec()) };
             assert_eq!((group, client), expected, "never torn");
         }
+    }
+
+    #[test]
+    fn client_state_commits_and_reloads_atomically() {
+        let s = store("client-state");
+        let log = crate::mls_ds::ClientLog { cursor: 7, cursor_hash: "sha256:abc".into() };
+        s.commit_client_state(1, b"provider-snapshot", &log).unwrap();
+        let (generation, group, loaded) = s.load_client_state().expect("reload with no fetch");
+        assert_eq!(generation, 1);
+        assert_eq!(group, b"provider-snapshot");
+        assert_eq!(loaded.cursor, 7);
+        assert_eq!(loaded.cursor_hash, "sha256:abc");
     }
 }
