@@ -14,6 +14,7 @@ pub mod attestation;
 pub mod boundary;
 pub mod closure;
 pub mod genesis;
+pub mod pull;
 pub mod store;
 
 use cbcl_core::dialect::DialectRegistry;
