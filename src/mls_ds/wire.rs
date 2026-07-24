@@ -41,8 +41,10 @@ pub enum DsInbound {
     Record(RecordResponse),
     /// The cursor is at the head — nothing to pull; poll again later.
     AtHead { seq: i64 },
-    /// The room's pinned immutable genesis anchor (CON-008 `genesis-get` response).
-    GenesisAnchor { anchor: String },
+    /// The room's pinned immutable genesis anchor (CON-008 `genesis-get` response),
+    /// carrying the DS verification key for first-contact TOFU pinning (interim until
+    /// CON-009 attestation rides the pairing flow; a pin, once saved, never changes).
+    GenesisAnchor { anchor: String, ds_vk: [u8; 32] },
     /// The DS refused the request (recognised, legal refusal).
     Rejected(String),
     /// The room reached closure (H10) — stop pulling.
@@ -180,7 +182,10 @@ impl DsWire {
             "genesis-anchor" => {
                 let items = body_items(body, "anchor")?;
                 self.bind_room(&str_at(items, 1, "room")?)?;
-                Ok(DsInbound::GenesisAnchor { anchor: str_at(items, 2, "anchor-hash")? })
+                Ok(DsInbound::GenesisAnchor {
+                    anchor: str_at(items, 2, "anchor-hash")?,
+                    ds_vk: pk32(&str_at(items, 3, "ds-vk")?)?,
+                })
             }
             "ds-rejected" | "genesis-none" | "log-behind" | "log-truncated" | "stale-head" => {
                 Ok(DsInbound::Rejected(render(body)))
@@ -255,6 +260,19 @@ fn num_at(items: &[SExpr], i: usize, what: &str) -> Result<i64, String> {
         _ => Err(format!("missing/kind {what} at {i}")),
     }
 }
+/// Decode a 32-byte hex verification key.
+pub fn pk32(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err("vk not 32 bytes hex".into());
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|_| "vk not utf8")?;
+        out[i] = u8::from_str_radix(s, 16).map_err(|_| "vk not hex")?;
+    }
+    Ok(out)
+}
+
 fn sig64(hex: &str) -> Result<[u8; 64], String> {
     if hex.len() != 128 {
         return Err("sig not 64 bytes hex".into());
@@ -366,13 +384,17 @@ mod tests {
 
         let mut w2 = DsWire::new("room-alpha");
         w2.genesis_get_request().unwrap();
+        let vk_hex = "ab".repeat(32);
         let anchor = render(&response_frame(
             "genesis-anchor",
-            SExpr::List(vec![sym("anchor"), st("room-alpha"), st("sha256:abc")]),
+            SExpr::List(vec![sym("anchor"), st("room-alpha"), st("sha256:abc"), st(&vk_hex)]),
             &req_hash_of(&w2),
         ));
         match w2.inbound(&anchor).unwrap() {
-            DsInbound::GenesisAnchor { anchor } => assert_eq!(anchor, "sha256:abc"),
+            DsInbound::GenesisAnchor { anchor, ds_vk } => {
+                assert_eq!(anchor, "sha256:abc");
+                assert_eq!(ds_vk, [0xabu8; 32]);
+            }
             other => panic!("expected GenesisAnchor, got {other:?}"),
         }
     }

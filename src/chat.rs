@@ -82,6 +82,9 @@ pub struct DeclaredDialect {
 pub struct RoomCfg {
     pub enc: bool,
     pub declared: Option<Vec<DeclaredDialect>>,
+    /// SPEC-024 (ADR-034): the room speaks `mls-ds/v1` — the hub either conveys
+    /// `:protocol mls-ds/v1` or declares the `mls-ds/v1` dialect in its menu.
+    pub mls_ds: bool,
 }
 
 impl RoomCfg {
@@ -89,6 +92,7 @@ impl RoomCfg {
         Self {
             enc: false,
             declared: None,
+            mls_ds: false,
         }
     }
 }
@@ -116,6 +120,10 @@ fn parse_roomcfg(text: &str) -> Option<RoomCfg> {
         match (keyword.as_str(), value) {
             ("enc", Some(SExpr::Atom(Atom::Bool(enc)))) => cfg.enc = *enc,
             ("enc", Some(SExpr::Atom(Atom::Symbol(word)))) => cfg.enc = word == "true",
+            ("protocol", Some(SExpr::Atom(Atom::Symbol(word))))
+            | ("protocol", Some(SExpr::Atom(Atom::Str(word)))) => {
+                cfg.mls_ds = word == "mls-ds/v1";
+            }
             ("dialects", Some(SExpr::List(entries))) => {
                 let mut declared = Vec::new();
                 for entry in entries {
@@ -132,6 +140,12 @@ fn parse_roomcfg(text: &str) -> Option<RoomCfg> {
             _ => {}
         }
         index += 2;
+    }
+    // Declaring the mls-ds/v1 dialect in the menu also marks the room v1.
+    if let Some(menu) = &cfg.declared {
+        if menu.iter().any(|entry| entry.name == "mls-ds/v1") {
+            cfg.mls_ds = true;
+        }
     }
     Some(cfg)
 }
@@ -255,6 +269,36 @@ pub async fn create_chat_agent(
         }
     }
 
+    // SPEC-024 (ADR-034/ADR-035): a room the hub marks `mls-ds/v1` activates the
+    // v1 posture on the session (H7 owner-removal rejection + CON-013 atomic
+    // persist) and runs the DS pull loop instead of relying on SPEC-013 push for
+    // the record log. The pull task feeds admitted records into the receive loop
+    // below, which owns the MlsSession for the apply + atomic commit.
+    let mut ds_pull: Option<crate::mls_ds::task::DsPullConfig> = None;
+    if roomcfg.mls_ds {
+        if let Some(session) = mls.as_mut() {
+            session
+                .mark_v1()
+                .map_err(|e| ChatError::Hello(format!("mls-ds/v1 activation: {e}")))?;
+            let initial_log = session
+                .load_v1_state()
+                .map(|(_, _, log)| log)
+                .unwrap_or_else(|| crate::mls_ds::ClientLog {
+                    cursor: 0,
+                    cursor_hash: crate::mls_ds::task::GENESIS_CURSOR_HASH.into(),
+                });
+            // The DS endpoint lives on the same hub as /chat/v1.
+            let ds_url = ws_url.as_str().replace("/chat/v1", "/mls-ds/v1");
+            ds_pull = Some(crate::mls_ds::task::DsPullConfig {
+                ds_url,
+                room: channel.to_owned(),
+                state_dir: session.v1_pins_dir(),
+                poll: Duration::from_secs(2),
+                initial_log,
+            });
+        }
+    }
+
     // REQ-008 (SPEC-016): the advertised set must be a subset of the channel's
     // declared menu when one is conveyed. A hub that conveys no menu (today's
     // cbcl-bus) soft-passes with an explicit warning — never silently.
@@ -347,6 +391,13 @@ pub async fn create_chat_agent(
             .as_ref()
             .map(|menu| menu.iter().map(|entry| entry.name.clone()).collect()),
     );
+    // v1 rooms: start the DS pull loop; its admitted records flow into the
+    // receive loop through ds_rx for the MLS apply + CON-013 atomic commit.
+    let (ds_tx, ds_rx) = mpsc::channel(8);
+    if let Some(cfg) = ds_pull {
+        crate::mls_ds::task::spawn_ds_pull_loop(cfg, ds_tx);
+    }
+
     spawn_receive_loop(ReceiveLoopArgs {
         store,
         handle: handle.clone(),
@@ -361,6 +412,7 @@ pub async fn create_chat_agent(
         mls,
         receive_all,
         wire_handle: agent_handle.to_owned(),
+        ds_rx,
     });
 
     Ok((handle, warnings))
@@ -459,6 +511,11 @@ struct ReceiveLoopArgs {
     /// This agent's wire handle (`@name`) — used only by receive-all to skip
     /// its own messages.
     wire_handle: String,
+    /// SPEC-024 (ADR-035): admitted DS records from the per-room pull task.
+    /// The receive loop owns the MlsSession, so the CON-006 apply and the
+    /// CON-013 atomic commit happen here. Idle (sender dropped immediately)
+    /// on non-v1 rooms.
+    ds_rx: mpsc::Receiver<crate::mls_ds::task::DsApply>,
 }
 
 /// A scheduled responder timer fired by the receive loop (SPEC-003 REQ-005/007).
@@ -622,6 +679,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         mut mls,
         receive_all,
         wire_handle,
+        mut ds_rx,
     } = args;
     tokio::spawn(async move {
         // Pending Δ-window and liveness-fallback timers, fired into the select.
@@ -676,6 +734,42 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             let _ = outbound.result_tx.send(Err(OutboundReject::fatal(detail.clone())));
                             let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(detail)).await;
                             break;
+                        }
+                    }
+                }
+                // SPEC-024 (ADR-035): an ADMITTED DS record from the pull task. The
+                // record already passed CON-011 recognition, CON-012 binding, and
+                // CON-005 admission (anchor + hash + DS-sig + exact-next). Here the
+                // session applies the embedded frame (CON-006 — decrypt/merge through
+                // the same engine as any inbound, H7 active via is_v1) and then
+                // commits provider snapshot + cursor in ONE manifest flip (CON-013).
+                // An apply failure holds the durable cursor: on restart the same
+                // record is re-pulled (immutable log, idempotent).
+                maybe_apply = ds_rx.recv() => {
+                    let Some(apply) = maybe_apply else { continue };
+                    let Some(session) = mls.as_mut() else { continue };
+                    let applied_text = match session.handle_frame(&apply.payload) {
+                        SessionEvent::Plaintext { text, .. } => Some(text),
+                        SessionEvent::NotMls => None,   // marker/control payload — nothing to render
+                        SessionEvent::Handled { .. } => None,
+                        SessionEvent::Dropped { reason, .. } => {
+                            tracing::warn!(reason, "ds-admitted record failed MLS apply; cursor NOT committed");
+                            continue;
+                        }
+                    };
+                    if let Err(error) = session.persist_v1_state(apply.generation, &apply.log) {
+                        tracing::warn!(%error, "CON-013 persist failed; durable cursor holds");
+                        continue;
+                    }
+                    // Decrypted DS-delivered content reaches recv exactly like live
+                    // content (receive-all path; own messages skipped).
+                    if let Some(text) = applied_text {
+                        if receive_all {
+                            let own = crate::chat_responder::message_sender(&text).as_deref()
+                                == Some(wire_handle.as_str());
+                            if !own && store.enqueue_inbound(&handle, text).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -857,6 +951,17 @@ mod tests {
         assert_eq!(declared[0].digest, "abc123");
         assert_eq!(declared[1].name, "vote");
         assert_eq!(declared[1].digest, "def456");
+        assert!(!cfg.mls_ds, "no v1 marker → legacy room");
+
+        // SPEC-024 (ADR-034): the v1 marker — :protocol keyword or the dialect menu.
+        let cfg = super::parse_roomcfg("(roomcfg @demo :enc true :protocol mls-ds/v1)")
+            .expect("protocol roomcfg should parse");
+        assert!(cfg.mls_ds, ":protocol mls-ds/v1 marks the room v1");
+        let cfg = super::parse_roomcfg(
+            r#"(roomcfg @demo :enc true :dialects (("mls-ds/v1" "922ba8")))"#,
+        )
+        .expect("v1-menu roomcfg should parse");
+        assert!(cfg.mls_ds, "declaring the mls-ds/v1 dialect marks the room v1");
 
         // Not a roomcfg → None.
         assert!(super::parse_roomcfg("(presence @demo :members ())").is_none());

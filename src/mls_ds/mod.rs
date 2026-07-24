@@ -16,6 +16,7 @@ pub mod closure;
 pub mod genesis;
 pub mod pull;
 pub mod store;
+pub mod task;
 pub mod wire;
 
 use cbcl_core::dialect::DialectRegistry;

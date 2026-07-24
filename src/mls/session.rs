@@ -274,6 +274,12 @@ impl MlsSession {
         self.is_v1
     }
 
+    /// The pull task's pin directory (genesis anchor + TOFU DS key), colocated
+    /// with the session's resume state.
+    pub fn v1_pins_dir(&self) -> std::path::PathBuf {
+        self.meta_path.with_extension("v1pins")
+    }
+
     /// CON-013 (ADR-033): persist the v1 client-state tuple AND the OpenMLS provider snapshot in
     /// ONE atomic commit (the `store.rs` manifest-flip), so a crash never exposes a group-vs-cursor
     /// mix (REQ-083). v1 rooms use this INSTEAD of the separate `persist_meta` + provider renames;
