@@ -460,25 +460,43 @@ impl Harness {
     }
 
     async fn create_agent(&self, dialects: &[&str]) -> CreateAgentResponse {
-        let response = reqwest::Client::new()
-            .post(self.url("/v1/agents"))
-            .header("authorization", format!("Bearer {}", self.record.token))
-            .json(&serde_json::json!({
-                "dialects": dialects,
-                // r5_runtime's mock router does not answer meta queries; the
-                // fixture is installed explicitly via `try_install` after this
-                // call. Opt out of auto-install so init does not stall.
-                "auto_install_advertised": false,
-            }))
-            .send()
-            .await
-            .expect("create-agent request must complete");
-        assert!(
-            response.status().is_success(),
+        let body = serde_json::json!({
+            "dialects": dialects,
+            // r5_runtime's mock router does not answer meta queries; the
+            // fixture is installed explicitly via `try_install` after this
+            // call. Opt out of auto-install so init does not stall.
+            "auto_install_advertised": false,
+        });
+        // The daemon establishes its router WebSocket connection *during*
+        // create-agent, so a slow/loaded runner can transiently return
+        // 503 router_connection_failed before the mock router's accept task is
+        // scheduled (`/v1/ping` readiness only proves the HTTP server is up).
+        // Retry the transient 503 — the real CLI does the same for
+        // SERVICE_UNAVAILABLE. A genuine failure still surfaces after the
+        // bounded retries (~1s), and this runs before the test's own
+        // assertions, so it cannot mask them.
+        let mut last_status = None;
+        for _ in 0..50 {
+            let response = reqwest::Client::new()
+                .post(self.url("/v1/agents"))
+                .header("authorization", format!("Bearer {}", self.record.token))
+                .json(&body)
+                .send()
+                .await
+                .expect("create-agent request must complete");
+            if response.status().is_success() {
+                return response.json().await.expect("create response must decode");
+            }
+            last_status = Some(response.status());
+            if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
             "create-agent must succeed, got {}",
-            response.status()
+            last_status.expect("at least one create-agent attempt was made")
         );
-        response.json().await.expect("create response must decode")
     }
 
     async fn post_send(
@@ -555,10 +573,16 @@ impl MockRouter {
         let shared = Arc::new(Mutex::new(MockRouterState::default()));
         let task_shared = Arc::clone(&shared);
         let task = tokio::spawn(async move {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                return;
-            };
-            handle_connection(stream, task_shared).await;
+            // Accept in a loop. If the daemon's first router connect races the
+            // accept-task scheduling on a slow/loaded runner and the harness
+            // retries create-agent (see `Harness::create_agent`), a fresh
+            // connection still finds a listener here instead of hanging.
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                handle_connection(stream, Arc::clone(&task_shared)).await;
+            }
         });
         Self {
             addr,
