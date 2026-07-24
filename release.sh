@@ -9,9 +9,10 @@ set -e
 # Example: ./release.sh 0.1.0
 #
 # Bumps the version, runs the gate (test + clippy), commits, tags, and pushes.
-# Pushing the tag triggers .woodpecker/release.yaml on Codeberg, which
-# cross-compiles the four prebuilt binaries and publishes them (plus install.sh)
-# to Cloudflare R2, served at https://files.anuna.io/hark/.
+# Pushing the tag triggers .forgejo/workflows/release.yaml on git.anuna.io
+# (Forgejo Actions), which cross-compiles the four prebuilt binaries and
+# publishes them (plus install.sh) to Cloudflare R2, served at
+# https://files.anuna.io/hark/.
 #
 # Requires the sibling ../cbcl-rs checkout (path dependency) for the local gate.
 
@@ -86,7 +87,8 @@ git push origin "$TAG"
 echo ""
 info "Release $TAG published!"
 echo ""
-echo "Woodpecker release pipeline triggered (.woodpecker/release.yaml)."
+echo "Forgejo Actions release pipeline triggered (.forgejo/workflows/release.yaml)."
+echo "Watch it at: https://git.anuna.io/anuna-research/hark/actions"
 echo "When it finishes, the release will be available at:"
 echo "  https://files.anuna.io/hark/            (latest)"
 echo "  https://files.anuna.io/hark/$TAG/"
