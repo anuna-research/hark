@@ -19,7 +19,7 @@ pub mod store;
 
 use cbcl_core::dialect::DialectRegistry;
 use cbcl_core::mls_ds::{DomainTuple, ReadContext};
-use cbcl_core::sexpr::{Atom, SExpr};
+use cbcl_core::sexpr::SExpr;
 use cbcl_core::store::ThreadedMessageStore;
 use cbcl_parser::{parse, parse_dialect, run_pipeline_full, PipelineContext, PipelineResult};
 use sha2::{Digest, Sha256};
@@ -193,6 +193,7 @@ pub fn verify_response_frame(
 mod tests {
     use super::*;
     use cbcl_core::mls_ds::Ed25519Keypair;
+    use cbcl_core::sexpr::Atom;
 
     fn sym(s: &str) -> SExpr {
         SExpr::Atom(Atom::Symbol(s.into()))
