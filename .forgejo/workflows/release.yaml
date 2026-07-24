@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 Anuna Research
+#
+# hark release pipeline (SPEC-016 REQ-001, ADR-006) — Forgejo Actions.
+#
+# This is the migration of the former .woodpecker/release.yaml (which ran on
+# ci.codeberg.org) to the Anuna Forgejo instance at git.anuna.io. Triggered by
+# pushing a tag like `v0.1.0` (see ./release.sh). Cross-compiles the four
+# prebuilt binaries that scripts/install.sh downloads
+#   hark-darwin-arm64  hark-darwin-x64  hark-linux-x64  hark-linux-arm64
+# each with a matching .sha256, then publishes them (plus install.sh) to
+# Cloudflare R2 (bucket anuna-files) so they are served at
+#   https://files.anuna.io/hark/            <- flat "latest", what install.sh reads
+#   https://files.anuna.io/hark/<tag>/      <- immutable per-release archive
+#
+# Everything builds on a single Linux `ubuntu-latest` runner, including the
+# darwin artifacts (via osxcross + the macOS SDK) — the Forgejo runners are
+# Linux-only, exactly as Codeberg's were. hark's TLS stack is rustls/ring (no
+# openssl, no aws-lc), so the cross-builds need only the target C toolchain: no
+# libssl-dev:arm64 and no vendored-openssl gymnastics. hark also has no custom
+# [profile.release], so no LTO/OOM softening is required.
+#
+# Unlike the Woodpecker version (where each step was a fresh container), this is
+# ONE job so all steps share the workspace: `dist/` accumulates across the build
+# steps and the osxcross toolchain is built once and reused by both darwin
+# targets (the `[ -d /tmp/osxcross ]` guard).
+#
+# hark depends on the sibling cbcl-rs repo via `../cbcl-rs/...` path deps
+# (Cargo.toml). cbcl-rs is PUBLIC on git.anuna.io, so the job clones it
+# anonymously as a sibling and checks out a PINNED commit (CBCL_RS_REF): Cargo's
+# `--locked` cannot pin path-dependency *contents*, so building against a moving
+# branch would let an unrelated cbcl-rs change silently alter a hark release.
+# Bump CBCL_RS_REF deliberately in the release-prep commit.
+#
+# Required Forgejo Actions secrets (Settings -> Actions -> Secrets on the
+# git.anuna.io/anuna-research/hark repo). These are the same Cloudflare R2
+# credentials the Codeberg pipeline used; re-add them here — the R2 bucket and
+# files.anuna.io serving are unchanged by the migration:
+#   CF_R2_ACCESS_KEY_ID  CF_R2_SECRET_ACCESS_KEY  CF_ACCOUNT_ID
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# The pinned cbcl-rs commit hark releases build against. Bump per release.
+env:
+  CBCL_RS_REF: 1c6fa8f581a69a7bcb88fb787fa37c81f5de4221
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone + pin the cbcl-rs path dependency
+        # Clone the public sibling to ../cbcl-rs (relative to the hark checkout,
+        # which is exactly where the `../cbcl-rs` path dep resolves) and detach
+        # to the pin. Public on git.anuna.io, so no token is needed.
+        run: |
+          if [ ! -d ../cbcl-rs ]; then
+            git clone https://git.anuna.io/anuna-research/cbcl-rs.git ../cbcl-rs
+          fi
+          git -C ../cbcl-rs checkout --detach "$CBCL_RS_REF"
+
+      - name: Ensure Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustc --version
+          cargo --version
+
+      - name: Build linux-x64
+        run: |
+          rustup target add x86_64-unknown-linux-gnu
+          cargo build --release --locked --target x86_64-unknown-linux-gnu
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/hark dist/hark-linux-x64
+          cd dist && sha256sum hark-linux-x64 > hark-linux-x64.sha256
+
+      - name: Build linux-arm64
+        # ring compiles a little C/asm for the target, so it needs the aarch64
+        # cross toolchain (compiler + linker). No system libraries beyond that —
+        # hark pulls no openssl-sys.
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          $SUDO apt-get update && $SUDO apt-get install -y gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+          export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          cargo build --release --locked --target aarch64-unknown-linux-gnu
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-gnu/release/hark dist/hark-linux-arm64
+          cd dist && sha256sum hark-linux-arm64 > hark-linux-arm64.sha256
+
+      - name: Install osxcross toolchain (macOS SDK)
+        # Build the osxcross toolchain once against the macOS SDK; both darwin
+        # targets below reuse /tmp/osxcross. Same recipe the Codeberg pipeline
+        # used.
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          $SUDO apt-get update && $SUDO apt-get install -y clang cmake patch xz-utils libxml2-dev
+          if [ ! -d /tmp/osxcross ]; then
+            git clone https://github.com/tpoechtrager/osxcross /tmp/osxcross
+            curl -fsSL https://github.com/joseluisq/macosx-sdks/releases/download/14.5/MacOSX14.5.sdk.tar.xz \
+              -o /tmp/osxcross/tarballs/MacOSX14.5.sdk.tar.xz
+            ( cd /tmp/osxcross && UNATTENDED=1 ./build.sh )
+          fi
+
+      - name: Build darwin-arm64
+        run: |
+          export PATH="/tmp/osxcross/target/bin:$PATH"
+          export CC_aarch64_apple_darwin=aarch64-apple-darwin23.5-clang
+          export CXX_aarch64_apple_darwin=aarch64-apple-darwin23.5-clang++
+          export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=aarch64-apple-darwin23.5-clang
+          rustup target add aarch64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/hark dist/hark-darwin-arm64
+          cd dist && sha256sum hark-darwin-arm64 > hark-darwin-arm64.sha256
+
+      - name: Build darwin-x64
+        run: |
+          export PATH="/tmp/osxcross/target/bin:$PATH"
+          export CC_x86_64_apple_darwin=x86_64-apple-darwin23.5-clang
+          export CXX_x86_64_apple_darwin=x86_64-apple-darwin23.5-clang++
+          export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=x86_64-apple-darwin23.5-clang
+          rustup target add x86_64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          cp target/x86_64-apple-darwin/release/hark dist/hark-darwin-x64
+          cd dist && sha256sum hark-darwin-x64 > hark-darwin-x64.sha256
+
+      - name: Create release metadata
+        run: |
+          # The installer the curl one-liner fetches, shipped alongside the binaries.
+          cp scripts/install.sh dist/install.sh
+          # Optional machine-readable pointer (install.sh does not require it, but
+          # it mirrors the sibling repos and lets tooling resolve the latest version).
+          cat > dist/version.json << EOF
+          {
+            "version": "${GITHUB_REF_NAME#v}",
+            "download_url": "https://files.anuna.io/hark/${GITHUB_REF_NAME}"
+          }
+          EOF
+          ls -la dist/
+
+      - name: Upload to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          # Ensure the AWS CLI is available (the R2 S3-compatible endpoint).
+          if ! command -v aws >/dev/null 2>&1; then
+            SUDO=""; command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+            $SUDO apt-get update && $SUDO apt-get install -y awscli
+          fi
+
+          export AWS_DEFAULT_REGION=auto
+          export R2_ENDPOINT="https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          export BUCKET="anuna-files"
+          export PROJECT="hark"
+
+          # Flat prefix = the "latest" the curl installer reads
+          # (https://files.anuna.io/hark/hark-<os>-<arch> and .../install.sh), plus
+          # an immutable per-tag archive at hark/<tag>/.
+          for file in dist/hark-* dist/install.sh dist/version.json; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            aws s3 cp "$file" "s3://${BUCKET}/${PROJECT}/${name}"                     --endpoint-url "$R2_ENDPOINT"
+            aws s3 cp "$file" "s3://${BUCKET}/${PROJECT}/${GITHUB_REF_NAME}/${name}"   --endpoint-url "$R2_ENDPOINT"
+            echo "Uploaded: $name"
+          done
+
+          # Informational only, and non-fatal: an "Object Read & Write" R2 token
+          # can PutObject (the uploads above) but may lack bucket ListBucket.
+          echo "Files in ${PROJECT}/ (latest):"
+          aws s3 ls "s3://${BUCKET}/${PROJECT}/" --endpoint-url "$R2_ENDPOINT" || echo "(list not permitted by this token; the uploads above succeeded)"
+          echo ""
+          echo "Release available at:"
+          echo "  https://files.anuna.io/${PROJECT}/"
+          echo "  https://files.anuna.io/${PROJECT}/${GITHUB_REF_NAME}/"
+          echo "Install: curl https://files.anuna.io/${PROJECT}/install.sh | sh"
