@@ -140,3 +140,33 @@ async fn hark_rejects_a_forged_record_over_the_socket() {
     assert!(matches!(verdict, Verdict::Violation(_)), "a forged record over the socket is ds-equivocation");
     assert_eq!(driver.cursor().cursor, 0, "cursor held over the socket on a rejected record");
 }
+
+/// THE CAPSTONE — hark's real PullDriver against the LIVE cbcl-bus hub (the actual
+/// cbcl-mls-ds-ws cowboy endpoint), cross-process over a real socket. Env-gated:
+/// runs only when `MLS_DS_URL` points at a booted hub (via tests/e2e/run-mls-ds.sh);
+/// otherwise it self-skips so `cargo test` stays hermetic. The hub's pinned DS seed
+/// is 0x2a*32, so hark derives the same public key and pins it.
+#[tokio::test]
+async fn hark_pull_loop_against_live_cbcl_bus_hub() {
+    let Ok(url) = std::env::var("MLS_DS_URL") else {
+        eprintln!("[socket] MLS_DS_URL unset — skipping the live cbcl-bus hub interop (run tests/e2e/run-mls-ds.sh)");
+        return;
+    };
+    let ds = Ed25519Keypair::from_seed(&[42u8; 32]); // the hub's pinned DS seed (cbcl-mls-ds-ws)
+    let ds_vk = ds.public_bytes();
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect to the live cbcl-bus hub");
+    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() });
+    for expected in 1..=3 {
+        let PullAction::Pull { after_seq } = driver.next_pull() else { panic!("expected a Pull") };
+        ws.send(Message::text(format!("next-record {after_seq}"))).await.unwrap();
+        let Message::Text(resp) = ws.next().await.unwrap().unwrap() else { panic!("expected a record frame") };
+        let verdict = driver.on_record(&ds_vk, &parse_record(resp.as_str()));
+        println!("[socket] live hub after_seq={after_seq} -> {verdict:?}");
+        assert!(
+            matches!(verdict, Verdict::Applied { cursor, .. } if cursor == expected),
+            "the LIVE cbcl-bus hub's record {expected} must C-APPLY in hark, got {verdict:?}"
+        );
+    }
+    assert_eq!(driver.cursor().cursor, 3, "hark ran the pull loop against the LIVE cbcl-bus hub (cursor 0->3)");
+    println!("[socket] hark <-> LIVE cbcl-bus hub over a real WebSocket: cursor 0 -> 3");
+}
