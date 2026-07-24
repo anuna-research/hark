@@ -707,6 +707,7 @@ mod tests {
             None,
             &mut fork,
             false,
+            false,
         )
         .unwrap();
         match inbound {
@@ -761,6 +762,7 @@ mod tests {
             None,
             &mut fork,
             false,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -798,6 +800,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
             false,
         )
         .unwrap();
@@ -864,6 +867,7 @@ mod tests {
             None,
             &mut fork,
             false,
+            false,
         )
         .unwrap_err();
         assert!(format!("{err}").contains("evidence"), "{err}");
@@ -894,6 +898,7 @@ mod tests {
             Some(&stale),
             &mut fork,
             false,
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, MlsError::Rejected(_)), "{err}");
@@ -918,6 +923,7 @@ mod tests {
             &genesis,
             Some(&evidence),
             &mut fork,
+            false,
             false,
         )
         .unwrap();
@@ -965,6 +971,7 @@ mod tests {
             None,
             &mut fork,
             false,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -997,6 +1004,7 @@ mod tests {
             None,
             &mut fork,
             false,
+            false,
         )
         .unwrap();
         assert!(matches!(ok, Inbound::App { .. }));
@@ -1012,6 +1020,7 @@ mod tests {
                 &genesis,
                 None,
                 &mut fork,
+                false,
                 false,
             )
             .unwrap();
@@ -1040,6 +1049,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
             false,
         )
         .unwrap();

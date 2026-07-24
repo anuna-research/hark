@@ -90,7 +90,6 @@ struct PendingBroadcast {
     #[serde(default)]
     group_id_b64: String,
     frame: String,
->>>>>>> 53b51de (fix(chat,mls): round-3 hardening — durable epoch-scoped transition replay, admission-time accounting)
 }
 
 /// What an inbound frame turned out to be.
