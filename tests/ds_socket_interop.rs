@@ -91,7 +91,7 @@ fn parse_record(frame: &str) -> RecordResponse {
         record_hash: f[2].to_string(),
         record_signature: from_hex_64(f[3]),
         log_record: log_record(seq, f[1]),
-    }
+        genesis_ref: "sha256:anchor".into(),    }
 }
 
 #[tokio::test]
@@ -105,7 +105,7 @@ async fn hark_pull_loop_over_a_real_websocket() {
 
     // hark client: the REAL PullDriver, driven over a REAL WebSocket.
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/mls-ds/v1")).await.unwrap();
-    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() });
+    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() }, Some("sha256:anchor".into()));
     for expected in 1..=3 {
         let PullAction::Pull { after_seq } = driver.next_pull() else { panic!("expected a Pull") };
         ws.send(Message::text(format!("next-record {after_seq}"))).await.unwrap();
@@ -132,7 +132,7 @@ async fn hark_rejects_a_forged_record_over_the_socket() {
     let addr = spawn_ds(served).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/mls-ds/v1")).await.unwrap();
-    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() });
+    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() }, Some("sha256:anchor".into()));
     let PullAction::Pull { after_seq } = driver.next_pull() else { panic!() };
     ws.send(Message::text(format!("next-record {after_seq}"))).await.unwrap();
     let Message::Text(resp) = ws.next().await.unwrap().unwrap() else { panic!() };
@@ -155,7 +155,7 @@ async fn hark_pull_loop_against_live_cbcl_bus_hub() {
     let ds = Ed25519Keypair::from_seed(&[42u8; 32]); // the hub's pinned DS seed (cbcl-mls-ds-ws)
     let ds_vk = ds.public_bytes();
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect to the live cbcl-bus hub");
-    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() });
+    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() }, Some("sha256:anchor".into()));
     for expected in 1..=3 {
         let PullAction::Pull { after_seq } = driver.next_pull() else { panic!("expected a Pull") };
         ws.send(Message::text(format!("next-record {after_seq}"))).await.unwrap();

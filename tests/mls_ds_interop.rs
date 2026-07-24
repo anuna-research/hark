@@ -50,7 +50,7 @@ impl MockDs {
                 record_hash: rh.clone(),
                 record_signature: sig,
                 log_record: rec,
-            });
+                genesis_ref: "sha256:anchor".into(),            });
             prev = rh;
         }
         Self { ds, chain }
@@ -71,7 +71,7 @@ impl MockDs {
 fn client_pull_loop_runs_end_to_end_against_a_ds() {
     let ds = MockDs::new(*b"ds-key01", 3, H0);
     let ds_vk = ds.ds_key();
-    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() });
+    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() }, Some("sha256:anchor".into()));
 
     for expected in 1..=3 {
         match driver.next_pull() {
@@ -96,7 +96,7 @@ fn client_pull_loop_runs_end_to_end_against_a_ds() {
 fn client_rejects_records_not_signed_by_the_pinned_ds() {
     let ds = MockDs::new(*b"ds-key01", 1, H0);
     let forger = MockDs::new(*b"forger00", 1, H0); // a different key, same chain shape
-    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() });
+    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: H0.into() }, Some("sha256:anchor".into()));
 
     // The forger's record is well-formed but signed by the wrong key.
     let PullAction::Pull { after_seq } = driver.next_pull() else { panic!("expected Pull") };
@@ -145,7 +145,7 @@ fn client_pull_loop_consumes_lfe_hub_chain() {
     assert_eq!(recs.len(), 3, "the LFE hub emitted a 3-record chain");
 
     // the honest-path deliver: pull -> verify (pinned key) -> reduce -> advance, over the WHOLE chain.
-    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: h0.clone() });
+    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: h0.clone() }, Some("sha256:anchor".into()));
     for (i, (seq, prev, rh, sig)) in recs.iter().enumerate() {
         let expected = (i as i64) + 1;
         let PullAction::Pull { after_seq } = driver.next_pull() else {
@@ -158,7 +158,7 @@ fn client_pull_loop_consumes_lfe_hub_chain() {
             record_hash: rh.clone(),
             record_signature: *sig,
             log_record: log_record(*seq, prev),
-        };
+            genesis_ref: "sha256:anchor".into(),        };
         let verdict = driver.on_record(&ds_pubkey, &resp);
         println!("[interop] LFE-hub rec {expected} -> {verdict:?}");
         assert!(
@@ -170,7 +170,7 @@ fn client_pull_loop_consumes_lfe_hub_chain() {
     println!("[interop] hark client advanced cursor 0 -> 3 over the REAL cbcl-bus hub's DS-signed chain");
 
     // NI — a record with a forged signature is rejected under the same pinned key.
-    let mut d2 = PullDriver::new(ClientLog { cursor: 0, cursor_hash: h0 });
+    let mut d2 = PullDriver::new(ClientLog { cursor: 0, cursor_hash: h0 }, Some("sha256:anchor".into()));
     let PullAction::Pull { .. } = d2.next_pull() else { panic!() };
     let (seq, prev, rh, _) = &recs[0];
     let forged = RecordResponse {
@@ -179,7 +179,7 @@ fn client_pull_loop_consumes_lfe_hub_chain() {
         record_hash: rh.clone(),
         record_signature: [0u8; 64],
         log_record: log_record(*seq, prev),
-    };
+        genesis_ref: "sha256:anchor".into(),    };
     assert!(matches!(d2.on_record(&ds_pubkey, &forged), Verdict::Violation(_)), "forged sig -> ds-equivocation");
     assert_eq!(d2.cursor().cursor, 0, "cursor held on the forged record");
 }

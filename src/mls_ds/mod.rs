@@ -88,6 +88,8 @@ pub struct RecordResponse {
     pub record_hash: String,
     pub record_signature: [u8; 64],
     pub log_record: SExpr,
+    /// The immutable genesis anchor this record names (bound by [`bind_record_anchor`]).
+    pub genesis_ref: String,
 }
 
 /// The CON-005 record-admission verdict.
@@ -97,6 +99,8 @@ pub enum Verdict {
     Applied { cursor: i64, cursor_hash: String },
     /// notNext (REQ-034): cursor preserved, no effect.
     NotNext,
+    /// AwaitingGenesis: no saved anchor yet — schedule `genesis-get`, cursor holds (not a fault).
+    AwaitingGenesis,
     /// Violation(ds-equivocation): cursor + group held; bytes retained as fork evidence.
     Violation(&'static str),
 }
@@ -215,7 +219,7 @@ mod tests {
         let rec = SExpr::List(vec![sym("log-v1"), st("room-alpha"), num(seq), st(prev_hash)]);
         let rh = record_hash(&rec);
         let sig = DomainTuple::Record { log_record: rec.clone() }.sign(ds);
-        RecordResponse { seq, prev_hash: prev_hash.into(), record_hash: rh, record_signature: sig, log_record: rec }
+        RecordResponse { seq, prev_hash: prev_hash.into(), record_hash: rh, record_signature: sig, log_record: rec, genesis_ref: "sha256:anchor".into() }
     }
 
     #[test]
@@ -242,5 +246,35 @@ mod tests {
             bind_record_anchor("sha256:foreign", Some("sha256:anchor")),
             AnchorBinding::Violation("ds-equivocation:genesis-anchor-mismatch")
         );
+    }
+
+    // CON-012 read-frame binding (ADR-036): the outstanding read root binds the response's
+    // (session_id, frame_id) read-context and request-content hash, rejecting a
+    // response-frame-for-request-frame transplant and a non-pinned signer.
+    #[test]
+    fn verify_response_frame_binds_read_context_and_content() {
+        let ds = Ed25519Keypair::from_seed(&[7u8; 32]);
+        let vk = ds.public_bytes();
+        let rch = format!("sha256:{}", "a".repeat(64));
+        let resp = DomainTuple::Response {
+            bindings: st("b"),
+            dialect_hash: format!("sha256:{}", "1".repeat(64)),
+            request_content_hash: rch.clone(),
+            response_message: st("m"),
+            read_context: ReadContext::Read { session_id: "s".into(), frame_id: 1 },
+        };
+        let sig = resp.sign(&ds);
+        let o = OutstandingRead { session_id: "s".into(), frame_id: 1, request_content_hash: rch.clone() };
+        // correctly bound + signed -> Ok.
+        assert!(verify_response_frame(&o, &vk, &resp, &sig).is_ok());
+        // a response for a DIFFERENT (session, frame) is a frame transplant.
+        let o2 = OutstandingRead { session_id: "other".into(), frame_id: 9, request_content_hash: rch.clone() };
+        assert_eq!(verify_response_frame(&o2, &vk, &resp, &sig), Err("frame-transplant"));
+        // a request-content mismatch is rejected.
+        let o3 = OutstandingRead { session_id: "s".into(), frame_id: 1, request_content_hash: format!("sha256:{}", "b".repeat(64)) };
+        assert_eq!(verify_response_frame(&o3, &vk, &resp, &sig), Err("request-content-mismatch"));
+        // a non-pinned signer is rejected.
+        let forger = Ed25519Keypair::from_seed(&[8u8; 32]);
+        assert_eq!(verify_response_frame(&o, &forger.public_bytes(), &resp, &sig), Err("response-signature-invalid"));
     }
 }

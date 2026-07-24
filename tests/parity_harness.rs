@@ -259,6 +259,7 @@ fn norm_of_record(v: &Verdict) -> &'static str {
     match v {
         Verdict::Applied { .. } => "ADMIT",
         Verdict::NotNext => "HOLD",
+        Verdict::AwaitingGenesis => "AWAITING",
         Verdict::Violation(_) => "REJECT",
     }
 }
@@ -288,7 +289,7 @@ fn signed_record(seq: i64, prev: &str, ds: &Ed25519Keypair) -> RecordResponse {
     let rec = list(vec![sym("log-v1"), st("room-alpha"), num(seq), st(prev)]);
     let rh = record_hash(&rec);
     let sig = DomainTuple::Record { log_record: rec.clone() }.sign(ds);
-    RecordResponse { seq, prev_hash: prev.into(), record_hash: rh, record_signature: sig, log_record: rec }
+    RecordResponse { seq, prev_hash: prev.into(), record_hash: rh, record_signature: sig, log_record: rec, genesis_ref: "sha256:anchor".into() }
 }
 fn record_scenario(name: &str) -> &'static str {
     let ds = Ed25519Keypair::from_seed(&[5u8; 32]);
