@@ -1,0 +1,223 @@
+{
+  "spec": "IMPL-025 TEST-024",
+  "oracle": "semantic-transition",
+  "note": "Contract of {named-scenario -> normalized outcome} across the ported cores (oracle: reducer=CON-005, genesis=CON-008). The JS reducer is a MONOLITH; hark DECOMPOSES CON-005 into record/boundary modules, so parity is compared in a per-oracle normalized label space via harkModule. harkComparable=false ⇒ JS-only verdict outside hark cores, OR a documented divergence (js-reducer-stricter).",
+  "normalizedSpace": {
+    "reducer": [
+      "ADMIT",
+      "HOLD",
+      "REJECT"
+    ],
+    "genesis": [
+      "FIRST",
+      "EXISTING",
+      "CONFLICT"
+    ]
+  },
+  "harkModules": {
+    "record": "transition_record",
+    "boundary": "validate_v1_commit",
+    "genesis": "validate_genesis",
+    "none": "not-in-a-hark-core"
+  },
+  "scenarios": [
+    {
+      "name": "commit-exact-next-applied",
+      "oracle": "reducer",
+      "norm": "ADMIT",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "applied",
+        "cursor": 1
+      }
+    },
+    {
+      "name": "commit-wrong-seq-notNext",
+      "oracle": "reducer",
+      "norm": "HOLD",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "notNext"
+      }
+    },
+    {
+      "name": "commit-wrong-prev-notNext",
+      "oracle": "reducer",
+      "norm": "HOLD",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "notNext"
+      }
+    },
+    {
+      "name": "commit-bad-ds-sig-violation",
+      "oracle": "reducer",
+      "norm": "REJECT",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "ds-equivocation"
+      }
+    },
+    {
+      "name": "commit-record-hash-mismatch-violation",
+      "oracle": "reducer",
+      "norm": "REJECT",
+      "harkModule": "record",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "ds-equivocation"
+      }
+    },
+    {
+      "name": "add-valid-auth-admit",
+      "oracle": "reducer",
+      "norm": "ADMIT",
+      "harkModule": "boundary",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "applied",
+        "cursor": 1
+      }
+    },
+    {
+      "name": "add-invalid-auth-violation",
+      "oracle": "reducer",
+      "norm": "REJECT",
+      "harkModule": "boundary",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "invalid-add-authorization"
+      }
+    },
+    {
+      "name": "commit-non-add-carries-auth-violation",
+      "oracle": "reducer",
+      "norm": "REJECT",
+      "harkModule": "boundary",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "ds-equivocation"
+      }
+    },
+    {
+      "name": "commit-genesis-anchor-mismatch-violation",
+      "oracle": "reducer",
+      "norm": "REJECT",
+      "harkModule": "anchor",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "violation",
+        "code": "ds-equivocation"
+      }
+    },
+    {
+      "name": "commit-awaiting-genesis",
+      "oracle": "reducer",
+      "norm": "AWAITING",
+      "harkModule": "anchor",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "awaitingGenesis"
+      }
+    },
+    {
+      "name": "commit-deterministic-reject",
+      "oracle": "reducer",
+      "norm": "JS-ONLY",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "deterministicReject",
+        "cursor": 1
+      }
+    },
+    {
+      "name": "commit-retryable",
+      "oracle": "reducer",
+      "norm": "JS-ONLY",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "retrySame"
+      }
+    },
+    {
+      "name": "add-nontarget-stateless-skip",
+      "oracle": "reducer",
+      "norm": "JS-ONLY",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "statelessSkip"
+      }
+    },
+    {
+      "name": "add-target-stateless-pendingWelcome",
+      "oracle": "reducer",
+      "norm": "JS-ONLY",
+      "harkModule": "none",
+      "harkComparable": false,
+      "jsVerdict": {
+        "tag": "pendingWelcome"
+      }
+    },
+    {
+      "name": "genesis-valid-first-tofu",
+      "oracle": "genesis",
+      "norm": "FIRST",
+      "harkModule": "genesis",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "FIRST"
+      }
+    },
+    {
+      "name": "genesis-existing-verified",
+      "oracle": "genesis",
+      "norm": "EXISTING",
+      "harkModule": "genesis",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "EXISTING"
+      }
+    },
+    {
+      "name": "genesis-grade-lie-conflict",
+      "oracle": "genesis",
+      "norm": "CONFLICT",
+      "harkModule": "genesis",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "CONFLICT"
+      }
+    },
+    {
+      "name": "genesis-room-transplant-conflict",
+      "oracle": "genesis",
+      "norm": "CONFLICT",
+      "harkModule": "genesis",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "CONFLICT"
+      }
+    },
+    {
+      "name": "genesis-bad-claim-sig-conflict",
+      "oracle": "genesis",
+      "norm": "CONFLICT",
+      "harkModule": "genesis",
+      "harkComparable": true,
+      "jsVerdict": {
+        "tag": "CONFLICT"
+      }
+    }
+  ]
+}

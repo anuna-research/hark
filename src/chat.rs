@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use url::Url;
 
-use crate::chat_frame::decode_payload;
+use crate::chat_frame::{decode_frame, decode_payload};
 use crate::chat_responder::{Action, Responder, WindowOutcome};
 use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore, OutboundReject};
 use crate::identity::ChatIdentity;
@@ -708,8 +708,12 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                 message = websocket.next() => {
                     let payload_text = match message {
                         Some(Ok(WsMessage::Binary(bytes))) => {
-                            match decode_payload(&bytes) {
-                                Some(payload) => String::from_utf8_lossy(payload).into_owned(),
+                            // CON-012 (IMPL-025): decode with the receive-frame that RETAINS the
+                            // outer signature. `frame.signature` is available for mls-ds/v1
+                            // DS-response verification under the pinned DS key; SPEC-013 frames
+                            // continue unchanged through the session path below.
+                            match decode_frame(&bytes) {
+                                Some(frame) => String::from_utf8_lossy(frame.payload).into_owned(),
                                 None => continue, // malformed frame: drop, keep the connection
                             }
                         }

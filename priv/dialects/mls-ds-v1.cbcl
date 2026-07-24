@@ -1,0 +1,113 @@
+(define mls-ds/v1 (cbcl) @cbcl-chat
+  (:roles (client ds))
+  (:resource-requirements
+    ((max-depth 9) (max-expansion-size 8192) (verification-time 10)))
+
+  (extend next-record (body) :from client :to ds
+    (ask @ds (ds-request :op next :body body :domain "mls-ds/v1")))
+  (extend commit-submit (body) :from client :to ds
+    (tell @ds (ds-request :op submit-commit :enc mls :body body :domain "mls-ds/v1")))
+  (extend commit-add-submit (body) :from client :to ds
+    (tell @ds (ds-request :op submit-add :enc mls :body body :domain "mls-ds/v1")))
+  (extend proposal-submit (body) :from client :to ds
+    (tell @ds (ds-request :op submit-proposal :enc mls :body body :domain "mls-ds/v1")))
+  (extend recovery-submit (body) :from client :to ds
+    (tell @ds (ds-request :op submit-recovery :body body :domain "mls-ds/v1")))
+  (extend welcome-get (body) :from client :to ds
+    (ask @ds (ds-request :op get-welcome :body body :domain "mls-ds/v1")))
+  (extend welcome-ack (body) :from client :to ds
+    (tell @ds (ds-request :op ack-welcome :body body :domain "mls-ds/v1")))
+  (extend genesis-get (body) :from client :to ds
+    (ask @ds (ds-request :op get-genesis :body body :domain "mls-ds/v1")))
+  (extend genesis-register (body) :from client :to ds
+    (tell @ds (ds-request :op register-genesis :body body :domain "mls-ds/v1")))
+  (extend successor-candidate-get (body) :from client :to ds
+    (ask @ds (ds-request :op get-successor-candidate :body body :domain "mls-ds/v1")))
+  (extend successor-offer-submit (body) :from client :to ds
+    (tell @ds (ds-request :op put-successor-offer :body body :domain "mls-ds/v1")))
+  (extend successor-offer-get (body) :from client :to ds
+    (ask @ds (ds-request :op get-successor-offer :body body :domain "mls-ds/v1")))
+  (extend successor-offer-revoke (body) :from client :to ds
+    (tell @ds (ds-request :op revoke-successor-offer :body body :domain "mls-ds/v1")))
+  (extend successor-get (body) :from client :to ds
+    (ask @ds (ds-request :op get-successor :body body :domain "mls-ds/v1")))
+  (extend successor-close (body) :from client :to ds
+    (tell @ds (ds-request :op close-successor :body body :domain "mls-ds/v1")))
+
+  (extend commit-record (body) :from ds :to client
+    (reply @client (ds-response :op record-commit :body body :domain "mls-ds/v1")))
+  (extend commit-add-record (body) :from ds :to client
+    (reply @client (ds-response :op record-add :body body :domain "mls-ds/v1")))
+  (extend proposal-record (body) :from ds :to client
+    (reply @client (ds-response :op record-proposal :body body :domain "mls-ds/v1")))
+  (extend recovery-record (body) :from ds :to client
+    (reply @client (ds-response :op record-recovery :body body :domain "mls-ds/v1")))
+  (extend record-tombstone (body) :from ds :to client
+    (reply @client (ds-response :op tombstone :body body :domain "mls-ds/v1")))
+  (extend at-head (body) :from ds :to client
+    (ok @client (ds-response :op head :body body :domain "mls-ds/v1")))
+  (extend log-behind (body) :from ds :to client
+    (error @client (ds-response :op cursor-behind :body body :domain "mls-ds/v1")))
+  (extend log-truncated (body) :from ds :to client
+    (error @client (ds-response :op cursor-truncated :body body :domain "mls-ds/v1")))
+  (extend record-admitted (body) :from ds :to client
+    (ok @client (ds-response :op admitted-record :body body :domain "mls-ds/v1")))
+  (extend stale-head (body) :from ds :to client
+    (error @client (ds-response :op stale-base :body body :domain "mls-ds/v1")))
+  (extend welcome-delivery (body) :from ds :to client
+    (reply @client (ds-response :op deliver-welcome :body body :domain "mls-ds/v1")))
+  (extend welcome-missing (body) :from ds :to client
+    (error @client (ds-response :op missing-welcome :body body :domain "mls-ds/v1")))
+  (extend welcome-acknowledged (body) :from ds :to client
+    (ok @client (ds-response :op acked-welcome :body body :domain "mls-ds/v1")))
+  (extend genesis-none (body) :from ds :to client
+    (ok @client (ds-response :op no-genesis :body body :domain "mls-ds/v1")))
+  (extend genesis-anchor (body) :from ds :to client
+    (reply @client (ds-response :op current-genesis :body body :domain "mls-ds/v1")))
+  (extend genesis-accepted (body) :from ds :to client
+    (ok @client (ds-response :op accepted-genesis :body body :domain "mls-ds/v1")))
+  (extend genesis-exists (body) :from ds :to client
+    (reply @client (ds-response :op existing-genesis :body body :domain "mls-ds/v1")))
+  (extend successor-candidate (body) :from ds :to client
+    (reply @client (ds-response :op candidate-successor :body body :domain "mls-ds/v1")))
+  (extend successor-offer-stored (body) :from ds :to client
+    (ok @client (ds-response :op stored-successor-offer :body body :domain "mls-ds/v1")))
+  (extend successor-offer-delivery (body) :from ds :to client
+    (reply @client (ds-response :op successor-offer :body body :domain "mls-ds/v1")))
+  (extend successor-offer-none (body) :from ds :to client
+    (ok @client (ds-response :op no-successor-offer :body body :domain "mls-ds/v1")))
+  (extend successor-offer-revoked (body) :from ds :to client
+    (ok @client (ds-response :op revoked-successor-offer :body body :domain "mls-ds/v1")))
+  (extend successor-none (body) :from ds :to client
+    (ok @client (ds-response :op no-successor :body body :domain "mls-ds/v1")))
+  (extend room-closed (body) :from ds :to client
+    (reply @client (ds-response :op closed-room :body body :domain "mls-ds/v1")))
+  (extend ds-rejected (body) :from ds :to client
+    (error @client (ds-response :op reject :body body :domain "mls-ds/v1")))
+
+  (protocol
+    (then begin next-record
+      (any commit-record commit-add-record proposal-record
+           recovery-record record-tombstone at-head log-behind log-truncated
+           room-closed ds-rejected))
+    (then begin commit-submit (any record-admitted stale-head ds-rejected))
+    (then begin commit-add-submit (any record-admitted stale-head ds-rejected))
+    (then begin proposal-submit (any record-admitted stale-head ds-rejected))
+    (then begin recovery-submit (any record-admitted stale-head ds-rejected))
+    (then begin welcome-get (any welcome-delivery welcome-missing ds-rejected))
+    (then begin welcome-ack (any welcome-acknowledged ds-rejected))
+    (then begin genesis-get (any genesis-none genesis-anchor ds-rejected))
+    (then begin genesis-register
+      (any genesis-accepted genesis-exists ds-rejected))
+    (then begin successor-candidate-get
+      (any successor-candidate ds-rejected))
+    (then begin successor-offer-submit
+      (any successor-offer-stored ds-rejected))
+    (then begin successor-offer-get
+      (any successor-offer-delivery successor-offer-none room-closed ds-rejected))
+    (then begin successor-offer-revoke
+      (any successor-offer-revoked room-closed ds-rejected))
+    (then begin successor-get
+      (any successor-none room-closed ds-rejected))
+    (then begin successor-close
+      (any room-closed ds-rejected))))

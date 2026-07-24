@@ -275,13 +275,17 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "cbcl-core"
 version = "0.1.0"
+source = "git+https://codeberg.org/anuna/cbcl-rs?rev=fd8f034#fd8f034043702b5ac276369a077be159f08934e0"
 dependencies = [
+ "ed25519-dalek",
  "hashbrown 0.15.5",
+ "sha2",
 ]
 
 [[package]]
 name = "cbcl-parser"
 version = "0.1.0"
+source = "git+https://codeberg.org/anuna/cbcl-rs?rev=fd8f034#fd8f034043702b5ac276369a077be159f08934e0"
 dependencies = [
  "cbcl-core",
 ]

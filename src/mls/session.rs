@@ -58,6 +58,10 @@ struct SessionMeta {
     /// must survive HP-3 (REQ-016/ADR-006).
     #[serde(default)]
     tofu_pending: bool,
+    /// SPEC-024 per-room protocol version (ADR-034): 0/absent = legacy SPEC-013, 1 = mls-ds/v1.
+    /// On a v1 room, owner-removal is deterministically rejected (H7) and the pull loop is active.
+    #[serde(default)]
+    protocol_version: u8,
 }
 
 /// What an inbound frame turned out to be.
@@ -94,6 +98,9 @@ pub struct MlsSession {
     /// A `roomcfg :enc false` conflicted with the pin: fail closed.
     downgrade_refused: bool,
     meta_path: PathBuf,
+    /// SPEC-024 per-room protocol-version flag (ADR-034): true on a mls-ds/v1 room, activating
+    /// H7 owner-removal rejection and the pull loop. Loaded from `SessionMeta.protocol_version`.
+    is_v1: bool,
     /// The wire identity (signs idkey/bye assertions — same key as the MLS
     /// leaf, different DS labels).
     wire_seed: [u8; 32],
@@ -146,12 +153,14 @@ impl MlsSession {
             enc_pinned: pinned_encrypted,
             downgrade_refused: false,
             meta_path,
+            is_v1: false,
             wire_seed: wire.signing_seed(),
             present: std::collections::HashSet::new(),
         };
 
         if let Some(meta) = meta {
             session.enc_pinned = session.enc_pinned || meta.enc_pinned;
+            session.is_v1 = meta.protocol_version >= 1;
             session.genesis = meta.genesis;
             // Reload the persisted group (REQ-009): a missing/stale state
             // simply means re-join (logged by the provider open path).
@@ -219,6 +228,7 @@ impl MlsSession {
                 .map(|g| B64.encode(g.group_id().as_slice())),
             genesis: self.genesis.clone(),
             tofu_pending: matches!(self.trust, Some(GenesisTrust::TofuRequiresSafetyNumber)),
+            protocol_version: if self.is_v1 { 1 } else { 0 },
         };
         let bytes = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
         if let Some(parent) = self.meta_path.parent() {
@@ -250,6 +260,43 @@ impl MlsSession {
     /// Member of a live group?
     pub fn joined(&self) -> bool {
         self.group.is_some()
+    }
+
+    /// Mark this room as `mls-ds/v1` (ADR-034): activates H7 owner-removal rejection and the
+    /// pull loop, and persists the flag. Called by the v1-room creation path (claim → genesis).
+    pub fn mark_v1(&mut self) -> Result<(), MlsError> {
+        self.is_v1 = true;
+        self.persist_meta()
+    }
+
+    /// Whether this room speaks `mls-ds/v1` (ADR-034).
+    pub fn is_v1(&self) -> bool {
+        self.is_v1
+    }
+
+    /// CON-013 (ADR-033): persist the v1 client-state tuple AND the OpenMLS provider snapshot in
+    /// ONE atomic commit (the `store.rs` manifest-flip), so a crash never exposes a group-vs-cursor
+    /// mix (REQ-083). v1 rooms use this INSTEAD of the separate `persist_meta` + provider renames;
+    /// legacy rooms keep their format — no on-disk migration, since v1 rooms are new.
+    pub fn persist_v1_state(
+        &self,
+        generation: u64,
+        log: &crate::mls_ds::ClientLog,
+    ) -> Result<(), MlsError> {
+        let snapshot = self.provider.snapshot_bytes()?;
+        let store =
+            crate::mls_ds::store::DurableStore::open(self.meta_path.with_extension("v1store"));
+        store
+            .commit_client_state(generation, &snapshot, log)
+            .map_err(MlsError::Storage)
+    }
+
+    /// Reload the v1 client state committed by [`Self::persist_v1_state`] — whole-old or whole-new,
+    /// never mixed (CON-013). `(generation, provider_snapshot, ClientLog)` or None if absent.
+    pub fn load_v1_state(&self) -> Option<(u64, Vec<u8>, crate::mls_ds::ClientLog)> {
+        let store =
+            crate::mls_ds::store::DurableStore::open(self.meta_path.with_extension("v1store"));
+        store.load_client_state()
     }
 
     /// REQ-023: judge a `roomcfg` frame against the pin. `:enc false` on a
@@ -554,6 +601,9 @@ impl MlsSession {
             &genesis,
             evidence.as_ref(),
             &mut self.fork,
+            // ADR-034 per-room protocol version: true on a mls-ds/v1 room (set via mark_v1 on
+            // v1-room creation), activating H7 owner-removal rejection in process_inbound.
+            self.is_v1,
         ) {
             Ok(Inbound::App {
                 plaintext,

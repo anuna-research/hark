@@ -112,6 +112,10 @@ pub fn process_inbound(
     genesis: &GenesisAssertion,
     evidence: Option<&RemovalEvidence>,
     fork: &mut ForkSignal,
+    // SPEC-024 per-room protocol version (ADR-034): on a mls-ds/v1 room, owner removal is
+    // deterministically rejected (H7) and the SPEC-013 carve-out does not apply. false =
+    // legacy SPEC-013 behaviour, unchanged.
+    is_v1: bool,
 ) -> Result<Inbound, MlsError> {
     let msg = match MlsMessageIn::tls_deserialize_exact_bytes(wire) {
         Ok(msg) => msg,
@@ -192,6 +196,12 @@ pub fn process_inbound(
             })
         }
         ProcessedMessageContent::StagedCommitMessage(staged) => {
+            // H7 (SPEC-024 v1): on a v1 room, deterministically reject owner removal BEFORE any
+            // further validation or merge (REQ-098). Legacy rooms keep the SPEC-013 carve-out
+            // inside validate_staged_commit.
+            if is_v1 {
+                reject_v1_owner_removal(group, &staged)?;
+            }
             validate_staged_commit(
                 group,
                 &staged,
@@ -244,6 +254,30 @@ pub fn process_inbound(
 }
 
 /// REQ-017 (a)–(e) over a staged commit, pre-merge.
+/// SPEC-024 v1 owner-removal rejection (REQ-098, H7). Unlike the SPEC-013 carve-out — which
+/// lets the next-elected owner commit the departing owner's Remove — a `mls-ds/v1` room
+/// **deterministically rejects** any commit that removes the immutable owner (RFC 9420 §12.2;
+/// v1 authority turnover moves to a successor room, CON-010). Gated by the per-room
+/// protocol-version flag (ADR-034): the v1 commit path calls this INSTEAD of the carve-out.
+pub fn reject_v1_owner_removal(group: &MlsGroup, staged: &StagedCommit) -> Result<(), MlsError> {
+    let Some((owner_handle, owner_key)) = group_genesis_creator(group) else {
+        return Ok(()); // no recorded genesis owner — nothing to protect
+    };
+    for remove in staged.remove_proposals() {
+        let removed_index = remove.remove_proposal().removed();
+        if let Some(target) = group.members().find(|m| m.index == removed_index) {
+            let target_handle = credential_handle(&target.credential)?;
+            if target_handle == owner_handle && owner_key.as_slice() == target.signature_key.as_slice() {
+                return Err(MlsError::Rejected(format!(
+                    "v1 owner-removal rejected: commit removes the immutable owner {owner_handle} \
+                     (REQ-098; v1 authority turnover uses a successor room, CON-010)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_staged_commit(
     group: &MlsGroup,
     staged: &StagedCommit,
@@ -633,6 +667,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap();
         match inbound {
@@ -686,6 +721,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -723,6 +759,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap();
         assert!(matches!(inbound, Inbound::Handshake));
@@ -787,6 +824,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap_err();
         assert!(format!("{err}").contains("evidence"), "{err}");
@@ -816,6 +854,7 @@ mod tests {
             &genesis,
             Some(&stale),
             &mut fork,
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, MlsError::Rejected(_)), "{err}");
@@ -840,6 +879,7 @@ mod tests {
             &genesis,
             Some(&evidence),
             &mut fork,
+            false,
         )
         .unwrap();
         assert!(matches!(inbound, Inbound::Handshake));
@@ -885,6 +925,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -916,6 +957,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap();
         assert!(matches!(ok, Inbound::App { .. }));
@@ -931,6 +973,7 @@ mod tests {
                 &genesis,
                 None,
                 &mut fork,
+                false,
             )
             .unwrap();
             match inbound {
@@ -958,6 +1001,7 @@ mod tests {
             &genesis,
             None,
             &mut fork,
+            false,
         )
         .unwrap();
         assert!(matches!(ok, Inbound::App { .. }));
