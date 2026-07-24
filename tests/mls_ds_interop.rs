@@ -106,3 +106,80 @@ fn client_rejects_records_not_signed_by_the_pinned_ds() {
     assert!(matches!(verdict, Verdict::Violation(_)), "a non-DS-signed record must be ds-equivocation");
     assert_eq!(driver.cursor().cursor, 0, "cursor held — no advance on a rejected record");
 }
+
+// ── the CROSS-RUNTIME deliver honest-path ────────────────────────────────────────
+// hark's real PullDriver consumes a signed, hash-linked record CHAIN produced by the
+// REAL cbcl-bus LFE hub (cbcl-mls-ds-sign, enacl/libsodium), emitted to
+// tests/fixtures/ds_sign_chain.txt. The client pulls each record, verifies it under
+// the hub's pinned key, reduces (exact-next), and advances — end-to-end, no MockDs.
+
+fn hx<const N: usize>(s: &str) -> [u8; N] {
+    let v: Vec<u8> = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect();
+    let mut a = [0u8; N];
+    a.copy_from_slice(&v);
+    a
+}
+
+#[test]
+fn client_pull_loop_consumes_lfe_hub_chain() {
+    let raw = include_str!("fixtures/ds_sign_chain.txt");
+    let mut ds_pubkey = [0u8; 32];
+    let mut h0 = String::new();
+    let mut recs: Vec<(i64, String, String, [u8; 64])> = vec![];
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let (k, v) = line.split_once(' ').unwrap();
+        match k {
+            "ds_pubkey_hex" => ds_pubkey = hx::<32>(v.trim()),
+            "h0" => h0 = v.trim().to_string(),
+            "rec" => {
+                let f: Vec<&str> = v.split_whitespace().collect();
+                recs.push((f[0].parse().unwrap(), f[1].to_string(), f[2].to_string(), hx::<64>(f[3])));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(recs.len(), 3, "the LFE hub emitted a 3-record chain");
+
+    // the honest-path deliver: pull -> verify (pinned key) -> reduce -> advance, over the WHOLE chain.
+    let mut driver = PullDriver::new(ClientLog { cursor: 0, cursor_hash: h0.clone() });
+    for (i, (seq, prev, rh, sig)) in recs.iter().enumerate() {
+        let expected = (i as i64) + 1;
+        let PullAction::Pull { after_seq } = driver.next_pull() else {
+            panic!("expected a Pull at cursor {i}")
+        };
+        assert_eq!(after_seq, i as i64, "pull requests the record after the cursor");
+        let resp = RecordResponse {
+            seq: *seq,
+            prev_hash: prev.clone(),
+            record_hash: rh.clone(),
+            record_signature: *sig,
+            log_record: log_record(*seq, prev),
+        };
+        let verdict = driver.on_record(&ds_pubkey, &resp);
+        println!("[interop] LFE-hub rec {expected} -> {verdict:?}");
+        assert!(
+            matches!(verdict, Verdict::Applied { cursor, .. } if cursor == expected),
+            "the LFE hub's record {expected} must C-APPLY in hark, got {verdict:?}"
+        );
+    }
+    assert_eq!(driver.cursor().cursor, 3, "hark pulled+verified+reduced the LFE hub's whole signed chain");
+    println!("[interop] hark client advanced cursor 0 -> 3 over the REAL cbcl-bus hub's DS-signed chain");
+
+    // NI — a record with a forged signature is rejected under the same pinned key.
+    let mut d2 = PullDriver::new(ClientLog { cursor: 0, cursor_hash: h0 });
+    let PullAction::Pull { .. } = d2.next_pull() else { panic!() };
+    let (seq, prev, rh, _) = &recs[0];
+    let forged = RecordResponse {
+        seq: *seq,
+        prev_hash: prev.clone(),
+        record_hash: rh.clone(),
+        record_signature: [0u8; 64],
+        log_record: log_record(*seq, prev),
+    };
+    assert!(matches!(d2.on_record(&ds_pubkey, &forged), Verdict::Violation(_)), "forged sig -> ds-equivocation");
+    assert_eq!(d2.cursor().cursor, 0, "cursor held on the forged record");
+}
