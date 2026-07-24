@@ -16,6 +16,7 @@ pub mod closure;
 pub mod genesis;
 pub mod pull;
 pub mod store;
+pub mod wire;
 
 use cbcl_core::dialect::DialectRegistry;
 use cbcl_core::mls_ds::{DomainTuple, ReadContext};
@@ -82,6 +83,7 @@ pub struct ClientLog {
 }
 
 /// A verified DS response carrying a log record (post-CON-012 authentication).
+#[derive(Debug)]
 pub struct RecordResponse {
     pub seq: i64,
     pub prev_hash: String,
