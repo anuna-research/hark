@@ -6,18 +6,16 @@
 //! into `tests/fixtures/`) and asserts hark reproduces every oracle. Three DISTINCT oracles,
 //! never conflated (ADR-032):
 //!
-//!   1. Canonical byte     — `canonical_encode(value)` == the cbcl-rs BYTE AUTHORITY, per
-//!                           vector; +NI (malformed vector rejected) +NO (mutated preimage
-//!                           yields different bytes).
-//!   2. Crypto admission    — the COMPLETE corrected `DomainTuple` inventory: full
-//!                           domain-separation matrix (each sig verifies under its OWN tag,
-//!                           none under any of the other 14 → 210 transplant rejections) +
-//!                           a per-tuple field-mutation rejection.
-//!   3. Semantic transition — the JS `{scenario -> normalized outcome}` manifest, replayed
-//!                           NATIVELY through hark's DECOMPOSED cores (`transition_record`,
-//!                           `boundary::validate_v1_commit`) and asserted equal in the
-//!                           normalized {ADMIT,HOLD,REJECT} space. The one JS-reducer-stricter
-//!                           divergence is asserted PRESENT + DOCUMENTED, never silently passed.
+//! 1. Canonical byte — `canonical_encode(value)` == the cbcl-rs BYTE AUTHORITY, per
+//!    vector; +NI (malformed vector rejected) +NO (mutated preimage yields different bytes).
+//! 2. Crypto admission — the COMPLETE corrected `DomainTuple` inventory: full
+//!    domain-separation matrix (each sig verifies under its OWN tag, none under any of the
+//!    other 14 → 210 transplant rejections) + a per-tuple field-mutation rejection.
+//! 3. Semantic transition — the JS `{scenario -> normalized outcome}` manifest, replayed
+//!    NATIVELY through hark's DECOMPOSED cores (`transition_record`,
+//!    `boundary::validate_v1_commit`) and asserted equal in the normalized
+//!    {ADMIT,HOLD,REJECT} space. The one JS-reducer-stricter divergence is asserted
+//!    PRESENT + DOCUMENTED, never silently passed.
 //!
 //! Crypto + canonical are CONSUMED from `cbcl-core` (the pinned role layer, `mls-ds-proof`).
 //! The semantic manifest is a CONTRACT, not transplanted bytes: each runtime builds the

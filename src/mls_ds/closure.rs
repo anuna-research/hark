@@ -49,7 +49,7 @@ pub fn authenticate(expected_dialect: &str, pinned_ds_key_id: &str, ds_vk: &[u8;
     if p.ds_key_id != pinned_ds_key_id {
         return Verdict::Refuse("ds-key-substitution");
     }
-    if !(p.issued_at < p.not_after) || !(p.not_after <= p.issued_at + OFFER_WINDOW_MS) {
+    if p.issued_at >= p.not_after || p.not_after > p.issued_at + OFFER_WINDOW_MS {
         return Verdict::Refuse("offer-window-invalid");
     }
     let offer_sig = DomainTuple::PredecessorOffer { successor_offer_core: p.offer_core.clone() };

@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 Anuna Research
+#
+# hark CI gate (Forgejo Actions). Runs the same checks the release script gates
+# on locally — `cargo clippy -D warnings` and `cargo test` — on every push to
+# main and every pull request, so a clippy/compile/test regression is caught in
+# review instead of when ./release.sh is run.
+#
+# Like the release pipeline, this clones the sibling cbcl-rs path dependency
+# (public on git.anuna.io) and pins it to CBCL_RS_REF: `--locked` cannot pin
+# path-dependency *contents*, so CI must build against the same pinned commit a
+# release would. Keep CBCL_RS_REF in sync with .forgejo/workflows/release.yaml.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CBCL_RS_REF: 1c6fa8f581a69a7bcb88fb787fa37c81f5de4221
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone + pin the cbcl-rs path dependency
+        run: |
+          if [ ! -d ../cbcl-rs ]; then
+            git clone https://git.anuna.io/anuna-research/cbcl-rs.git ../cbcl-rs
+          fi
+          git -C ../cbcl-rs checkout --detach "$CBCL_RS_REF"
+
+      - name: Ensure Rust toolchain (clippy + fmt)
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup component add clippy
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ci-
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
