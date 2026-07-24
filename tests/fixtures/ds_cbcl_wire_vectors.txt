@@ -1,0 +1,10 @@
+# LFE hub CBCL-dialect DS wire vectors â hark DsWire+PullDriver consume (TEST-025)
+# key<space>value; frames are literal wire text. :caused-by binds request hashes.
+ds_pubkey_hex 197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61
+anchor sha256:3cfbfecd2579333217675024bc360a56f8c331443dbb6346374e0e314c1a9502
+pull_request (next-record (read "room-alpha" 0) :caused-by "begin")
+pull_request_hash sha256:28edcf29aade1fcbe07f095259448ca65eb6dd7f4b8538c3d4509697dbadf914
+pull_response (commit-record (record "room-alpha" 1 "sha256:0000000000000000000000000000000000000000000000000000000000000000" "sha256:4bcfb3de410e410832059f7eff47c2f7de9580392ab0ae24bd50a3b016e084d9" "35c27b10ca90e63ddefd6212fff2933e0b3e07b79130c9c69fad194e8ab8f958a6837c4f57de329f5e5df26a34aba431116e96476d9c85c55ea55233bbb1de0c" "sha256:3cfbfecd2579333217675024bc360a56f8c331443dbb6346374e0e314c1a9502" (log-v1 "room-alpha" 1 "sha256:0000000000000000000000000000000000000000000000000000000000000000" "payload-frame-1")) :caused-by "sha256:28edcf29aade1fcbe07f095259448ca65eb6dd7f4b8538c3d4509697dbadf914")
+genesis_request (genesis-get (read-genesis "room-alpha") :caused-by "begin")
+genesis_request_hash sha256:08336fe46a6fe5413133c96667c1746e1fde2d081919e9f4a155d63d45d957c9
+genesis_response (genesis-anchor (anchor "room-alpha" "sha256:3cfbfecd2579333217675024bc360a56f8c331443dbb6346374e0e314c1a9502" "197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61") :caused-by "sha256:08336fe46a6fe5413133c96667c1746e1fde2d081919e9f4a155d63d45d957c9")

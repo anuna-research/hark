@@ -74,7 +74,7 @@ fn write_pin(dir: &PathBuf, name: &str, value: &str) {
 /// Extract the embedded payload frame from an interim `log-v1` record:
 /// `(log-v1 "<room>" <seq> "<prev>" "<payload-text>")`. Records without a
 /// payload (e.g. bootstrap markers) apply as no-ops.
-fn record_payload(log_record: &SExpr) -> Option<String> {
+pub fn record_payload(log_record: &SExpr) -> Option<String> {
     let SExpr::List(items) = log_record else { return None };
     match items.first() {
         Some(SExpr::Atom(Atom::Symbol(s))) if s == "log-v1" => {}
