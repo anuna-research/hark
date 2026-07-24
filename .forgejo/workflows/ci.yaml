@@ -35,8 +35,21 @@ jobs:
           fi
           git -C ../cbcl-rs checkout --detach "$CBCL_RS_REF"
 
-      - name: Ensure Rust toolchain (clippy + fmt)
+      - name: Ensure Rust toolchain (clippy)
+        # The Forgejo runner image ships node/git/curl but NOT rustup, and may
+        # lack a C toolchain (ring compiles a little C/asm). Install both if
+        # absent; appending to $GITHUB_PATH exposes cargo to later steps.
         run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          if ! command -v cc >/dev/null 2>&1; then
+            $SUDO apt-get update && $SUDO apt-get install -y build-essential pkg-config curl
+          fi
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           rustup show active-toolchain || rustup toolchain install stable --profile minimal
           rustup component add clippy
           rustc --version
