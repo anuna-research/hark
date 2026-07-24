@@ -14,11 +14,14 @@ path = "src/main.rs"
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
-# IMPL-025: pinned to the role-layer cbcl-rs (fd8f034 = epp `febc669` + the mls-ds
+# IMPL-025: pinned to the role-layer cbcl-rs at fd8f034 (epp `febc669` + the mls-ds
 # commits), the ADR-021 pin recommendation. `mls-ds-proof` compiles the DomainTuple
 # crypto + strict Ed25519 the client consumes.
-cbcl-core = { path = "../cbcl-rs-dsfix/crates/cbcl-core", features = ["mls-ds-proof"] }
-cbcl-parser = { path = "../cbcl-rs-dsfix/crates/cbcl-parser" }
+# PROVISIONAL PIN: fd8f034 is the tip of the fix/mls-ds-quoted-hash-depth branch on
+# the cbcl-rs remote, NOT yet merged to cbcl-rs main. Move `rev` to the merged/tagged
+# commit once the role layer lands (closes IMPL-024 ADR-021).
+cbcl-core = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034", features = ["mls-ds-proof"] }
+cbcl-parser = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034" }
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 config = "0.15"
