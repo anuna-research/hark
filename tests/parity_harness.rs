@@ -418,3 +418,68 @@ fn oracle3_semantic_parity_against_js_manifest() {
     assert_eq!(divergences, 0, "H4 anchor-binding (bind_record_anchor) closed the js-reducer-stricter divergence");
     println!("[oracle3] {compared}/15 semantic scenarios in cross-runtime parity; {divergences} divergence remaining");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORACLE 2b — CROSS-RUNTIME DS SIGNATURE (the LFE hub signs, hark verifies)
+// The crypto honest-path of TEST-025: a real cbcl-bus hub (cbcl-mls-ds-sign, enacl/
+// libsodium) DS-signs a record; a hark client pinned to the hub key ACCEPTS it and
+// rejects any other signer. Proves key-derivation, record_hash, verify, and
+// DETERMINISTIC-signature byte-parity across the two runtimes over the vector the LFE
+// hub emits (tests/fixtures/ds_sign_vectors.txt).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn hex_bytes(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
+fn hex_arr<const N: usize>(s: &str) -> [u8; N] {
+    let v = hex_bytes(s);
+    assert_eq!(v.len(), N, "expected {N} bytes, got {}", v.len());
+    let mut a = [0u8; N];
+    a.copy_from_slice(&v);
+    a
+}
+
+#[test]
+fn oracle2b_lfe_hub_ds_signature_interop() {
+    let raw = include_str!("fixtures/ds_sign_vectors.txt");
+    let kv = |key: &str| -> String {
+        raw.lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                if l.starts_with('#') || l.is_empty() {
+                    return None;
+                }
+                l.split_once(' ')
+            })
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_else(|| panic!("interop vector missing {key}"))
+    };
+    let seed = hex_arr::<32>(&kv("seed_hex"));
+    let ds_pubkey = hex_arr::<32>(&kv("ds_pubkey_hex"));
+    let room = kv("room");
+    let seq: i64 = kv("seq").parse().unwrap();
+    let prev = kv("prev_hash");
+    let expected_rh = kv("record_hash");
+    let sig = hex_arr::<64>(&kv("sig_hex"));
+
+    // 1. key-derivation parity — enacl seed->key == hark from_seed (RFC 8032).
+    let kp = Ed25519Keypair::from_seed(&seed);
+    assert_eq!(kp.public_bytes(), ds_pubkey, "seed->pubkey parity (enacl == cbcl-core)");
+
+    // 2. record_hash parity over the rebuilt (log-v1 room seq prev) record.
+    let rec = list(vec![sym("log-v1"), st(&room), num(seq), st(&prev)]);
+    assert_eq!(record_hash(&rec), expected_rh, "record_hash parity");
+
+    // 3. hark ACCEPTS the LFE hub's DS signature under the pinned key.
+    let record = DomainTuple::Record { log_record: rec.clone() };
+    assert!(record.verify(&ds_pubkey, &sig), "hark verifies the LFE hub DS signature");
+
+    // 4. deterministic-signature byte-parity — hark's own sig equals the LFE sig.
+    assert_eq!(record.sign(&kp), sig, "Ed25519 deterministic sig parity (enacl == cbcl-core)");
+
+    // 5. NI — a non-pinned signer is rejected (ds-key-substitution).
+    let forger = Ed25519Keypair::from_seed(&[0u8; 32]);
+    assert!(!record.verify(&forger.public_bytes(), &sig), "non-pinned key rejects the signature");
+    println!("[oracle2b] LFE hub -> hark DS-signature interop: key + record_hash + verify + deterministic-sig parity");
+}
