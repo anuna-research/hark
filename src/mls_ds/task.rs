@@ -23,7 +23,7 @@
 //! AddAuth tuple; H7 owner-removal rejection IS active via `mark_v1` in the session's
 //! own `process_inbound` gate.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -63,10 +63,10 @@ pub struct DsApply {
     pub log: ClientLog,
 }
 
-fn read_pin(dir: &PathBuf, name: &str) -> Option<String> {
+fn read_pin(dir: &Path, name: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(name)).ok().map(|s| s.trim().to_string())
 }
-fn write_pin(dir: &PathBuf, name: &str, value: &str) {
+fn write_pin(dir: &Path, name: &str, value: &str) {
     let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(dir.join(name), value);
 }
