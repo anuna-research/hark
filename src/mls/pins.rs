@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-use super::{DS_IDKEY_ASSERT, DS_IDKEY_ROTATE, DS_MLS_RESYNC, MlsError};
+use super::{DS_IDKEY_ASSERT, DS_IDKEY_ROTATE, DS_MLS_INVITE, DS_MLS_RESYNC, MlsError};
 
 const PINS_VERSION: u32 = 1;
 
@@ -295,6 +295,30 @@ pub fn resync_signing_bytes(handle: &str, key: &[u8; 32], room: &str, nonce: u64
     out
 }
 
+/// The `cbcl-mls-invite/v1` signed context (SPEC-061 CON-002): `lp(label) ‖
+/// lp(room) ‖ lp(creator_key) ‖ lp(token_digest) ‖ u64-be(not_after_ms)`. MUST be
+/// byte-identical to cbcl-bus's `invite_signing_bytes`
+/// (crates/cbcl-mls-wasm) — SPEC-061 OQ-001.
+///
+/// `token_digest` is SHA-256 over the invite token rather than the token itself,
+/// so the grant travels beside the token without repeating it and a grant lifted
+/// off one invite does not transfer to another. `creator_key` is inside the
+/// signed bytes so a grant cannot be replayed under a different asserted creator.
+pub fn invite_signing_bytes(
+    room: &str,
+    creator_key: &[u8; 32],
+    token_digest: &[u8],
+    not_after_ms: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    lp(&mut out, DS_MLS_INVITE.as_bytes());
+    lp(&mut out, room.as_bytes());
+    lp(&mut out, creator_key);
+    lp(&mut out, token_digest);
+    out.extend_from_slice(&not_after_ms.to_be_bytes());
+    out
+}
+
 /// The `cbcl-idkey-rotate/v1` signed context (REQ-011): both keys sign this
 /// exact byte string.
 pub fn rekey_signing_bytes(
@@ -428,6 +452,42 @@ mod tests {
         // signature over one context cannot verify against the other.
         let idkey = idkey_signing_bytes("@alice", &key, "@research", 7);
         assert_ne!(got, idkey, "resync context must differ from idkey");
+    }
+
+    /// SPEC-061 CON-002 / OQ-001: the admission-grant signed context is
+    /// byte-identical to cbcl-bus's `invite_signing_bytes`. This is the pinned
+    /// cross-stack vector — the SAME literal appears in cbcl-bus's
+    /// `invite_signing_bytes_cross_stack_vector`, so if either side drifts, both
+    /// tests do not fail together, one does, and the difference is the bug.
+    ///
+    /// It matters more than the usual parity check: an invite minted by a web
+    /// creator and redeemed by a hark agent (or the reverse) is a signature
+    /// verified across the boundary. A layout mismatch does not degrade, it
+    /// refuses every cross-stack admission.
+    #[test]
+    fn invite_signing_bytes_cross_stack_vector() {
+        let key = [0xABu8; 32];
+        let digest = [0x11u8; 32]; // a fixed stand-in for SHA-256(token)
+        let got = invite_signing_bytes("@research", &key, &digest, 1_785_000_000_000);
+
+        // Independent manual construction:
+        // lp(label) ‖ lp(room) ‖ lp(creator_key) ‖ lp(token_digest) ‖ u64-be(exp)
+        let mut want = Vec::new();
+        let label = b"cbcl-mls-invite/v1"; // 18 bytes
+        want.extend_from_slice(&(label.len() as u32).to_be_bytes());
+        want.extend_from_slice(label);
+        want.extend_from_slice(&9u32.to_be_bytes());
+        want.extend_from_slice(b"@research");
+        want.extend_from_slice(&32u32.to_be_bytes());
+        want.extend_from_slice(&key);
+        want.extend_from_slice(&32u32.to_be_bytes());
+        want.extend_from_slice(&digest);
+        want.extend_from_slice(&1_785_000_000_000u64.to_be_bytes());
+        assert_eq!(got, want, "invite signing bytes match the cbcl-bus layout (SPEC-061 OQ-001)");
+
+        // Domain separation: no other context can be replayed as an admission.
+        assert_ne!(got, resync_signing_bytes("@research", &key, "@research", 0));
+        assert_ne!(got, idkey_signing_bytes("@research", &key, "@research", 0));
     }
 
     /// REQ-019 nonce purpose: an assertion whose nonce predates the pin

@@ -64,6 +64,21 @@ pub const DS_MLS_GENESIS: &str = "cbcl-mls-genesis/v1";
 pub const DS_MLS_RESYNC: &str = "cbcl-mls-resync/v1";
 /// Identity-safety-number frame label (REQ-021).
 pub const DS_IDENTITY_SAFETY: &str = "cbcl-mls-identity-safety/v1";
+/// Creator-signed admission-grant label (SPEC-061 REQ-002). MUST equal
+/// cbcl-bus's `DS_MLS_INVITE` (crates/cbcl-mls-wasm) — it is part of the signed
+/// bytes, so a mismatch makes an invite minted on one stack unredeemable on the
+/// other, which is a channel partitioned between agent and web members.
+///
+/// The grant is what lets a channel's creator authorise an admission ONCE, in
+/// advance, instead of having to be online when somebody redeems it. It is the
+/// precondition for accepting RFC 9420 §12.4.3.2 external Commits at all: a
+/// joiner needs a GroupInfo, GroupInfo distribution is an application choice, and
+/// the distributor is a hub the RFC assumes is "largely untrusted" (§3). Were
+/// possession of a GroupInfo sufficient, group admission would pass to whoever
+/// hands them out. §12.3 permits the rule that closes this — "An application may
+/// extend the above procedure by additional rules, for example, requiring
+/// application-level permissions to add members".
+pub const DS_MLS_INVITE: &str = "cbcl-mls-invite/v1";
 
 /// Leaf capabilities advertising the genesis extension type. REQ-016 obliges
 /// every hark and web-client KeyPackage/leaf to carry this; openmls then

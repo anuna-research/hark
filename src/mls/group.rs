@@ -96,6 +96,114 @@ pub fn genesis_signing_bytes(
     out
 }
 
+/// SPEC-061 CON-002: the creator-signed admission grant, as it travels. Serde
+/// field names are wire-visible and MUST match cbcl-bus's `AdmissionGrant`
+/// (crates/cbcl-mls-wasm) — SPEC-061 OQ-001.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AdmissionGrant {
+    pub room: String,
+    pub creator_handle: String,
+    pub token_digest_b64: String,
+    pub not_after_ms: u64,
+    pub sig_b64: String,
+}
+
+/// What a joiner puts in an external Commit's AAD (SPEC-061 CON-001): the invite
+/// token being redeemed, and the creator's grant over that token's digest. In the
+/// AAD rather than beside the frame so the joiner's own signature over the
+/// FramedContent covers it — a relay cannot re-pair a valid grant with a commit
+/// the creator never authorised. MUST match cbcl-bus's `ExternalAdmission`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExternalAdmission {
+    pub token_b64: String,
+    pub grant_json: String,
+}
+
+impl AdmissionGrant {
+    /// Mint a grant for `room` over `token`, valid until `not_after_ms`.
+    ///
+    /// Only meaningful on the channel's CREATOR (SPEC-061 REQ-003) — members
+    /// verify against the key the group's genesis names, so a grant signed by
+    /// anybody else is refused by every member. A misuse is inert, not dangerous,
+    /// but it is still a misuse.
+    pub fn mint<S: FrameSigner>(
+        signer: &S,
+        creator_handle: &str,
+        creator_key: &[u8; 32],
+        room: &str,
+        token: &[u8],
+        not_after_ms: u64,
+    ) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256::digest(token);
+        let signed = super::pins::invite_signing_bytes(room, creator_key, &digest, not_after_ms);
+        Self {
+            room: room.to_string(),
+            creator_handle: creator_handle.to_string(),
+            token_digest_b64: B64.encode(digest),
+            not_after_ms,
+            sig_b64: B64.encode(signer.sign(&signed)),
+        }
+    }
+
+    /// Verify this grant against the room and creator the GROUP itself asserts
+    /// (SPEC-061 REQ-002). `creator_handle`/`creator_key` MUST come from the
+    /// group's own genesis assertion — never from this grant and never from the
+    /// wire, or the check is circular and an untrusted hub could mint admissions
+    /// at will.
+    pub fn verify(
+        &self,
+        room: &str,
+        creator_handle: &str,
+        creator_key: &[u8; 32],
+        token: &[u8],
+        now_ms: u64,
+    ) -> Result<(), MlsError> {
+        use sha2::{Digest as _, Sha256};
+        if self.room != room {
+            return Err(MlsError::Rejected(format!(
+                "admission grant is bound to {}, not {room} (SPEC-061 REQ-002)",
+                self.room
+            )));
+        }
+        if self.creator_handle != creator_handle {
+            return Err(MlsError::Rejected(format!(
+                "admission grant names {} as creator, but this group's genesis names {creator_handle}",
+                self.creator_handle
+            )));
+        }
+        if self.not_after_ms <= now_ms {
+            return Err(MlsError::Rejected(
+                "admission grant has expired (SPEC-061 REQ-002)".into(),
+            ));
+        }
+        let digest = Sha256::digest(token);
+        let asserted = B64
+            .decode(&self.token_digest_b64)
+            .map_err(|e| MlsError::Rejected(format!("grant token digest: {e}")))?;
+        if asserted.as_slice() != digest.as_slice() {
+            return Err(MlsError::Rejected(
+                "admission grant is not for the token presented (SPEC-061 REQ-002)".into(),
+            ));
+        }
+        let sig = B64
+            .decode(&self.sig_b64)
+            .map_err(|e| MlsError::Rejected(format!("grant signature: {e}")))?;
+        let signed = super::pins::invite_signing_bytes(room, creator_key, &digest, self.not_after_ms);
+        let vk = VerifyingKey::from_bytes(creator_key)
+            .map_err(|_| MlsError::Rejected("genesis creator key is not a valid Ed25519 key".into()))?;
+        let sig = Signature::from_slice(&sig)
+            .map_err(|_| MlsError::Rejected("admission grant signature is malformed".into()))?;
+        vk.verify(&signed, &sig).map_err(|_| {
+            MlsError::Rejected(
+                "admission grant does not verify under this channel's genesis creator key \
+                 (SPEC-061 REQ-002 / NFR-001)"
+                    .into(),
+            )
+        })
+    }
+}
+
 impl GenesisAssertion {
     pub fn mint<S: FrameSigner>(
         signer: &S,

@@ -32,8 +32,11 @@
     (tell @room (removal-ack :name name)))
 
   ;; --- SPEC-001 rooms: presence, config, invites, directory, history ----
-  (extend presence (members)
-    (tell @room (roster :members members)))
+  ;; :agents carries the channel's pairing provenance as (agent adder) pairs, so
+  ;; a member who joined AFTER an agent announced itself still knows which of the
+  ;; roster are agents (SPEC-016 REQ-002/010).
+  (extend presence (members agents)
+    (tell @room (roster :members members :agents agents)))
   (extend roomcfg (enc dialects)
     (tell @room (room-config :enc enc :dialects dialects)))
 
@@ -63,4 +66,14 @@
   (extend welcome (for ct)
     (tell @room (mls-welcome :for for :ct ct)))
   (extend deliver (enc epoch ct)
-    (tell @room (mls-message :enc enc :epoch epoch :ct ct))))
+    (tell @room (mls-message :enc enc :epoch epoch :ct ct)))
+
+  ;; --- SPEC-061 external-Commit admission -------------------------------
+  ;; The group state a client needs to admit ITSELF (RFC 9420 §12.4.3.2) when
+  ;; nobody is online to commit an Add for it. Declared here with the rest of
+  ;; the MLS control frames so an agent learns them from the hub's own grammar
+  ;; rather than by hard-coding, same as keypub/keyget/welcome.
+  (extend groupinfo (epoch gi)
+    (tell @room (mls-group-info :epoch epoch :gi gi)))
+  (extend groupinfoget ()
+    (tell @room (mls-group-info-request))))

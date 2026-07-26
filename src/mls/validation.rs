@@ -17,8 +17,11 @@ use openmls::prelude::{
 };
 use tls_codec::{DeserializeBytes as _, Serialize as _};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+
 use super::group::{
-    GenesisAssertion, credential_handle, elect_committer, group_genesis_creator, member_bindings,
+    AdmissionGrant, ExternalAdmission, GenesisAssertion, credential_handle, elect_committer,
+    group_genesis_creator, member_bindings,
 };
 use super::pins::PinStore;
 use super::provider::DurableProvider;
@@ -150,19 +153,39 @@ pub fn process_inbound(
         }
     };
 
-    // REQ-017(e): only member senders. External joins / external proposals
-    // (NewMemberCommit, NewMemberProposal, External) are fail-closed.
+    // REQ-017(e) fail-closed on sender type, with ONE opening: SPEC-061.
+    //
+    // `NewMemberCommit` is an external Commit (RFC 9420 §12.4.3.2) — a client
+    // seating itself with no member online to commit an Add. That is how an
+    // invitation stops being redeemable only in the creator's presence, and it is
+    // admitted here ONLY as a staged commit and ONLY through
+    // `validate_external_commit`, which demands the creator-signed admission
+    // grant. Every other non-member sender still fails closed, and an external
+    // join arriving as anything but a commit does too.
+    //
+    // Parity note (SPEC-061 OQ-001): cbcl-bus opens exactly the same one value in
+    // the same place. If the two stacks disagree here, an external Commit one
+    // accepts is one the other rejects, which partitions the channel between
+    // agent and web members.
     let sender_index = match processed.sender() {
-        Sender::Member(idx) => *idx,
+        Sender::Member(idx) => Some(*idx),
+        Sender::NewMemberCommit => None,
         other => {
             return Err(MlsError::Rejected(format!(
                 "non-member sender {other:?} rejected (REQ-017e: external joins are fail-closed)"
             )));
         }
     };
+    // The grant rides in the commit's AAD, so it is covered by the joiner's own
+    // signature over the FramedContent rather than merely travelling beside it.
+    // Read before `into_content` consumes the message.
+    let aad = processed.aad().to_vec();
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app) => {
+            let sender_index = sender_index.ok_or_else(|| {
+                MlsError::Rejected("application message from a non-member sender (REQ-017e)".into())
+            })?;
             let members = member_bindings(group)?;
             let (sender_handle, sender_key) = group
                 .members()
@@ -199,18 +222,30 @@ pub fn process_inbound(
             // H7 (SPEC-024 v1): on a v1 room, deterministically reject owner removal BEFORE any
             // further validation or merge (REQ-098). Legacy rooms keep the SPEC-013 carve-out
             // inside validate_staged_commit.
+            //
+            // Kept ahead of the SPEC-061 split below, which is where its ordering
+            // intent ("before any further validation") and this one meet: an
+            // external Commit is refused for carrying ANY Remove (SPEC-061
+            // REQ-004), so H7 is subsumed on that path — but running it first
+            // costs nothing and keeps one rule in one place rather than two rules
+            // that have to agree with each other.
             if is_v1 {
                 reject_v1_owner_removal(group, &staged)?;
             }
-            validate_staged_commit(
-                group,
-                &staged,
-                sender_index.u32(),
-                room,
-                pins,
-                genesis,
-                evidence,
-            )?;
+            match sender_index {
+                Some(idx) => validate_staged_commit(
+                    group,
+                    &staged,
+                    idx.u32(),
+                    room,
+                    pins,
+                    genesis,
+                    evidence,
+                )?,
+                // SPEC-061: an external Commit, admitted only on the creator's
+                // signature over the invite it redeems.
+                None => validate_external_commit(&staged, &aad, room, pins, genesis, now_ms())?,
+            }
             // Collect TOFU pins for validated Adds before merging.
             let tofu: Vec<(String, [u8; 32])> = staged
                 .add_proposals()
@@ -235,6 +270,11 @@ pub fn process_inbound(
             Ok(Inbound::Handshake)
         }
         ProcessedMessageContent::ProposalMessage(proposal) => {
+            if sender_index.is_none() {
+                return Err(MlsError::Rejected(
+                    "proposal from a non-member sender rejected (REQ-017e)".into(),
+                ));
+            }
             // Standalone proposals get the same per-object validation BEFORE
             // being stored (REQ-017: unvalidated proposals are not stored).
             validate_standalone_proposal(group, &proposal, room, pins, genesis, evidence)?;
@@ -253,7 +293,6 @@ pub fn process_inbound(
     }
 }
 
-/// REQ-017 (a)–(e) over a staged commit, pre-merge.
 /// SPEC-024 v1 owner-removal rejection (REQ-098, H7). Unlike the SPEC-013 carve-out — which
 /// lets the next-elected owner commit the departing owner's Remove — a `mls-ds/v1` room
 /// **deterministically rejects** any commit that removes the immutable owner (RFC 9420 §12.2;
@@ -278,6 +317,118 @@ pub fn reject_v1_owner_removal(group: &MlsGroup, staged: &StagedCommit) -> Resul
     Ok(())
 }
 
+/// Wall-clock milliseconds, for admission-grant expiry (SPEC-061 REQ-002).
+/// hark is a native binary, so unlike the wasm crate it has a clock of its own
+/// and does not take the time from a caller.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// SPEC-061 REQ-002/REQ-004: validate an inbound EXTERNAL Commit (RFC 9420
+/// §12.4.3.2) before merging. This is the only path by which a NON-member changes
+/// the group, so it refuses by default and admits only on a complete answer.
+///
+/// Byte-for-byte the same policy as cbcl-bus's `validate_external_commit`
+/// (crates/cbcl-mls-wasm) — SPEC-061 OQ-001. Two independent gates:
+///
+/// 1. **Shape** (§12.3): exactly one `ExternalInit`, PSKs allowed, nothing else.
+///    Stricter than the RFC on one point, deliberately: a Remove is refused
+///    outright (REQ-004). That is the first mitigation the RFC offers for its own
+///    warning that resync "allows an attacker that has compromised a member's
+///    signature private key to introduce themselves into the group and remove the
+///    prior, legitimate member in a single Commit" — salient here because REQ-007
+///    makes the MLS leaf the wire identity, so that compromise is the same one.
+///
+/// 2. **Authority** (REQ-002): the AAD MUST carry a `{token, grant}` pair whose
+///    grant verifies under the key this group's OWN genesis names as creator.
+fn validate_external_commit(
+    staged: &StagedCommit,
+    aad: &[u8],
+    room: &str,
+    pins: &PinStore,
+    genesis: &GenesisAssertion,
+    now_ms: u64,
+) -> Result<(), MlsError> {
+    use openmls::prelude::Proposal;
+
+    // (1) Shape.
+    if staged.add_proposals().next().is_some() {
+        return Err(MlsError::Rejected(
+            "external Commit carrying an Add refused (RFC 9420 §12.3)".into(),
+        ));
+    }
+    if staged.update_proposals().next().is_some() {
+        return Err(MlsError::Rejected(
+            "external Commit carrying an Update refused (RFC 9420 §12.3)".into(),
+        ));
+    }
+    if staged.remove_proposals().next().is_some() {
+        return Err(MlsError::Rejected(
+            "external Commit carrying a Remove refused — the resync flavour is not enabled \
+             (SPEC-061 REQ-004 / ADR-003)"
+                .into(),
+        ));
+    }
+    let mut external_inits = 0usize;
+    for queued in staged.queued_proposals() {
+        match queued.proposal() {
+            Proposal::ExternalInit(_) => external_inits += 1,
+            Proposal::PreSharedKey(_) => {}
+            other => {
+                return Err(MlsError::Rejected(format!(
+                    "external Commit carrying {other:?} refused (RFC 9420 §12.3 allowlist)"
+                )));
+            }
+        }
+    }
+    if external_inits != 1 {
+        return Err(MlsError::Rejected(format!(
+            "external Commit MUST carry exactly one ExternalInit, found {external_inits} \
+             (RFC 9420 §12.3)"
+        )));
+    }
+
+    // (2) Authority — against the creator THIS group's genesis names.
+    let creator_key = genesis.creator_key()?;
+    let presented: ExternalAdmission = serde_json::from_slice(aad).map_err(|_| {
+        MlsError::Rejected(
+            "external Commit refused: its AAD carries no admission grant (SPEC-061 REQ-002)".into(),
+        )
+    })?;
+    let token = B64
+        .decode(&presented.token_b64)
+        .map_err(|e| MlsError::Rejected(format!("admission token: {e}")))?;
+    let grant: AdmissionGrant = serde_json::from_str(&presented.grant_json)
+        .map_err(|e| MlsError::Rejected(format!("admission grant json: {e}")))?;
+    grant.verify(room, &genesis.creator_handle, &creator_key, &token, now_ms)?;
+
+    // The joiner's own leaf still answers to the pin rules every other leaf does
+    // (REQ-012d). An external Commit MUST carry a path, and its path leaf IS the
+    // joiner. A grant says the creator invited SOMEBODY; it never says this key is
+    // who it claims to be, and conflating those turns a bearer credential into
+    // impersonation.
+    let leaf = staged.update_path_leaf_node().ok_or_else(|| {
+        MlsError::Rejected(
+            "external Commit refused: no path leaf — RFC 9420 §12.4.3.2 requires a full Commit"
+                .into(),
+        )
+    })?;
+    let handle = credential_handle(leaf.credential())?;
+    if let Some(pin) = pins.pinned(&handle) {
+        if pin.key != leaf.signature_key().as_slice() {
+            return Err(MlsError::Rejected(format!(
+                "external Commit refused: {handle} presented a leaf key that is not the one \
+                 pinned for it (REQ-012d hard reject)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// REQ-017 (a)–(e) over a staged commit, pre-merge.
 fn validate_staged_commit(
     group: &MlsGroup,
     staged: &StagedCommit,
