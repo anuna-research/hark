@@ -854,12 +854,18 @@ async fn create_chat_transport_agent(
     // encrypted) channel — the mode is pinned encrypted BEFORE the first
     // frame is sent. The session also resumes prior MLS state (REQ-009);
     // a public channel with no prior state gets no session.
-    let cap_present = request
+    // Normalised once, here, and used for BOTH the pin decision and the record
+    // persisted for a later resume. Keeping the raw value in the record would
+    // let a blank-but-present cap pin the resumed session encrypted while
+    // `cap_part` still sends nothing — turning a public room's `:enc false` into
+    // a terminal downgrade refusal on the next daemon start (SPEC-026 REQ-007).
+    let cap = request
         .cap
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_some();
+        .map(str::to_owned);
+    let cap_present = cap.is_some();
     let file_stem = chat_key_filename(wire_handle);
     let mls = crate::mls::session::MlsSession::open_if_relevant(
         &chat.identity_dir,
@@ -883,7 +889,7 @@ async fn create_chat_transport_agent(
         &channel,
         wire_handle,
         request.dialects,
-        request.cap.clone(),
+        cap.clone(),
         request.added_by.clone(),
         chat.claim_window,
         chat.liveness_timeout,
@@ -912,7 +918,7 @@ async fn create_chat_transport_agent(
         wire_handle: wire_handle.to_owned(),
         channel: channel.clone(),
         dialects: dialects.clone(),
-        cap: request.cap.clone(),
+        cap: cap.clone(),
         added_by: request.added_by.clone(),
         receive_all,
     };
@@ -1987,19 +1993,27 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
             format!("agent handle is unhealthy: {reason}"),
             detail,
         ),
-        // Transient: the handle is still healthy, the send just raced ahead of
-        // MLS membership (no Welcome yet). 503 + a distinct code so the client
-        // can retry rather than treating the handle as dead.
-        AgentError::NotReady { detail } => ApiError::new(
+        // Transient: the handle is still healthy. 503 + a distinct code so the
+        // client retries rather than treating the handle as dead. Which code
+        // depends on WHY — an MLS membership race and a hub outage need
+        // different things from the operator, and reporting the MLS one during
+        // a public-channel outage sends them after a group that is not the
+        // problem (SPEC-026 REQ-004).
+        AgentError::NotReady { reason, detail } => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "mls_membership_pending",
-            "agent is not yet a member of the channel's MLS group; retry shortly",
-            detail.or_else(|| {
-                Some(
+            reason.code(),
+            reason.message(),
+            detail.or_else(|| match reason {
+                crate::daemon::NotReadyReason::MlsMembershipPending => Some(
                     "the room owner must add this agent (fetch its KeyPackage) before it can \
                      send encrypted content — retry once the Welcome arrives"
                         .to_owned(),
-                )
+                ),
+                crate::daemon::NotReadyReason::HubReconnecting => Some(
+                    "the daemon is re-establishing the hub connection on a bounded backoff; \
+                     re-offer the message shortly (see `hark daemon status`)"
+                        .to_owned(),
+                ),
             }),
         ),
         AgentError::RecvAlreadyWaiting => ApiError::new(

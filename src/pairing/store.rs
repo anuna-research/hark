@@ -45,6 +45,19 @@ pub const STORE_FILE: &str = "paired-agents.json";
 /// different by a field this version thinks it understands.
 const STORE_VERSION: u32 = 1;
 
+/// Serialises the read-modify-write in [`PairingStore::upsert`] /
+/// [`PairingStore::remove`] / [`PairingStore::save`].
+///
+/// One lock for every store path rather than one per path: a daemon has exactly
+/// one chat identity directory, so there is nothing to gain from finer
+/// granularity and a global is the shorter thing to reason about. No `.await`
+/// happens under it — the store is synchronous — so a blocking mutex is safe in
+/// the async callers.
+static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Distinguishes concurrent writers' temp files within one process.
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// One agent's re-establishable pairing ([[SPEC-026 REQ-007]]).
 ///
 /// This is exactly the argument set [`crate::chat::create_chat_agent`] needs,
@@ -53,6 +66,7 @@ const STORE_VERSION: u32 = 1;
 /// `mls_create` — a rehydrated agent never re-creates the group, for the same
 /// reason a reconnect never does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PairedAgent {
     /// The daemon-local handle. Preserved across a restart so an operator's
     /// exported `CBCL_AGENT_HANDLE` keeps working (SPEC-026 ADR-006).
@@ -60,7 +74,10 @@ pub struct PairedAgent {
     /// The chat wire identity (`@name`), which also names the signing key.
     pub wire_handle: String,
     pub channel: String,
-    #[serde(default)]
+    /// REQUIRED by the CON-002 grammar, not defaulted. An absent or misspelled
+    /// key means the writer and this reader disagree about the format, and
+    /// guessing on a capability-bearing record is how parser-differential bugs
+    /// start.
     pub dialects: Vec<String>,
     /// The channel capability. A bearer credential — the reason for the `0600`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,7 +85,9 @@ pub struct PairedAgent {
     /// Provenance: who added this agent (SPEC-016 REQ-010).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_by: Option<String>,
-    #[serde(default)]
+    /// REQUIRED by the grammar. Defaulting a misspelled key to `false` would
+    /// silently downgrade a firehose agent to an answer-only one across a
+    /// restart, with nothing to show for it.
     pub receive_all: bool,
 }
 
@@ -182,6 +201,12 @@ impl PairingStore {
 
     /// Replace the store with `agents`, owner-only.
     pub fn save(&self, agents: &[PairedAgent]) -> Result<(), StoreError> {
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.save_locked(agents)
+    }
+
+    /// [`Self::save`], for callers already holding [`STORE_LOCK`].
+    fn save_locked(&self, agents: &[PairedAgent]) -> Result<(), StoreError> {
         for agent in agents {
             recognise(agent).map_err(|reason| StoreError::Malformed {
                 path: self.path.clone(),
@@ -200,24 +225,38 @@ impl PairingStore {
     }
 
     /// Add or replace the record for `agent.agent_handle`.
+    ///
+    /// The whole read-modify-write runs under [`STORE_LOCK`]: two joins
+    /// completing at once would otherwise both read the same old list and both
+    /// write, and whichever renamed last would silently drop the other agent —
+    /// which then does not come back on the next start, the exact failure this
+    /// store exists to prevent.
+    ///
+    /// An unrecognised store is an **error**, not an empty list. Degrading here
+    /// the way [`Self::load`] does would let the next join overwrite a file it
+    /// could not parse with a single record, destroying every pairing in it and
+    /// "repairing" input REQ-010 says must stay rejected.
     pub fn upsert(&self, agent: PairedAgent) -> Result<(), StoreError> {
-        let mut agents = self.load_checked().unwrap_or_default();
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut agents = self.load_checked()?;
         agents.retain(|existing| existing.agent_handle != agent.agent_handle);
         agents.push(agent);
-        self.save(&agents)
+        self.save_locked(&agents)
     }
 
-    /// Forget the record for `agent_handle`. Removing an absent record is a
-    /// no-op: a `hark close` on an agent whose record has already gone must not
-    /// fail the close.
+    /// Forget the record for `agent_handle`. Removing an *absent* record is a
+    /// no-op — a `hark close` on an agent whose record has already gone must not
+    /// fail the close — but an *unreadable* store is still an error, for the
+    /// same reason as [`Self::upsert`].
     pub fn remove(&self, agent_handle: &str) -> Result<(), StoreError> {
-        let mut agents = self.load_checked().unwrap_or_default();
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut agents = self.load_checked()?;
         let before = agents.len();
         agents.retain(|existing| existing.agent_handle != agent_handle);
         if agents.len() == before {
             return Ok(());
         }
-        self.save(&agents)
+        self.save_locked(&agents)
     }
 
     /// Write atomically (temp + rename) with owner-only permissions, matching
@@ -232,7 +271,16 @@ impl PairingStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(write)?;
         }
-        let temp = self.path.with_extension("json.tmp");
+        // A temp path unique to this writer. [`STORE_LOCK`] serialises writers
+        // inside one process, but a second `hark` process sharing the same
+        // config directory is not covered by it — and a shared temp path lets
+        // that process truncate ours, or rename it out from under us, between
+        // our write and our rename.
+        let temp = self.path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         {
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create(true).truncate(true);

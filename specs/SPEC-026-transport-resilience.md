@@ -3,7 +3,7 @@ id: SPEC-026
 title: Transport Resilience — Hub Reconnect and Durable Pairing
 status: implemented 2026-07-26 (IMPL-026 — all REQs; awaiting the Principle-12 adversarial review before the tier-2 gate closes)
 tier: 2 (the re-join replays a signed-member handshake and re-arms an MLS session; the pairing store holds a channel capability)
-version: 0.2.0
+version: 0.3.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 5)
 last-updated: 2026-07-26
@@ -271,7 +271,14 @@ intent recorded at first join. Re-creating the group would fork it.
 This is the equivalent of the browser's `restoreChannels()` on reopen: a reconnected socket
 that skipped the handshake would be a member of nothing.
 
-Trace: [[#TEST-003]], [[#TEST-007]], [[#CON-001]]
+The system SHALL NOT re-deliver the history the hub replays after a re-join. Every successful
+`hello` is answered with the room's recent messages (`backfill_n`, 50 by default; cleartext
+rooms unconditionally), on a reconnect exactly as on a first join. Re-delivering them would
+duplicate messages to `recv`, re-contend for asks the responder already settled, and walk the
+inbound queue toward `queue_overflow` — which marks the handle unhealthy, reintroducing the
+failure this specification exists to prevent.
+
+Trace: [[#TEST-003]], [[#TEST-007]], [[#TEST-017]], [[#CON-001]]
 
 ### REQ-004 — The handle stays usable across the gap
 
@@ -279,10 +286,22 @@ While a reconnect is in progress the agent handle SHALL remain usable:
 
 - a pending or new `recv` SHALL continue to wait rather than error;
 - an `emit` / `reply` SHALL be refused as **retryable** (`AgentError::NotReady`), never as
-  `AgentError::Unhealthy`;
+  `AgentError::Unhealthy`, and SHALL be refused **immediately** — within 2 s — at any point in
+  the gap, including while a re-join handshake is in flight;
+- a close SHALL take effect immediately, likewise at any point in the gap;
 - the handle SHALL remain the session's active handle.
 
-Trace: [[#TEST-004]], [[#CON-003]]
+The immediacy clauses are not decoration. A handshake carries two 10 s timeouts and an
+unbounded connect; a loop that awaited it without also servicing the outbound and close
+channels would leave a caller blocked on a channel nobody is draining for longer than the
+pre-fix behaviour did, which failed fast. Refusing late is worse than refusing.
+
+The refusal SHALL name the *transport* as the cause. `AgentError::NotReady` also covers the
+[[SPEC-013-mls-private-channels#REQ-023]] membership race, and reporting that one during a
+public-channel outage sends the operator after a group that is not the problem: the two carry
+distinct error codes (`agent_not_ready` and `mls_membership_pending`).
+
+Trace: [[#TEST-004]], [[#TEST-018]], [[#TEST-019]], [[#TEST-020]], [[#CON-003]]
 
 ### REQ-005 — What remains terminal
 
@@ -302,7 +321,10 @@ Trace: [[#TEST-005]], [[#TEST-006]], [[#CON-001]]
 ### REQ-006 — A reconnecting agent is visible
 
 `hark daemon status` and `GET /v1/agents` SHALL report an agent whose socket is down with the
-state `reconnecting`, the count of consecutive failed attempts, and the last transport error.
+state `reconnecting`, the count of consecutive **failed** attempts, and the last transport
+error. The count SHALL be published only after an attempt has actually failed: an
+increment-then-publish reports one refusal before the first dial has been made, telling the
+operator the hub has rejected them when nothing has been tried.
 The daemon SHALL log the transition to `reconnecting` once per outage at `warn`, and SHALL NOT
 log once per attempt.
 
@@ -364,7 +386,17 @@ This is [[LangSec]] Principle 4 (be conservative in what you accept) at a trust 
 store carries capabilities, and a permissively-parsed record is a record whose capability
 field may not be the one that was written.
 
-Trace: [[#TEST-013]], [[#CON-002]]
+A **write** against an unrecognised store SHALL fail rather than degrade. Reading may degrade
+to "no persisted agents" so a daemon can still start; a read-modify-write may not, because
+degrading there lets the next join overwrite a file it could not parse with a single record —
+destroying every pairing in it and silently "repairing" input this requirement says must stay
+rejected.
+
+Concurrent writes SHALL NOT lose records. The store is a whole-file read-modify-write, so two
+joins completing at once would otherwise both read the same list and both write, and whichever
+renamed last would drop the other agent — which then does not come back on the next start.
+
+Trace: [[#TEST-013]], [[#TEST-021]], [[#TEST-022]], [[#TEST-023]], [[#CON-002]]
 
 ## 5. Non-functional requirements
 
@@ -730,6 +762,15 @@ what to do on each.
 | **TEST-012** | [[#REQ-009]] | positive | After closing an agent the store holds no record for it, and a subsequent start creates no agent. |
 | **TEST-013** | [[#REQ-010]] | negative-input | Each of: absent file; non-JSON bytes; `version: 2`; a record missing `channel`; a record whose `channel` fails `validate_chat_handle`; a record whose `dialects` contains an invalid id; a well-formed record *alongside* a malformed one. Each yields **zero** agents and a diagnostic — in particular the last case yields zero, not one. |
 | **TEST-014** | [[#REQ-007]], [[#REQ-010]] | property | Round-trip: for a generated set of valid records, `load(save(records)) == records`. |
+| **TEST-017** | [[#REQ-003]] | negative-output | The hub backfills a frame, drops, and backfills the same frame again on the re-join. The second copy must not reach `recv`. |
+| **TEST-018** | [[#REQ-004]] | negative-output | An `emit` offered while a re-join handshake is stalled is refused in under 2 s, not parked behind the 10 s join timeout. |
+| **TEST-019** | [[#REQ-004]] | positive | A close issued while a re-join handshake is stalled takes effect promptly. |
+| **TEST-020** | [[#REQ-004]] | negative-output | A refusal during a transport outage carries `agent_not_ready`, not `mls_membership_pending`. |
+| **TEST-021** | [[#REQ-010]] | negative-output | `upsert` and `remove` against an unrecognised store both fail, and the file is left byte-identical for the operator to inspect. |
+| **TEST-022** | [[#CON-002]] | negative-input | A misspelled or absent `receive_all`, an absent `dialects`, and an unknown extra key each reject the whole store. |
+| **TEST-023** | [[#REQ-010]] | positive | Four concurrent `upsert`s all survive: no record is lost to a racing rename. |
+| **TEST-024** | [[#REQ-001]] | negative-output | An ask whose claim write failed is forfeited: it does not later win its own election with itself as sole contender. |
+| **TEST-025** | [[#REQ-008]] | negative-input | Attaching a resumed connection to a handle closed mid-handshake fails rather than recreating it; attaching to a live placeholder preserves its queue. |
 | **TEST-016** | [[#REQ-009]] | negative-output | The hub stalls on the first resume attempt (holding the agent in the loop), the operator closes the agent, and the hub would accept the *second* attempt. The agent must stay closed. Discovered during implementation: without the check the resume wins the race and resurrects it. |
 | **TEST-015** | [[#REQ-001]] (write side), [[#REQ-004]] | positive + negative-output | The hub drops the socket while the agent is emitting. The failing `emit` returns `AgentError::NotReady` — **not** `Unhealthy` — the agent reconnects, and a subsequent `emit` after recovery succeeds. Discovered during implementation: the original REQ-001 named only the read-side ends, which would have left the reported failure intact for an agent that was writing when the hub went away. |
 
@@ -757,6 +798,15 @@ Attribution map π is recorded in the "Validates" column and is total over the r
 | TEST-014 | `tests/pairing_store.rs::the_store_round_trips_every_valid_record_shape` |
 | TEST-015 | `tests/chat_reconnect.rs::a_write_that_fails_on_a_dead_socket_reconnects_and_the_emit_is_retryable` |
 | TEST-016 | `tests/pairing_rehydrate.rs::closing_an_agent_mid_resume_stops_the_resume` |
+| TEST-017 | `tests/chat_reconnect.rs::replayed_history_is_not_delivered_twice_after_a_reconnect` |
+| TEST-018 | `tests/chat_reconnect.rs::an_emit_during_a_reconnect_handshake_is_refused_immediately` |
+| TEST-019 | `tests/chat_reconnect.rs::a_close_during_a_reconnect_handshake_is_immediate` |
+| TEST-020 | `tests/chat_reconnect.rs::a_transport_outage_reports_agent_not_ready_not_an_mls_failure` |
+| TEST-021 | `tests/pairing_store.rs::a_write_against_an_unrecognised_store_fails_instead_of_clobbering_it` |
+| TEST-022 | `tests/pairing_store.rs::the_per_record_grammar_rejects_missing_and_unknown_keys` |
+| TEST-023 | `tests/pairing_store.rs::concurrent_upserts_do_not_lose_records` |
+| TEST-024 | `src/chat_responder.rs::a_forgotten_ask_does_not_win_its_own_election` |
+| TEST-025 | `src/daemon.rs::attaching_to_a_closed_handle_fails_rather_than_recreating_it`, `::attaching_preserves_the_placeholder_queue` |
 | — (harness) | `tests/support/chat_hub.rs`, pinned by `tests/chat_reconnect.rs::fake_hub_drives_the_production_join_path` |
 
 ### Red Gate and mutation evidence
@@ -810,7 +860,25 @@ has its keys is the worse failure.
 ## Changelog
 
 <details>
-<summary>Revision history — 0.1.0 → 0.2.0</summary>
+<summary>Revision history — 0.1.0 → 0.3.0</summary>
+
+- 0.3.0 — folded an external code review (10 findings, all verified against the code and all
+  real). Four of them were consequences of the reconnect itself and were reported as P1:
+  the hub's **backfill replay** is re-delivered on every re-join, so [[#REQ-003]] gained the
+  suppression clause and [[ReplayGuard]]; the loop **stopped servicing sends and closes while
+  a handshake was in flight**, so [[#REQ-004]] gained its immediacy clauses; a **claim whose
+  write failed kept its timer**, which after a reconnect lets an ask win an election over a
+  claim the hub never received — a live regression introduced by surviving the failure rather
+  than dying on it ([[#TEST-024]]); and a resumed connection **attached unconditionally**,
+  recreating a handle closed mid-handshake ([[#TEST-025]], which also retired the 0.2.0
+  `SIMPLIFY` annotation by updating the placeholder in place). On the persistence side
+  [[#REQ-010]] gained the write-must-not-clobber and no-lost-update clauses, and [[#CON-002]]
+  now enforces the per-record grammar it declares — `deny_unknown_fields` and required
+  `dialects`/`receive_all`, which had been optional in the implementation while the grammar
+  called them mandatory. Also: the attempt counter now counts *failures* rather than
+  intentions, a transport outage reports `agent_not_ready` instead of a false
+  `mls_membership_pending`, and a blank capability is normalised before it is persisted so a
+  resume cannot pin a public room encrypted.
 
 - 0.2.0 — implemented (IMPL-026). Three normative changes came out of the implementation, all
   recorded rather than absorbed: [[#REQ-001]] now names the **write side** explicitly (a

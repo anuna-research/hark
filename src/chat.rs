@@ -460,32 +460,50 @@ pub async fn create_chat_agent(
     // daemon restarted, so an operator's exported `CBCL_AGENT_HANDLE` and any
     // script holding it keep working. The handle is an opaque local identifier
     // with no hub-side meaning, so reuse costs nothing.
-    //
-    // SIMPLIFY: the insert below REPLACES any placeholder entry registered for
-    // this handle while the agent was still coming up, rather than updating it
-    // in place. Ceiling: a `recv` issued against an agent that has not yet
-    // joined blocks until its own timeout instead of being woken by the join,
-    // because the entry's `Notify` is replaced with it. Upgrade path: an
-    // `AgentStore::attach_connection` that mutates the existing entry. Not done
-    // now because the placeholder's queue and waiter are empty by construction
-    // (trace: SPEC-026 REQ-008, ADR-006).
-    let handle = resume.unwrap_or_else(AgentHandle::generate);
     let (close_tx, close_rx) = oneshot::channel();
     let (send_tx, send_rx) = mpsc::channel(8);
     // The advertised dialects are both the store's record and the responder's
     // capability set (SPEC-003 REQ-002).
     let capability = dialects.clone();
-    store
-        .insert_connected_with_router_channels(
-            handle.clone(),
-            dialects,
-            Some(close_tx),
-            Some(AgentSendChannel::new(send_tx)),
-            Some(agent_handle.to_owned()), // the chat wire identity (@handle)
-            Some(channel.to_owned()),
-        )
-        .await
-        .map_err(|error| ChatError::Store(error.to_string()))?;
+    let handle = match resume {
+        // A resume ATTACHES to the placeholder registered before the first dial
+        // — it must not create one. The operator can close the agent at any
+        // point during the handshake; closing removes the placeholder, and an
+        // unconditional insert here would recreate the very handle they just
+        // gave up on, with this successful join behind it. `attach_connection`
+        // fails with `UnknownHandle` in exactly that case, and it updates the
+        // entry in place, so the placeholder's queue, notify and any waiting
+        // `recv` survive the transition rather than being replaced under them.
+        Some(handle) => {
+            store
+                .attach_connection(
+                    &handle,
+                    dialects,
+                    close_tx,
+                    AgentSendChannel::new(send_tx),
+                    agent_handle.to_owned(),
+                    Some(channel.to_owned()),
+                )
+                .await
+                .map_err(|error| ChatError::Store(error.to_string()))?;
+            handle
+        }
+        None => {
+            let handle = AgentHandle::generate();
+            store
+                .insert_connected_with_router_channels(
+                    handle.clone(),
+                    dialects,
+                    Some(close_tx),
+                    Some(AgentSendChannel::new(send_tx)),
+                    Some(agent_handle.to_owned()), // the chat wire identity (@handle)
+                    Some(channel.to_owned()),
+                )
+                .await
+                .map_err(|error| ChatError::Store(error.to_string()))?;
+            handle
+        }
+    };
 
     let responder = Responder::new(
         agent_handle.to_owned(),
@@ -652,6 +670,98 @@ enum Recovery {
     },
 }
 
+/// How many recently-delivered frame identities are remembered, for
+/// [`ReplayGuard`]. Comfortably above the hub's `backfill_n` (50), so the whole
+/// replayed window can be recognised.
+const REPLAY_MEMORY: usize = 256;
+
+/// How many frames after a re-join are checked against that memory. The hub
+/// replays at most `backfill_n`; beyond that the socket is carrying live
+/// traffic, which must never be suppressed.
+const REPLAY_WINDOW: usize = 64;
+
+/// Suppresses the history a hub replays after a re-join ([[SPEC-026 REQ-003]]).
+///
+/// Every successful `hello` is answered with the room's recent history, on a
+/// reconnect exactly as on a first join. Without this, an outage re-delivers up
+/// to `backfill_n` messages to `recv` and re-contends for asks the responder
+/// already settled; repeated outages walk the inbound queue toward
+/// `queue_overflow`, which marks the handle unhealthy — the reconnect would
+/// reintroduce the very failure it exists to prevent.
+///
+/// Identity is the payload bytes. A frame the hub replays is byte-identical to
+/// the one already seen, so equality is exactly the right test, and it does not
+/// depend on the hub's signature being deterministic the way keying on the
+/// signature would.
+///
+/// The check is **windowed** rather than always-on, which is the whole reason
+/// the counter exists: two genuinely distinct messages can be byte-identical
+/// (`(tell @room "ok" :from @x)` twice), and suppressing the second would lose
+/// real traffic. Confining the check to the frames immediately following a
+/// re-join bounds that risk to the moment a replay is actually possible.
+struct ReplayGuard {
+    seen: std::collections::VecDeque<u64>,
+    remaining: usize,
+}
+
+impl ReplayGuard {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::VecDeque::with_capacity(REPLAY_MEMORY),
+            remaining: 0,
+        }
+    }
+
+    /// A re-join just completed: check the next [`REPLAY_WINDOW`] frames.
+    fn arm(&mut self) {
+        self.remaining = REPLAY_WINDOW;
+    }
+
+    /// Record `payload` and report whether it is a replay that should be
+    /// dropped. Outside the window this only records.
+    fn is_replay(&mut self, payload: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        payload.hash(&mut hasher);
+        let digest = hasher.finish();
+
+        let armed = self.remaining > 0;
+        self.remaining = self.remaining.saturating_sub(1);
+        if armed && self.seen.contains(&digest) {
+            return true;
+        }
+        if self.seen.len() == REPLAY_MEMORY {
+            self.seen.pop_front();
+        }
+        self.seen.push_back(digest);
+        false
+    }
+}
+
+/// Answer one outbound frame offered while the hub connection is down.
+///
+/// Returns `Some(terminal)` only when the send channel itself has closed — the
+/// agent is going away, and there is nothing left to reconnect for. Otherwise
+/// the frame is refused *retryably* so the caller re-offers it, which is what
+/// re-seals it against the epoch the group is actually in (ADR-003).
+fn refuse_during_gap(
+    outbound: Option<crate::daemon::OutboundFrame>,
+    last_error: &str,
+) -> Option<Recovery> {
+    let Some(outbound) = outbound else {
+        return Some(Recovery::Terminal {
+            reason: "local_send_failed",
+            detail: "chat send channel closed".to_owned(),
+        });
+    };
+    let _ = outbound
+        .result_tx
+        .send(Err(OutboundReject::reconnecting(format!(
+            "hub connection is down; reconnecting: {last_error}"
+        ))));
+    None
+}
+
 /// Re-establish the agent's hub connection ([[SPEC-026 REQ-001]]).
 ///
 /// Loops on the [`ReconnectSchedule`] until the re-join succeeds, the agent is
@@ -689,15 +799,16 @@ async fn reconnect(
     );
     let mut announced_ceiling = false;
     let mut last_error = cause.clone();
+    // Zero *failed* attempts so far. The counter is published only after an
+    // attempt has actually failed (REQ-006): reporting one before the first
+    // dial, as an increment-then-publish would, tells the operator the hub has
+    // refused them when nothing has been tried yet.
     let _ = store
         .mark_reconnecting(handle, 0, Some(cause.clone()))
         .await;
 
     loop {
         let delay = schedule.next_delay(rand::random::<f64>());
-        let _ = store
-            .mark_reconnecting(handle, schedule.attempts(), Some(last_error.clone()))
-            .await;
 
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
@@ -706,23 +817,39 @@ async fn reconnect(
                 _ = &mut *close_rx => return Recovery::Closed,
                 () = &mut sleep => break,
                 outbound = send_rx.recv() => {
-                    let Some(outbound) = outbound else {
-                        return Recovery::Terminal {
-                            reason: "local_send_failed",
-                            detail: "chat send channel closed".to_owned(),
-                        };
-                    };
-                    let _ = outbound.result_tx.send(Err(OutboundReject::retryable(format!(
-                        "hub connection is down; reconnecting (attempt {}): {last_error}",
-                        schedule.attempts()
-                    ))));
+                    match refuse_during_gap(outbound, &last_error) {
+                        Some(terminal) => return terminal,
+                        None => continue,
+                    }
                 }
             }
         }
 
         // The re-join NEVER creates the MLS group: `create_group_as_creator` a
         // second time would fork the group into two ciphertext worlds.
-        match join_hub(join, identity, mls.as_mut(), false).await {
+        //
+        // Driven INSIDE the select rather than awaited on its own: a handshake
+        // can take two 10 s timeouts, or an unbounded connect, and a loop that
+        // stopped reading `send_rx` for that long would leave an `emit` blocked
+        // on a channel nobody is draining instead of refusing it immediately —
+        // the opposite of REQ-004. `close_rx` for the same reason: a `hark
+        // close` must not wait out a handshake against a hub that is gone.
+        let attempt = join_hub(join, identity, mls.as_mut(), false);
+        tokio::pin!(attempt);
+        let outcome = loop {
+            tokio::select! {
+                _ = &mut *close_rx => return Recovery::Closed,
+                result = &mut attempt => break result,
+                outbound = send_rx.recv() => {
+                    match refuse_during_gap(outbound, &last_error) {
+                        Some(terminal) => return terminal,
+                        None => continue,
+                    }
+                }
+            }
+        };
+
+        match outcome {
             Ok(joined) => {
                 tracing::info!(
                     agent = handle.as_str(),
@@ -759,6 +886,11 @@ async fn reconnect(
             }
             Err(error) => {
                 last_error = sanitize(&error.to_string());
+                // Published here, after the attempt actually failed, so the
+                // count an operator reads is failures rather than intentions.
+                let _ = store
+                    .mark_reconnecting(handle, schedule.attempts(), Some(last_error.clone()))
+                    .await;
                 tracing::debug!(
                     agent = handle.as_str(),
                     channel = join.channel,
@@ -956,6 +1088,9 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         // was issue #25.
         let mut schedule = ReconnectSchedule::default();
         let mut pending_reconnect: Option<String> = None;
+        // SPEC-026 REQ-003: the hub replays the room's recent history after
+        // EVERY successful hello, including a re-join's.
+        let mut replay_guard = ReplayGuard::new();
         loop {
             if let Some(cause) = pending_reconnect.take() {
                 match reconnect(
@@ -975,6 +1110,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         websocket = replacement.websocket;
                         conn = replacement.conn;
                         schedule.reset();
+                        replay_guard.arm();
                         let _ = store.mark_connected(&handle).await;
                     }
                     Recovery::Closed => {
@@ -1142,6 +1278,19 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             continue;
                         }
                     };
+                    // SPEC-026 REQ-003: drop the history the hub replayed after
+                    // the re-join. Checked before the session and the responder
+                    // see it — a replayed frame is one we have already fully
+                    // processed, so re-running either is duplicated work at
+                    // best and a duplicate delivery or a re-contended ask at
+                    // worst.
+                    if replay_guard.is_replay(&payload_text) {
+                        tracing::debug!(
+                            agent = handle.as_str(),
+                            "dropping a frame the hub replayed after the re-join"
+                        );
+                        continue;
+                    }
                     // SPEC-013: the MLS session consumes its frames first —
                     // welcome/deliver/keypkg/idkey/presence — decrypting
                     // content and emitting any protocol frames to send. In a
@@ -1214,10 +1363,12 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     // The responder decides: claim for answerable asks, deliver to
                     // `recv` only when elected, drop everything else (REQ-002).
                     // SPEC-026 REQ-001: a claim that cannot be written means the
-                    // socket died. Reconnect rather than die — the claim itself
-                    // is forfeited (another agent answers, or the liveness
-                    // fallback fires), which is the correct outcome for a claim
-                    // the hub never saw.
+                    // socket died. Reconnect rather than die — and FORFEIT the
+                    // claim. The responder has already inserted this agent as a
+                    // contender, so an ask left tracked with its timer running
+                    // would go on to win its own election after the reconnect
+                    // and answer an ask the hub never saw it claim (REQ-005 of
+                    // SPEC-003: election is over claims that were broadcast).
                     let mut send_failed: Option<String> = None;
                     for action in responder.on_inbound(&responder_text) {
                         let Action::Claim { ask_id, frame_text } = action;
@@ -1226,10 +1377,17 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                                 let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
                                 if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
                                     send_failed = Some(sanitize(&error.to_string()));
+                                    responder.forget(&ask_id);
+                                    continue; // no timer for a claim nobody received
                                 }
                             }
-                            // Our own claim should always be valid CBCL; skip if not.
-                            Err(_) => continue,
+                            // Our own claim should always be valid CBCL; if it
+                            // is not, stop tracking the ask rather than leaving
+                            // a contender behind an election it cannot win.
+                            Err(_) => {
+                                responder.forget(&ask_id);
+                                continue;
+                            }
                         }
                         let delay = claim_window;
                         timers.push(async move {

@@ -608,10 +608,21 @@ async fn recovery_clears_the_reconnect_progress() {
 
     let (handle, _warnings) = join(store.clone(), &hub).await.expect("the join succeeds");
     let reconnecting = await_snapshot(&store, &handle, Duration::from_secs(3), |snapshot| {
-        snapshot.reconnect_attempts >= 1
+        snapshot.state == AgentState::Reconnecting
     })
     .await;
-    assert!(reconnecting.reconnect_attempts >= 1);
+    assert_eq!(reconnecting.state, AgentState::Reconnecting);
+    // The counter is *failed attempts*, and none has failed yet — the loop is
+    // still in its first backoff delay. Publishing 1 here (increment-then-
+    // publish) would tell an operator the hub had already refused them.
+    assert_eq!(
+        reconnecting.reconnect_attempts, 0,
+        "no attempt has failed yet during the first delay"
+    );
+    assert!(
+        reconnecting.reconnect_detail.is_some(),
+        "the error that ended the socket is reported from the start"
+    );
 
     let recovered = await_snapshot(&store, &handle, Duration::from_secs(5), |snapshot| {
         snapshot.state == AgentState::Connected
@@ -670,4 +681,208 @@ async fn a_hub_that_accepts_but_never_answers_is_retried_not_terminal() {
         snapshot.unhealthy_reason, None,
         "a join timeout is a transport failure, not a settled refusal"
     );
+}
+
+/// SPEC-026 REQ-004 (negative-output) — an `emit` offered *while a reconnect
+/// handshake is in flight* is refused immediately, not parked behind it.
+///
+/// The handshake is not instant: the bootstrap and the join ack each carry a
+/// 10 s timeout, and the connect itself is unbounded. A loop that awaited the
+/// join without also polling `send_rx` would leave the caller blocked on a
+/// channel nobody is draining for as long as that takes — a *worse* outcome
+/// than the pre-fix behaviour, which at least failed fast.
+#[tokio::test]
+async fn an_emit_during_a_reconnect_handshake_is_refused_immediately() {
+    // The second connection stalls: accepted, then silent. The agent sits in
+    // `join_hub` for the full join timeout, which is the window under test.
+    let hub = FakeHub::start(vec![
+        Act::AcceptThenDrop {
+            enc: false,
+            after_frames: 1,
+        },
+        Act::Stall,
+        Act::Accept { enc: false },
+    ])
+    .await;
+    let store = store();
+
+    let (handle, _warnings) = join(store.clone(), &hub).await.expect("the join succeeds");
+
+    // Wait until the second connection exists — the agent is now inside the
+    // stalled handshake.
+    assert!(
+        hub.wait_for_connections(2, Duration::from_secs(5)).await,
+        "the agent reaches the stalling hub"
+    );
+
+    let started = tokio::time::Instant::now();
+    let error = store
+        .send_outbound(&handle, "(tell @general \"hi\" :from @aria)".to_owned())
+        .await
+        .expect_err("a send mid-handshake is refused");
+    let waited = started.elapsed();
+
+    assert!(
+        matches!(error, hark::daemon::AgentError::NotReady { .. }),
+        "refused retryably, got {error:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(2),
+        "the refusal must not wait out the handshake; waited {waited:?}"
+    );
+}
+
+/// SPEC-026 REQ-004 — a `hark close` during a reconnect handshake takes effect
+/// immediately, for the same reason.
+#[tokio::test]
+async fn a_close_during_a_reconnect_handshake_is_immediate() {
+    let hub = FakeHub::start(vec![
+        Act::AcceptThenDrop {
+            enc: false,
+            after_frames: 1,
+        },
+        Act::Stall,
+    ])
+    .await;
+    let store = store();
+
+    let (handle, _warnings) = join(store.clone(), &hub).await.expect("the join succeeds");
+    assert!(hub.wait_for_connections(2, Duration::from_secs(5)).await);
+
+    let started = tokio::time::Instant::now();
+    store.close(&handle).await.expect("close succeeds");
+    // The close signal must reach the transport loop rather than sitting behind
+    // the 10 s join timeout. Observed by the agent leaving the store.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut gone = false;
+    while tokio::time::Instant::now() < deadline {
+        if !store
+            .status_snapshots()
+            .await
+            .iter()
+            .any(|snapshot| snapshot.agent_handle == handle.as_str())
+        {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        gone,
+        "the agent must be gone promptly; waited {:?}",
+        started.elapsed()
+    );
+}
+
+/// SPEC-026 REQ-003 (negative-output) — a reconnect must not re-deliver the
+/// history the hub replays on join.
+///
+/// Every successful `hello` is followed by the room's recent history
+/// (`backfill_n`, 50 by default; cleartext rooms unconditionally). Before the
+/// reconnect existed this only ever happened once per process. Now it happens
+/// once per outage, so a receive-all agent gets the same messages again — and a
+/// responder re-contends for asks it already settled. Repeated outages walk the
+/// inbound queue toward `queue_overflow`, which marks the handle unhealthy: the
+/// reconnect would have reintroduced the very failure it exists to prevent.
+#[tokio::test]
+async fn replayed_history_is_not_delivered_twice_after_a_reconnect() {
+    let replayed = "(tell @general \"the same message\" :from @bo)";
+    let hub = FakeHub::start(vec![
+        Act::AcceptThenDropAfterSending {
+            enc: false,
+            send: vec![replayed.to_owned()],
+        },
+        Act::AcceptAndSend {
+            enc: false,
+            send: vec![replayed.to_owned()],
+        },
+    ])
+    .await;
+    let store = store();
+
+    let (handle, _warnings) = join(store.clone(), &hub).await.expect("the join succeeds");
+
+    // The pre-drop copy is delivered.
+    let first = store
+        .recv(&handle, Some(Duration::from_secs(3)))
+        .await
+        .expect("the first copy reaches recv");
+    assert!(first.contains("the same message"), "got {first:?}");
+
+    // Wait for the drop to be NOTICED first — a freshly joined agent is also
+    // `connected` with zero attempts, so checking for recovery straight away
+    // matches before anything has happened.
+    let dropped = await_snapshot(&store, &handle, Duration::from_secs(5), |snapshot| {
+        snapshot.state == AgentState::Reconnecting
+    })
+    .await;
+    assert_eq!(
+        dropped.state,
+        AgentState::Reconnecting,
+        "the drop must be noticed before the replay can be tested"
+    );
+
+    // Reconnect happens, and the hub replays the same frame.
+    assert!(
+        hub.wait_for_connections(2, Duration::from_secs(6)).await,
+        "the agent re-joins and receives the backfill again"
+    );
+    let snapshot = await_snapshot(&store, &handle, Duration::from_secs(6), |snapshot| {
+        snapshot.state == AgentState::Connected
+    })
+    .await;
+    assert_eq!(snapshot.state, AgentState::Connected, "the agent came back");
+
+    // The replay must NOT arrive a second time.
+    let duplicate = store.recv(&handle, Some(Duration::from_millis(750))).await;
+    assert!(
+        matches!(duplicate, Err(hark::daemon::AgentError::RecvTimeout)),
+        "replayed history must be suppressed, but recv returned {duplicate:?}"
+    );
+}
+
+/// SPEC-026 REQ-004 (negative-output) — a refusal during a transport outage
+/// must not be reported as an MLS failure.
+///
+/// `AgentError::NotReady` covers two very different situations: the SPEC-013
+/// membership race, and a hub outage. Collapsing them sends an operator whose
+/// *public* channel is simply disconnected off to investigate a group that has
+/// nothing to do with it — and there is no group at all on a public channel.
+#[tokio::test]
+async fn a_transport_outage_reports_agent_not_ready_not_an_mls_failure() {
+    use hark::daemon::NotReadyReason;
+
+    // One connection only: after the drop, every dial is refused, so the agent
+    // stays in the gap.
+    let hub = FakeHub::start(vec![Act::AcceptThenDrop {
+        enc: false,
+        after_frames: 1,
+    }])
+    .await;
+    let store = store();
+
+    let (handle, _warnings) = join(store.clone(), &hub).await.expect("the join succeeds");
+    await_snapshot(&store, &handle, Duration::from_secs(5), |snapshot| {
+        snapshot.state == AgentState::Reconnecting
+    })
+    .await;
+
+    let error = store
+        .send_outbound(&handle, "(tell @general \"hi\" :from @aria)".to_owned())
+        .await
+        .expect_err("a send during the outage is refused");
+    let hark::daemon::AgentError::NotReady { reason, .. } = error else {
+        panic!("expected NotReady, got {error:?}");
+    };
+    assert_eq!(
+        reason,
+        NotReadyReason::HubReconnecting,
+        "the cause is the transport, not MLS membership"
+    );
+    assert_eq!(
+        reason.code(),
+        "agent_not_ready",
+        "and it surfaces as the documented generic code"
+    );
+    assert_ne!(reason.code(), NotReadyReason::MlsMembershipPending.code());
 }

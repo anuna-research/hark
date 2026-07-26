@@ -38,6 +38,13 @@ pub enum Act {
     /// client frames have been read (0 = close immediately after the ack). This is
     /// the hub redeploy: an ordinary member socket that simply ends.
     AcceptThenDrop { enc: bool, after_frames: usize },
+    /// Acknowledge as `Accept`, then push `send` at the client — the hub's
+    /// backfill-on-join, which a real hub replays after every successful
+    /// `hello` (`backfill_n`, 50 by default).
+    AcceptAndSend { enc: bool, send: Vec<String> },
+    /// `AcceptAndSend`, then drop the socket. The redeploy that happens after
+    /// the client has already seen some history.
+    AcceptThenDropAfterSending { enc: bool, send: Vec<String> },
     /// Reject the join outright: `(error <channel> "<slug>")`, socket left open,
     /// exactly as cbcl-bus does.
     Reject { slug: String },
@@ -230,7 +237,10 @@ async fn serve(
             acked = true;
             let reply = match &act {
                 Act::Reject { slug } => format!("(error {channel} \"{slug}\")"),
-                Act::Accept { enc } | Act::AcceptThenDrop { enc, .. } => {
+                Act::Accept { enc }
+                | Act::AcceptThenDrop { enc, .. }
+                | Act::AcceptAndSend { enc, .. }
+                | Act::AcceptThenDropAfterSending { enc, .. } => {
                     format!("(roomcfg {channel} :enc {enc})")
                 }
                 Act::Stall => unreachable!("handled above"),
@@ -241,6 +251,28 @@ async fn serve(
                 .is_err()
             {
                 return;
+            }
+            // Backfill-on-join: a real hub replays the room's recent history
+            // straight after the ack, on EVERY successful hello — including a
+            // reconnect's.
+            if let Act::AcceptAndSend { send, .. } | Act::AcceptThenDropAfterSending { send, .. } =
+                &act
+            {
+                for frame in send {
+                    if ws
+                        .send(Message::Binary(hub_frame(frame).into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                if matches!(act, Act::AcceptThenDropAfterSending { .. }) {
+                    // Give the client a beat to read the backfill before the
+                    // socket disappears under it.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    return;
+                }
             }
             if let Act::AcceptThenDrop {
                 after_frames: 0, ..

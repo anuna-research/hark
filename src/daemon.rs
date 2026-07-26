@@ -112,7 +112,43 @@ pub struct OutboundFrame {
 #[derive(Debug, Clone)]
 pub struct OutboundReject {
     pub detail: String,
-    pub retryable: bool,
+    /// `None` for a fatal reject. `Some(reason)` means retry, and says *why* —
+    /// the reason travels with the refusal because the two retryable cases
+    /// deserve different diagnoses and `send_outbound` cannot tell them apart
+    /// from the detail string without sniffing it.
+    pub retry: Option<NotReadyReason>,
+}
+
+/// Why a send was refused but the handle is still good.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NotReadyReason {
+    /// SPEC-013 REQ-023: no Welcome yet, so this agent is not a group member.
+    MlsMembershipPending,
+    /// SPEC-026 REQ-004: the hub socket is down and being re-established.
+    HubReconnecting,
+}
+
+impl NotReadyReason {
+    /// The local-API error code. `agent_not_ready` is the generic one an
+    /// operator sees during an outage; the MLS code carries channel-specific
+    /// guidance that would be a false diagnosis on a public channel.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MlsMembershipPending => "mls_membership_pending",
+            Self::HubReconnecting => "agent_not_ready",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::MlsMembershipPending => {
+                "agent is not yet a member of the channel's MLS group; retry shortly"
+            }
+            Self::HubReconnecting => {
+                "the hub connection is down and being re-established; retry shortly"
+            }
+        }
+    }
 }
 
 impl OutboundReject {
@@ -120,15 +156,24 @@ impl OutboundReject {
     pub fn fatal(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
-            retryable: false,
+            retry: None,
         }
     }
 
-    /// A transient precondition failed — the same send may succeed shortly.
+    /// A transient MLS-membership precondition failed — the same send may
+    /// succeed once the Welcome lands (SPEC-013 REQ-023).
     pub fn retryable(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
-            retryable: true,
+            retry: Some(NotReadyReason::MlsMembershipPending),
+        }
+    }
+
+    /// The hub connection is down and being re-established (SPEC-026 REQ-004).
+    pub fn reconnecting(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            retry: Some(NotReadyReason::HubReconnecting),
         }
     }
 }
@@ -145,11 +190,16 @@ pub enum AgentError {
         detail: Option<String>,
     },
     /// A transient precondition blocked the send but the handle is still
-    /// healthy — retry shortly. Today this is exclusively the MLS
-    /// membership-not-yet-established case (no Welcome yet, SPEC-013 REQ-023):
-    /// unlike [`AgentError::Unhealthy`], the handle is left usable.
+    /// healthy — retry shortly. Unlike [`AgentError::Unhealthy`], the handle is
+    /// left usable. `reason` distinguishes the MLS membership race (SPEC-013
+    /// REQ-023) from a hub outage (SPEC-026 REQ-004); they need different
+    /// diagnoses, and reporting the MLS one during a public-channel outage
+    /// sends the operator after a group that is not the problem.
     #[error("agent handle is not ready yet")]
-    NotReady { detail: Option<String> },
+    NotReady {
+        reason: NotReadyReason,
+        detail: Option<String>,
+    },
     #[error("a receive call is already waiting for this handle")]
     RecvAlreadyWaiting,
     #[error("receive timed out")]
@@ -556,6 +606,7 @@ impl AgentStore {
                 // re-offers and it lands once the join completes.
                 None if entry.state == AgentState::Reconnecting => {
                     return Err(AgentError::NotReady {
+                        reason: NotReadyReason::HubReconnecting,
                         detail: entry.reconnect_detail.clone(),
                     });
                 }
@@ -590,11 +641,13 @@ impl AgentStore {
 
         match result_rx.await {
             Ok(Ok(())) => Ok(()),
-            // A transient precondition (MLS membership not yet established):
-            // leave the handle healthy so the next attempt — once the Welcome
-            // lands — can succeed. Marking it unhealthy here would strand the
-            // handle over a membership race (SPEC-013 REQ-023).
-            Ok(Err(reject)) if reject.retryable => Err(AgentError::NotReady {
+            // A transient precondition — an MLS membership race (SPEC-013
+            // REQ-023) or a hub outage (SPEC-026 REQ-004). Leave the handle
+            // healthy so the next attempt can succeed; marking it unhealthy
+            // here would strand it over something that resolves on its own.
+            // The reason rides along so the caller is told which it was.
+            Ok(Err(reject)) if reject.retry.is_some() => Err(AgentError::NotReady {
+                reason: reject.retry.expect("just checked"),
                 detail: Some(reject.detail),
             }),
             Ok(Err(reject)) => {
@@ -910,6 +963,49 @@ impl AgentStore {
             .get(&handle)
             .expect("agent was just inserted")
             .snapshot(&handle))
+    }
+
+    /// SPEC-026 REQ-008: give an existing placeholder entry its connection.
+    ///
+    /// Deliberately **not** an insert. It fails with [`AgentError::UnknownHandle`]
+    /// when the entry is gone, which is how a resume learns the operator closed
+    /// the agent mid-handshake — an insert would recreate the handle they just
+    /// gave up on. And it updates in place, so the placeholder's inbound queue,
+    /// its `Notify`, and any `recv` already waiting on it survive the
+    /// transition instead of being silently replaced underneath.
+    pub async fn attach_connection(
+        &self,
+        handle: &AgentHandle,
+        dialects: Vec<String>,
+        close_tx: oneshot::Sender<()>,
+        send_channel: AgentSendChannel,
+        wire_id: String,
+        channel: Option<String>,
+    ) -> Result<AgentStatusSnapshot, AgentError> {
+        validate_agent_advertisement(&dialects)?;
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        entry.dialects = dialects;
+        entry.router_agent_id = wire_id;
+        entry.channel = channel;
+        entry.state = AgentState::Connected;
+        entry.unhealthy_reason = None;
+        entry.unhealthy_detail = None;
+        entry.reconnect_attempts = 0;
+        entry.reconnect_detail = None;
+        entry.close_tx = Some(close_tx);
+        entry.send_channel = Some(send_channel);
+        let notify = Arc::clone(&entry.notify);
+        let snapshot = entry.snapshot(handle);
+        inner.active = Some(handle.clone());
+        drop(inner);
+        // A `recv` that has been waiting through the outage is woken to re-check
+        // its queue rather than sitting out the rest of its timeout.
+        notify.notify_waiters();
+        Ok(snapshot)
     }
 
     /// SPEC-026 REQ-001 / CON-003: the socket is back. Clears the reconnect
@@ -1980,6 +2076,99 @@ mod tests {
         assert_eq!(status[0].reconnect_detail, None);
     }
 
+    /// SPEC-026 REQ-008 (negative-input) — attaching a resumed connection to a
+    /// handle that is no longer registered must FAIL, not recreate it.
+    ///
+    /// The operator can close an agent at any point during its resume
+    /// handshake. Closing removes the entry; an insert here would recreate the
+    /// very handle they gave up on, with a live connection behind it, and no
+    /// further close could reach the resume loop that made it.
+    #[tokio::test]
+    async fn attaching_to_a_closed_handle_fails_rather_than_recreating_it() {
+        let store = agent_store(10, 100);
+        let handle = handle();
+        store
+            .insert_reconnecting(
+                handle.clone(),
+                vec!["elf".to_owned()],
+                "@aria".to_owned(),
+                Some("@research".to_owned()),
+                None,
+            )
+            .await
+            .expect("the placeholder registers");
+
+        // The operator closes it mid-handshake.
+        store.close(&handle).await.expect("close succeeds");
+
+        let (close_tx, _close_rx) = tokio::sync::oneshot::channel();
+        let (send_tx, _send_rx) = tokio::sync::mpsc::channel(4);
+        let error = store
+            .attach_connection(
+                &handle,
+                vec!["elf".to_owned()],
+                close_tx,
+                super::AgentSendChannel::new(send_tx),
+                "@aria".to_owned(),
+                Some("@research".to_owned()),
+            )
+            .await
+            .expect_err("attaching to a closed handle must fail");
+        assert_eq!(error, super::AgentError::UnknownHandle);
+        assert!(
+            store.status_snapshots().await.is_empty(),
+            "the closed agent must not be resurrected by the attach"
+        );
+    }
+
+    /// SPEC-026 REQ-008 (positive) — attaching updates the placeholder in
+    /// place, so an inbound message queued during the outage and any `recv`
+    /// waiting on it survive the transition.
+    #[tokio::test]
+    async fn attaching_preserves_the_placeholder_queue() {
+        let store = agent_store(10, 100);
+        let handle = handle();
+        store
+            .insert_reconnecting(
+                handle.clone(),
+                vec!["elf".to_owned()],
+                "@aria".to_owned(),
+                Some("@research".to_owned()),
+                Some("coming back".to_owned()),
+            )
+            .await
+            .expect("the placeholder registers");
+        store
+            .enqueue_inbound(&handle, "queued during the outage".to_owned())
+            .await
+            .expect("enqueue succeeds");
+
+        let (close_tx, _close_rx) = tokio::sync::oneshot::channel();
+        let (send_tx, _send_rx) = tokio::sync::mpsc::channel(4);
+        let snapshot = store
+            .attach_connection(
+                &handle,
+                vec!["elf".to_owned()],
+                close_tx,
+                super::AgentSendChannel::new(send_tx),
+                "@aria".to_owned(),
+                Some("@research".to_owned()),
+            )
+            .await
+            .expect("attaching to a live placeholder succeeds");
+
+        assert_eq!(snapshot.state, super::AgentState::Connected);
+        assert_eq!(snapshot.reconnect_attempts, 0);
+        assert_eq!(snapshot.reconnect_detail, None);
+        assert_eq!(
+            store
+                .recv(&handle, Some(std::time::Duration::from_millis(50)))
+                .await
+                .expect("the queued message survived the attach"),
+            "queued during the outage"
+        );
+    }
+
     /// SPEC-026 CON-003 (negative-output) — marking a handle reconnecting must
     /// not close its connection or drop a pending meta waiter, the two things
     /// `mark_unhealthy` deliberately does. A reconnect that tore down the
@@ -2066,6 +2255,7 @@ mod tests {
         assert_eq!(
             error,
             super::AgentError::NotReady {
+                reason: super::NotReadyReason::MlsMembershipPending,
                 detail: Some("not yet a member".to_owned()),
             }
         );

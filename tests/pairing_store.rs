@@ -210,3 +210,107 @@ fn an_empty_agent_list_is_recognised() {
         "an empty list parses cleanly; only malformed input reports an error"
     );
 }
+
+/// SPEC-026 REQ-010 (negative-output) — an unrecognised store must not be
+/// *destroyed* by the next write.
+///
+/// `load` deliberately degrades to "no agents" so a daemon can still start. But
+/// `upsert` and `remove` are read-modify-write: if they degrade the same way,
+/// the next successful join overwrites the unreadable file with a single record
+/// and silently deletes every pairing it could not parse — repairing input that
+/// REQ-010 says must stay rejected, and losing data while doing it.
+#[test]
+fn a_write_against_an_unrecognised_store_fails_instead_of_clobbering_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = PairingStore::new(dir.path());
+    let corrupt = r#"{"version":2,"agents":[]}"#;
+    std::fs::write(store.path(), corrupt).expect("the fixture writes");
+
+    store
+        .upsert(record("1K65XWE7NSPZMCVJFFAWS02SHR"))
+        .expect_err("an upsert must refuse to overwrite an unrecognised store");
+    store
+        .remove("1K65XWE7NSPZMCVJFFAWS02SHR")
+        .expect_err("a remove must refuse to rewrite an unrecognised store");
+
+    assert_eq!(
+        std::fs::read_to_string(store.path()).expect("the file is still there"),
+        corrupt,
+        "the unrecognised bytes are left exactly as found, for the operator to inspect"
+    );
+}
+
+/// SPEC-026 CON-002 (negative-input) — the per-record grammar is enforced as
+/// declared. `receive_all` and `dialects` are REQUIRED by the grammar, and an
+/// unknown key means the writer and this reader disagree about the format.
+///
+/// The `receive_all` case is the one with teeth: defaulting a misspelled key to
+/// `false` silently downgrades a firehose agent to an answer-only one, on a
+/// record that also carries a capability.
+#[test]
+fn the_per_record_grammar_rejects_missing_and_unknown_keys() {
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "a misspelled receive_all",
+            r#"{"version":1,"agents":[{"agent_handle":"1K65XWE7NSPZMCVJFFAWS02SHR","wire_handle":"@aria","channel":"@research","dialects":[],"recieve_all":true}]}"#,
+        ),
+        (
+            "receive_all absent entirely",
+            r#"{"version":1,"agents":[{"agent_handle":"1K65XWE7NSPZMCVJFFAWS02SHR","wire_handle":"@aria","channel":"@research","dialects":[]}]}"#,
+        ),
+        (
+            "dialects absent entirely",
+            r#"{"version":1,"agents":[{"agent_handle":"1K65XWE7NSPZMCVJFFAWS02SHR","wire_handle":"@aria","channel":"@research","receive_all":false}]}"#,
+        ),
+        (
+            "an unknown extra key",
+            r#"{"version":1,"agents":[{"agent_handle":"1K65XWE7NSPZMCVJFFAWS02SHR","wire_handle":"@aria","channel":"@research","dialects":[],"receive_all":false,"future_field":1}]}"#,
+        ),
+    ];
+
+    for (name, body) in cases {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = PairingStore::new(dir.path());
+        std::fs::write(store.path(), body).expect("the fixture writes");
+        assert!(
+            store.load_checked().is_err(),
+            "{name}: the record does not match the declared grammar and must be rejected"
+        );
+        assert!(store.load().is_empty(), "{name}: and yields no records");
+    }
+}
+
+/// SPEC-026 CON-002 — concurrent joins must not lose each other's records.
+///
+/// `upsert` is a read-modify-write over a whole file. Two joins completing at
+/// once can both read the same old list and then both write, and whichever
+/// renames last silently drops the other agent — which then does not come back
+/// on the next daemon start, the exact failure this store exists to prevent.
+#[test]
+fn concurrent_upserts_do_not_lose_records() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let handles = [
+        "1K65XWE7NSPZMCVJFFAWS02SHR",
+        "2M76YXF8PTQANDWKGGBXT13TJS",
+        "3N87ZYG9PVRBPEXMHHCYV24VKT",
+        "4P98A0H9QWSCQFYNJJDZW35WMV",
+    ];
+
+    std::thread::scope(|scope| {
+        for handle in handles {
+            let path = dir.path().to_owned();
+            scope.spawn(move || {
+                PairingStore::new(path)
+                    .upsert(record(handle))
+                    .expect("each concurrent upsert succeeds");
+            });
+        }
+    });
+
+    let loaded = PairingStore::new(dir.path()).load();
+    let mut got: Vec<String> = loaded.iter().map(|a| a.agent_handle.clone()).collect();
+    got.sort();
+    let mut want: Vec<String> = handles.iter().map(|h| (*h).to_owned()).collect();
+    want.sort();
+    assert_eq!(got, want, "every concurrently-joined agent survives");
+}
