@@ -92,10 +92,12 @@ impl FakeHub {
                 };
                 let recorded = Arc::clone(&recorded);
                 let channel = channel.clone();
-                // Serve connections sequentially: the tests are about one agent's
-                // socket ending and being replaced, so overlapping connections
-                // would only hide an ordering bug.
-                serve(stream, act, channel, recorded, index).await;
+                // Each connection is served concurrently, but the transcript
+                // slot is claimed at *accept* time above, so slot order is
+                // still connection order. Concurrency matters for the daemon
+                // restart tests, where the old connection is still draining
+                // while the replacement daemon dials in.
+                tokio::spawn(serve(stream, act, channel, recorded, index));
             }
             // Script exhausted: drop the listener so later attempts get a refusal
             // rather than an accepted-but-silent socket.

@@ -1214,6 +1214,10 @@ async fn daemon_run() -> AppResult<()> {
     })?;
 
     let agents = AgentStore::new(AgentStoreConfig::from_config(&config));
+    // SPEC-026 REQ-008: bring back every agent the last daemon had, before the
+    // server is awaited and without blocking readiness on it. A restart used to
+    // drop every agent and require re-pairing by hand.
+    crate::local_api::rehydrate_paired_agents(agents.clone(), &config);
     let result = serve_local_api_with_agents(
         listener,
         record,

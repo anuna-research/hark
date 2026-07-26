@@ -400,6 +400,7 @@ pub async fn create_chat_agent(
     mut mls: Option<MlsSession>,
     mls_create: bool,
     receive_all: bool,
+    resume: Option<AgentHandle>,
 ) -> Result<(AgentHandle, Vec<String>), ChatError> {
     AgentStore::validate_advertisement(&dialects)
         .map_err(|error| ChatError::Store(error.to_string()))?;
@@ -455,7 +456,20 @@ pub async fn create_chat_agent(
         }
     }
 
-    let handle = AgentHandle::generate();
+    // SPEC-026 ADR-006: a resumed agent keeps the handle it had before the
+    // daemon restarted, so an operator's exported `CBCL_AGENT_HANDLE` and any
+    // script holding it keep working. The handle is an opaque local identifier
+    // with no hub-side meaning, so reuse costs nothing.
+    //
+    // SIMPLIFY: the insert below REPLACES any placeholder entry registered for
+    // this handle while the agent was still coming up, rather than updating it
+    // in place. Ceiling: a `recv` issued against an agent that has not yet
+    // joined blocks until its own timeout instead of being woken by the join,
+    // because the entry's `Notify` is replaced with it. Upgrade path: an
+    // `AgentStore::attach_connection` that mutates the existing entry. Not done
+    // now because the placeholder's queue and waiter are empty by construction
+    // (trace: SPEC-026 REQ-008, ADR-006).
+    let handle = resume.unwrap_or_else(AgentHandle::generate);
     let (close_tx, close_rx) = oneshot::channel();
     let (send_tx, send_rx) = mpsc::channel(8);
     // The advertised dialects are both the store's record and the responder's

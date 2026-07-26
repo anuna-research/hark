@@ -57,6 +57,7 @@ async fn exactly_one_of_two_agents_is_elected() {
         None,
         false,
         false,
+        None,
     )
     .await
     .expect("agent A joins");
@@ -74,6 +75,7 @@ async fn exactly_one_of_two_agents_is_elected() {
         None,
         false,
         false,
+        None,
     )
     .await
     .expect("agent B joins");

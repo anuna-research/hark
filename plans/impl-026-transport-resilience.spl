@@ -224,3 +224,45 @@
 (claims agent:claude
   :at "2026-07-26T10:41:04Z"
   (given completed-observability))
+
+(claims agent:claude
+  :at "2026-07-26T10:41:11Z"
+  (given claim-v1-store)
+  (normally r-cl-state-v1-store claim-v1-store state-claimed-v1-store)
+  (normally r-cl-chain-v1-store state-claimed-v1-store claimed-store)
+)
+
+;; Propagation rules: failures in 'store' block downstream tasks
+(normally r-propagate-persist-from-store-failed failed-store upstream-blocked-persist)
+(normally r-propagate-persist-from-store-permanently-failed permanently-failed-store upstream-blocked-persist)
+(normally r-propagate-persist-from-store-stale-v1 stale-v1-store upstream-blocked-persist)
+(normally r-propagate-persist-from-store-timeout-v1 timeout-v1-store upstream-blocked-persist)
+(normally r-propagate-persist-from-store-blocked upstream-blocked-store upstream-blocked-persist)
+
+;; Transitive propagation: upstream-blocked cascades through dependency chain
+(normally r-propagate-rehydrate-from-persist-blocked upstream-blocked-persist upstream-blocked-rehydrate)
+
+(claims agent:claude
+  :at "2026-07-26T10:44:22Z"
+  (given completed-store))
+
+(claims agent:claude
+  :at "2026-07-26T10:44:22Z"
+  (given claim-v1-persist)
+  (normally r-cl-state-v1-persist claim-v1-persist state-claimed-v1-persist)
+  (normally r-cl-chain-v1-persist state-claimed-v1-persist claimed-persist)
+)
+
+;; Propagation rules: failures in 'persist' block downstream tasks
+(normally r-propagate-rehydrate-from-persist-failed failed-persist upstream-blocked-rehydrate)
+(normally r-propagate-rehydrate-from-persist-permanently-failed permanently-failed-persist upstream-blocked-rehydrate)
+(normally r-propagate-rehydrate-from-persist-stale-v1 stale-v1-persist upstream-blocked-rehydrate)
+(normally r-propagate-rehydrate-from-persist-timeout-v1 timeout-v1-persist upstream-blocked-rehydrate)
+
+(claims agent:claude
+  :at "2026-07-26T10:52:51Z"
+  (given completed-persist))
+
+(claims agent:claude
+  :at "2026-07-26T10:52:51Z"
+  (given completed-rehydrate))

@@ -53,6 +53,7 @@ async fn join(
         None,  // no MLS session: this channel is not pinned encrypted
         false, // mls_create
         true,  // receive_all
+        None,  // a fresh join, not a resume
     )
     .await
 }
@@ -381,6 +382,7 @@ async fn a_downgraded_re_join_on_a_pinned_channel_is_terminal() {
         Some(mls),
         false,
         true,
+        None,
     )
     .await
     .expect("the first join succeeds");
@@ -453,6 +455,7 @@ async fn the_re_join_does_not_recreate_the_mls_group() {
         Some(mls),
         true, // mls_create: this agent IS the room creator
         true,
+        None,
     )
     .await
     .expect("the creating join succeeds");

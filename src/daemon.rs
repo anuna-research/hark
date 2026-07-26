@@ -548,13 +548,24 @@ impl AgentStore {
             let inner = self.inner.lock().await;
             let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
             entry.ensure_healthy()?;
-            entry
-                .send_channel
-                .clone()
-                .ok_or_else(|| AgentError::Unhealthy {
-                    reason: "local_send_failed".to_owned(),
-                    detail: Some("agent has no router send channel".to_owned()),
-                })?
+            match entry.send_channel.clone() {
+                Some(channel) => channel,
+                // SPEC-026 REQ-004/REQ-008: an agent still coming up after a
+                // daemon restart has no transport to hand the frame to *yet*.
+                // That is the retryable case, not the dead one — the caller
+                // re-offers and it lands once the join completes.
+                None if entry.state == AgentState::Reconnecting => {
+                    return Err(AgentError::NotReady {
+                        detail: entry.reconnect_detail.clone(),
+                    });
+                }
+                None => {
+                    return Err(AgentError::Unhealthy {
+                        reason: "local_send_failed".to_owned(),
+                        detail: Some("agent has no router send channel".to_owned()),
+                    });
+                }
+            }
         };
 
         let (result_tx, result_rx) = oneshot::channel();
@@ -848,6 +859,57 @@ impl AgentStore {
         entry.reconnect_attempts = attempts;
         entry.reconnect_detail = detail;
         Ok(())
+    }
+
+    /// SPEC-026 REQ-008: register an agent that is being re-established after a
+    /// daemon restart but has not reached the hub yet.
+    ///
+    /// It exists so that "the hub was down when I rebooted" is a *visible,
+    /// self-healing* state rather than a missing agent. Without it, an operator
+    /// restarting into a hub outage would see `agents: 0` — indistinguishable
+    /// from having lost the pairing, which is the failure being fixed.
+    ///
+    /// The entry carries no send channel and no close signal; those arrive with
+    /// the connection. A send against it is refused *retryably*, like any other
+    /// send during a gap.
+    pub async fn insert_reconnecting(
+        &self,
+        handle: AgentHandle,
+        dialects: Vec<String>,
+        wire_id: String,
+        channel: Option<String>,
+        detail: Option<String>,
+    ) -> Result<AgentStatusSnapshot, AgentError> {
+        validate_agent_advertisement(&dialects)?;
+        let mut inner = self.inner.lock().await;
+        let entry = AgentEntry {
+            router_agent_id: wire_id,
+            dialects,
+            state: AgentState::Reconnecting,
+            unhealthy_reason: None,
+            unhealthy_detail: None,
+            reconnect_attempts: 0,
+            reconnect_detail: detail,
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            recv_waiter: None,
+            next_recv_waiter_id: 0,
+            notify: Arc::new(Notify::new()),
+            close_tx: None,
+            send_channel: None,
+            pending_meta_reply: None,
+            store: Arc::new(Mutex::new(ThreadedMessageStore::new())),
+            send_sequencer: Arc::new(Mutex::new(())),
+            dialect_cache: DialectCache::new(),
+            channel,
+        };
+        inner.agents.insert(handle.clone(), entry);
+        inner.active = Some(handle.clone());
+        Ok(inner
+            .agents
+            .get(&handle)
+            .expect("agent was just inserted")
+            .snapshot(&handle))
     }
 
     /// SPEC-026 REQ-001 / CON-003: the socket is back. Clears the reconnect

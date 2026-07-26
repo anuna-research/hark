@@ -54,6 +54,7 @@ async fn signed_hello_is_accepted_by_live_hub() {
         None,
         false,
         false,
+        None,
     )
     .await
     .expect("signed hello accepted + join acknowledged by live hub");
@@ -89,6 +90,7 @@ async fn join_to_unknown_channel_is_rejected() {
         None,
         false,
         false,
+        None,
     )
     .await;
 
