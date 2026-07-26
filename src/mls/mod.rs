@@ -20,6 +20,7 @@
 //! - [`safety`] — identity safety number + epoch state hash (REQ-021/024).
 //! - [`session`] — encryption-mode pin + the chat-session facade (REQ-023).
 
+pub mod claim;
 pub mod group;
 pub mod keypackages;
 pub mod pins;
