@@ -3,7 +3,7 @@ id: SPEC-027
 title: Commit Sequencing — Honouring the Epoch Claim (RFC 9420 §14)
 status: draft
 tier: 1 (MLS group state and admission — cross-model adversarial review AND human security sign-off REQUIRED before merge; green tests are not sufficient)
-version: 0.1.0
+version: 0.1.1
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 5)
 last-updated: 2026-07-27
@@ -199,8 +199,15 @@ defect above; and the corresponding amendment to [[SPEC-061]] REQ-005 in cbcl-bu
 
 **Out of scope.** The election rule itself ([[SPEC-013-mls-private-channels]] REQ-012b decides
 *who* should commit; this decides *that only one does*). Any change to admission — see
-[[#ADR-003]]. The `mls-ds/v1` rooms of [[SPEC-024-mls-ds-v1]], pending [[#OQ-002]]. hark
-redeeming an invitation, which it does not do.
+[[#ADR-003]]. The `mls-ds/v1` rooms of [[SPEC-024-mls-ds-v1]], pending [[#OQ-002]].
+
+hark **redeeming** an invitation is also out of scope, because hark does not do it: it declares
+`groupinfoget` in `src/dialects/hub.cbcl:78` and never sends one. Recorded here rather than
+omitted, because the day that changes two obligations attach at once and neither is obvious
+from hark's own code: `groupinfo-claimed` is a **retry**, distinct from `no-groupinfo`; and per
+cbcl-bus **BUG-022**, the grant MUST NOT be spent until the join is acknowledged — spending it
+early left a joiner that lost the race with no group *and* no grant, permanently unable to
+re-seat.
 
 ## 4. Requirements
 
@@ -485,7 +492,15 @@ Implements: [[#REQ-003]], [[#REQ-004]] · Verified by: [[#TEST-004]], [[#TEST-00
 Techniques: the claim transaction is concurrent state at a trust boundary → **integration
 testing against a real hub** plus **property testing of exclusivity**; the ordering
 requirements are a state machine → **example-based testing with a scripted peer**; the
-cross-stack contract → the existing **SPEC-061 TEST-008 interop harness**, extended.
+cross-stack contract → **two vehicles, because neither alone reaches it**.
+
+**On the cross-stack vehicles, and why there are two.** SPEC-061 TEST-008's harness drives the
+web client from files emitted by hark (`hark emit → $DIR → node join.mjs → hark verify`); there
+is no hub process and no socket in it. It therefore cannot exercise a hub-served claim at all,
+and a test of contention written against it would be verifying nothing. Frame-level agreement is
+what it *can* prove ([[#TEST-009a]]); contention needs the TEST-011 vehicle, which has a real
+WebSocket pipeline ([[#TEST-009b]]). Conflating them is how a cross-stack requirement ends up
+with no cross-stack evidence.
 
 | TEST | Validates | Type | Scenario |
 |------|-----------|------|----------|
@@ -497,7 +512,8 @@ cross-stack contract → the existing **SPEC-061 TEST-008 interop harness**, ext
 | **TEST-006** | [[#REQ-004]], [[#BUG-001]] | positive | After hark commits its own Add, a `(groupinfo …)` for the NEW epoch is emitted. Regression for BUG-001. |
 | **TEST-007** | [[#REQ-006]], [[#CON-001]] | positive + negative-output | Two connections contend: exactly one grant. The loser is granted after the winner's connection dies, and after the epoch advances — but not while the winner lives at that epoch. |
 | **TEST-008** | [[#NFR-001]] | negative-output | Ten consecutive refusals produce one `warn` and a visible status, not a silent eleventh retry. |
-| **TEST-009** | [[#REQ-005]], [[#ADR-003]] | positive | SPEC-061 TEST-008 interop, extended: a hark agent and a web client contend for one epoch; exactly one Commit is admitted, both stacks agree on membership and on the safety number, and the loser retries rather than desyncing. |
+| **TEST-009a** | [[#REQ-005]], [[#CON-001]] | positive | **File-mediated** (the SPEC-061 TEST-008 vehicle): both stacks produce and recognise byte-identical `epochclaim` / `epochgranted` frames. This is all that harness can verify — it has no hub (see below). |
+| **TEST-009b** | [[#REQ-005]], [[#ADR-003]] | positive | **Hub-mediated** (the SPEC-061 TEST-011 vehicle — store level plus a real WebSocket): a hark connection and a web connection contend for one epoch against a running hub; exactly one is granted, the loser is refused with `groupinfo-claimed` and retries, and both stacks agree on membership and on the safety number afterwards. |
 | **TEST-010** | [[#ADR-002]] | positive | A committer in a room with **no** published GroupInfo is granted the claim. This is the case overloading `groupinfoget` would have deadlocked. |
 
 ## 9. Open questions
@@ -562,6 +578,26 @@ this work, and neither is mine to fix unilaterally.
   suite that verifies both a rule and its negation cannot fail on that rule.
 - **CON-003 retains v0.6.0 lease language.** It still reads *"another requester holds an
   **unexpired** claim"*, three paragraphs above the text stating release is never by a clock.
+- **TEST-008's harness passes when it checks nothing, and this one is load-bearing here.**
+  `run-spec061-interop.sh` opens with
+
+  ```bash
+  if [ ! -d "$HARK" ]; then
+    echo "SKIPPED: no hark checkout at $HARK — cross-stack parity NOT checked"
+    exit 0
+  fi
+  ```
+
+  The message is honest and the exit status is not: anything reading the status — CI, a release
+  gate, a person running it in a loop — sees a pass. It is how the harness went unrun against
+  cbcl-bus PR #45 and #46 twice without anyone noticing, which the cbcl-bus side found and
+  reported.
+
+  **Why it matters to this specification and not only to that one.** [[#REQ-005]] says neither
+  stack honours the claim alone, and the *evidence* for that claim is the cross-stack test. A
+  harness that reports success while skipping gives REQ-005 no enforcement whatsoever — the
+  merge gate would be satisfied by a run that checked nothing. Exiting non-zero (or requiring an
+  explicit `SPEC061_ALLOW_SKIP=1`) is a precondition for [[#TEST-009a]] being worth running.
 
 ## 10. Review gate
 
@@ -580,8 +616,16 @@ strength of its own author's confidence.
 ## Changelog
 
 <details>
-<summary>Revision history — 0.1.0</summary>
+<summary>Revision history — 0.1.0 → 0.1.1</summary>
 
+- 0.1.1 — folded a briefing from the cbcl-bus side, after verifying both of its checkable
+  claims against `origin/main`. [[#TEST-009]] was **misspecified** and is split into
+  [[#TEST-009a]] (file-mediated) and [[#TEST-009b]] (hub-mediated): SPEC-061 TEST-008's harness
+  has no hub in it, so contention for a hub-served claim cannot be tested through it, and the
+  original entry named a vehicle that could not carry it. Recorded the harness's silent skip as
+  a defect that undermines [[#REQ-005]]'s enforcement rather than only SPEC-061's, and attached
+  the cbcl-bus BUG-022 discipline to the out-of-scope note on redeeming invitations, so it is
+  not lost the day hark starts doing so.
 - 0.1.0 — initial draft, from `anuna-research/hark#27` (raised from cbcl-bus#44). RFC 9420 §14
   and §3.2 quoted from the published text rather than from the issue. Two things the issue does
   not cover are specified here because §14 raises them: the starvation bound ([[#NFR-001]]) and
