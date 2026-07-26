@@ -444,6 +444,51 @@ impl MlsSession {
         self.persist_meta()
     }
 
+    /// The handles currently seated in this room's ratchet tree, or `None` when
+    /// we hold no group. Read-only, and the counterpart to
+    /// [`MlsSession::safety_numbers`] — a safety number says two members agree on
+    /// a group, this says who is in it. The SPEC-061 interop check needs it,
+    /// because "the frame was Handled" and "the joiner is now a member" are
+    /// different claims and only the second is the one worth making.
+    pub fn member_handles(&self) -> Option<Vec<String>> {
+        let group = self.group.as_ref()?;
+        super::group::member_bindings(group)
+            .ok()
+            .map(|bs| bs.into_iter().map(|(h, _)| h).collect())
+    }
+
+    /// SPEC-061 REQ-005: the `(groupinfo …)` frame for this room's CURRENT epoch,
+    /// or `None` when we hold no group.
+    ///
+    /// This is hark's half of external-Commit admission, and it is the half that
+    /// matters even though an agent is never the party redeeming an invite: a
+    /// joiner needs a `GroupInfo` from *somebody*, so a private channel whose only
+    /// online members are agents could otherwise never admit an invited human at
+    /// all. Publishing is the whole of what an agent has to do — it validates
+    /// external Commits (see `validate_external_commit`) but never mints one.
+    ///
+    /// Single-use, per RFC 9420 §12.4.3.2: "each GroupInfo object can be used for
+    /// one external join, since that external join will cause the epoch to
+    /// change." Hence a fresh one after every merged handshake, and the epoch on
+    /// the wire so the hub — which cannot parse the object — can keep the newest.
+    pub fn group_info_frame(&self) -> Option<String> {
+        use openmls::prelude::tls_codec::Serialize as _;
+        use openmls_traits::OpenMlsProvider as _;
+        let group = self.group.as_ref()?;
+        let gi = group
+            .export_group_info(self.provider.crypto(), &self.identity.signer, true)
+            .ok()?
+            .tls_serialize_detached()
+            .ok()?;
+        Some(format!(
+            "(groupinfo {} :epoch {} :gi \"{}\" :from {})",
+            self.room,
+            group.epoch().as_u64(),
+            B64.encode(gi),
+            self.handle
+        ))
+    }
+
     /// REQ-005 + REQ-023: encrypt one outbound payload as a `deliver :enc
     /// mls` frame, or refuse when failing closed. In a pinned-encrypted
     /// channel there is NO plaintext fallback.
@@ -632,7 +677,15 @@ impl MlsSession {
             }
             Ok(Inbound::Handshake) => {
                 let _ = self.persist_meta();
-                SessionEvent::Handled { outbound: vec![] }
+                // SPEC-061 REQ-005: the epoch just moved, which spends whatever
+                // GroupInfo the room was holding. Publish one for the new epoch,
+                // or a member invited to this channel has nothing to join
+                // against — and if every other member is an agent, nothing to
+                // join against ever. Best-effort: losing one costs a joiner a
+                // retry, so it must never break the handshake path.
+                SessionEvent::Handled {
+                    outbound: self.group_info_frame().into_iter().collect(),
+                }
             }
             Ok(Inbound::Dropped {
                 reason,
