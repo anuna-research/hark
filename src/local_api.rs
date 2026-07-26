@@ -1793,7 +1793,25 @@ async fn rehydrate_one(
     }
 
     let mut schedule = ReconnectSchedule::default();
+    let mut detail = "re-establishing after a daemon restart".to_owned();
     loop {
+        // The operator may close the agent while this loop is still dialling.
+        // Closing removes the store entry; a loop that did not check would win
+        // the race on its next successful attempt and re-register an agent that
+        // was deliberately given up on — a resurrection no amount of closing
+        // could undo. `mark_reconnecting` doubles as the probe: it fails with
+        // `UnknownHandle` exactly when the entry is gone.
+        if agents
+            .mark_reconnecting(&handle, schedule.attempts(), Some(detail.clone()))
+            .await
+            .is_err()
+        {
+            tracing::debug!(
+                agent = handle.as_str(),
+                "the resumed agent was closed while it was being re-established; stopping"
+            );
+            return;
+        }
         match resume_chat_agent(&agents, &chat, &record, handle.clone()).await {
             Ok(()) => {
                 tracing::info!(
@@ -1818,11 +1836,8 @@ async fn rehydrate_one(
                 return;
             }
             Err(error) => {
-                let detail = error.to_string();
+                detail = error.to_string();
                 let delay = schedule.next_delay(rand::random::<f64>());
-                let _ = agents
-                    .mark_reconnecting(&handle, schedule.attempts(), Some(detail.clone()))
-                    .await;
                 tracing::debug!(
                     agent = handle.as_str(),
                     attempt = schedule.attempts(),
@@ -1830,6 +1845,9 @@ async fn rehydrate_one(
                     "resume attempt failed"
                 );
                 tokio::time::sleep(delay).await;
+                // The attempt count and this error are published by the probe
+                // at the top of the loop, which is also where a close is
+                // noticed — one write, one place.
             }
         }
     }

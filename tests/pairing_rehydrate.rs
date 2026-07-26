@@ -187,3 +187,69 @@ fn a_closed_agent_does_not_come_back_on_the_next_start() {
 
     assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
 }
+
+/// SPEC-026 REQ-008/REQ-009 (negative-output) — closing an agent *while it is
+/// still being re-established* must stop the resume, not race it.
+///
+/// The resume loop retries forever by design (ADR-004). If it does not notice
+/// that the operator closed the agent out from under it, it eventually wins the
+/// race and re-registers an agent the operator deliberately gave up on — a
+/// resurrection that no amount of closing can fix.
+#[test]
+fn closing_an_agent_mid_resume_stops_the_resume() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+    // The join succeeds. The first resume attempt hits a hub that accepts and
+    // then stalls, which holds the agent in the resume loop long enough to close
+    // it — and the SECOND resume attempt would succeed, so a loop that does not
+    // notice the close really would resurrect the agent.
+    let hub = runtime.block_on(FakeHub::start_for(
+        vec![
+            Act::Accept { enc: false },
+            Act::Stall,
+            Act::Accept { enc: false },
+        ],
+        "@demo",
+    ));
+    let env = TestEnv::new();
+
+    let join = env
+        .command(["join", "@demo", "--as", "@aria", "--hub", &hub.ws_url()])
+        .output()
+        .expect("join runs");
+    assert_success(&join);
+    let handle = active_handle(&env).expect("the joined agent is the active handle");
+
+    assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
+    assert_success(
+        &env.command(["daemon", "start"])
+            .output()
+            .expect("start runs"),
+    );
+
+    // Wait for the agent to be registered as reconnecting, then close it.
+    let status = await_status(&env, Duration::from_secs(15), |stdout| {
+        stdout.contains("reconnecting")
+    });
+    assert!(status.contains("reconnecting"), "{status}");
+    assert_success(
+        &env.command_with_handle(["close"], &handle)
+            .output()
+            .expect("close runs"),
+    );
+
+    // Past the stalled attempt's join timeout plus a backoff period, so the
+    // third connection — the one that WOULD succeed — has had its chance.
+    std::thread::sleep(Duration::from_secs(15));
+    let status = env
+        .command(["daemon", "status"])
+        .output()
+        .expect("status runs");
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("agents: 0"),
+        "a closed agent must not be resurrected by an in-flight resume: {}",
+        output_debug(&status)
+    );
+
+    assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));
+}

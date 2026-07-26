@@ -125,7 +125,7 @@ hint: IO error: peer closed connection without sending TLS close_notify
 stream `Err` — by marking the handle unhealthy and `break`ing out of the loop; the task then
 ends and nothing respawns it. The behaviour was never specified, so nothing flagged it.
 
-**Resolution.** [[#REQ-001]] … [[#REQ-010]] below, verified by [[#TEST-001]] … [[#TEST-014]].
+**Resolution.** [[#REQ-001]] … [[#REQ-010]] below, verified by [[#TEST-001]] … [[#TEST-016]].
 Regression test: [[#TEST-001b]] asserts the absence of the exact observed symptom.
 
 ## 1. Context
@@ -337,12 +337,19 @@ Preserving the handle is what makes an exported `CBCL_AGENT_HANDLE` survive a da
 
 Trace: [[#TEST-010]], [[#TEST-011]], [[#CON-002]]
 
-### REQ-009 — Closing an agent deletes its record
+### REQ-009 — Closing an agent deletes its record and stops its resume
 
 Closing an agent SHALL delete its pairing record, so that a deliberately closed agent does not
-return on the next daemon start.
+return on the next daemon start, and SHALL stop any re-establishment already in flight for
+that agent.
 
-Trace: [[#TEST-012]], [[#CON-002]]
+The second clause is not redundant with the first. [[#REQ-008]]'s resume loop retries
+indefinitely, so an agent closed *while it is still coming up* would otherwise be re-registered
+by the loop's next successful attempt — a resurrection that no further closing could undo,
+because the record is already gone and the loop is not reading it. Found during
+implementation; see [[#TEST-016]].
+
+Trace: [[#TEST-012]], [[#TEST-016]], [[#CON-002]]
 
 ### REQ-010 — The pairing store is recognised before use
 
@@ -723,6 +730,7 @@ what to do on each.
 | **TEST-012** | [[#REQ-009]] | positive | After closing an agent the store holds no record for it, and a subsequent start creates no agent. |
 | **TEST-013** | [[#REQ-010]] | negative-input | Each of: absent file; non-JSON bytes; `version: 2`; a record missing `channel`; a record whose `channel` fails `validate_chat_handle`; a record whose `dialects` contains an invalid id; a well-formed record *alongside* a malformed one. Each yields **zero** agents and a diagnostic — in particular the last case yields zero, not one. |
 | **TEST-014** | [[#REQ-007]], [[#REQ-010]] | property | Round-trip: for a generated set of valid records, `load(save(records)) == records`. |
+| **TEST-016** | [[#REQ-009]] | negative-output | The hub stalls on the first resume attempt (holding the agent in the loop), the operator closes the agent, and the hub would accept the *second* attempt. The agent must stay closed. Discovered during implementation: without the check the resume wins the race and resurrects it. |
 | **TEST-015** | [[#REQ-001]] (write side), [[#REQ-004]] | positive + negative-output | The hub drops the socket while the agent is emitting. The failing `emit` returns `AgentError::NotReady` — **not** `Unhealthy` — the agent reconnects, and a subsequent `emit` after recovery succeeds. Discovered during implementation: the original REQ-001 named only the read-side ends, which would have left the reported failure intact for an agent that was writing when the hub went away. |
 
 Attribution map π is recorded in the "Validates" column and is total over the requirements in
@@ -748,6 +756,7 @@ Attribution map π is recorded in the "Validates" column and is total over the r
 | TEST-013 | `tests/pairing_store.rs::every_malformed_store_yields_no_records`, `::an_absent_store_is_empty_not_an_error`, `::an_empty_agent_list_is_recognised` |
 | TEST-014 | `tests/pairing_store.rs::the_store_round_trips_every_valid_record_shape` |
 | TEST-015 | `tests/chat_reconnect.rs::a_write_that_fails_on_a_dead_socket_reconnects_and_the_emit_is_retryable` |
+| TEST-016 | `tests/pairing_rehydrate.rs::closing_an_agent_mid_resume_stops_the_resume` |
 | — (harness) | `tests/support/chat_hub.rs`, pinned by `tests/chat_reconnect.rs::fake_hub_drives_the_production_join_path` |
 
 ### Red Gate and mutation evidence
@@ -803,13 +812,17 @@ has its keys is the worse failure.
 <details>
 <summary>Revision history — 0.1.0 → 0.2.0</summary>
 
-- 0.2.0 — implemented (IMPL-026). Two normative changes came out of the implementation, both
+- 0.2.0 — implemented (IMPL-026). Three normative changes came out of the implementation, all
   recorded rather than absorbed: [[#REQ-001]] now names the **write side** explicitly (a
   failed `send` is the same event as a failed read, and fixing only the read side would have
   left the reported failure intact for an agent that was emitting when the hub went away),
   with [[#TEST-015]] added for it; and the test specification gained a location table plus
   the Red-Gate / mutation evidence, so which discipline was applied where is inspectable
-  rather than asserted. One deliberate simplification carries a `// SIMPLIFY:` annotation in
+  rather than asserted. [[#REQ-009]] gained its second clause — closing an agent must also
+  stop a re-establishment already in flight, or the resume loop wins the race and resurrects
+  it ([[#TEST-016]], which was observed reproducing the resurrection before the fix).
+  [[#TEST-005b]] was added for a hub that accepts and then stalls. One deliberate
+  simplification carries a `// SIMPLIFY:` annotation in
   `src/chat.rs` (a resumed agent's placeholder store entry is replaced rather than updated in
   place, traced here via [[#REQ-008]] / [[#ADR-006]]).
 - 0.1.0 — initial draft, from issue #25 (`anuna-research/hark#25`, reported by elf-02) with a
