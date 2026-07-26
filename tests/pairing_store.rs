@@ -64,7 +64,7 @@ fn the_store_round_trips_every_valid_record_shape() {
             wire_handle: "@bo".to_owned(),
             channel: "@general".to_owned(),
             dialects: vec![],
-            cap: None,     // a public channel
+            cap: None,      // a public channel
             added_by: None, // joined directly, not paired in
             receive_all: false,
         },

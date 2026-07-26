@@ -266,3 +266,14 @@
 (claims agent:claude
   :at "2026-07-26T10:52:51Z"
   (given completed-rehydrate))
+
+(claims agent:claude
+  :at "2026-07-26T10:52:55Z"
+  (given claim-v1-docs)
+  (normally r-cl-state-v1-docs claim-v1-docs state-claimed-v1-docs)
+  (normally r-cl-chain-v1-docs state-claimed-v1-docs claimed-docs)
+)
+
+(claims agent:claude
+  :at "2026-07-26T11:01:31Z"
+  (given completed-docs))

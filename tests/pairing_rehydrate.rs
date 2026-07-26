@@ -13,7 +13,7 @@ mod support;
 use std::time::Duration;
 
 use support::chat_hub::{Act, FakeHub};
-use support::{assert_success, output_debug, TestEnv};
+use support::{TestEnv, assert_success, output_debug};
 
 /// The `active: <handle>` line from `hark daemon status`, if any.
 fn active_handle(env: &TestEnv) -> Option<String> {
@@ -99,7 +99,10 @@ fn a_daemon_restart_re_establishes_the_agent_under_the_same_handle() {
 fn a_restart_with_no_hub_keeps_the_agent_and_still_reports_ready() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
     // One connection only: the join succeeds, and every later dial is refused.
-    let hub = runtime.block_on(FakeHub::start_for(vec![Act::Accept { enc: false }], "@demo"));
+    let hub = runtime.block_on(FakeHub::start_for(
+        vec![Act::Accept { enc: false }],
+        "@demo",
+    ));
     let env = TestEnv::new();
 
     let join = env

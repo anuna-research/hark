@@ -121,7 +121,7 @@ impl ReconnectSchedule {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReconnectSchedule, DEFAULT_MAX, DEFAULT_MIN};
+    use super::{DEFAULT_MAX, DEFAULT_MIN, ReconnectSchedule};
     use std::time::Duration;
 
     fn ms(value: u64) -> Duration {

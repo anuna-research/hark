@@ -277,7 +277,7 @@ async fn join_hub(
     // a `roomcfg :enc false` on a pinned-encrypted channel is a refused
     // downgrade and the join fails closed — then publish KeyPackages and
     // the self-signed idkey assertion (REQ-002, REQ-019).
-    if let Some(session) = mls.as_deref_mut() {
+    if let Some(session) = mls.as_mut() {
         session
             .on_roomcfg(&ack)
             .map_err(|e| ChatError::DowngradeRefused(e.to_string()))?;
@@ -340,7 +340,7 @@ async fn join_hub(
     // performative, not inferable from the handle). Sent once, right after
     // the join ack — a failure here is a failed join, not a silent
     // plain-member fallback.
-    let announce = build_announce_frame(channel, agent_handle, &dialects, added_by.as_deref());
+    let announce = build_announce_frame(channel, agent_handle, dialects, added_by.as_deref());
     // Enforce the announce is valid CBCL against the hub dialect the hub *taught*
     // us via its `(meta (define hub …))` advertisement — a real conformance check
     // against the grammar the peer actually declared, catching a malformed
@@ -628,13 +628,19 @@ struct ReceiveLoopArgs {
     join: JoinParams,
 }
 
+/// A replacement connection produced by [`reconnect`].
+struct Reconnected {
+    websocket: ChatSocket,
+    conn: SignedConn,
+}
+
 /// How a reconnect attempt schedule ended ([[SPEC-026 REQ-001]], [[SPEC-026 REQ-005]]).
 enum Recovery {
     /// The re-join succeeded: here is the replacement socket and its signer.
-    Reconnected {
-        websocket: ChatSocket,
-        conn: SignedConn,
-    },
+    /// Boxed because a `ChatSocket` carries the TLS buffers — inlining it would
+    /// make every `Recovery` value, including the two small terminal ones, pay
+    /// for the successful case.
+    Reconnected(Box<Reconnected>),
     /// The agent was closed while the schedule was waiting. A `hark close`
     /// during an outage must not have to wait out the backoff.
     Closed,
@@ -728,10 +734,10 @@ async fn reconnect(
                 for warning in &joined.warnings {
                     tracing::debug!(agent = handle.as_str(), warning, "re-join warning");
                 }
-                return Recovery::Reconnected {
+                return Recovery::Reconnected(Box::new(Reconnected {
                     websocket: joined.websocket,
                     conn: joined.conn,
-                };
+                }));
             }
             // REQ-005(a): the hub gave a verdict. Retrying is a loop against a
             // settled answer — the channel is gone, or this agent is not
@@ -965,12 +971,9 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                 )
                 .await
                 {
-                    Recovery::Reconnected {
-                        websocket: replacement,
-                        conn: signer,
-                    } => {
-                        websocket = replacement;
-                        conn = signer;
+                    Recovery::Reconnected(replacement) => {
+                        websocket = replacement.websocket;
+                        conn = replacement.conn;
                         schedule.reset();
                         let _ = store.mark_connected(&handle).await;
                     }

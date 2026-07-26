@@ -1,9 +1,9 @@
 ---
 id: SPEC-026
 title: Transport Resilience — Hub Reconnect and Durable Pairing
-status: draft
+status: implemented 2026-07-26 (IMPL-026 — all REQs; awaiting the Principle-12 adversarial review before the tier-2 gate closes)
 tier: 2 (the re-join replays a signed-member handshake and re-arms an MLS session; the pairing store holds a channel capability)
-version: 0.1.0
+version: 0.2.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 5)
 last-updated: 2026-07-26
@@ -713,6 +713,7 @@ what to do on each.
 | **TEST-003** | [[#REQ-003]] | positive | On the second connection the fake hub observes, in order: a signed `hello` carrying the original capability, then an `announce` naming the original dialects. |
 | **TEST-004** | [[#REQ-004]], [[#NFR-003]] | negative-output | `emit` during a gap returns `AgentError::NotReady`, **not** `Unhealthy`; the handle remains the active handle; a `recv` outstanding across the gap does not error and receives a message delivered after recovery. |
 | **TEST-005** | [[#REQ-005]]a | negative-input | The fake hub accepts the reconnect's socket and answers the `hello` with `(error @room "forbidden-room")`. The handle goes `unhealthy` with the slug in the detail, and no further attempt is made. |
+| **TEST-005b** | [[#REQ-005]] | negative-output | A hub that accepts the socket and then says nothing — a real deploy state, where the proxy answers before the app is serving — times the join out and is **retried**, not treated as a verdict. Distinguishes "no answer" from "no". |
 | **TEST-006** | [[#REQ-005]]b | negative-input | On an encryption-pinned channel the fake hub answers the reconnect with `roomcfg :enc false`. The handle goes `unhealthy`, downgrade refused, and no further attempt is made. |
 | **TEST-007** | [[#REQ-003]] | negative-output | An agent created with `mls_create = true` does **not** send a second group creation on reconnect: the fake hub sees exactly one group-creating exchange across two connections. |
 | **TEST-008** | [[#REQ-006]], [[#OBS-002]] | positive | During the gap the snapshot reports state `reconnecting` with `reconnect_attempts ≥ 1` and a non-empty `reconnect_detail`; after recovery, `connected` with `reconnect_attempts == 0`. |
@@ -727,7 +728,61 @@ what to do on each.
 Attribution map π is recorded in the "Validates" column and is total over the requirements in
 §4–§5: every REQ and NFR has at least one TEST, and every TEST names at least one REQ.
 
+### Where each TEST lives
+
+| TEST | Location |
+|------|----------|
+| TEST-001, TEST-001b | `tests/chat_reconnect.rs::a_dropped_socket_is_reconnected_and_never_marks_the_handle_unhealthy` |
+| TEST-002 | `src/reconnect.rs` unit tests (five: base schedule, jitter direction, the ceiling property, reset, counters + degenerate bounds) |
+| TEST-003 | `tests/chat_reconnect.rs::the_reconnect_replays_the_hello_with_its_capability_and_the_announce` |
+| TEST-004 | `tests/chat_reconnect.rs::the_handle_stays_usable_across_the_gap`; store half in `src/daemon.rs::reconnecting_is_healthy_for_admission_and_reports_its_progress` |
+| TEST-005 | `tests/chat_reconnect.rs::a_hub_rejection_on_re_join_is_terminal` |
+| TEST-005b | `tests/chat_reconnect.rs::a_hub_that_accepts_but_never_answers_is_retried_not_terminal` |
+| TEST-006 | `tests/chat_reconnect.rs::a_downgraded_re_join_on_a_pinned_channel_is_terminal` |
+| TEST-007 | `tests/chat_reconnect.rs::the_re_join_does_not_recreate_the_mls_group` |
+| TEST-008 | `tests/chat_reconnect.rs::a_reconnecting_agent_reports_its_attempts_and_the_error_that_caused_them` and `::recovery_clears_the_reconnect_progress` |
+| TEST-009 | `tests/pairing_store.rs::a_saved_record_round_trips_and_the_file_is_owner_only`, `::upsert_replaces_rather_than_duplicates` |
+| TEST-010 | `tests/pairing_rehydrate.rs::a_daemon_restart_re_establishes_the_agent_under_the_same_handle` |
+| TEST-011 | `tests/pairing_rehydrate.rs::a_restart_with_no_hub_keeps_the_agent_and_still_reports_ready` |
+| TEST-012 | `tests/pairing_store.rs::removing_one_record_leaves_the_others`; end-to-end in `tests/pairing_rehydrate.rs::a_closed_agent_does_not_come_back_on_the_next_start` |
+| TEST-013 | `tests/pairing_store.rs::every_malformed_store_yields_no_records`, `::an_absent_store_is_empty_not_an_error`, `::an_empty_agent_list_is_recognised` |
+| TEST-014 | `tests/pairing_store.rs::the_store_round_trips_every_valid_record_shape` |
+| TEST-015 | `tests/chat_reconnect.rs::a_write_that_fails_on_a_dead_socket_reconnects_and_the_emit_is_retryable` |
+| — (harness) | `tests/support/chat_hub.rs`, pinned by `tests/chat_reconnect.rs::fake_hub_drives_the_production_join_path` |
+
+### Red Gate and mutation evidence
+
+Constitutional Principle 3 requires tests observed to fail before the
+implementation makes them pass, or mutation testing where strict temporal enforcement was
+impractical. Both were used, and which was used where is recorded rather than glossed:
+
+- **Observed failing first**: [[#TEST-001]], [[#TEST-001b]], [[#TEST-003]] … [[#TEST-008]]
+  (six failures against the pre-fix transport loop, with the exact reported symptom
+  `unhealthy / hub_closed` among them); [[#TEST-010]] and [[#TEST-011]] (both `agents: 0`
+  after a restart — the reported secondary gap); the CON-003 store tests (compile failure,
+  then assertion failures).
+- **Mutation-tested after the fact**, because the implementation and its tests were written
+  together: [[#CON-004]] — 5/5 mutants killed (jitter applied upward, no doubling, `reset`
+  not clearing, `at_ceiling` off-by-one, attempts not advancing). [[#CON-002]] — 6/6 killed
+  (recogniser always accepting, version check removed, **bad records filtered and the rest
+  kept**, store written world-readable, `remove` removing nothing, `upsert` duplicating).
+  The rehydration path — 3/3 killed (close not forgetting the record, rehydration a no-op,
+  an unreachable agent dropped rather than pre-registered).
+
 ## 11. Open questions
+
+### Concept-page deferral (vault hygiene)
+
+This spec introduces ten dead `[[wikilinks]]` — `[[MLS]]`, `[[LangSec]]`,
+`[[Observability Requirement]]`, `[[SPEC-003]]`, `[[SPEC-024-mls-ds-v1]]`, and
+`[[SPEC-055 membership grant]]`. They are **deliberate visible debt**, not oversights: each
+names a load-bearing concept a reader must understand to evaluate the spec, and a plain-text
+mention would leave the vault unable to answer "everything that uses this" via
+`zetl backlinks`. They join the vault's existing concept-page backlog (94 dead links predate
+this spec, on the same convention). **Owner:** hark. **Resolution path:** author the concept
+pages as a vault-wide pass, not per-spec — writing six pages here would leave the other 94
+links dead and this spec's links inconsistent with the rest of the vault. `zetl check
+--fail-on error` is green.
 
 ### OQ-001 — Does re-publishing KeyPackages on every re-join need a ceiling?
 
@@ -746,8 +801,17 @@ has its keys is the worse failure.
 ## Changelog
 
 <details>
-<summary>Revision history — 0.1.0</summary>
+<summary>Revision history — 0.1.0 → 0.2.0</summary>
 
+- 0.2.0 — implemented (IMPL-026). Two normative changes came out of the implementation, both
+  recorded rather than absorbed: [[#REQ-001]] now names the **write side** explicitly (a
+  failed `send` is the same event as a failed read, and fixing only the read side would have
+  left the reported failure intact for an agent that was emitting when the hub went away),
+  with [[#TEST-015]] added for it; and the test specification gained a location table plus
+  the Red-Gate / mutation evidence, so which discipline was applied where is inspectable
+  rather than asserted. One deliberate simplification carries a `// SIMPLIFY:` annotation in
+  `src/chat.rs` (a resumed agent's placeholder store entry is replaced rather than updated in
+  place, traced here via [[#REQ-008]] / [[#ADR-006]]).
 - 0.1.0 — initial draft, from issue #25 (`anuna-research/hark#25`, reported by elf-02) with a
   live incident against `wss://cbcl-bus.fly.dev/chat/v1` on hark 0.1.5. Deviates from the
   issue's suggested fix in one place, recorded and argued in [[#ADR-004]]: the schedule does

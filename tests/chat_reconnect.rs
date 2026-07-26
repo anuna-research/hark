@@ -541,7 +541,10 @@ async fn a_write_that_fails_on_a_dead_socket_reconnects_and_the_emit_is_retryabl
     .await;
     assert_eq!(snapshot.state, AgentState::Connected);
     store
-        .send_outbound(&handle, "(tell @general \"hi again\" :from @aria)".to_owned())
+        .send_outbound(
+            &handle,
+            "(tell @general \"hi again\" :from @aria)".to_owned(),
+        )
         .await
         .expect("the re-offered emit succeeds after recovery");
 }
@@ -622,5 +625,49 @@ async fn recovery_clears_the_reconnect_progress() {
     assert_eq!(
         recovered.reconnect_detail, None,
         "a recovered agent reports no outstanding error"
+    );
+}
+
+/// TEST-005 (SPEC-026 REQ-005, negative-output) — a hub that accepts the socket
+/// and then says nothing is **not** terminal.
+///
+/// This is a real deploy state, not a contrived one: the machine is up and the
+/// proxy is answering before the app is serving. A join that times out must go
+/// back on the schedule; treating "no answer" like "no" would strand the agent
+/// on exactly the transient the schedule exists for.
+#[tokio::test]
+async fn a_hub_that_accepts_but_never_answers_is_retried_not_terminal() {
+    let hub = FakeHub::start(vec![
+        Act::AcceptThenDrop {
+            enc: false,
+            after_frames: 1,
+        },
+        Act::Stall,
+        Act::Accept { enc: false },
+    ])
+    .await;
+    let store = store();
+
+    let (handle, _warnings) = join(store.clone(), &hub).await.expect("the join succeeds");
+
+    // The stalled attempt has to time out (JOIN_TIMEOUT is 10 s) before the
+    // third connection is made, so allow for it generously.
+    assert!(
+        hub.wait_for_connections(3, Duration::from_secs(20)).await,
+        "a stalled hub is retried, not accepted as a verdict; connections={}",
+        hub.connections()
+    );
+    let snapshot = await_snapshot(&store, &handle, Duration::from_secs(10), |snapshot| {
+        snapshot.state == AgentState::Connected
+    })
+    .await;
+    assert_eq!(
+        snapshot.state,
+        AgentState::Connected,
+        "the agent rides out a stalled hub and joins on the next attempt"
+    );
+    assert_eq!(
+        snapshot.unhealthy_reason, None,
+        "a join timeout is a transport failure, not a settled refusal"
     );
 }

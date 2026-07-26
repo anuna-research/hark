@@ -242,7 +242,10 @@ async fn serve(
             {
                 return;
             }
-            if let Act::AcceptThenDrop { after_frames: 0, .. } = act {
+            if let Act::AcceptThenDrop {
+                after_frames: 0, ..
+            } = act
+            {
                 // Drop without a close frame — the TLS-less analogue of the
                 // "peer closed connection without sending close_notify" the
                 // incident report shows.
