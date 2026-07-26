@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+/// A scriptable fake `/chat/v1` hub (SPEC-026 test harness).
+pub mod chat_hub;
+
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},

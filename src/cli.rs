@@ -1304,6 +1304,16 @@ async fn daemon_status() -> AppResult<()> {
                 if let Some(detail) = agent.unhealthy_detail {
                     println!("  unhealthy_detail={detail}");
                 }
+                // SPEC-026 OBS-002: an agent riding out a hub outage. Reported
+                // separately from the unhealthy fields so an operator can tell
+                // "coming back" from "dead" at a glance — the whole point of
+                // giving the gap its own state.
+                if agent.reconnect_attempts > 0 {
+                    println!("  reconnect_attempts={}", agent.reconnect_attempts);
+                }
+                if let Some(detail) = agent.reconnect_detail {
+                    println!("  reconnect_detail={detail}");
+                }
             }
             Ok(())
         }
@@ -1492,6 +1502,8 @@ mod tests {
             unhealthy_reason: None,
             unhealthy_detail: None,
             channel: Some("@research".to_owned()),
+            reconnect_attempts: 0,
+            reconnect_detail: None,
         }
     }
 

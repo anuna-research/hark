@@ -31,6 +31,14 @@ use crate::{
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AgentState {
     Connected,
+    /// SPEC-026 CON-003: the hub socket ended at the transport level and the
+    /// transport loop is re-establishing it on the [`crate::reconnect`]
+    /// schedule. **Healthy for admission** — a `recv` keeps waiting and a send
+    /// still reaches the transport loop, which refuses it as *retryable*. This
+    /// is the state that makes a hub redeploy a blip rather than a bereavement
+    /// (issue #25); marking such a handle [`AgentState::Unhealthy`] is terminal
+    /// and is precisely the defect SPEC-026 exists to fix.
+    Reconnecting,
     Unhealthy,
 }
 
@@ -38,6 +46,7 @@ impl AgentState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Connected => "connected",
+            Self::Reconnecting => "reconnecting",
             Self::Unhealthy => "unhealthy",
         }
     }
@@ -60,6 +69,14 @@ pub struct AgentStatusSnapshot {
     /// The chat channel this agent joined (`@name`); `None` on the router
     /// transport, which has no channel notion.
     pub channel: Option<String>,
+    /// SPEC-026 OBS-002: consecutive failed reconnect attempts. Zero whenever
+    /// the state is not [`AgentState::Reconnecting`]. Kept separate from
+    /// `unhealthy_reason`/`unhealthy_detail`, which retain their terminal-only
+    /// meaning: an operator must be able to tell "coming back" from "dead".
+    pub reconnect_attempts: u32,
+    /// SPEC-026 OBS-002: the transport error that ended the socket, for the
+    /// operator. `None` unless reconnecting.
+    pub reconnect_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -170,6 +187,10 @@ struct AgentEntry {
     state: AgentState,
     unhealthy_reason: Option<String>,
     unhealthy_detail: Option<String>,
+    /// SPEC-026 OBS-002: reconnect progress, meaningful only while the state is
+    /// [`AgentState::Reconnecting`].
+    reconnect_attempts: u32,
+    reconnect_detail: Option<String>,
     queue: VecDeque<QueuedMessage>,
     queued_bytes: usize,
     recv_waiter: Option<RecvWaiterId>,
@@ -487,6 +508,8 @@ impl AgentStore {
             state: AgentState::Connected,
             unhealthy_reason: None,
             unhealthy_detail: None,
+            reconnect_attempts: 0,
+            reconnect_detail: None,
             queue: VecDeque::new(),
             queued_bytes: 0,
             recv_waiter: None,
@@ -803,6 +826,52 @@ impl AgentStore {
         Ok(())
     }
 
+    /// SPEC-026 REQ-001 / CON-003: the agent's socket ended at the transport
+    /// level and the transport loop is re-establishing it.
+    ///
+    /// Deliberately *unlike* [`Self::mark_unhealthy`]: it does not close the
+    /// connection and does not drop a pending meta waiter. The session task is
+    /// still alive and still owns the close signal — tearing that down would
+    /// leave a `hark close` during an outage with nothing to signal.
+    pub async fn mark_reconnecting(
+        &self,
+        handle: &AgentHandle,
+        attempts: u32,
+        detail: Option<String>,
+    ) -> Result<(), AgentError> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        entry.state = AgentState::Reconnecting;
+        entry.reconnect_attempts = attempts;
+        entry.reconnect_detail = detail;
+        Ok(())
+    }
+
+    /// SPEC-026 REQ-001 / CON-003: the socket is back. Clears the reconnect
+    /// progress so the next outage is reported from zero.
+    ///
+    /// Only a reconnecting handle recovers this way. A handle already marked
+    /// [`AgentState::Unhealthy`] stays unhealthy: those transitions are terminal
+    /// by construction (REQ-005), and silently reviving one would let a hub
+    /// rejection be papered over by a later successful connect.
+    pub async fn mark_connected(&self, handle: &AgentHandle) -> Result<(), AgentError> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        if entry.state == AgentState::Unhealthy {
+            return entry.ensure_healthy();
+        }
+        entry.state = AgentState::Connected;
+        entry.reconnect_attempts = 0;
+        entry.reconnect_detail = None;
+        Ok(())
+    }
+
     pub async fn status_snapshots(&self) -> Vec<AgentStatusSnapshot> {
         let inner = self.inner.lock().await;
         let mut snapshots = inner
@@ -986,6 +1055,11 @@ impl AgentEntry {
         self.state = AgentState::Unhealthy;
         self.unhealthy_reason = Some(reason.into());
         self.unhealthy_detail = detail;
+        // Terminal wins over "coming back": a handle that died mid-outage
+        // reports why it died, not how many times it had tried (SPEC-026
+        // CON-003 — the two field pairs never both carry meaning).
+        self.reconnect_attempts = 0;
+        self.reconnect_detail = None;
         // Drop any pending meta waiter on every unhealthy path — including
         // `enqueue_inbound`'s queue-overflow case, which calls us directly
         // without going through `AgentStore::mark_unhealthy`. Without this,
@@ -1012,6 +1086,8 @@ impl AgentEntry {
             unhealthy_reason: self.unhealthy_reason.clone(),
             unhealthy_detail: self.unhealthy_detail.clone(),
             channel: self.channel.clone(),
+            reconnect_attempts: self.reconnect_attempts,
+            reconnect_detail: self.reconnect_detail.clone(),
         }
     }
 }
@@ -1785,6 +1861,100 @@ mod tests {
                 reason: "queue_overflow".to_owned(),
                 detail: None,
             }
+        );
+    }
+
+    /// SPEC-026 CON-003 / TEST-004 (unit half) — a handle whose socket is down
+    /// is `reconnecting`, and `reconnecting` is **healthy for admission**: a
+    /// `recv` keeps waiting and a send still reaches the transport loop. This is
+    /// the load-bearing half of the issue-#25 fix at the store level — the old
+    /// behaviour marked the handle `unhealthy`, which is terminal and is what
+    /// stranded the agent.
+    #[tokio::test]
+    async fn reconnecting_is_healthy_for_admission_and_reports_its_progress() {
+        let store = agent_store(10, 100);
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("agent should insert");
+
+        store
+            .mark_reconnecting(&handle, 3, Some("hub closed the socket".to_owned()))
+            .await
+            .expect("mark_reconnecting should succeed");
+
+        let status = store.status_snapshots().await;
+        assert_eq!(status[0].state, super::AgentState::Reconnecting);
+        assert_eq!(status[0].state.as_str(), "reconnecting");
+        assert_eq!(status[0].reconnect_attempts, 3);
+        assert_eq!(
+            status[0].reconnect_detail.as_deref(),
+            Some("hub closed the socket")
+        );
+        // Negative-output: the terminal fields keep their terminal meaning. A
+        // reconnecting agent is NOT reporting an unhealthy reason.
+        assert_eq!(status[0].unhealthy_reason, None);
+        assert_eq!(status[0].unhealthy_detail, None);
+
+        // A recv against a reconnecting handle waits (and times out) rather than
+        // erroring `Unhealthy` — the gap is a pause, not a death.
+        assert_eq!(
+            store
+                .recv(&handle, Some(std::time::Duration::from_millis(1)))
+                .await
+                .expect_err("an empty queue still times out"),
+            super::AgentError::RecvTimeout,
+        );
+
+        // Recovery clears both the state and the progress fields.
+        store
+            .mark_connected(&handle)
+            .await
+            .expect("mark_connected should succeed");
+        let status = store.status_snapshots().await;
+        assert_eq!(status[0].state, super::AgentState::Connected);
+        assert_eq!(status[0].reconnect_attempts, 0);
+        assert_eq!(status[0].reconnect_detail, None);
+    }
+
+    /// SPEC-026 CON-003 (negative-output) — marking a handle reconnecting must
+    /// not close its connection or drop a pending meta waiter, the two things
+    /// `mark_unhealthy` deliberately does. A reconnect that tore down the
+    /// close-signal would make `hark close` unable to reach the transport loop.
+    #[tokio::test]
+    async fn reconnecting_does_not_tear_the_connection_down() {
+        let store = agent_store(10, 100);
+        let handle = handle();
+        let (close_tx, mut close_rx) = tokio::sync::oneshot::channel();
+        store
+            .insert_connected_with_close_signal(
+                handle.clone(),
+                vec!["elf".to_owned()],
+                Some(close_tx),
+            )
+            .await
+            .expect("agent should insert");
+
+        store
+            .mark_reconnecting(&handle, 1, Some("io error".to_owned()))
+            .await
+            .expect("mark_reconnecting should succeed");
+
+        assert!(
+            matches!(close_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "the close signal must stay armed across a reconnect"
+        );
+
+        // And the transition is still terminal-capable: mark_unhealthy from the
+        // reconnecting state does fire it.
+        store
+            .mark_unhealthy(&handle, "hub_rejected", Some("forbidden-room".to_owned()))
+            .await
+            .expect("mark_unhealthy should succeed");
+        assert!(
+            close_rx.try_recv().is_ok(),
+            "a terminal transition still closes the connection"
         );
     }
 

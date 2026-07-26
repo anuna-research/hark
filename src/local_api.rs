@@ -236,6 +236,20 @@ pub struct AgentStatus {
     /// The chat channel the agent joined; absent on the router transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// SPEC-026 OBS-002: consecutive failed reconnect attempts while `state` is
+    /// `reconnecting`; `0` otherwise. Serialised only when non-zero so a
+    /// connected agent's status is unchanged from before SPEC-026.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reconnect_attempts: u32,
+    /// SPEC-026 OBS-002: the transport error that ended the socket. Present only
+    /// while reconnecting — an operator reads this to tell "coming back" from
+    /// `unhealthy_detail`'s "dead".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_detail: Option<String>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -1022,6 +1036,8 @@ async fn agents(
             unhealthy_reason: snapshot.unhealthy_reason,
             unhealthy_detail: snapshot.unhealthy_detail,
             channel: snapshot.channel,
+            reconnect_attempts: snapshot.reconnect_attempts,
+            reconnect_detail: snapshot.reconnect_detail,
         })
         .collect();
     let active_agent_handle = state
