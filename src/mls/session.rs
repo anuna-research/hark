@@ -112,6 +112,83 @@ pub struct MlsSession {
     present: std::collections::HashSet<String>,
 }
 
+/// The on-disk stem for one agent's MLS state **in one room**.
+///
+/// Keyed on `(wire handle, room)`, not the handle alone. The signing key is
+/// legitimately per-handle — an agent's identity is the same in every channel —
+/// but its MLS *group* state is not: a group, its genesis, its pins and its
+/// consumed-KeyPackage ledger all belong to one room.
+///
+/// Sharing one stem across rooms let a second channel open the first's files,
+/// find a meta naming another room, filter it out as unusable, and then persist
+/// its own over the top — destroying the first channel's `group_id`, `genesis`
+/// and `enc_pinned`. The victim resumed with no group, unable to decrypt
+/// anything, while `hark daemon status` reported it `connected`.
+fn state_stem(file_stem: &str, room: &str) -> String {
+    let room: String = room
+        .trim_start_matches('@')
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let room = if room.is_empty() {
+        "room".to_owned()
+    } else {
+        room
+    };
+    format!("{file_stem}.{room}")
+}
+
+/// The four files (plus the v1 pin directory) that make up one room's state.
+const STATE_SUFFIXES: [&str; 4] = ["mls", "pins", "kpledger", "mlsmeta"];
+
+/// Move pre-per-room state to its per-room stem, once.
+///
+/// Everything written before the keying was fixed lives at `<handle>.*` and
+/// belongs to whichever room its meta names. If that room is this one, it is
+/// this session's state and is moved; if it names another room, it is left
+/// alone for its rightful owner to claim. An unreadable or absent legacy meta
+/// moves nothing — there is no room to attribute it to, and guessing is how the
+/// original bug destroyed state in the first place.
+fn migrate_legacy_state(
+    identity_dir: &Path,
+    file_stem: &str,
+    stem: &str,
+    room: &str,
+) -> Result<(), MlsError> {
+    if identity_dir.join(format!("{stem}.mlsmeta")).exists() {
+        return Ok(()); // already migrated
+    }
+    let legacy_meta = identity_dir.join(format!("{file_stem}.mlsmeta"));
+    let Ok(bytes) = fs::read(&legacy_meta) else {
+        return Ok(());
+    };
+    let owns_this_room = serde_json::from_slice::<SessionMeta>(&bytes)
+        .map(|meta| meta.room == room)
+        .unwrap_or(false);
+    if !owns_this_room {
+        return Ok(());
+    }
+    for suffix in STATE_SUFFIXES {
+        let from = identity_dir.join(format!("{file_stem}.{suffix}"));
+        let to = identity_dir.join(format!("{stem}.{suffix}"));
+        if from.exists() {
+            fs::rename(&from, &to)?;
+        }
+    }
+    let from = identity_dir.join(format!("{file_stem}.v1store"));
+    if from.exists() {
+        fs::rename(&from, identity_dir.join(format!("{stem}.v1store")))?;
+    }
+    tracing::info!(room, stem, "migrated MLS state to its per-room stem");
+    Ok(())
+}
+
 impl MlsSession {
     /// Open (or resume) the session state for `(file_stem, room)` under
     /// `identity_dir`. `pinned_encrypted` is the REQ-023 admission-path /
@@ -125,10 +202,15 @@ impl MlsSession {
         wire: &ChatIdentity,
         pinned_encrypted: bool,
     ) -> Result<Self, MlsError> {
-        let provider = DurableProvider::open(&identity_dir.join(format!("{file_stem}.mls")))?;
-        let pins = PinStore::open(&identity_dir.join(format!("{file_stem}.pins")))?;
-        let ledger = ConsumedLedger::open(&identity_dir.join(format!("{file_stem}.kpledger")))?;
-        let meta_path = identity_dir.join(format!("{file_stem}.mlsmeta"));
+        // The caller passes the per-HANDLE stem (which is also the signing key's).
+        // MLS state is per-(handle, room), so derive it here rather than at each
+        // call site: one place decides, and neither caller can get it wrong.
+        let stem = state_stem(file_stem, room);
+        migrate_legacy_state(identity_dir, file_stem, &stem, room)?;
+        let provider = DurableProvider::open(&identity_dir.join(format!("{stem}.mls")))?;
+        let pins = PinStore::open(&identity_dir.join(format!("{stem}.pins")))?;
+        let ledger = ConsumedLedger::open(&identity_dir.join(format!("{stem}.kpledger")))?;
+        let meta_path = identity_dir.join(format!("{stem}.mlsmeta"));
 
         let meta: Option<SessionMeta> = match fs::read(&meta_path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -202,7 +284,16 @@ impl MlsSession {
         wire: &ChatIdentity,
         pinned_encrypted: bool,
     ) -> Result<Option<Self>, MlsError> {
-        let has_state = identity_dir.join(format!("{file_stem}.mlsmeta")).exists();
+        // State belonging to THIS room — either already at the per-room stem, or
+        // still at the legacy per-handle stem with a meta naming this room.
+        // Keying this on the handle alone handed a public channel a session
+        // merely because some other channel had left state behind.
+        let stem = state_stem(file_stem, room);
+        let has_state = identity_dir.join(format!("{stem}.mlsmeta")).exists()
+            || fs::read(identity_dir.join(format!("{file_stem}.mlsmeta")))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<SessionMeta>(&bytes).ok())
+                .is_some_and(|meta| meta.room == room);
         if !pinned_encrypted && !has_state {
             return Ok(None);
         }
@@ -878,7 +969,19 @@ pub fn offline_safety_numbers(
     file_stem: &str,
     room: &str,
 ) -> Result<(SafetyNumbers, Option<GenesisTrust>), MlsError> {
-    let meta_path = identity_dir.join(format!("{file_stem}.mlsmeta"));
+    // Per-room stem first; fall back to the legacy per-handle one, because this
+    // is a READ path and migration only happens when a session is opened — an
+    // agent that has not reconnected since the fix still has its state there.
+    let stem = state_stem(file_stem, room);
+    let meta_path = identity_dir.join(format!("{stem}.mlsmeta"));
+    let (meta_path, stem) = if meta_path.exists() {
+        (meta_path, stem)
+    } else {
+        (
+            identity_dir.join(format!("{file_stem}.mlsmeta")),
+            file_stem.to_owned(),
+        )
+    };
     let bytes = fs::read(&meta_path).map_err(|e| {
         MlsError::Rejected(format!(
             "no MLS session state at {} ({e}); has this agent joined an encrypted channel?",
@@ -898,7 +1001,7 @@ pub fn offline_safety_numbers(
         .as_deref()
         .and_then(|b| B64.decode(b).ok())
         .ok_or_else(|| MlsError::Rejected("agent has not joined the MLS group yet".into()))?;
-    let provider = DurableProvider::open(&identity_dir.join(format!("{file_stem}.mls")))?;
+    let provider = DurableProvider::open(&identity_dir.join(format!("{stem}.mls")))?;
     use openmls_traits::OpenMlsProvider as _;
     let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
         .map_err(MlsError::stack("load group"))?
@@ -1014,6 +1117,194 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         (dir, ChatIdentity::from_seed([seed; 32]))
+    }
+
+    /// **S1 regression (SPEC-026 review).** Two agents under ONE wire handle in
+    /// two different channels must not share MLS state.
+    ///
+    /// The state files were keyed on the wire handle alone, so the second
+    /// channel's session opened the first's `.mls`/`.pins`/`.kpledger`, found a
+    /// meta naming another room, filtered it out — and then `persist_meta()`
+    /// wrote its own over the top, destroying the first channel's `group_id`,
+    /// `genesis` and `enc_pinned`. The first agent came back with no group,
+    /// unable to decrypt anything, while reporting `connected`.
+    ///
+    /// Harmless-looking before SPEC-026, because a human did the two joins in
+    /// sequence. REQ-008 rehydration spawns one task per record concurrently,
+    /// which turned it into an automatic race whose winner varies per restart.
+    #[test]
+    fn two_channels_under_one_wire_handle_do_not_share_mls_state() {
+        let (dir, wire) = setup("two-rooms", 91, "@aria");
+
+        // The encrypted channel: a real group, pinned.
+        let mut private = MlsSession::open(&dir, "aria", "@priv", "@aria", &wire, true)
+            .expect("private session opens");
+        private
+            .create_group_as_creator()
+            .expect("the creator bootstraps the group");
+        let group_id = private
+            .group
+            .as_ref()
+            .map(|g| g.group_id().as_slice().to_vec())
+            .expect("the private session holds a group");
+        assert!(private.encrypted());
+        drop(private);
+
+        // A second, PUBLIC channel under the same wire handle. Before the fix
+        // this opened the private channel's files and overwrote its meta.
+        let public = MlsSession::open_if_relevant(&dir, "aria", "@pub", "@aria", &wire, false)
+            .expect("opening the public channel does not error");
+        drop(public);
+
+        // The private channel must be exactly as it was left.
+        let resumed = MlsSession::open(&dir, "aria", "@priv", "@aria", &wire, false)
+            .expect("the private session resumes");
+        assert!(
+            resumed.encrypted(),
+            "the encryption pin must survive another channel opening under the same handle"
+        );
+        assert_eq!(
+            resumed
+                .group
+                .as_ref()
+                .map(|g| g.group_id().as_slice().to_vec()),
+            Some(group_id),
+            "the private channel's group must survive: losing it strands the agent \
+             with no way to decrypt, while status still reads `connected`"
+        );
+    }
+
+    /// An unrelated channel must not inherit a session from LEGACY state
+    /// either — the case the per-room test above cannot reach.
+    ///
+    /// `has_state` has to consult the legacy meta's `room`, not merely whether a
+    /// legacy file exists. Checking existence alone is exactly the original bug:
+    /// a public channel is handed a session because some other channel left
+    /// state under the shared handle stem.
+    #[test]
+    fn an_unrelated_channel_does_not_inherit_legacy_state() {
+        let (dir, wire) = setup("no-inherit-legacy", 95, "@aria");
+        {
+            let mut legacy = MlsSession::open(&dir, "aria", "@priv", "@aria", &wire, true)
+                .expect("session opens");
+            legacy.create_group_as_creator().expect("bootstrap");
+        }
+        for suffix in ["mls", "pins", "kpledger", "mlsmeta"] {
+            let per_room = dir.join(format!("aria.priv.{suffix}"));
+            if per_room.exists() {
+                fs::rename(&per_room, dir.join(format!("aria.{suffix}"))).expect("stage legacy");
+            }
+        }
+        assert!(dir.join("aria.mlsmeta").exists(), "legacy state is present");
+
+        assert!(
+            MlsSession::open_if_relevant(&dir, "aria", "@pub", "@aria", &wire, false)
+                .expect("no error")
+                .is_none(),
+            "an unpinned public channel gets no session from another room's legacy state"
+        );
+        assert!(
+            dir.join("aria.mlsmeta").exists(),
+            "and that state is still untouched"
+        );
+    }
+
+    /// Existing agents keep their group across the keying change.
+    ///
+    /// Everything written before this fix is at `<handle>.*`. If migration did
+    /// not happen, every already-paired agent would silently come back with no
+    /// group — the same symptom as the bug, caused by the fix.
+    #[test]
+    fn legacy_per_handle_state_is_migrated_to_its_room() {
+        let (dir, wire) = setup("migrate", 93, "@aria");
+
+        // Lay down state the way a pre-fix build did: at the per-handle stem.
+        {
+            let mut legacy = MlsSession::open(&dir, "aria", "@priv", "@aria", &wire, true)
+                .expect("session opens");
+            legacy.create_group_as_creator().expect("bootstrap");
+        }
+        for suffix in ["mls", "pins", "kpledger", "mlsmeta"] {
+            let per_room = dir.join(format!("aria.priv.{suffix}"));
+            if per_room.exists() {
+                fs::rename(&per_room, dir.join(format!("aria.{suffix}"))).expect("stage legacy");
+            }
+        }
+        assert!(dir.join("aria.mlsmeta").exists(), "staged at the legacy stem");
+
+        let resumed = MlsSession::open(&dir, "aria", "@priv", "@aria", &wire, false)
+            .expect("the legacy session resumes");
+        assert!(
+            resumed.group.is_some(),
+            "a pre-fix agent must keep its group across the keying change"
+        );
+        assert!(resumed.encrypted(), "and its pin");
+        assert!(
+            dir.join("aria.priv.mlsmeta").exists(),
+            "state is moved to the per-room stem, not copied"
+        );
+        assert!(
+            !dir.join("aria.mlsmeta").exists(),
+            "and the legacy path is left empty so it cannot be claimed twice"
+        );
+    }
+
+    /// Migration must NOT take state belonging to another room.
+    ///
+    /// The legacy stem is shared, so the meta's own `room` is the only thing
+    /// that says whose it is. Moving it on any weaker test would hand one
+    /// channel's group to another — the original bug with extra steps.
+    #[test]
+    fn legacy_state_for_another_room_is_left_alone() {
+        let (dir, wire) = setup("migrate-other", 94, "@aria");
+        {
+            let mut legacy = MlsSession::open(&dir, "aria", "@priv", "@aria", &wire, true)
+                .expect("session opens");
+            legacy.create_group_as_creator().expect("bootstrap");
+        }
+        for suffix in ["mls", "pins", "kpledger", "mlsmeta"] {
+            let per_room = dir.join(format!("aria.priv.{suffix}"));
+            if per_room.exists() {
+                fs::rename(&per_room, dir.join(format!("aria.{suffix}"))).expect("stage legacy");
+            }
+        }
+
+        // A DIFFERENT room opens under the same handle.
+        let other = MlsSession::open(&dir, "aria", "@other", "@aria", &wire, true)
+            .expect("the other room opens");
+        assert!(
+            other.group.is_none(),
+            "the other room must not inherit @priv's group"
+        );
+        assert!(
+            dir.join("aria.mlsmeta").exists(),
+            "@priv's legacy state is still there for @priv to claim"
+        );
+
+        // …and @priv can still claim it.
+        let priv_again = MlsSession::open(&dir, "aria", "@priv", "@aria", &wire, false)
+            .expect("@priv resumes");
+        assert!(priv_again.group.is_some(), "@priv still has its group");
+    }
+
+    /// The public channel in the test above must also not be handed a session
+    /// merely because ANOTHER channel left state under the same wire handle.
+    /// `open_if_relevant` keyed `has_state` on the shared stem, so an unpinned
+    /// public join inherited a session it had no business having.
+    #[test]
+    fn an_unrelated_channel_does_not_inherit_a_session_from_the_same_handle() {
+        let (dir, wire) = setup("no-inherit", 92, "@aria");
+        let mut private = MlsSession::open(&dir, "aria", "@priv", "@aria", &wire, true)
+            .expect("private session opens");
+        private.create_group_as_creator().expect("bootstrap");
+        drop(private);
+
+        assert!(
+            MlsSession::open_if_relevant(&dir, "aria", "@pub", "@aria", &wire, false)
+                .expect("no error")
+                .is_none(),
+            "a public channel with no state of its own gets no session"
+        );
     }
 
     /// TEST-023 (REQ-023): the admission-path pin; `roomcfg :enc false` on a
