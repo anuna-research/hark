@@ -293,8 +293,20 @@ Trace: [[#TEST-006]], [[#BUG-001]]
 
 ### REQ-005 — hark declares the capability only when its half is complete
 
-hark SHALL NOT advertise the `epoch-claim/v1` capability on its `hello` until its own claim
-handling is implemented and reviewed.
+hark SHALL NOT advertise the epoch-protocol capability on its `hello` until its own claim handling
+is implemented and reviewed.
+
+**The capability name is the content digest of the `mls-epoch` grammar**, computed by hark from
+the bytes it holds — `ae36fe37…` for the current grammar — not a version string it asserts. Two
+stacks can both write `v1` and mean different things; two cannot both present the same SHA-256 and
+mean different things. Because it is computed rather than told, there is no bootstrap frame to
+trust and nothing to spoof.
+
+The consequence is deliberate and worth stating where an implementer will see it: **editing that
+grammar is a protocol change.** Even a comment alters the digest, which empties the room's
+capability intersection and deactivates the mechanism everywhere until both stacks carry the new
+bytes. That is fail-closed and correct, and it is *silent* — which is why hark carries the grammar
+as a fixture under a drift guard rather than trusting its copy to stay current.
 
 *Reduced.* This began as "neither stack ships alone", enforced as a merge gate. That was the wrong
 mechanism and [[SPEC-063-one-committer-per-epoch]] REQ-006 replaces it with the right one: the hub
@@ -573,7 +585,11 @@ What hark relies on from that contract, and would need re-checking if it changed
   the holder ([[#REQ-014]]);
 - a contended refusal is a **retry**, distinct from `epoch-claim-inactive`, which is not
   ([[#REQ-002]]);
-- a claim can be released without spending it ([[#REQ-016]]).
+- a claim can be released without spending it ([[#REQ-016]]);
+- every verb carries the `:token` that proves holdership, the hub mints it on a first claim, and
+  arming and releasing are matched on it ([[#REQ-012]] — it is what survives a restart);
+- refusals are three classes, not two: contention, "you hold no claim", and "the room has not
+  activated this" ([[#REQ-002]]).
 
 Verified by: [[#TEST-011]], and cross-stack by SPEC-063's own interop tests.
 
@@ -642,7 +658,7 @@ nothing, which is what an earlier revision of this section specified.
 | **TEST-002b** | [[#REQ-002]], [[#NFR-001]] | negative-output | `epoch-claim-inactive` is **not** retried on the schedule and does **not** consume the starvation budget. Collapsing the two refusals into one turns a rollout into a hot loop and reports a room as starved when nothing is contending. **Implemented and mutation-checked.** |
 | **TEST-003** | [[#REQ-002]] | positive | After a refusal, the epoch advances (another member commits); the retry is granted and succeeds against the new epoch. |
 | **TEST-004** | [[#REQ-003]] | negative-output | A Commit that is never accepted produces **no** `welcome` frame, ever. |
-| **TEST-005** | [[#REQ-003]], [[#REQ-005]] | positive | On acceptance, the `welcome` is emitted, and not before the `deliver`. hark does not advertise `epoch-claim/v1` until its half is complete. |
+| **TEST-005** | [[#REQ-003]], [[#REQ-005]] | positive | On acceptance, the `welcome` is emitted, and not before the `deliver`. hark's declared capability equals the hub's digest for the same grammar bytes, and is not advertised until its half is complete. **Digest pinned and mutation-checked.** |
 | **TEST-006** | [[#REQ-004]], [[#BUG-001]] | positive | After hark commits its own Add, a `(groupinfo …)` for the NEW epoch is emitted. Regression for BUG-001. |
 | **TEST-007** | [[#REQ-006]], [[#CON-001]] | positive + negative-output | Two connections contend: exactly one grant. The loser is granted after the winner's connection dies, and after the epoch advances — but not while the winner lives at that epoch. |
 | **TEST-008** | [[#NFR-001]] | negative-output | Ten consecutive refusals produce one `warn` and a visible status, not a silent eleventh retry. |

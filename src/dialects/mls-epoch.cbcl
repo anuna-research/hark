@@ -1,0 +1,49 @@
+;; mls-epoch — the verbs by which a client obtains the right to MOVE a group's
+;; epoch, and the object it needs to move it (SPEC-061, SPEC-063).
+;;
+;; SEPARATE FROM hub.cbcl ON PURPOSE, and the separation is load-bearing rather
+;; than tidiness. THIS FILE'S BYTES ARE THE PROTOCOL VERSION: it is
+;; content-addressed into the dialect store like every other grammar here
+;; (SPEC-015 REQ-001), and its sha256 IS the capability name a client declares to
+;; say it implements this protocol (SPEC-063 CON-004). Two stacks that both claim
+;; "v1" can mean different things; two stacks presenting the same digest cannot.
+;;
+;; CONSEQUENCES, both intended:
+;;   - Editing this file is a PROTOCOL CHANGE. A comment fix changes the digest,
+;;     which deactivates the mechanism in every mixed room until both stacks carry
+;;     the new bytes. That is fail-closed and correct, but it means prose belongs
+;;     in SPEC-063, not here. Keep this file to the grammar.
+;;   - A client cannot declare the capability without holding these exact bytes,
+;;     so it can compute the digest itself rather than being told one — no
+;;     bootstrap frame, no trusted announcement.
+;;
+;; Everything about WHY lives in SPEC-063-one-committer-per-epoch. RFC 9420 §14
+;; requires an established rule for conflicting Commits in one epoch; §3.2 says a
+;; committer holding a promise from an orchestration server may advance its state
+;; without waiting for its own Commit back. These verbs are that promise.
+;;
+;; `epochgranted` is HUB-ORIGINATED: a member that sends one is refused at ingress
+;; and it is never fanned (SPEC-063 REQ-005). It is declared here so an agent
+;; learns its shape from the grammar it already holds.
+
+(define mls-epoch (cbcl) @cbcl-chat
+  (:resource-requirements ((max-depth 8) (max-expansion-size 512) (verification-time 10)))
+
+  ;; --- SPEC-061: the object an external joiner needs (RFC 9420 §12.4.3.2) ---
+  (extend groupinfo (epoch gi)
+    (tell @room (mls-group-info :epoch epoch :gi gi)))
+  (extend groupinfoget ()
+    (tell @room (mls-group-info-request)))
+
+  ;; --- SPEC-063: one committer per epoch ---
+  ;; `epochclaim` reserves; `epocharm` turns the reservation into the promise and
+  ;; is what a client MUST hold before it merges; `epochrelease` ends it, once the
+  ;; Commit has been echoed AND any deferred Welcome sent.
+  (extend epochclaim (epoch token)
+    (tell @room (mls-epoch-claim :epoch epoch :token token)))
+  (extend epocharm (epoch token)
+    (tell @room (mls-epoch-arm :epoch epoch :token token)))
+  (extend epochrelease (epoch token)
+    (tell @room (mls-epoch-release :epoch epoch :token token)))
+  (extend epochgranted (epoch token state)
+    (tell @room (mls-epoch-granted :epoch epoch :token token :state state))))

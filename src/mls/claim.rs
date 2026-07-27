@@ -20,11 +20,16 @@
 
 use cbcl_core::sexpr::{Atom, SExpr};
 
-/// The error slug the hub answers a contended claim with. Deliberately the same
-/// slug `groupinfoget` already uses: both verbs contend for one claim, because
-/// an external joiner and a member committer both move the epoch and must
-/// therefore exclude each other.
-pub const CLAIMED_SLUG: &str = "groupinfo-claimed";
+/// Contention on the EPOCH path. Deliberately distinct from `groupinfo-claimed`,
+/// which is the same underlying claim refusing a *joiner* — a client that cannot
+/// tell which mechanism refused it cannot tell what to do about it.
+pub const CLAIMED_SLUG: &str = "epoch-claimed";
+
+/// The requester holds no claim to arm or release. **Not** a retry: it means
+/// take a claim first. A client that conflates this with contention either
+/// spins waiting for a holder that does not exist, or gives up on a claim it
+/// could simply have taken.
+pub const NO_CLAIM_SLUG: &str = "epoch-no-claim";
 
 /// The hub's refusal when the room has not activated `epoch-claim/v1` — the
 /// capability is not unanimous across present members
@@ -51,18 +56,33 @@ pub enum ClaimState {
     Armed,
 }
 
-/// A grant the hub issued: the epoch it covers and the state it is in.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// A grant the hub issued: the epoch it covers, the token that proves
+/// holdership, and the state it is in.
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Grant {
     pub epoch: u64,
+    /// **The thing that survives a restart.** A returning committer has a new
+    /// process and a new connection, so the token is the only evidence tying it
+    /// to what it reserved — and `epocharm` is available *only* to the holder,
+    /// matched by token. Losing it means losing the claim and the promise with
+    /// it, which is why it belongs in the durable operation record
+    /// ([[SPEC-027 REQ-012]]) and not merely in memory.
+    pub token: String,
     pub state: ClaimState,
 }
 
 /// How to treat a refusal ([[SPEC-027 REQ-002]]).
+///
+/// Three classes, not two, and they are distinguished by **what makes each one
+/// clear** — which is the only thing a retry loop can act on.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Refusal {
     /// Another committer holds the epoch. It will clear; retry on the schedule.
     Contended,
+    /// We hold no claim to arm or release. Clears immediately by taking one —
+    /// so it is neither a wait nor a failure, and treating it as either is a
+    /// spin or a needless abandonment.
+    NoClaim,
     /// The room has not activated the capability. Retrying cannot help — this
     /// clears on a membership change, not with time — so it must NOT consume
     /// the retry schedule or the starvation budget.
@@ -81,9 +101,59 @@ pub enum Refusal {
 pub const REFUSAL_BUDGET: u32 = 10;
 
 /// The claim request for `room` at `epoch`, sent by `from`.
-pub fn epochclaim_frame(room: &str, epoch: u64, from: &str) -> String {
-    format!("(epochclaim {room} :epoch {epoch} :from {from})")
+///
+/// `token` is `None` on a first claim — the hub mints one and returns it in the
+/// grant — and `Some` when reacquiring, which is the path that matters: after a
+/// restart the process and the connection are both new, and the token is the
+/// only thing that identifies us as the existing holder rather than a rival.
+pub fn epochclaim_frame(room: &str, epoch: u64, from: &str, token: Option<&str>) -> String {
+    epoch_frame("epochclaim", room, epoch, from, token)
 }
+
+/// Turn a reservation into the promise ([[SPEC-063]] REQ-007). Requires the
+/// token: arming is available only to the holder, and the hub matches on it.
+pub fn epocharm_frame(room: &str, epoch: u64, from: &str, token: &str) -> String {
+    epoch_frame("epocharm", room, epoch, from, Some(token))
+}
+
+/// End the claim, once the Commit has been echoed AND any deferred Welcome
+/// sent ([[SPEC-027 REQ-014]]).
+pub fn epochrelease_frame(room: &str, epoch: u64, from: &str, token: &str) -> String {
+    epoch_frame("epochrelease", room, epoch, from, Some(token))
+}
+
+fn epoch_frame(verb: &str, room: &str, epoch: u64, from: &str, token: Option<&str>) -> String {
+    match token {
+        Some(token) => format!("({verb} {room} :epoch {epoch} :token \"{token}\" :from {from})"),
+        None => format!("({verb} {room} :epoch {epoch} :from {from})"),
+    }
+}
+
+/// The capability name hark declares to say it implements the epoch protocol:
+/// the lowercase-hex SHA-256 of the `mls-epoch` grammar, computed from the bytes
+/// hark itself holds ([[SPEC-063]] CON-004).
+///
+/// Not a hand-written version string. Two stacks can both write `v1` and mean
+/// different things; two stacks cannot both present the same digest and mean
+/// different things. And because the digest is computed rather than told, there
+/// is no bootstrap frame to trust and nothing to spoof.
+///
+/// The sharp edge, which is deliberate: **editing that file is a protocol
+/// change.** Even a comment changes the digest, which empties the capability
+/// intersection and deactivates the mechanism in every mixed room until both
+/// stacks carry the new bytes. Fail-closed, and silent unless something checks —
+/// which is what `mls_epoch_fixture_matches_the_canonical_cbcl_bus_grammar`
+/// is for.
+pub fn capability_name() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(EPOCH_GRAMMAR);
+    format!("{:x}", hasher.finalize())
+}
+
+/// The grammar whose digest is the capability. Byte-identical to the hub's
+/// canonical copy, enforced by a drift guard in `tests/join_cli.rs`.
+pub const EPOCH_GRAMMAR: &[u8] = include_bytes!("../dialects/mls-epoch.cbcl");
 
 /// The grant an `(epochgranted @room :epoch N :state claimed|armed)` frame
 /// carries, if `text` is one for `room` **and the hub is the party that said
@@ -138,6 +208,7 @@ pub fn granted(text: &str, room: &str) -> Option<Grant> {
         return None;
     }
     let mut epoch: Option<u64> = None;
+    let mut token: Option<String> = None;
     let mut state: Option<ClaimState> = None;
     let mut index = 2;
     while index + 1 < items.len() {
@@ -145,6 +216,10 @@ pub fn granted(text: &str, room: &str) -> Option<Grant> {
             match (keyword.as_str(), items.get(index + 1)) {
                 ("epoch", Some(SExpr::Atom(Atom::Num(value)))) if *value >= 0 => {
                     epoch = Some(*value as u64);
+                }
+                ("token", Some(SExpr::Atom(Atom::Str(value))))
+                | ("token", Some(SExpr::Atom(Atom::Symbol(value)))) => {
+                    token = Some(value.clone());
                 }
                 ("state", Some(SExpr::Atom(Atom::Symbol(word))))
                 | ("state", Some(SExpr::Atom(Atom::Str(word)))) => {
@@ -163,6 +238,7 @@ pub fn granted(text: &str, room: &str) -> Option<Grant> {
     }
     Some(Grant {
         epoch: epoch?,
+        token: token?,
         state: state?,
     })
 }
@@ -174,6 +250,7 @@ pub fn granted(text: &str, room: &str) -> Option<Grant> {
 pub fn refusal(text: &str, room: &str) -> Option<Refusal> {
     match error_slug_for(text, room).as_deref() {
         Some(CLAIMED_SLUG) => Some(Refusal::Contended),
+        Some(NO_CLAIM_SLUG) => Some(Refusal::NoClaim),
         Some(INACTIVE_SLUG) => Some(Refusal::Inactive),
         _ => None,
     }
@@ -234,11 +311,57 @@ mod tests {
     /// the epoch it is claiming, which is the whole content of the promise.
     #[test]
     fn the_request_names_the_room_epoch_and_sender() {
-        let frame = epochclaim_frame("@research", 7, "@aria");
-        assert_eq!(frame, "(epochclaim @research :epoch 7 :from @aria)");
+        // First claim: no token yet — the hub mints one and returns it.
+        let first = epochclaim_frame("@research", 7, "@aria", None);
+        assert_eq!(first, "(epochclaim @research :epoch 7 :from @aria)");
+
+        // Reacquisition: the token is the ONLY thing tying a new process and a
+        // new connection to what it already reserved.
+        let again = epochclaim_frame("@research", 7, "@aria", Some("deadbeef"));
+        assert_eq!(
+            again,
+            "(epochclaim @research :epoch 7 :token \"deadbeef\" :from @aria)"
+        );
+
+        // Arming and releasing are holder-only, so both always carry it.
+        assert_eq!(
+            epocharm_frame("@research", 7, "@aria", "deadbeef"),
+            "(epocharm @research :epoch 7 :token \"deadbeef\" :from @aria)"
+        );
+        assert_eq!(
+            epochrelease_frame("@research", 7, "@aria", "deadbeef"),
+            "(epochrelease @research :epoch 7 :token \"deadbeef\" :from @aria)"
+        );
+
+        for frame in [first, again] {
+            assert!(
+                cbcl_parser::parse(&frame).is_ok(),
+                "every claim frame must be valid CBCL or the hub will not parse it"
+            );
+        }
+    }
+
+    /// SPEC-063 CON-004 — the capability is the grammar's digest, computed from
+    /// the bytes hark holds rather than from a version string it asserts.
+    ///
+    /// Pinned against the hub's canonical value. If this fails, hark and the hub
+    /// disagree about what "implements the epoch protocol" means, and the
+    /// consequence is *silence*: the room's capability intersection empties and
+    /// the mechanism deactivates rather than misbehaving.
+    #[test]
+    fn the_capability_is_the_epoch_grammar_digest() {
+        assert_eq!(
+            capability_name(),
+            "ae36fe37a70e714e9159a532c14c2ed2395b76b795b0c5d27fa950c9cde43e80",
+            "hark's declared capability must equal the hub's \
+             cbcl-chat-dialects:epoch-dialect-digest for the same bytes"
+        );
+        assert_eq!(capability_name().len(), 64, "lowercase hex sha256");
         assert!(
-            cbcl_parser::parse(&frame).is_ok(),
-            "the claim must be valid CBCL or the hub will not parse it"
+            capability_name()
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "lowercase, matching the hub's binary:encode_hex(_, 'lowercase)"
         );
     }
 
@@ -247,26 +370,33 @@ mod tests {
     #[test]
     fn a_grant_for_this_room_yields_its_epoch_and_state() {
         assert_eq!(
-            granted("(epochgranted @research :epoch 7 :state claimed)", "@research"),
+            granted(
+                "(epochgranted @research :epoch 7 :token \"ab12\" :state claimed)",
+                "@research"
+            ),
             Some(Grant {
                 epoch: 7,
+                token: "ab12".to_owned(),
                 state: ClaimState::Claimed
             })
         );
         assert_eq!(
-            granted("(epochgranted @research :epoch 7 :state armed)", "@research"),
+            granted(
+                "(epochgranted @research :epoch 7 :token \"ab12\" :state armed)",
+                "@research"
+            ),
             Some(Grant {
                 epoch: 7,
+                token: "ab12".to_owned(),
                 state: ClaimState::Armed
             })
         );
+        // A grant with no token is not usable: arming and releasing are
+        // holder-only and matched on it, so we could never do either.
         assert_eq!(
-            granted("(epochgranted @research :epoch 0 :state claimed)", "@research"),
-            Some(Grant {
-                epoch: 0,
-                state: ClaimState::Claimed
-            }),
-            "epoch zero is a real epoch — a group's first"
+            granted("(epochgranted @research :epoch 7 :state armed)", "@research"),
+            None,
+            "a tokenless grant cannot be armed or released, so it is not a grant"
         );
     }
 
@@ -279,7 +409,7 @@ mod tests {
     #[test]
     fn the_state_comes_from_the_frame_not_from_the_request() {
         let reacquired = granted(
-            "(epochgranted @research :epoch 7 :state armed)",
+            "(epochgranted @research :epoch 7 :token \"ab12\" :state armed)",
             "@research",
         )
         .expect("a reacquisition is a grant");
@@ -290,11 +420,17 @@ mod tests {
         );
 
         // A grant with no state is not a grant: there is nothing to gate on.
-        assert_eq!(granted("(epochgranted @research :epoch 7)", "@research"), None);
+        assert_eq!(
+            granted("(epochgranted @research :epoch 7 :token \"ab12\")", "@research"),
+            None
+        );
         // Nor is an unrecognised state — guessing is how a client merges on
         // something it does not understand.
         assert_eq!(
-            granted("(epochgranted @research :epoch 7 :state pending)", "@research"),
+            granted(
+                "(epochgranted @research :epoch 7 :token \"ab12\" :state pending)",
+                "@research"
+            ),
             None
         );
     }
@@ -309,11 +445,11 @@ mod tests {
     #[test]
     fn a_member_authored_grant_is_not_a_grant() {
         for forged in [
-            "(epochgranted @research :epoch 7 :state armed :from @mallory)",
-            "(epochgranted @research :from @mallory :epoch 7 :state armed)",
+            "(epochgranted @research :epoch 7 :token \"ab12\" :state armed :from @mallory)",
+            "(epochgranted @research :from @mallory :epoch 7 :token \"ab12\" :state armed)",
             // Our own handle confers nothing: provenance is about the hub, not
             // about who looks friendly.
-            "(epochgranted @research :epoch 7 :state armed :from @aria)",
+            "(epochgranted @research :epoch 7 :token \"ab12\" :state armed :from @aria)",
         ] {
             assert_eq!(
                 granted(forged, "@research"),
@@ -322,7 +458,11 @@ mod tests {
             );
         }
         assert!(
-            granted("(epochgranted @research :epoch 7 :state armed)", "@research").is_some(),
+            granted(
+                "(epochgranted @research :epoch 7 :token \"ab12\" :state armed)",
+                "@research"
+            )
+            .is_some(),
             "and the genuine hub frame, which carries no :from, still works"
         );
     }
@@ -333,22 +473,28 @@ mod tests {
     #[test]
     fn a_grant_for_another_room_is_not_a_grant() {
         assert_eq!(
-            granted("(epochgranted @other :epoch 7 :state armed)", "@research"),
-            None
-        );
-        assert_eq!(
             granted(
-                "(tell @research \"epochgranted\" :epoch 7 :state armed)",
+                "(epochgranted @other :epoch 7 :token \"ab12\" :state armed)",
                 "@research"
             ),
             None
         );
         assert_eq!(
-            granted("(epochgranted @research :state armed)", "@research"),
+            granted(
+                "(tell @research \"epochgranted\" :epoch 7 :token \"ab12\" :state armed)",
+                "@research"
+            ),
             None
         );
         assert_eq!(
-            granted("(epochgranted @research :epoch -1 :state armed)", "@research"),
+            granted("(epochgranted @research :token \"ab12\" :state armed)", "@research"),
+            None
+        );
+        assert_eq!(
+            granted(
+                "(epochgranted @research :epoch -1 :token \"ab12\" :state armed)",
+                "@research"
+            ),
             None,
             "a negative epoch is malformed, not epoch 0"
         );
@@ -365,8 +511,19 @@ mod tests {
     #[test]
     fn refusals_are_classified_by_what_makes_them_clear() {
         assert_eq!(
-            refusal("(error @research \"groupinfo-claimed\")", "@research"),
+            refusal("(error @research \"epoch-claimed\")", "@research"),
             Some(Refusal::Contended)
+        );
+        assert_eq!(
+            refusal("(error @research \"epoch-no-claim\")", "@research"),
+            Some(Refusal::NoClaim),
+            "no-claim clears by taking a claim — neither a wait nor a failure"
+        );
+        // The JOINER path's contention slug is a different mechanism refusing a
+        // different thing, and must not be read as an epoch refusal.
+        assert_eq!(
+            refusal("(error @research \"groupinfo-claimed\")", "@research"),
+            None
         );
         assert_eq!(
             refusal("(error @research \"epoch-claim-inactive\")", "@research"),
@@ -374,7 +531,7 @@ mod tests {
         );
         // Another room's refusal is not ours.
         assert_eq!(
-            refusal("(error @other \"groupinfo-claimed\")", "@research"),
+            refusal("(error @other \"epoch-claimed\")", "@research"),
             None
         );
         // And an unrelated error is neither.
