@@ -15,8 +15,14 @@
 //! response disagreeing with a saved pin is ds-key-substitution / anchor conflict and
 //! stops the loop with evidence logged.
 //!
-//! Reconnect: the DS socket rides hub restarts with the same bounded backoff the chat
-//! socket uses — the durable cursor makes resume trivial (re-pull from where we were).
+//! Reconnect: the DS socket rides hub restarts on bounded exponential backoff — the durable
+//! cursor makes resume trivial (re-pull from where we were). The chat socket now does the
+//! same (SPEC-026), but on a *different* envelope: 1s→15s with 25% downward jitter, matching
+//! the browser client, against this loop's 1s→30s unjittered. That is deliberate, not drift
+//! (SPEC-026 ADR-002) — a DS pull that lags a few extra seconds costs only latency against an
+//! immutable, cursor-addressed log, whereas a chat member that lags is a member the room
+//! cannot reach. This loop is also per *agent*, not per *connection*: a chat reconnect does
+//! not respawn it, and it keeps pulling across a chat outage.
 //!
 //! NOT here yet (documented gaps, closed with the hub's real record schema): Add-auth
 //! evidence (`boundary::validate_v1_commit`) — the interim `log-v1` record carries no

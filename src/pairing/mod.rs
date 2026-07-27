@@ -15,6 +15,7 @@ pub mod bip39;
 pub mod client;
 pub mod record;
 pub mod spake2;
+pub mod store;
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,

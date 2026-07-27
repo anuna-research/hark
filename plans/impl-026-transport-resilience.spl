@@ -1,0 +1,279 @@
+;; IMPL-026 — Transport Resilience: hub reconnect + durable pairing
+;; Plan for specs/SPEC-026-transport-resilience.md (issue anuna-research/hark#25).
+;;
+;; Two halves, both required for the recovery story to close:
+;;   A. the chat transport reconnects instead of dying (REQ-001..REQ-006)
+;;   B. the pairing survives a daemon restart      (REQ-007..REQ-010)
+;;
+;; Red Gate: every task's test is written and observed to FAIL before the
+;; implementation makes it pass. The acceptance strings below are lifted from the
+;; SPEC-026 TEST-### entries, not invented here.
+;;
+;; Work lands entirely in this repo: src/chat.rs, src/daemon.rs, src/local_api.rs,
+;; src/cli.rs, src/pairing/, tests/chat_reconnect.rs, tests/pairing_store.rs.
+
+(meta plan
+  (id "IMPL-026")
+  (title "hark transport resilience")
+  (version "0.1.0")
+  (status "draft")
+  (created "2026-07-26")
+  (author "agent:claude")
+  (spec "SPEC-026")
+  (description "Make a cbcl-bus hub redeploy a blip rather than a bereavement: the /chat/v1 transport reconnects on a bounded jittered schedule and replays the signed-member join, the agent handle stays usable across the gap, a reconnecting agent is visible in daemon status, and the pairing record is durable so a daemon restart re-establishes every agent without a human."))
+
+;; ---------------------------------------------------------------- agents
+(given agent-claude-available)
+
+;; ---------------------------------------------------------------- tasks
+(given task-fake-hub)
+(given task-schedule)
+(given task-state)
+(given task-join-extract)
+(given task-reconnect)
+(given task-observability)
+(given task-store)
+(given task-persist)
+(given task-rehydrate)
+(given task-docs)
+
+(meta task-fake-hub
+  (description "TEST harness. A scriptable /chat/v1 fake hub in tests/support: a real tokio-tungstenite server on 127.0.0.1:0 speaking the genuine framing (u32be len || payload || 64-byte sig), following the tests/ds_socket_interop.rs precedent. Per connection the script says what to do: send the conn-nonce bootstrap, then either acknowledge (roomcfg, with a settable :enc and dialect menu), reject ((error @room \"slug\")), or drop the socket. It records every payload it received, per connection, so a test can assert the re-join replayed the hello + announce. No mocking of hark's own code (Constitutional Principle 5).")
+  (acceptance "The harness drives the EXISTING create_chat_agent to a successful join over a real socket, and the recorded transcript for connection 1 contains a signed hello followed by an announce. This is the harness's own smoke test and must pass before any resilience task uses it."))
+
+(meta task-schedule
+  (description "SPEC-026 CON-004. A pure ReconnectSchedule in src/chat.rs (or a small sibling module): new(min,max,jitter) / default() = (1s, 15s, 0.25), next_delay(random) advancing base = min(base*2, max) from min, jitter applied DOWNWARD so a delay never exceeds the ceiling, reset(), attempts(), at_ceiling(). Mirrors cbcl-bus apps/cbcl_chat/priv/web/chat-reconnect.mjs createBackoff, including the injected random so the spread is exact under test. No I/O, no async: the pure core of the Purity Boundary Map.")
+  (acceptance "TEST-002. Positive: bases run 1000,2000,4000,8000,15000,15000; random=0.0 gives delay==base; random->1.0 gives 75% of base; reset() returns the base to 1000; attempts() counts; at_ceiling() flips exactly at 15000. Negative-output: for random sampled across [0,1) no delay exceeds 15000ms or is negative. Written and observed failing first."))
+
+(meta task-state
+  (description "SPEC-026 CON-003. AgentState gains Reconnecting (as_str \"reconnecting\"), which is HEALTHY for admission: ensure_healthy() must keep rejecting only Unhealthy, so recv keeps waiting and send_outbound still reaches the transport loop. AgentStore gains mark_reconnecting(handle, attempts, detail) and mark_connected(handle) (clears attempts + detail, returns the state to Connected). AgentStatusSnapshot gains reconnect_attempts: u32 and reconnect_detail: Option<String>. unhealthy_reason/unhealthy_detail keep their current terminal-only meaning — they are NOT reused for the reconnecting state.")
+  (acceptance "TEST-004 unit half + TEST-008 unit half. Positive: after mark_reconnecting the snapshot state is \"reconnecting\" with the attempt count and detail, and ensure_healthy() still succeeds; mark_connected clears both and returns Connected. Negative-output: a reconnecting handle does NOT report unhealthy_reason, and send_outbound on it does NOT return AgentError::Unhealthy. Written and observed failing first."))
+
+(meta task-join-extract
+  (description "SPEC-026 CON-001. Extract the connect+handshake half of create_chat_agent into join_hub(params: &JoinParams, identity, mls: Option<&mut MlsSession>, mls_create: bool) -> Result<Joined, ChatError>, where JoinParams { ws_url, channel, wire_handle, dialects, cap, added_by } carries everything a re-join needs and Joined { websocket, conn, roomcfg, warnings }. create_chat_agent becomes: build JoinParams, call join_hub with the caller's mls_create, insert the store entry, spawn the receive loop with a clone of JoinParams. PURE REFACTOR — no behaviour change in this task; the ChatError variants and the warning set are unchanged.")
+  (acceptance "The whole existing test tree still passes unchanged (cargo test), including tests/chat_live.rs compiling. The task-fake-hub smoke test still passes. No new behaviour is introduced and no test is modified to accommodate the refactor — if a test needs changing, the refactor is not pure and must be re-done."))
+
+(meta task-reconnect
+  (description "SPEC-026 REQ-001/003/004/005, ADR-001/003/004. In spawn_receive_loop, replace the three `break`s on the websocket arm (Close frame, stream None, stream Err) with a reconnect arm: mark_reconnecting, then loop { sleep(schedule.next_delay(rand)) ; join_hub(&params, &identity, mls.as_mut(), false) } — mls_create is ALWAYS false on a re-join (a second create_group_as_creator would fork the group). While waiting, keep servicing close_rx (a hark close during a gap must not hang) and send_rx (answer OutboundReject::retryable, never queue). On Ok: swap in the new websocket + SignedConn, schedule.reset(), mark_connected, resume the loop. On Err(JoinRejected) or Err(DowngradeRefused): mark_unhealthy and break — those are the only terminal cases. Any other Err: keep retrying, indefinitely.")
+  (acceptance "TEST-001, TEST-001b, TEST-003, TEST-004, TEST-005, TEST-006, TEST-007, all against task-fake-hub, all written and observed failing first. Positive: hub closes then accepts -> the hub observes a second hello and a second announce carrying the ORIGINAL cap and dialects, and recv receives a message delivered after recovery. Negative-output: the handle is never unhealthy/hub_closed across a drop (this is the literal issue-#25 regression test); an mls_create agent creates the group exactly once across two connections. Negative-input: a hub that answers the re-join with (error @room \"forbidden-room\") makes the handle terminally unhealthy carrying the slug and stops the schedule; a roomcfg :enc false on a pinned channel does the same, downgrade refused. Additionally: emit during the gap returns AgentError::NotReady, never Unhealthy."))
+
+(meta task-observability
+  (description "SPEC-026 REQ-006, OBS-001/002. Surface the reconnecting state: reconnect_attempts + reconnect_detail through AgentStatus in local_api and through `hark daemon status` output; tracing::warn once on entering an outage (handle, channel, the error that ended the socket), tracing::info once on recovery (handle, channel, attempts, outage duration), tracing::debug per attempt. Also correct the false claim in src/mls_ds/task.rs's module doc — the chat socket now does reconnect on bounded backoff, but on the browser's 1s->15s jittered schedule, not the DS loop's 30s (ADR-002).")
+  (acceptance "TEST-008. Positive: during the gap GET /v1/agents reports state \"reconnecting\" with reconnect_attempts >= 1 and a non-empty reconnect_detail, and `hark daemon status` prints them; after recovery, \"connected\" with reconnect_attempts == 0. Negative-output: the outage warn is emitted once, not once per attempt. Written and observed failing first."))
+
+(meta task-store
+  (description "SPEC-026 CON-002, REQ-007/REQ-010. A PairingStore over <chat.identity_dir>/paired-agents.json: load() -> Vec<PairingRecord> (TOTAL recognition against the declared grammar — an absent, unreadable, malformed, unknown-version, or partly-invalid store yields an EMPTY vec plus a diagnostic, never a partial list), save(records) writing mode 0600 on Unix, upsert(record), remove(agent_handle). Field recognition reuses the EXISTING recognisers — AgentHandle's TryFrom<String>, validate_chat_handle, validate_dialect_id — never a second implementation (LangSec one-parser-per-language). Pure recogniser separated from the filesystem shell per the Purity Boundary Map.")
+  (acceptance "TEST-013 and TEST-014, written and observed failing first. Negative-input: absent file; non-JSON bytes; version 2; a record missing channel; a record whose channel fails validate_chat_handle; a record whose dialects contains an invalid id; a valid record ALONGSIDE a malformed one — every case yields ZERO records and a diagnostic, and the mixed case yields zero rather than one. Property: load(save(records)) == records for a generated set of valid records. Positive: the written file's mode is 0600 on Unix."))
+
+(meta task-persist
+  (description "SPEC-026 REQ-007/REQ-009. create_chat_transport_agent upserts the pairing record after a successful join; the close path (and agent removal) removes it. A write failure does NOT fail the join — the agent is live either way — but IS surfaced as a warning on the create response so the operator learns the agent will not survive a restart.")
+  (acceptance "TEST-009 and TEST-012, written and observed failing first. Positive: after a join the store holds exactly one record with the join's agent handle, channel, dialects, cap and receive-all mode, at mode 0600. Positive: after close the store holds no record for that handle. Negative-output: a store the daemon cannot write does not fail the join, and the create response carries a warning naming the path."))
+
+(meta task-rehydrate
+  (description "SPEC-026 REQ-008, ADR-006. On daemon start, after the local API is listening, re-establish every persisted agent under its RECORDED agent handle (not a freshly generated one — CBCL_AGENT_HANDLE in operator shells must survive). Rehydration must not block readiness: the daemon reports ready first, and an agent whose hub is unreachable enters the task-reconnect schedule rather than being dropped. Needs AgentStore insertion under a supplied handle, reusing AgentHandle's existing validated construction.")
+  (acceptance "TEST-010 and TEST-011, written and observed failing first. Positive: given a store with one record and a live fake hub, daemon start re-establishes the agent under the SAME agent handle. Negative-output: given a store with one record and NO hub, the daemon still reports ready and the agent exists in state \"reconnecting\" — it is neither absent nor unhealthy."))
+
+(meta task-docs
+  (description "SPEC-026 Phase-3 documentation gate. README: a Recovery section stating what survives a hub redeploy and a daemon restart, and what the reconnecting state means. specs/daemon.md + specs/config.md: the pairing store path, its permissions, and the fact that deleting chat-keys/ drops pairings. Move SPEC-026 status draft -> implemented with the date. Verify traceability: zetl check --dead-links --fail-on error, and confirm every SPEC-026 REQ/NFR names a TEST that exists in the tree.")
+  (acceptance "zetl check --fail-on error exits 0; SPEC-026 status is implemented; every TEST-### named in SPEC-026 section 10 resolves to a real test function, and every REQ/NFR in sections 4-5 is named by at least one of them (the attribution map is total). README and the daemon/config specs describe the recovery behaviour."))
+
+;; ---------------------------------------------------------------- readiness
+;; The harness and the two pure cores have no in-plan prerequisites.
+(normally r-ready-fake-hub task-fake-hub ready-fake-hub)
+(normally r-ready-schedule task-schedule ready-schedule)
+(normally r-ready-state task-state ready-state)
+(normally r-ready-store task-store ready-store)
+;; The extraction is a pure refactor but wants the harness first, so "no behaviour
+;; changed" is an observation over a real socket rather than an assertion.
+(normally r-ready-join-extract (and task-join-extract completed-fake-hub) ready-join-extract)
+;; The reconnect arm needs all three: the seam to call, the schedule to wait on,
+;; and the state to report.
+(normally r-ready-reconnect (and task-reconnect completed-join-extract completed-schedule completed-state) ready-reconnect)
+;; Observability renders the state the reconnect arm sets.
+(normally r-ready-observability (and task-observability completed-reconnect) ready-observability)
+;; Persistence writes what the store defines.
+(normally r-ready-persist (and task-persist completed-store) ready-persist)
+;; Rehydration reads what persistence wrote, and lands an agent straight into the
+;; reconnect schedule when the hub is down — so it needs both halves.
+(normally r-ready-rehydrate (and task-rehydrate completed-persist completed-reconnect) ready-rehydrate)
+;; Docs close the plan: they assert the whole traceability surface.
+(normally r-ready-docs (and task-docs completed-observability completed-rehydrate) ready-docs)
+
+(meta r-ready-fake-hub (description "Test harness, no dep.") (justification "Every resilience acceptance criterion is an observation of a real socket; the harness is the instrument and comes first."))
+(meta r-ready-schedule (description "CON-004 pure core, no dep.") (justification "Deterministic arithmetic with an injected random — nothing to depend on."))
+(meta r-ready-state (description "CON-003 store state, no dep.") (justification "AgentState/AgentStore changes are local to daemon.rs and independent of the socket."))
+(meta r-ready-store (description "CON-002 recogniser, no dep.") (justification "The pairing grammar and its filesystem shell are independent of the transport."))
+(meta r-ready-join-extract (description "CON-001 seam, wants the harness.") (justification "A pure refactor is only credible if a real-socket test observes it changed nothing."))
+(meta r-ready-reconnect (description "REQ-001..005, needs seam + schedule + state.") (justification "The reconnect arm calls join_hub, waits on ReconnectSchedule, and reports through AgentState::Reconnecting."))
+(meta r-ready-observability (description "REQ-006, needs the state to be set.") (justification "There is nothing to render until the reconnect arm sets it."))
+(meta r-ready-persist (description "REQ-007/009, needs the store.") (justification "The write path needs the format and its recogniser."))
+(meta r-ready-rehydrate (description "REQ-008, needs persist + reconnect.") (justification "TEST-011 requires a rehydrated agent with no hub to land in the reconnecting state, which only exists once the reconnect arm does."))
+(meta r-ready-docs (description "Phase-3 gate, needs everything.") (justification "The traceability assertion is over the finished tree."))
+
+;; ---------------------------------------------------------------- assignment
+(normally r-assign-fake-hub (and ready-fake-hub agent-claude-available) assign-to-fake-hub-claude)
+(normally r-assign-schedule (and ready-schedule agent-claude-available) assign-to-schedule-claude)
+(normally r-assign-state (and ready-state agent-claude-available) assign-to-state-claude)
+(normally r-assign-store (and ready-store agent-claude-available) assign-to-store-claude)
+(normally r-assign-join-extract (and ready-join-extract agent-claude-available) assign-to-join-extract-claude)
+(normally r-assign-reconnect (and ready-reconnect agent-claude-available) assign-to-reconnect-claude)
+(normally r-assign-observability (and ready-observability agent-claude-available) assign-to-observability-claude)
+(normally r-assign-persist (and ready-persist agent-claude-available) assign-to-persist-claude)
+(normally r-assign-rehydrate (and ready-rehydrate agent-claude-available) assign-to-rehydrate-claude)
+(normally r-assign-docs (and ready-docs agent-claude-available) assign-to-docs-claude)
+
+;; Failure propagation is NOT hand-authored here: hence appends its own
+;; failed-* / permanently-failed-* / upstream-blocked-* rules as the task loop
+;; runs. Writing them up front only makes the freshly-authored plan fail
+;; `plan validate --strict` on literals nothing has yet derived. The intended
+;; spine, for the reader: task-reconnect is load-bearing — a failure there
+;; blocks observability, rehydrate, and docs; a task-join-extract that turns out
+;; not to be a pure refactor invalidates the reconnect work built on the seam.
+
+(claims agent:claude
+  :at "2026-07-26T10:23:31Z"
+  (given claim-v1-fake-hub)
+  (normally r-cl-state-v1-fake-hub claim-v1-fake-hub state-claimed-v1-fake-hub)
+  (normally r-cl-chain-v1-fake-hub state-claimed-v1-fake-hub claimed-fake-hub)
+)
+
+;; Propagation rules: failures in 'fake-hub' block downstream tasks
+(normally r-propagate-join-extract-from-fake-hub-failed failed-fake-hub upstream-blocked-join-extract)
+(normally r-propagate-join-extract-from-fake-hub-permanently-failed permanently-failed-fake-hub upstream-blocked-join-extract)
+(normally r-propagate-join-extract-from-fake-hub-stale-v1 stale-v1-fake-hub upstream-blocked-join-extract)
+(normally r-propagate-join-extract-from-fake-hub-timeout-v1 timeout-v1-fake-hub upstream-blocked-join-extract)
+(normally r-propagate-join-extract-from-fake-hub-blocked upstream-blocked-fake-hub upstream-blocked-join-extract)
+
+;; Transitive propagation: upstream-blocked cascades through dependency chain
+(normally r-propagate-reconnect-from-join-extract-blocked upstream-blocked-join-extract upstream-blocked-reconnect)
+(normally r-propagate-observability-from-reconnect-blocked upstream-blocked-reconnect upstream-blocked-observability)
+(normally r-propagate-rehydrate-from-reconnect-blocked upstream-blocked-reconnect upstream-blocked-rehydrate)
+(normally r-propagate-docs-from-observability-blocked upstream-blocked-observability upstream-blocked-docs)
+(normally r-propagate-docs-from-rehydrate-blocked upstream-blocked-rehydrate upstream-blocked-docs)
+
+(claims agent:claude
+  :at "2026-07-26T10:25:34Z"
+  (given completed-fake-hub))
+
+(claims agent:claude
+  :at "2026-07-26T10:25:34Z"
+  (given claim-v1-schedule)
+  (normally r-cl-state-v1-schedule claim-v1-schedule state-claimed-v1-schedule)
+  (normally r-cl-chain-v1-schedule state-claimed-v1-schedule claimed-schedule)
+)
+
+;; Propagation rules: failures in 'schedule' block downstream tasks
+(normally r-propagate-reconnect-from-schedule-failed failed-schedule upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-schedule-permanently-failed permanently-failed-schedule upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-schedule-stale-v1 stale-v1-schedule upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-schedule-timeout-v1 timeout-v1-schedule upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-schedule-blocked upstream-blocked-schedule upstream-blocked-reconnect)
+
+(claims agent:claude
+  :at "2026-07-26T10:27:27Z"
+  (given completed-schedule))
+
+(claims agent:claude
+  :at "2026-07-26T10:27:27Z"
+  (given claim-v1-state)
+  (normally r-cl-state-v1-state claim-v1-state state-claimed-v1-state)
+  (normally r-cl-chain-v1-state state-claimed-v1-state claimed-state)
+)
+
+;; Propagation rules: failures in 'state' block downstream tasks
+(normally r-propagate-reconnect-from-state-failed failed-state upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-state-permanently-failed permanently-failed-state upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-state-stale-v1 stale-v1-state upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-state-timeout-v1 timeout-v1-state upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-state-blocked upstream-blocked-state upstream-blocked-reconnect)
+
+(claims agent:claude
+  :at "2026-07-26T10:29:46Z"
+  (given completed-state))
+
+(claims agent:claude
+  :at "2026-07-26T10:29:46Z"
+  (given claim-v1-join-extract)
+  (normally r-cl-state-v1-join-extract claim-v1-join-extract state-claimed-v1-join-extract)
+  (normally r-cl-chain-v1-join-extract state-claimed-v1-join-extract claimed-join-extract)
+)
+
+;; Propagation rules: failures in 'join-extract' block downstream tasks
+(normally r-propagate-reconnect-from-join-extract-failed failed-join-extract upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-join-extract-permanently-failed permanently-failed-join-extract upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-join-extract-stale-v1 stale-v1-join-extract upstream-blocked-reconnect)
+(normally r-propagate-reconnect-from-join-extract-timeout-v1 timeout-v1-join-extract upstream-blocked-reconnect)
+
+(claims agent:claude
+  :at "2026-07-26T10:38:35Z"
+  (given completed-reconnect))
+
+(claims agent:claude
+  :at "2026-07-26T10:38:35Z"
+  (given claim-v1-observability)
+  (normally r-cl-state-v1-observability claim-v1-observability state-claimed-v1-observability)
+  (normally r-cl-chain-v1-observability state-claimed-v1-observability claimed-observability)
+)
+
+;; Propagation rules: failures in 'observability' block downstream tasks
+(normally r-propagate-docs-from-observability-failed failed-observability upstream-blocked-docs)
+(normally r-propagate-docs-from-observability-permanently-failed permanently-failed-observability upstream-blocked-docs)
+(normally r-propagate-docs-from-observability-stale-v1 stale-v1-observability upstream-blocked-docs)
+(normally r-propagate-docs-from-observability-timeout-v1 timeout-v1-observability upstream-blocked-docs)
+
+(claims agent:claude
+  :at "2026-07-26T10:41:04Z"
+  (given completed-observability))
+
+(claims agent:claude
+  :at "2026-07-26T10:41:11Z"
+  (given claim-v1-store)
+  (normally r-cl-state-v1-store claim-v1-store state-claimed-v1-store)
+  (normally r-cl-chain-v1-store state-claimed-v1-store claimed-store)
+)
+
+;; Propagation rules: failures in 'store' block downstream tasks
+(normally r-propagate-persist-from-store-failed failed-store upstream-blocked-persist)
+(normally r-propagate-persist-from-store-permanently-failed permanently-failed-store upstream-blocked-persist)
+(normally r-propagate-persist-from-store-stale-v1 stale-v1-store upstream-blocked-persist)
+(normally r-propagate-persist-from-store-timeout-v1 timeout-v1-store upstream-blocked-persist)
+(normally r-propagate-persist-from-store-blocked upstream-blocked-store upstream-blocked-persist)
+
+;; Transitive propagation: upstream-blocked cascades through dependency chain
+(normally r-propagate-rehydrate-from-persist-blocked upstream-blocked-persist upstream-blocked-rehydrate)
+
+(claims agent:claude
+  :at "2026-07-26T10:44:22Z"
+  (given completed-store))
+
+(claims agent:claude
+  :at "2026-07-26T10:44:22Z"
+  (given claim-v1-persist)
+  (normally r-cl-state-v1-persist claim-v1-persist state-claimed-v1-persist)
+  (normally r-cl-chain-v1-persist state-claimed-v1-persist claimed-persist)
+)
+
+;; Propagation rules: failures in 'persist' block downstream tasks
+(normally r-propagate-rehydrate-from-persist-failed failed-persist upstream-blocked-rehydrate)
+(normally r-propagate-rehydrate-from-persist-permanently-failed permanently-failed-persist upstream-blocked-rehydrate)
+(normally r-propagate-rehydrate-from-persist-stale-v1 stale-v1-persist upstream-blocked-rehydrate)
+(normally r-propagate-rehydrate-from-persist-timeout-v1 timeout-v1-persist upstream-blocked-rehydrate)
+
+(claims agent:claude
+  :at "2026-07-26T10:52:51Z"
+  (given completed-persist))
+
+(claims agent:claude
+  :at "2026-07-26T10:52:51Z"
+  (given completed-rehydrate))
+
+(claims agent:claude
+  :at "2026-07-26T10:52:55Z"
+  (given claim-v1-docs)
+  (normally r-cl-state-v1-docs claim-v1-docs state-claimed-v1-docs)
+  (normally r-cl-chain-v1-docs state-claimed-v1-docs claimed-docs)
+)
+
+(claims agent:claude
+  :at "2026-07-26T11:01:31Z"
+  (given completed-docs))

@@ -14,6 +14,7 @@ pub mod local_api;
 pub mod mls;
 pub mod mls_ds;
 pub mod pairing;
+pub mod reconnect;
 pub mod router;
 pub mod selector;
 pub mod signed_frame;

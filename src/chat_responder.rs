@@ -198,6 +198,20 @@ impl Responder {
         vec![Action::Claim { ask_id, frame_text }]
     }
 
+    /// Stop contending for `ask_id` ([[SPEC-026 REQ-001]]).
+    ///
+    /// Called when the claim broadcast could not be written. `on_possible_ask`
+    /// inserts this agent as a contender *before* the transport gets a chance to
+    /// send, so an ask left in the map after a failed write would still win its
+    /// own election — the agent is the only contender it knows about — and it
+    /// would answer an ask no other member ever saw it claim. Forgetting the ask
+    /// forfeits it, which is the correct outcome for a claim the hub never
+    /// received: another agent answers, or the asker's own liveness fallback
+    /// fires.
+    pub fn forget(&mut self, ask_id: &str) {
+        self.asks.remove(ask_id);
+    }
+
     /// Called when the Δ window for `ask_id` closes.
     pub fn on_window_closed(&mut self, ask_id: &str) -> WindowOutcome {
         let Some(state) = self.asks.get(ask_id) else {
@@ -345,6 +359,47 @@ mod tests {
 
     fn ask(thread: &str, from: &str) -> String {
         format!("(lang summarize (ask @general \"q\" :from {from} :thread \"{thread}\"))")
+    }
+
+    /// SPEC-026 REQ-001 (negative-output) — an ask whose claim could not be
+    /// written must not go on to win its own election.
+    ///
+    /// `on_possible_ask` inserts this agent as a contender *before* the
+    /// transport has a chance to send. Before the reconnect existed, a failed
+    /// write killed the session task and the pending timers died with it. Now
+    /// the loop survives the failure, so an ask left tracked would reach its Δ
+    /// window with exactly one known contender — itself — win, and answer an ask
+    /// no other member ever saw it claim.
+    #[test]
+    fn a_forgotten_ask_does_not_win_its_own_election() {
+        let mut r = responder();
+        assert_eq!(r.on_inbound(&ask("t1", "@asker")).len(), 1);
+        assert_eq!(r.tracked(), 1, "the ask is tracked as soon as it is claimed");
+
+        // Without `forget`, this is the bug: sole contender ⇒ rank 0 ⇒ Win.
+        let mut unforgotten = responder();
+        unforgotten.on_inbound(&ask("t1", "@asker"));
+        assert!(
+            matches!(unforgotten.on_window_closed("t1"), WindowOutcome::Win(_)),
+            "a tracked ask wins when it is the only contender — which is why a \
+             claim the hub never received must not stay tracked"
+        );
+
+        r.forget("t1");
+        assert_eq!(r.tracked(), 0, "the forfeited ask is no longer tracked");
+        assert!(
+            matches!(r.on_window_closed("t1"), WindowOutcome::Idle),
+            "a forfeited ask must not be answered"
+        );
+        assert_eq!(
+            r.on_fallback("t1"),
+            None,
+            "and its liveness fallback has nothing to take over"
+        );
+
+        // Forgetting something untracked is a no-op, so the transport can call
+        // it unconditionally on a failed write.
+        r.forget("never-seen");
     }
 
     #[test]

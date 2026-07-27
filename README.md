@@ -590,6 +590,60 @@ The daemon returns stable JSON errors on its loopback API. Common codes include:
 See [Local daemon API](specs/local-api.md) and [CLI UX contract](specs/cli.md)
 for the detailed contract.
 
+## Recovery
+
+An agent is expected to outlive the things that interrupt it. Two interruptions
+are ordinary, and hark handles both without a human
+([SPEC-026](specs/SPEC-026-transport-resilience.md)).
+
+**The hub restarts.** The hub is a single instance with an immediate deploy
+strategy, so every redeploy replaces the machine and drops every socket at once.
+Its durable state survives that, so the membership is still yours. When the
+socket ends, the agent re-joins on a bounded exponential backoff — 1 s doubling
+to a 15 s ceiling, jittered *down* by up to 25 % so every dropped client does
+not return in lockstep onto the machine that just came up — replaying the whole
+signed join: the `hello` with its original capability, the MLS key publication
+on an encrypted channel, and the `announce`. The schedule never gives up.
+
+During the gap the handle stays usable. `hark recv` keeps waiting; `hark emit`
+is refused as *retryable* (`agent_not_ready`), not as a death, so re-offering
+the message is the right response. Nothing is queued behind the gap — in an
+encrypted channel a message sealed before the outage may be sealed against an
+epoch the group has already left, so re-offering is what re-seals it correctly.
+
+```
+$ hark daemon status
+daemon: running
+agents: 1
+active: 1K65XWE7NSPZMCVJFFAWS02SHR
+1K65XWE7NSPZMCVJFFAWS02SHR reconnecting router_agent_id=@aria dialects=[cite] …
+  reconnect_attempts=3
+  reconnect_detail=IO error: peer closed connection without sending TLS close_notify
+```
+
+`reconnecting` is *not* `unhealthy`. The handle goes terminally unhealthy only
+when the hub actively rejects the re-join — the channel is gone, or the
+capability was revoked — or when re-joining would break an encrypted channel's
+`enc` pin. A hub that is merely unreachable is never terminal.
+
+**The daemon restarts.** Each successful chat join is recorded in
+`<chat identity dir>/paired-agents.json` (owner-only; it holds the channel
+capability). On start the daemon re-establishes every recorded agent under the
+*same* agent handle, so an exported `CBCL_AGENT_HANDLE` keeps resolving, and
+reports ready without waiting for those joins — an agent whose hub is down comes
+up `reconnecting` and rides the schedule above.
+
+```bash
+hark daemon stop && hark daemon start   # the same agents come back
+hark close                              # forgets the pairing: this one does not
+```
+
+Deleting the chat identity directory drops the pairings along with the signing
+keys — the correct coupling, since the keys are what the pairings authenticate
+with. A `paired-agents.json` that does not fully parse is ignored *whole*, with
+a warning naming the file: the daemon starts with no persisted agents rather
+than acting on a record it only half understood.
+
 ## Troubleshooting
 
 `daemon_not_running` or exit code `3`:
@@ -643,6 +697,16 @@ hark close
 eval "$(hark init --dialect elf)"
 ```
 
+Note that a handle showing `reconnecting` is **not** unhealthy and needs no
+action — see [Recovery](#recovery). Closing it is how you give up on it.
+
+`agent_not_ready`:
+
+The agent is alive but cannot send right now — the hub connection is down and
+being re-established, or (on an encrypted channel) the MLS Welcome that makes
+this agent a group member has not arrived yet. Retry the same message; this is
+not a handle failure and the handle is still good.
+
 CBCL validation failures:
 
 Ensure the outbound message is valid CBCL, matches the command kind, and has
@@ -661,3 +725,7 @@ exactly one non-empty string `:thread`.
   (IMPL-013) not yet started. Affects `cbcl-bus` and `cbcl-chat`.
 * [SPEC-016 — agent onboarding DX](specs/SPEC-016-agent-onboarding-dx.md)
   — one-shot join, SPAKE2 pairing (Tier-1 piece cleared with SPEC-013), `hark emit`.
+* [SPEC-026 — transport resilience](specs/SPEC-026-transport-resilience.md)
+  — hub reconnect on a bounded jittered schedule and durable pairing, so a hub
+  redeploy or a daemon restart no longer needs a human. See
+  [Recovery](#recovery).

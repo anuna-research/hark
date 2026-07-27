@@ -236,6 +236,20 @@ pub struct AgentStatus {
     /// The chat channel the agent joined; absent on the router transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// SPEC-026 OBS-002: consecutive failed reconnect attempts while `state` is
+    /// `reconnecting`; `0` otherwise. Serialised only when non-zero so a
+    /// connected agent's status is unchanged from before SPEC-026.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reconnect_attempts: u32,
+    /// SPEC-026 OBS-002: the transport error that ended the socket. Present only
+    /// while reconnecting — an operator reads this to tell "coming back" from
+    /// `unhealthy_detail`'s "dead".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect_detail: Option<String>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -840,12 +854,18 @@ async fn create_chat_transport_agent(
     // encrypted) channel — the mode is pinned encrypted BEFORE the first
     // frame is sent. The session also resumes prior MLS state (REQ-009);
     // a public channel with no prior state gets no session.
-    let cap_present = request
+    // Normalised once, here, and used for BOTH the pin decision and the record
+    // persisted for a later resume. Keeping the raw value in the record would
+    // let a blank-but-present cap pin the resumed session encrypted while
+    // `cap_part` still sends nothing — turning a public room's `:enc false` into
+    // a terminal downgrade refusal on the next daemon start (SPEC-026 REQ-007).
+    let cap = request
         .cap
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_some();
+        .map(str::to_owned);
+    let cap_present = cap.is_some();
     let file_stem = chat_key_filename(wire_handle);
     let mls = crate::mls::session::MlsSession::open_if_relevant(
         &chat.identity_dir,
@@ -869,7 +889,7 @@ async fn create_chat_transport_agent(
         &channel,
         wire_handle,
         request.dialects,
-        request.cap.clone(),
+        cap.clone(),
         request.added_by.clone(),
         chat.claim_window,
         chat.liveness_timeout,
@@ -877,6 +897,7 @@ async fn create_chat_transport_agent(
         mls,
         request.mls_create.unwrap_or(false),
         receive_all,
+        None, // a fresh join mints a new handle; only a resume supplies one
     )
     .await
     .map_err(chat_error_to_api)?;
@@ -885,6 +906,27 @@ async fn create_chat_transport_agent(
         warnings.push(format!(
             "receiving all messages in {channel} (dialect `*`); every channel message is \
              delivered to `recv`, not only answerable asks"
+        ));
+    }
+
+    // SPEC-026 REQ-007: record the pairing so a daemon restart re-establishes
+    // this agent without a human. A write failure does NOT fail the join — the
+    // agent is live either way — but it IS surfaced, because the operator has
+    // to know the agent will not survive a restart.
+    let record = crate::pairing::store::PairedAgent {
+        agent_handle: handle.as_str().to_owned(),
+        wire_handle: wire_handle.to_owned(),
+        channel: channel.clone(),
+        dialects: dialects.clone(),
+        cap: cap.clone(),
+        added_by: request.added_by.clone(),
+        receive_all,
+    };
+    if let Err(error) = crate::pairing::store::PairingStore::new(&chat.identity_dir).upsert(record)
+    {
+        tracing::warn!(%error, "could not persist the pairing record");
+        warnings.push(format!(
+            "{error}; this agent will NOT be re-established after a daemon restart"
         ));
     }
 
@@ -1022,6 +1064,8 @@ async fn agents(
             unhealthy_reason: snapshot.unhealthy_reason,
             unhealthy_detail: snapshot.unhealthy_detail,
             channel: snapshot.channel,
+            reconnect_attempts: snapshot.reconnect_attempts,
+            reconnect_detail: snapshot.reconnect_detail,
         })
         .collect();
     let active_agent_handle = state
@@ -1664,10 +1708,200 @@ async fn close_agent(
         .close(&handle)
         .await
         .map_err(agent_error_to_api)?;
+    // SPEC-026 REQ-009: a deliberately closed agent must not return on the next
+    // daemon start. Best-effort — the agent is closed either way, and failing
+    // the close because a file could not be rewritten would be the worse
+    // outcome.
+    if let Some(store) = pairing_store(&state) {
+        if let Err(error) = store.remove(handle.as_str()) {
+            tracing::warn!(%error, agent = handle.as_str(), "could not forget the pairing record");
+        }
+    }
     Ok(Json(CloseResponse {
         ok: true,
         agent_handle: handle.as_str().to_owned(),
     }))
+}
+
+/// The durable pairing store for this daemon's chat identity directory
+/// ([[SPEC-026 CON-002]]), or `None` on a router-only configuration that has no
+/// chat identity directory to put it in.
+fn pairing_store(state: &AppState) -> Option<crate::pairing::store::PairingStore> {
+    let chat = state.config.validate_chat().ok()?;
+    Some(crate::pairing::store::PairingStore::new(chat.identity_dir))
+}
+
+/// Re-establish every persisted agent ([[SPEC-026 REQ-008]]).
+///
+/// Called once at daemon start, *before* the server is awaited, and returns
+/// immediately: each agent is re-established in its own task, so the daemon
+/// reports ready without waiting on a hub that may not be there. An agent whose
+/// hub is unreachable is registered as `reconnecting` and retried on the
+/// [[crate::reconnect]] schedule — being unable to reach the hub at this instant
+/// is exactly the condition SPEC-026 exists to make survivable, so it must not
+/// mean "drop the agent".
+///
+/// Router-transport daemons have no pairing store and no-op here.
+pub fn rehydrate_paired_agents(agents: AgentStore, config: &AppConfig) {
+    let Ok(crate::config::Transport::Chat) = config.transport() else {
+        return;
+    };
+    let Ok(chat) = config.validate_chat() else {
+        return;
+    };
+    let store = crate::pairing::store::PairingStore::new(&chat.identity_dir);
+    let records = store.load();
+    if records.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = records.len(),
+        "re-establishing persisted agents after a daemon restart"
+    );
+    for record in records {
+        tokio::spawn(rehydrate_one(agents.clone(), chat.clone(), record));
+    }
+}
+
+/// Re-establish one persisted agent, retrying transport failures forever on the
+/// SPEC-026 schedule and giving up only on a settled refusal.
+async fn rehydrate_one(
+    agents: AgentStore,
+    chat: crate::config::ValidatedChatConfig,
+    record: crate::pairing::store::PairedAgent,
+) {
+    use crate::reconnect::ReconnectSchedule;
+
+    let Ok(handle) = crate::daemon::AgentHandle::new(record.agent_handle.clone()) else {
+        // Unreachable: `PairingStore::load` recognises the handle before
+        // returning the record (CON-002). Belt and braces at the boundary.
+        tracing::warn!(
+            agent = record.agent_handle,
+            "skipping a pairing record with a malformed agent handle"
+        );
+        return;
+    };
+    // Register it up front so `hark daemon status` shows the agent coming back
+    // rather than nothing at all, and so the handle resolves for any command
+    // issued while it is still dialling.
+    if let Err(error) = agents
+        .insert_reconnecting(
+            handle.clone(),
+            record.dialects.clone(),
+            record.wire_handle.clone(),
+            Some(record.channel.clone()),
+            Some("re-establishing after a daemon restart".to_owned()),
+        )
+        .await
+    {
+        tracing::warn!(%error, agent = handle.as_str(), "could not register the resumed agent");
+        return;
+    }
+
+    let mut schedule = ReconnectSchedule::default();
+    let mut detail = "re-establishing after a daemon restart".to_owned();
+    loop {
+        // The operator may close the agent while this loop is still dialling.
+        // Closing removes the store entry; a loop that did not check would win
+        // the race on its next successful attempt and re-register an agent that
+        // was deliberately given up on — a resurrection no amount of closing
+        // could undo. `mark_reconnecting` doubles as the probe: it fails with
+        // `UnknownHandle` exactly when the entry is gone.
+        if agents
+            .mark_reconnecting(&handle, schedule.attempts(), Some(detail.clone()))
+            .await
+            .is_err()
+        {
+            tracing::debug!(
+                agent = handle.as_str(),
+                "the resumed agent was closed while it was being re-established; stopping"
+            );
+            return;
+        }
+        match resume_chat_agent(&agents, &chat, &record, handle.clone()).await {
+            Ok(()) => {
+                tracing::info!(
+                    agent = handle.as_str(),
+                    channel = record.channel,
+                    "re-established a persisted agent"
+                );
+                return;
+            }
+            // The hub gave a verdict, or the encryption pin was violated: the
+            // same two terminal conditions as a reconnect (SPEC-026 REQ-005).
+            // Retrying would be a loop against a settled answer.
+            Err(error @ (ChatError::JoinRejected(_) | ChatError::DowngradeRefused(_))) => {
+                let _ = agents
+                    .mark_unhealthy(&handle, "resume_refused", Some(error.to_string()))
+                    .await;
+                tracing::warn!(
+                    %error,
+                    agent = handle.as_str(),
+                    "the hub refused a persisted agent; not retrying"
+                );
+                return;
+            }
+            Err(error) => {
+                detail = error.to_string();
+                let delay = schedule.next_delay(rand::random::<f64>());
+                tracing::debug!(
+                    agent = handle.as_str(),
+                    attempt = schedule.attempts(),
+                    error = detail,
+                    "resume attempt failed"
+                );
+                tokio::time::sleep(delay).await;
+                // The attempt count and this error are published by the probe
+                // at the top of the loop, which is also where a close is
+                // noticed — one write, one place.
+            }
+        }
+    }
+}
+
+/// One attempt at re-establishing `record` under its original handle.
+async fn resume_chat_agent(
+    agents: &AgentStore,
+    chat: &crate::config::ValidatedChatConfig,
+    record: &crate::pairing::store::PairedAgent,
+    handle: crate::daemon::AgentHandle,
+) -> Result<(), ChatError> {
+    let key_path = chat
+        .identity_dir
+        .join(format!("{}.key", chat_key_filename(&record.wire_handle)));
+    let identity = ChatIdentity::load_or_create(&key_path)
+        .map_err(|error| ChatError::Store(format!("chat identity {key_path:?}: {error}")))?;
+    let file_stem = chat_key_filename(&record.wire_handle);
+    let mls = crate::mls::session::MlsSession::open_if_relevant(
+        &chat.identity_dir,
+        &file_stem,
+        &record.channel,
+        &record.wire_handle,
+        &identity,
+        record.cap.is_some(),
+    )
+    .map_err(|error| ChatError::Store(format!("mls session: {error}")))?;
+
+    create_chat_agent(
+        agents.clone(),
+        &chat.ws_url,
+        &record.channel,
+        &record.wire_handle,
+        record.dialects.clone(),
+        record.cap.clone(),
+        record.added_by.clone(),
+        chat.claim_window,
+        chat.liveness_timeout,
+        std::sync::Arc::new(identity),
+        mls,
+        // Never on a resume: the group already exists, and re-creating it would
+        // fork the channel into two ciphertext worlds.
+        false,
+        record.receive_all,
+        Some(handle),
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn stop(
@@ -1759,19 +1993,27 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
             format!("agent handle is unhealthy: {reason}"),
             detail,
         ),
-        // Transient: the handle is still healthy, the send just raced ahead of
-        // MLS membership (no Welcome yet). 503 + a distinct code so the client
-        // can retry rather than treating the handle as dead.
-        AgentError::NotReady { detail } => ApiError::new(
+        // Transient: the handle is still healthy. 503 + a distinct code so the
+        // client retries rather than treating the handle as dead. Which code
+        // depends on WHY — an MLS membership race and a hub outage need
+        // different things from the operator, and reporting the MLS one during
+        // a public-channel outage sends them after a group that is not the
+        // problem (SPEC-026 REQ-004).
+        AgentError::NotReady { reason, detail } => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "mls_membership_pending",
-            "agent is not yet a member of the channel's MLS group; retry shortly",
-            detail.or_else(|| {
-                Some(
+            reason.code(),
+            reason.message(),
+            detail.or_else(|| match reason {
+                crate::daemon::NotReadyReason::MlsMembershipPending => Some(
                     "the room owner must add this agent (fetch its KeyPackage) before it can \
                      send encrypted content — retry once the Welcome arrives"
                         .to_owned(),
-                )
+                ),
+                crate::daemon::NotReadyReason::HubReconnecting => Some(
+                    "the daemon is re-establishing the hub connection on a bounded backoff; \
+                     re-offer the message shortly (see `hark daemon status`)"
+                        .to_owned(),
+                ),
             }),
         ),
         AgentError::RecvAlreadyWaiting => ApiError::new(
