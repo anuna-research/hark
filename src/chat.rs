@@ -1173,9 +1173,15 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         // The frame that lost the race is refused *retryably*
                         // so the caller re-offers it, which re-seals it against
                         // the epoch the group is actually in (ADR-003).
+                        //
+                        // `reconnecting`, NOT `retryable`: the cause is the
+                        // transport, and `retryable` carries the MLS-membership
+                        // reason. Reporting that here tells an operator whose
+                        // *public* channel just lost its socket to go and
+                        // investigate a group that does not exist (REQ-004).
                         Err(error) => {
                             let detail = sanitize(&error.to_string());
-                            let _ = outbound.result_tx.send(Err(OutboundReject::retryable(detail.clone())));
+                            let _ = outbound.result_tx.send(Err(OutboundReject::reconnecting(detail.clone())));
                             pending_reconnect = Some(detail);
                             continue;
                         }
