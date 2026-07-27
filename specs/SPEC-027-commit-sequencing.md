@@ -214,8 +214,20 @@ joiner that lost the race with no group *and* no grant, permanently unable to re
 
 ### REQ-001 — Arm the claim before merging
 
-hark SHALL hold a granted claim for the group's current epoch, and SHALL have **armed** it, before
-calling `merge_pending_commit`. It SHALL NOT arm and merge in parallel.
+hark SHALL NOT call `merge_pending_commit` until it has received an
+`(epochgranted @room :epoch N :state armed)` naming the group's current epoch. It SHALL NOT arm
+and merge in parallel, and SHALL NOT infer the state from the request it sent.
+
+**The gate is that frame, not a belief about having armed.** An earlier revision of this
+requirement — and of [[SPEC-063-one-committer-per-epoch]] ADR-003, which it followed — said the
+grant must be "in hand" and named no observable, so a client could obey it sincerely and still
+merge on a reservation. SPEC-063 REQ-007 now makes `:state armed` the acknowledgement.
+
+Reading the state from the frame rather than from the request is load-bearing on exactly the path
+[[#REQ-012]] exists for: a holder reacquiring after a restart asks with `epochclaim` **while it is
+still armed**, and is answered `armed`. A client that assumed `claimed` because that is what it
+asked for would read "I lost my promise" at the moment it most needs to know it has not — and
+would then re-merge on a reservation.
 
 The states are [[SPEC-063-one-committer-per-epoch]]'s: a *claimed* epoch is a reservation the hub
 may take back (the holder has merged nothing, so nothing is promised); an *armed* one is a
@@ -234,18 +246,28 @@ a state machine: `keypkg` → record intent, emit `epochclaim` → granted → e
 
 Trace: [[#TEST-001]], [[#CON-002]]
 
-### REQ-002 — Defer, do not fail, on a refused claim
+### REQ-002 — Classify a refusal by what makes it clear
 
-When the claim is refused because another party holds it, hark SHALL treat the refusal as a
-**retry**, not an error: it SHALL NOT generate the Commit, SHALL NOT mark any handle unhealthy,
-and SHALL re-attempt once the epoch has advanced or the holder has released it.
+When a claim is refused, hark SHALL treat the refusal as a **retry** or as **not retryable**
+according to [[SPEC-063-one-committer-per-epoch]] CON-003's table, and SHALL NOT collapse the two.
+In neither case SHALL it mark a handle unhealthy or generate the Commit.
 
-A refusal means another committer is about to move the epoch. Whatever hark wanted to commit is
-either accomplished by that Commit (the member gets added by someone else) or still wanted
-afterwards, at which point the re-attempt is against the new epoch and is the correct thing to
-do anyway.
+- A **contended** refusal (`groupinfo-claimed`) means another committer holds the epoch. It clears
+  when that holder is done, in seconds. Retry on the [[#ADR-004]] schedule, counting against the
+  [[#NFR-001]] budget.
+- **`epoch-claim-inactive`** means the room has not activated the capability, because it is not
+  unanimous across present members. It clears on a **membership change** — a legacy client leaving
+  or upgrading — and never with time. hark SHALL NOT retry it on the schedule and SHALL NOT count
+  it against the starvation budget; it waits for a roster change and commits unclaimed in the
+  meantime, exactly as it does today.
 
-Trace: [[#TEST-002]], [[#TEST-003]], [[#CON-002]]
+*This distinction is the trap in the whole design.* The two refusals look identical — the hub says
+no, the epoch is unavailable — and differ in the only dimension a retry loop cares about. Retrying
+the inactive one on a backoff turns an ordinary rollout into a hot loop against a hub that will
+refuse every attempt for as long as one un-upgraded client stays connected, and counting it against
+the starvation budget would report a room as starved when nothing is contending at all.
+
+Trace: [[#TEST-002]], [[#TEST-002b]], [[#CON-002]]
 
 ### REQ-003 — The Welcome waits for acceptance
 
@@ -384,8 +406,9 @@ Trace: [[#TEST-016]], [[#CON-002]]
 
 ### NFR-001 — Starvation bound
 
-A committer that is refused the claim SHALL succeed in generating a Commit, or escalate
-visibly, within **10 consecutive refusals**. On exhausting that budget hark SHALL log at `warn`
+A committer that is refused the claim **for contention** SHALL succeed in generating a Commit, or
+escalate visibly, within **10 consecutive refusals**. `epoch-claim-inactive` is not contention and
+SHALL NOT count against this budget ([[#REQ-002]]). On exhausting that budget hark SHALL log at `warn`
 naming the room and the pending operation, and SHALL surface the condition in `hark daemon
 status`, rather than retrying silently and indefinitely.
 
@@ -394,6 +417,10 @@ message because they always lose to other members") and declines to solve it, le
 application. Ten is not a tuned number — it is a threshold above which the *dynamics* have gone
 wrong rather than any individual attempt, and the requirement is that it becomes visible, not
 that it be automatically resolved.
+
+[[SPEC-063-one-committer-per-epoch]] REQ-004 carries the cross-stack starvation requirement; the
+ten-refusal figure here is hark's, and is offered for promotion to a normative shared bound so both
+clients starve visibly on the same terms rather than each choosing its own threshold.
 
 Trace: [[#TEST-008]], [[#OBS-001]]
 
@@ -609,8 +636,10 @@ nothing, which is what an earlier revision of this section specified.
 
 | TEST | Validates | Type | Scenario |
 |------|-----------|------|----------|
+| **TEST-001b** | [[#REQ-001]] | negative-output | The merge is gated on an `epochgranted :state armed` frame, and the state is read from the frame rather than inferred: a reacquisition answered `armed` after a restart is recognised as still holding the promise. **Implemented and mutation-checked.** |
 | **TEST-001** | [[#REQ-001]], [[#NFR-002]] | positive | With a grant held, an Add generates, merges and persists as today, and the `deliver` goes out. No un-merged Commit is retained at any point. |
-| **TEST-002** | [[#REQ-002]] | negative-input | The hub refuses the claim. No Commit is generated, no group state changes, no handle goes unhealthy, and the attempt is retried. |
+| **TEST-002** | [[#REQ-002]] | negative-input | A **contended** refusal: no Commit generated, no state changed, no handle unhealthy, and the attempt is retried on the schedule. |
+| **TEST-002b** | [[#REQ-002]], [[#NFR-001]] | negative-output | `epoch-claim-inactive` is **not** retried on the schedule and does **not** consume the starvation budget. Collapsing the two refusals into one turns a rollout into a hot loop and reports a room as starved when nothing is contending. **Implemented and mutation-checked.** |
 | **TEST-003** | [[#REQ-002]] | positive | After a refusal, the epoch advances (another member commits); the retry is granted and succeeds against the new epoch. |
 | **TEST-004** | [[#REQ-003]] | negative-output | A Commit that is never accepted produces **no** `welcome` frame, ever. |
 | **TEST-005** | [[#REQ-003]], [[#REQ-005]] | positive | On acceptance, the `welcome` is emitted, and not before the `deliver`. hark does not advertise `epoch-claim/v1` until its half is complete. |

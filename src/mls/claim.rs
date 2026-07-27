@@ -26,6 +26,49 @@ use cbcl_core::sexpr::{Atom, SExpr};
 /// therefore exclude each other.
 pub const CLAIMED_SLUG: &str = "groupinfo-claimed";
 
+/// The hub's refusal when the room has not activated `epoch-claim/v1` — the
+/// capability is not unanimous across present members
+/// ([[SPEC-063-one-committer-per-epoch]] REQ-006).
+///
+/// **This is the trap, and it is why refusals are classified rather than
+/// counted.** It looks exactly like contention and is nothing like it: a
+/// contended claim clears when the holder is done, in seconds, so retrying is
+/// correct. An inactive room clears only when its *membership* changes — a
+/// legacy client leaving, or upgrading. Retrying it on a backoff turns an
+/// ordinary rollout into a hot loop against a hub that will refuse every
+/// attempt for as long as that client stays connected.
+pub const INACTIVE_SLUG: &str = "epoch-claim-inactive";
+
+/// Which claim state the hub reports ([[SPEC-063-one-committer-per-epoch]]).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ClaimState {
+    /// A reservation. The holder has merged nothing, so nothing is promised and
+    /// the hub may take it back on death or epoch advance.
+    Claimed,
+    /// The holder has declared it is about to merge. From here a release is a
+    /// fork, so it survives the holder's death and the hub's restart, and only
+    /// the holder can release it.
+    Armed,
+}
+
+/// A grant the hub issued: the epoch it covers and the state it is in.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct Grant {
+    pub epoch: u64,
+    pub state: ClaimState,
+}
+
+/// How to treat a refusal ([[SPEC-027 REQ-002]]).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Refusal {
+    /// Another committer holds the epoch. It will clear; retry on the schedule.
+    Contended,
+    /// The room has not activated the capability. Retrying cannot help — this
+    /// clears on a membership change, not with time — so it must NOT consume
+    /// the retry schedule or the starvation budget.
+    Inactive,
+}
+
 /// [[SPEC-027 NFR-001]]: consecutive refusals tolerated before the condition is
 /// surfaced rather than retried again.
 ///
@@ -42,8 +85,17 @@ pub fn epochclaim_frame(room: &str, epoch: u64, from: &str) -> String {
     format!("(epochclaim {room} :epoch {epoch} :from {from})")
 }
 
-/// The epoch an `(epochgranted @room :epoch N)` frame grants, if `text` is one
-/// for `room` **and the hub is the party that said it**.
+/// The grant an `(epochgranted @room :epoch N :state claimed|armed)` frame
+/// carries, if `text` is one for `room` **and the hub is the party that said
+/// it**.
+///
+/// The state is read from the frame, never assumed from what we asked for.
+/// [[SPEC-063-one-committer-per-epoch]] REQ-007 makes `:state armed` the
+/// observable that gates a merge — precisely because "hold the grant before
+/// merging" named no frame, so a client could obey it sincerely and still merge
+/// on a reservation. A client that inferred the state from its own request
+/// would reintroduce that: a holder reacquiring after a restart asks with
+/// `epochclaim` while it is still *armed*, and must be told so.
 ///
 /// The room is checked here rather than by the caller because a grant for
 /// another room is not a grant — and a session that accepted one would commit
@@ -66,7 +118,7 @@ pub fn epochclaim_frame(room: &str, epoch: u64, from: &str) -> String {
 /// `epochgranted` at ingress ([[SPEC-027 REQ-011]]): a rule enforced solely by
 /// the party it protects is not a rule, and a client that dropped this check
 /// would be the only thing standing between a member and a forged promise.
-pub fn granted_epoch(text: &str, room: &str) -> Option<u64> {
+pub fn granted(text: &str, room: &str) -> Option<Grant> {
     let SExpr::List(items) = cbcl_parser::parse(text).ok()? else {
         return None;
     };
@@ -85,24 +137,46 @@ pub fn granted_epoch(text: &str, room: &str) -> Option<u64> {
     ) {
         return None;
     }
+    let mut epoch: Option<u64> = None;
+    let mut state: Option<ClaimState> = None;
     let mut index = 2;
     while index + 1 < items.len() {
         if let SExpr::Atom(Atom::Keyword(keyword)) = &items[index] {
-            if keyword == "epoch" {
-                return match items.get(index + 1) {
-                    Some(SExpr::Atom(Atom::Num(epoch))) if *epoch >= 0 => Some(*epoch as u64),
-                    _ => None,
-                };
+            match (keyword.as_str(), items.get(index + 1)) {
+                ("epoch", Some(SExpr::Atom(Atom::Num(value)))) if *value >= 0 => {
+                    epoch = Some(*value as u64);
+                }
+                ("state", Some(SExpr::Atom(Atom::Symbol(word))))
+                | ("state", Some(SExpr::Atom(Atom::Str(word)))) => {
+                    state = match word.as_str() {
+                        "claimed" => Some(ClaimState::Claimed),
+                        "armed" => Some(ClaimState::Armed),
+                        // An unknown state is not a state. Guessing here is how
+                        // a client merges on something it does not understand.
+                        _ => return None,
+                    };
+                }
+                _ => {}
             }
         }
         index += 2;
     }
-    None
+    Some(Grant {
+        epoch: epoch?,
+        state: state?,
+    })
 }
 
-/// Whether `text` is the hub refusing a claim for `room` — the retry answer.
-pub fn is_claim_refusal(text: &str, room: &str) -> bool {
-    error_slug_for(text, room).as_deref() == Some(CLAIMED_SLUG)
+/// Classify a hub refusal for `room`, or `None` if `text` is not one.
+///
+/// The two are deliberately not merged into a boolean. They differ in the only
+/// dimension that matters to a retry loop: what makes them clear.
+pub fn refusal(text: &str, room: &str) -> Option<Refusal> {
+    match error_slug_for(text, room).as_deref() {
+        Some(CLAIMED_SLUG) => Some(Refusal::Contended),
+        Some(INACTIVE_SLUG) => Some(Refusal::Inactive),
+        _ => None,
+    }
 }
 
 /// The slug of an `(error @room "slug")` frame addressed to `room`.
@@ -168,17 +242,60 @@ mod tests {
         );
     }
 
-    /// CON-001 (positive) — a grant for this room at this epoch is recognised.
+    /// CON-001 (positive) — a grant for this room is recognised, and its STATE
+    /// is read from the frame.
     #[test]
-    fn a_grant_for_this_room_yields_its_epoch() {
+    fn a_grant_for_this_room_yields_its_epoch_and_state() {
         assert_eq!(
-            granted_epoch("(epochgranted @research :epoch 7)", "@research"),
-            Some(7)
+            granted("(epochgranted @research :epoch 7 :state claimed)", "@research"),
+            Some(Grant {
+                epoch: 7,
+                state: ClaimState::Claimed
+            })
         );
         assert_eq!(
-            granted_epoch("(epochgranted @research :epoch 0)", "@research"),
-            Some(0),
+            granted("(epochgranted @research :epoch 7 :state armed)", "@research"),
+            Some(Grant {
+                epoch: 7,
+                state: ClaimState::Armed
+            })
+        );
+        assert_eq!(
+            granted("(epochgranted @research :epoch 0 :state claimed)", "@research"),
+            Some(Grant {
+                epoch: 0,
+                state: ClaimState::Claimed
+            }),
             "epoch zero is a real epoch — a group's first"
+        );
+    }
+
+    /// SPEC-063 REQ-007 — **the state is never inferred from what we asked
+    /// for.** A holder reacquiring after a restart asks with `epochclaim` while
+    /// it is still armed, and the hub answers `armed`. A client that assumed
+    /// `claimed` because it sent `epochclaim` would read "I lost my promise"
+    /// exactly when it most needs to know it hasn't — and would then re-merge
+    /// on a reservation.
+    #[test]
+    fn the_state_comes_from_the_frame_not_from_the_request() {
+        let reacquired = granted(
+            "(epochgranted @research :epoch 7 :state armed)",
+            "@research",
+        )
+        .expect("a reacquisition is a grant");
+        assert_eq!(
+            reacquired.state,
+            ClaimState::Armed,
+            "the reply to an epochclaim can legitimately be `armed`"
+        );
+
+        // A grant with no state is not a grant: there is nothing to gate on.
+        assert_eq!(granted("(epochgranted @research :epoch 7)", "@research"), None);
+        // Nor is an unrecognised state — guessing is how a client merges on
+        // something it does not understand.
+        assert_eq!(
+            granted("(epochgranted @research :epoch 7 :state pending)", "@research"),
+            None
         );
     }
 
@@ -191,79 +308,84 @@ mod tests {
     /// by trusting the mechanism that prevents it.
     #[test]
     fn a_member_authored_grant_is_not_a_grant() {
-        assert_eq!(
-            granted_epoch(
-                "(epochgranted @research :epoch 7 :from @mallory)",
-                "@research"
-            ),
-            None,
-            "a frame carrying :from came from a member, not the hub"
-        );
-        // Order must not matter — the check is over the whole frame.
-        assert_eq!(
-            granted_epoch(
-                "(epochgranted @research :from @mallory :epoch 7)",
-                "@research"
-            ),
-            None
-        );
-        // Our own handle confers nothing either: provenance is about the hub,
-        // not about who looks friendly.
-        assert_eq!(
-            granted_epoch("(epochgranted @research :epoch 7 :from @aria)", "@research"),
-            None
-        );
-        // And the genuine hub frame, which carries no :from, still works.
-        assert_eq!(
-            granted_epoch("(epochgranted @research :epoch 7)", "@research"),
-            Some(7)
+        for forged in [
+            "(epochgranted @research :epoch 7 :state armed :from @mallory)",
+            "(epochgranted @research :from @mallory :epoch 7 :state armed)",
+            // Our own handle confers nothing: provenance is about the hub, not
+            // about who looks friendly.
+            "(epochgranted @research :epoch 7 :state armed :from @aria)",
+        ] {
+            assert_eq!(
+                granted(forged, "@research"),
+                None,
+                "a frame carrying :from came from a member, not the hub: {forged}"
+            );
+        }
+        assert!(
+            granted("(epochgranted @research :epoch 7 :state armed)", "@research").is_some(),
+            "and the genuine hub frame, which carries no :from, still works"
         );
     }
 
-    /// CON-001 (negative-input) — the load-bearing one. A grant for ANOTHER room
-    /// is not a grant. Accepting it would let a session commit against an epoch
-    /// nobody promised it, which is the exact failure the claim prevents.
+    /// CON-001 (negative-input) — a grant for ANOTHER room is not a grant.
+    /// Accepting one would let a session merge against an epoch nobody promised
+    /// it, which is the exact failure the claim prevents.
     #[test]
     fn a_grant_for_another_room_is_not_a_grant() {
         assert_eq!(
-            granted_epoch("(epochgranted @other :epoch 7)", "@research"),
+            granted("(epochgranted @other :epoch 7 :state armed)", "@research"),
             None
         );
-        // Nor is a differently-shaped frame that merely mentions the room.
         assert_eq!(
-            granted_epoch("(tell @research \"epochgranted\" :epoch 7)", "@research"),
+            granted(
+                "(tell @research \"epochgranted\" :epoch 7 :state armed)",
+                "@research"
+            ),
             None
         );
-        assert_eq!(granted_epoch("(epochgranted @research)", "@research"), None);
         assert_eq!(
-            granted_epoch("(epochgranted @research :epoch -1)", "@research"),
+            granted("(epochgranted @research :state armed)", "@research"),
+            None
+        );
+        assert_eq!(
+            granted("(epochgranted @research :epoch -1 :state armed)", "@research"),
             None,
             "a negative epoch is malformed, not epoch 0"
         );
-        assert_eq!(granted_epoch("not cbcl at all", "@research"), None);
+        assert_eq!(granted("not cbcl at all", "@research"), None);
     }
 
-    /// CON-001 (positive + negative-input) — a refusal is recognised only for
-    /// this room, and only for the claim slug. `no-groupinfo` is a different
-    /// answer and must not be read as "someone else holds it".
+    /// SPEC-027 REQ-002 — the two refusals are classified, not counted.
+    ///
+    /// They differ in the only dimension a retry loop cares about: what makes
+    /// them clear. Contention clears when the holder finishes, in seconds.
+    /// `epoch-claim-inactive` clears on a MEMBERSHIP change — a legacy client
+    /// leaving or upgrading — so retrying it on a backoff turns an ordinary
+    /// rollout into a hot loop against a hub that will refuse every attempt.
     #[test]
-    fn only_this_rooms_claim_slug_is_a_refusal() {
-        assert!(is_claim_refusal(
-            "(error @research \"groupinfo-claimed\")",
-            "@research"
-        ));
-        assert!(!is_claim_refusal(
-            "(error @other \"groupinfo-claimed\")",
-            "@research"
-        ));
-        assert!(!is_claim_refusal(
-            "(error @research \"no-groupinfo\")",
-            "@research"
-        ));
-        assert!(!is_claim_refusal(
-            "(error @research \"not-a-member\")",
-            "@research"
-        ));
+    fn refusals_are_classified_by_what_makes_them_clear() {
+        assert_eq!(
+            refusal("(error @research \"groupinfo-claimed\")", "@research"),
+            Some(Refusal::Contended)
+        );
+        assert_eq!(
+            refusal("(error @research \"epoch-claim-inactive\")", "@research"),
+            Some(Refusal::Inactive)
+        );
+        // Another room's refusal is not ours.
+        assert_eq!(
+            refusal("(error @other \"groupinfo-claimed\")", "@research"),
+            None
+        );
+        // And an unrelated error is neither.
+        assert_eq!(
+            refusal("(error @research \"not-a-member\")", "@research"),
+            None
+        );
+        assert_eq!(
+            refusal("(error @research \"no-groupinfo\")", "@research"),
+            None
+        );
     }
 
     /// NFR-001 — the budget permits nine retries and then stops, rather than
