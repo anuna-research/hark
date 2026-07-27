@@ -67,6 +67,96 @@ pub fn decide(record_epoch: u64, group_epoch: u64) -> Recovery {
     }
 }
 
+/// What a merged operation still owes the group ([[SPEC-027 REQ-014]]).
+///
+/// The order is the requirement, not an implementation detail. §14's Welcome
+/// clause is the one prohibition the promise does **not** license away — it is
+/// stated without the "since the client doesn't know" conditional — so the
+/// Welcome waits on acceptance. And the claim outlives both, because releasing
+/// it earlier is what lets a third committer move the epoch out from under an
+/// invitee that has not been seated yet.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Owed {
+    /// The Commit is out but unacknowledged. Nothing else may happen yet.
+    Acceptance,
+    /// Accepted. The deferred Welcome may now go, and must.
+    Welcome,
+    /// Everything the group needed has been sent; the claim may be released.
+    Release,
+    /// Released. The durable record may be discharged.
+    Nothing,
+}
+
+/// Tracks what one merged operation still owes.
+///
+/// Deliberately not three booleans read at each site. The invariant this
+/// protects — never release while a Welcome is outstanding — is exactly the
+/// kind that survives review as three correct conditionals and then dies the
+/// first time a fourth is added somewhere else.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct Discharge {
+    accepted: bool,
+    welcome_sent: bool,
+    released: bool,
+    owes_welcome: bool,
+}
+
+impl Discharge {
+    /// A freshly merged operation. `owes_welcome` is false for a Remove, which
+    /// seats nobody.
+    pub fn new(owes_welcome: bool) -> Self {
+        Self {
+            accepted: false,
+            welcome_sent: false,
+            released: false,
+            owes_welcome,
+        }
+    }
+
+    /// The Commit came back from the hub — [[SPEC-027 OQ-003]]'s acceptance
+    /// signal. Idempotent: the echo may be seen more than once across a
+    /// reconnect that replays history.
+    pub fn accepted(&mut self) {
+        self.accepted = true;
+    }
+
+    /// The deferred Welcome has been written to the socket.
+    ///
+    /// Refuses to record a Welcome that was sent before acceptance, because
+    /// recording it would let [`Self::owed`] report `Release` for an operation
+    /// that broke §14 on the way there — the tracker would launder the very
+    /// violation it exists to prevent.
+    pub fn welcome_sent(&mut self) -> Result<(), &'static str> {
+        if !self.accepted {
+            return Err("a Welcome must not be sent before the Commit is accepted (REQ-003)");
+        }
+        self.welcome_sent = true;
+        Ok(())
+    }
+
+    /// `epochrelease` has been sent.
+    pub fn released(&mut self) -> Result<(), &'static str> {
+        if self.owed() != Owed::Release {
+            return Err("the claim must not be released while anything is still owed (REQ-014)");
+        }
+        self.released = true;
+        Ok(())
+    }
+
+    /// What remains.
+    pub fn owed(&self) -> Owed {
+        if !self.accepted {
+            Owed::Acceptance
+        } else if self.owes_welcome && !self.welcome_sent {
+            Owed::Welcome
+        } else if !self.released {
+            Owed::Release
+        } else {
+            Owed::Nothing
+        }
+    }
+}
+
 /// One merged-but-undelivered epoch operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,6 +341,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// REQ-014 — an Add owes acceptance, then the Welcome, then the release,
+    /// and the order is the requirement.
+    #[test]
+    fn an_add_discharges_in_order() {
+        let mut d = Discharge::new(true);
+        assert_eq!(d.owed(), Owed::Acceptance);
+
+        // Releasing now would let a third committer move the epoch out from
+        // under an invitee that is in the tree and holds no secrets.
+        assert!(d.released().is_err());
+
+        d.accepted();
+        assert_eq!(d.owed(), Owed::Welcome);
+        assert!(
+            d.released().is_err(),
+            "acceptance alone does not discharge the claim — the Welcome is still owed"
+        );
+
+        d.welcome_sent().expect("the Welcome may go once accepted");
+        assert_eq!(d.owed(), Owed::Release);
+
+        d.released().expect("both obligations met");
+        assert_eq!(d.owed(), Owed::Nothing);
+    }
+
+    /// REQ-014 — a Remove seats nobody, so it goes straight from acceptance to
+    /// release. Making it wait on a Welcome it never owed would strand the
+    /// room's epoch behind a claim nobody can discharge.
+    #[test]
+    fn a_remove_needs_no_welcome() {
+        let mut d = Discharge::new(false);
+        assert_eq!(d.owed(), Owed::Acceptance);
+        d.accepted();
+        assert_eq!(d.owed(), Owed::Release);
+        d.released().expect("nothing else was owed");
+        assert_eq!(d.owed(), Owed::Nothing);
+    }
+
+    /// REQ-003 — the tracker refuses to *record* a Welcome sent too early.
+    ///
+    /// Not pedantry: if it accepted the report, `owed()` would then say
+    /// `Release`, and the operation would look discharged despite having broken
+    /// §14 on the way. A tracker that launders the violation it exists to
+    /// prevent is worse than none, because it produces evidence of compliance.
+    #[test]
+    fn a_welcome_before_acceptance_is_refused_not_recorded() {
+        let mut d = Discharge::new(true);
+        assert!(d.welcome_sent().is_err());
+        assert_eq!(
+            d.owed(),
+            Owed::Acceptance,
+            "the refused report changes nothing — the Welcome is still owed"
+        );
+    }
+
+    /// Acceptance is idempotent: a reconnect replays history, so the echo can
+    /// arrive more than once and must not disturb a discharge in progress.
+    #[test]
+    fn a_repeated_echo_is_harmless() {
+        let mut d = Discharge::new(true);
+        d.accepted();
+        d.welcome_sent().unwrap();
+        d.accepted();
+        assert_eq!(d.owed(), Owed::Release, "a replayed echo does not rewind");
     }
 
     /// REQ-012 — the recovery decision, which is the whole point of the record.
