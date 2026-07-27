@@ -496,6 +496,8 @@ pub fn add_member(
     target_handle: &str,
     pins: &PinStore,
     ledger: &ConsumedLedger,
+    room: &str,
+    promise: super::claim::CommitPromise<'_>,
 ) -> Result<AddOutcome, MlsError> {
     if !is_owner(group, identity)? {
         return Err(MlsError::Rejected(
@@ -532,6 +534,16 @@ pub fn add_member(
         )));
     }
 
+    // SPEC-027 REQ-001: the promise, checked before anything is generated.
+    //
+    // RFC 9420 §14 forbids a Commit from modifying a client's state — *because*
+    // the client cannot know whether its Commit will conflict. §3.2 names the
+    // escape: a promise from an orchestration server that this Commit is next.
+    // An `ArmedClaim` IS that promise, which is why it is a type and not a
+    // boolean: this function cannot be reached without one, or without the
+    // caller saying explicitly that the room has not activated the protocol.
+    check_promise(&promise, room, group.epoch().as_u64())?;
+
     let (commit, welcome, _group_info) = group
         .add_members(provider, &identity.signer, &[kp])
         .map_err(MlsError::stack("add members"))?;
@@ -547,6 +559,33 @@ pub fn add_member(
             .tls_serialize_detached()
             .map_err(MlsError::stack("serialize welcome"))?,
     })
+}
+
+/// [[SPEC-027 REQ-001]]: refuse to generate a Commit without the promise.
+///
+/// The epoch is re-checked here rather than trusted from when the claim was
+/// armed. The group can move underneath a committer between arming and
+/// merging — another member's Commit landing, a reconnect replaying history —
+/// and a promise for epoch N says nothing about a merge at N+1.
+pub(super) fn check_promise(
+    promise: &super::claim::CommitPromise<'_>,
+    room: &str,
+    epoch: u64,
+) -> Result<(), MlsError> {
+    use super::claim::CommitPromise;
+    match promise {
+        // The room has not activated the protocol: commit as before. §14 is
+        // unsatisfied for such a room, which is the status quo rather than a
+        // regression — and is why activation must be unanimous.
+        CommitPromise::Inactive => Ok(()),
+        CommitPromise::Armed(claim) if claim.covers(room, epoch) => Ok(()),
+        CommitPromise::Armed(claim) => Err(MlsError::Rejected(format!(
+            "refusing to commit in {room} at epoch {epoch}: the armed claim covers \
+             epoch {} — the group moved after the claim was armed, so the promise \
+             does not cover this merge (SPEC-027 REQ-001)",
+            claim.epoch()
+        ))),
+    }
 }
 
 /// A validated, joined group plus the genesis trust grade.
@@ -892,6 +931,107 @@ mod tests {
     /// TEST-001/TEST-003/TEST-016: create → add (REQ-008-verified) →
     /// welcome → join (REQ-012-validated) round trip with the genesis
     /// readable pre-finalize and the trust graded by pins.
+    /// SPEC-027 REQ-001 — **the gate refuses a promise that does not cover this
+    /// merge**, and this is the case the epoch check exists for.
+    ///
+    /// A committer arms at epoch N. Before it merges, another member's Commit
+    /// lands (or a reconnect replays history) and the group moves to N+1. The
+    /// armed claim is genuine, held, and for the wrong epoch — merging on it is
+    /// merging on a promise nobody made about this state. Without the re-check
+    /// this reads as compliance: the claim is armed, so the flag says go.
+    #[test]
+    fn a_promise_for_another_epoch_does_not_authorise_this_merge() {
+        use crate::mls::claim::{ArmedClaim, ClaimState, CommitPromise, Grant};
+
+        let armed_at_9 = ArmedClaim::from_grant(
+            &Grant {
+                epoch: 9,
+                token: "tok".to_owned(),
+                state: ClaimState::Armed,
+            },
+            "@research",
+        )
+        .expect("armed");
+
+        // The group is at epoch 0; the promise is for 9.
+        let err = check_promise(&CommitPromise::Armed(&armed_at_9), "@research", 0)
+            .expect_err("a promise for another epoch must not authorise the merge");
+        let text = err.to_string();
+        assert!(
+            text.contains("epoch 9") && text.contains("REQ-001"),
+            "the refusal names the epoch the promise covers, so an operator can \
+             see it is a sequencing problem and not a permissions one: {text}"
+        );
+
+        // The same promise at its own epoch is fine.
+        check_promise(&CommitPromise::Armed(&armed_at_9), "@research", 9)
+            .expect("the promise authorises its own epoch");
+        // And another room's merge is not covered either.
+        check_promise(&CommitPromise::Armed(&armed_at_9), "@other", 9)
+            .expect_err("a promise for another room is not a promise for this one");
+        // An unactivated room commits as before — the status quo, not a hole.
+        check_promise(&CommitPromise::Inactive, "@research", 0)
+            .expect("an inactive room commits unclaimed, as it did before SPEC-063");
+    }
+
+    /// SPEC-027 REQ-001 — the gate is reached from `add_member` itself, not
+    /// merely available beside it.
+    ///
+    /// Every call site currently passes `Inactive`, which is a no-op, so a
+    /// `check_promise` unit test alone cannot tell whether `add_member` calls
+    /// it. Removing the call passed that suite. This drives a real Add with a
+    /// genuine armed claim for the *wrong* epoch and requires the refusal.
+    #[test]
+    fn add_member_itself_refuses_a_promise_for_another_epoch() {
+        use crate::mls::claim::{ArmedClaim, ClaimState, CommitPromise, Grant};
+
+        let mut alice = party("gate-add", 71, "@alice");
+        let mut bob = party("gate-add", 72, "@bob");
+        pin_each_other(&mut [&mut alice, &mut bob]);
+        let (mut group, _genesis) =
+            create_group(&alice.provider, &alice.identity, "@research").unwrap();
+        let kp = super::super::keypackages::build_one_time(&bob.provider, &bob.identity, 1)
+            .unwrap()
+            .remove(0);
+
+        // Armed — but for an epoch this group is not at.
+        let stale = ArmedClaim::from_grant(
+            &Grant {
+                epoch: 99,
+                token: "tok".to_owned(),
+                state: ClaimState::Armed,
+            },
+            "@research",
+        )
+        .expect("armed");
+
+        let err = add_member(
+            &alice.provider,
+            &alice.identity,
+            &mut group,
+            &kp.bytes,
+            "@bob",
+            &alice.pins,
+            &alice.ledger,
+            "@research",
+            CommitPromise::Armed(&stale),
+        )
+        .err()
+        .expect("a promise for another epoch must not authorise this Add");
+        assert!(
+            err.to_string().contains("REQ-001"),
+            "and the refusal says why: {err}"
+        );
+
+        // Nothing was generated or merged: the group is where it was.
+        assert_eq!(
+            group.epoch().as_u64(),
+            0,
+            "a refused promise must leave the group untouched — the whole point \
+             is that state does not move without one"
+        );
+    }
+
     #[test]
     fn create_add_join_roundtrip_with_genesis() {
         let mut alice = party("rt", 31, "@alice");
@@ -919,6 +1059,9 @@ mod tests {
             "@bob",
             &alice.pins,
             &alice.ledger,
+        
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
         )
         .unwrap();
 
@@ -977,6 +1120,9 @@ mod tests {
             "@bob",
             &alice.pins,
             &alice.ledger,
+        
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
         );
         assert!(
             matches!(&dup, Err(MlsError::Rejected(m)) if m.contains("already a member")),
@@ -1023,7 +1169,10 @@ mod tests {
                 "@bob",
                 &alice.pins,
                 &alice.ledger,
-            )
+            
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
+        )
             .is_err(),
             "credential identity must match the intended target"
         );
@@ -1038,7 +1187,10 @@ mod tests {
                 "@bob",
                 &alice.pins,
                 &alice.ledger,
-            )
+            
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
+        )
             .is_err(),
             "leaf key must equal the pinned wire key"
         );
@@ -1081,6 +1233,9 @@ mod tests {
             "@bob",
             &mallory.pins,
             &mallory.ledger,
+        
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
         )
         .unwrap();
 
@@ -1110,6 +1265,9 @@ mod tests {
             "@bob",
             &alice.pins,
             &alice.ledger,
+        
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
         )
         .unwrap();
         join_from_welcome(
@@ -1150,6 +1308,9 @@ mod tests {
             "@bob",
             &alice.pins,
             &alice.ledger,
+        
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
         )
         .unwrap();
 
@@ -1212,6 +1373,9 @@ mod tests {
             "@bob",
             &alice.pins,
             &alice.ledger,
+        
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
         )
         .unwrap();
 

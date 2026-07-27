@@ -816,6 +816,14 @@ impl MlsSession {
                 &target,
                 &self.pins,
                 &self.ledger,
+                &self.room,
+                // SPEC-027 REQ-001: no room declares the epoch capability yet,
+                // so no room has activated the protocol and every commit takes
+                // the pre-SPEC-063 path. This becomes `Armed(&claim)` when the
+                // claim exchange lands; the gate is here now so that wiring is
+                // a change to one argument rather than a change to the
+                // invariant.
+                crate::mls::claim::CommitPromise::Inactive,
             )?;
             self.persist_meta()?;
             Ok(vec![
@@ -932,6 +940,8 @@ impl MlsSession {
             evidence,
             &self.pins,
             &creator,
+            // As above: inactive until a room activates the protocol.
+            crate::mls::claim::CommitPromise::Inactive,
         )?;
         let json = serde_json::to_vec(evidence).map_err(std::io::Error::other)?;
         self.persist_meta()?;

@@ -778,6 +778,9 @@ mod tests {
             "@bob",
             &alice.pins,
             &alice.ledger,
+        
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
         )
         .unwrap();
         let joined = join_from_welcome(

@@ -194,6 +194,11 @@ impl RemovalEvidence {
 /// re-checks at merge — and returns the Commit plus the evidence to fan with
 /// it. On an epoch race (evidence minted at an older epoch) this REJECTS;
 /// the caller re-mints fresh evidence at the live epoch and retries (K-1).
+// The parameter list is long because a Remove needs the whole trust context —
+// provider, identity, group, room, evidence, pins, the creator handle, and now
+// the SPEC-027 promise. Grouping them into a struct would hide which of them the
+// gate reads, on the one path where that matters most.
+#[allow(clippy::too_many_arguments)]
 pub fn remove_member(
     provider: &super::provider::DurableProvider,
     identity: &super::MlsIdentity,
@@ -202,6 +207,7 @@ pub fn remove_member(
     evidence: &RemovalEvidence,
     pins: &super::pins::PinStore,
     creator_handle: &str,
+    promise: super::claim::CommitPromise<'_>,
 ) -> Result<Vec<u8>, MlsError> {
     use super::group::{credential_handle, is_owner};
 
@@ -251,6 +257,10 @@ pub fn remove_member(
         target.index.u32(),
         &target_key,
     )?;
+
+    // SPEC-027 REQ-001: the same promise gate as the Add path. A Remove moves
+    // the epoch exactly as an Add does, so it conflicts exactly as an Add does.
+    super::group::check_promise(&promise, room, group.epoch().as_u64())?;
 
     let (commit, _welcome, _gi) = group
         .remove_members(provider, &identity.signer, &[target.index])
@@ -400,7 +410,10 @@ mod tests {
                 "@bob",
                 &alice.pins,
                 &alice.ledger,
-            )
+            
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
+        )
             .unwrap();
             let mut bob_group = join_from_welcome(
                 &bob.provider,
@@ -469,7 +482,9 @@ mod tests {
                 &stale_evidence,
                 &alice.pins,
                 "@alice",
-            )
+            
+            crate::mls::claim::CommitPromise::Inactive,
+        )
             .unwrap_err();
             assert!(matches!(err, MlsError::Rejected(_)), "{err}");
             assert_eq!(
@@ -493,6 +508,42 @@ mod tests {
                 bob_member.index.u32(),
                 &bob_key,
             );
+            // SPEC-027 REQ-001 — the gate is reached from `remove_member`
+            // itself. Every other call site passes `Inactive`, which is a
+            // no-op, so without this the gate could be deleted from the Remove
+            // path and nothing would notice. A Remove moves the epoch exactly
+            // as an Add does, so it conflicts exactly as an Add does.
+            {
+                use crate::mls::claim::{ArmedClaim, ClaimState, CommitPromise, Grant};
+                let stale = ArmedClaim::from_grant(
+                    &Grant {
+                        epoch: 99,
+                        token: "tok".to_owned(),
+                        state: ClaimState::Armed,
+                    },
+                    "@research",
+                )
+                .expect("armed");
+                let epoch_before = alice_group.epoch().as_u64();
+                let err = remove_member(
+                    &alice.provider,
+                    &alice.identity,
+                    &mut alice_group,
+                    "@research",
+                    &fresh_evidence,
+                    &alice.pins,
+                    "@alice",
+                    CommitPromise::Armed(&stale),
+                )
+                .expect_err("a promise for another epoch must not authorise this Remove");
+                assert!(err.to_string().contains("REQ-001"), "{err}");
+                assert_eq!(
+                    alice_group.epoch().as_u64(),
+                    epoch_before,
+                    "a refused promise leaves the group untouched"
+                );
+            }
+
             let commit_wire = remove_member(
                 &alice.provider,
                 &alice.identity,
@@ -501,7 +552,9 @@ mod tests {
                 &fresh_evidence,
                 &alice.pins,
                 "@alice",
-            )
+            
+            crate::mls::claim::CommitPromise::Inactive,
+        )
             .expect("retry with fresh evidence succeeds");
             assert_eq!(alice_group.members().count(), 1);
 
@@ -554,7 +607,10 @@ mod tests {
                 "@bob",
                 &alice.pins,
                 &alice.ledger,
-            )
+            
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
+        )
             .unwrap();
 
             // Bob crashed; alice (creator) signs the eviction herself.
@@ -581,7 +637,9 @@ mod tests {
                 &evidence,
                 &alice.pins,
                 "@alice",
-            )
+            
+            crate::mls::claim::CommitPromise::Inactive,
+        )
             .expect("creator-signed evidence is an accepted authority");
             assert_eq!(alice_group.members().count(), 1);
 
@@ -619,7 +677,10 @@ mod tests {
                 "@bob",
                 &alice.pins,
                 &alice.ledger,
-            )
+            
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
+        )
             .unwrap();
 
             let bob_member = alice_group
@@ -645,7 +706,9 @@ mod tests {
                 &evidence,
                 &alice.pins,
                 "@alice",
-            )
+            
+            crate::mls::claim::CommitPromise::Inactive,
+        )
             .unwrap_err();
             assert!(matches!(err, MlsError::Rejected(_)));
             assert_eq!(alice_group.members().count(), 2);

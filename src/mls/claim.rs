@@ -275,6 +275,77 @@ fn error_slug_for(text: &str, room: &str) -> Option<String> {
     })
 }
 
+/// Evidence that an **armed** claim is held for a particular room and epoch.
+///
+/// Constructible only from a hub grant that says `:state armed`, so a value of
+/// this type *is* RFC 9420 §3.2's promise. That is the point of it being a type
+/// rather than a boolean: [`super::group::add_member`] cannot be called without
+/// one, so "arm before merging" ([[SPEC-027 REQ-001]]) is a thing the compiler
+/// checks rather than a thing the state machine must remember.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ArmedClaim {
+    room: String,
+    epoch: u64,
+    token: String,
+}
+
+impl ArmedClaim {
+    /// Promote a grant to evidence, if it is armed and names `room`.
+    ///
+    /// A `claimed` grant is a reservation, not a promise, and returns `None`.
+    /// The distinction is the one cbcl-bus's intent-stamping bug got wrong, and
+    /// the one a merge must not blur.
+    pub fn from_grant(grant: &Grant, room: &str) -> Option<Self> {
+        match grant.state {
+            ClaimState::Armed => Some(Self {
+                room: room.to_owned(),
+                epoch: grant.epoch,
+                token: grant.token.clone(),
+            }),
+            ClaimState::Claimed => None,
+        }
+    }
+
+    /// Does this promise cover a commit against `room` at `epoch`?
+    ///
+    /// The epoch check is not ceremony. A grant is for the epoch it names, and
+    /// the group can move underneath us between arming and merging — another
+    /// member's Commit landing, or our own reconnect replaying history. Merging
+    /// against a different epoch than the one promised is merging on nothing.
+    pub fn covers(&self, room: &str, epoch: u64) -> bool {
+        self.room == room && self.epoch == epoch
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+/// What a caller of the commit path is standing on ([[SPEC-027 REQ-001]],
+/// [[SPEC-027 REQ-002]]).
+///
+/// Two variants and no default, so every call site says which world it is in.
+/// A default would make the dangerous case the quiet one: committing unclaimed
+/// in a room that *has* activated the protocol is exactly the false promise
+/// SPEC-063 exists to prevent, and it would look like ordinary code.
+#[derive(Debug, Clone, Copy)]
+pub enum CommitPromise<'a> {
+    /// The room has not activated the epoch protocol — the capability is not
+    /// unanimous across present members, so the hub refuses claims with
+    /// `epoch-claim-inactive` and every client commits as it did before.
+    ///
+    /// RFC 9420 §14 is unsatisfied for such a room. That is the status quo
+    /// rather than a regression, and it is why activation is unanimous: a
+    /// promise some members keep is worse than one nobody makes.
+    Inactive,
+    /// An armed claim is held for this room and epoch.
+    Armed(&'a ArmedClaim),
+}
+
 /// Tracks consecutive refusals for one pending commit ([[SPEC-027 NFR-001]]).
 #[derive(Debug, Clone, Default)]
 pub struct RefusalBudget {
@@ -543,6 +614,56 @@ mod tests {
             refusal("(error @research \"no-groupinfo\")", "@research"),
             None
         );
+    }
+
+    /// REQ-001 — a *reservation* is not a promise, and cannot become one by
+    /// being mistaken for one.
+    #[test]
+    fn only_an_armed_grant_becomes_evidence() {
+        let claimed = Grant {
+            epoch: 7,
+            token: "tok".to_owned(),
+            state: ClaimState::Claimed,
+        };
+        assert_eq!(
+            ArmedClaim::from_grant(&claimed, "@research"),
+            None,
+            "a claimed grant is a reservation the hub may take back — merging on \
+             it is merging on nothing"
+        );
+
+        let armed = Grant {
+            state: ClaimState::Armed,
+            ..claimed
+        };
+        let evidence = ArmedClaim::from_grant(&armed, "@research").expect("armed is a promise");
+        assert_eq!(evidence.token(), "tok");
+        assert_eq!(evidence.epoch(), 7);
+    }
+
+    /// REQ-001 — the promise covers ONE room at ONE epoch. The group can move
+    /// under us between arming and merging (another member's Commit, or a
+    /// reconnect replaying history), and a promise for a different epoch is not
+    /// a promise for this one.
+    #[test]
+    fn a_promise_covers_only_the_room_and_epoch_it_names() {
+        let armed = Grant {
+            epoch: 7,
+            token: "tok".to_owned(),
+            state: ClaimState::Armed,
+        };
+        let evidence = ArmedClaim::from_grant(&armed, "@research").expect("armed");
+
+        assert!(evidence.covers("@research", 7));
+        assert!(
+            !evidence.covers("@research", 8),
+            "the epoch moved under us: this promise no longer applies"
+        );
+        assert!(
+            !evidence.covers("@research", 6),
+            "nor does it apply backwards"
+        );
+        assert!(!evidence.covers("@other", 7), "nor to another room");
     }
 
     /// NFR-001 — the budget permits nine retries and then stops, rather than

@@ -268,6 +268,9 @@ mod tests {
             "@bob",
             &a_pins,
             &a_ledger,
+        
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
         )
         .unwrap();
         let after_add = group_safety_numbers(&group).unwrap();
