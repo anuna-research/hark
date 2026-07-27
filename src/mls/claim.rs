@@ -43,11 +43,29 @@ pub fn epochclaim_frame(room: &str, epoch: u64, from: &str) -> String {
 }
 
 /// The epoch an `(epochgranted @room :epoch N)` frame grants, if `text` is one
-/// for `room`.
+/// for `room` **and the hub is the party that said it**.
 ///
 /// The room is checked here rather than by the caller because a grant for
 /// another room is not a grant — and a session that accepted one would commit
 /// against an epoch nobody promised it.
+///
+/// **Provenance is checked, and it is the load-bearing part.** The grant is the
+/// whole of RFC 9420 §3.2's promise; a committer that accepts a forged one
+/// merges eagerly with no exclusivity behind it, which is exactly the conflict
+/// the claim exists to prevent — reached by trusting the thing that prevents it.
+/// Any member can publish arbitrary room frames and the hub fans them, so
+/// `(epochgranted @room :epoch 7 :from @mallory)` would otherwise be
+/// indistinguishable from a real grant.
+///
+/// The discriminator is the **absence of `:from`**. cbcl-chat requires `:from`
+/// on every member-authored room frame and refuses one without it as
+/// `missing-from`, never fanning it — so a frame that reached us carrying no
+/// `:from` cannot have come from a member. Hub-originated frames carry none.
+///
+/// This is the client half only. The hub MUST also refuse a member-authored
+/// `epochgranted` at ingress ([[SPEC-027 REQ-011]]): a rule enforced solely by
+/// the party it protects is not a rule, and a client that dropped this check
+/// would be the only thing standing between a member and a forged promise.
 pub fn granted_epoch(text: &str, room: &str) -> Option<u64> {
     let SExpr::List(items) = cbcl_parser::parse(text).ok()? else {
         return None;
@@ -59,6 +77,13 @@ pub fn granted_epoch(text: &str, room: &str) -> Option<u64> {
     match items.get(1)? {
         SExpr::Atom(Atom::Symbol(named)) if named == room => {}
         _ => return None,
+    }
+    // A member cannot omit `:from` (the hub refuses the frame); the hub does not
+    // add one. So its presence means this did not come from the hub.
+    if items.iter().any(
+        |item| matches!(item, SExpr::Atom(Atom::Keyword(keyword)) if keyword == "from"),
+    ) {
+        return None;
     }
     let mut index = 2;
     while index + 1 < items.len() {
@@ -154,6 +179,44 @@ mod tests {
             granted_epoch("(epochgranted @research :epoch 0)", "@research"),
             Some(0),
             "epoch zero is a real epoch — a group's first"
+        );
+    }
+
+    /// CON-001 (negative-input) — **a member cannot forge a grant.**
+    ///
+    /// The hub fans arbitrary member-authored room frames, so without a
+    /// provenance check `(epochgranted @research :epoch 7 :from @mallory)` reads
+    /// as a hub grant. A committer accepting it merges eagerly with nothing
+    /// guaranteeing exclusivity — the very conflict the claim prevents, produced
+    /// by trusting the mechanism that prevents it.
+    #[test]
+    fn a_member_authored_grant_is_not_a_grant() {
+        assert_eq!(
+            granted_epoch(
+                "(epochgranted @research :epoch 7 :from @mallory)",
+                "@research"
+            ),
+            None,
+            "a frame carrying :from came from a member, not the hub"
+        );
+        // Order must not matter — the check is over the whole frame.
+        assert_eq!(
+            granted_epoch(
+                "(epochgranted @research :from @mallory :epoch 7)",
+                "@research"
+            ),
+            None
+        );
+        // Our own handle confers nothing either: provenance is about the hub,
+        // not about who looks friendly.
+        assert_eq!(
+            granted_epoch("(epochgranted @research :epoch 7 :from @aria)", "@research"),
+            None
+        );
+        // And the genuine hub frame, which carries no :from, still works.
+        assert_eq!(
+            granted_epoch("(epochgranted @research :epoch 7)", "@research"),
+            Some(7)
         );
     }
 
