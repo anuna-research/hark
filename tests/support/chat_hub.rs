@@ -61,6 +61,11 @@ pub type Transcript = Vec<String>;
 pub struct FakeHub {
     addr: SocketAddr,
     transcripts: Arc<Mutex<Vec<Transcript>>>,
+    /// How many connections the hub has seen END — the client went away or the
+    /// socket was dropped. This is the only way a test can observe that hark
+    /// let go of a socket, which is what distinguishes "the loop noticed" from
+    /// "the loop is still sitting in a handshake timeout".
+    ended: Arc<Mutex<usize>>,
 }
 
 impl FakeHub {
@@ -85,6 +90,8 @@ impl FakeHub {
             .expect("fake hub should report its address");
         let transcripts = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&transcripts);
+        let ended = Arc::new(Mutex::new(0usize));
+        let ended_writer = Arc::clone(&ended);
         let channel = channel.to_owned();
 
         tokio::spawn(async move {
@@ -98,20 +105,45 @@ impl FakeHub {
                     all.len() - 1
                 };
                 let recorded = Arc::clone(&recorded);
+                let ended_writer = Arc::clone(&ended_writer);
                 let channel = channel.clone();
                 // Each connection is served concurrently, but the transcript
                 // slot is claimed at *accept* time above, so slot order is
                 // still connection order. Concurrency matters for the daemon
                 // restart tests, where the old connection is still draining
                 // while the replacement daemon dials in.
-                tokio::spawn(serve(stream, act, channel, recorded, index));
+                tokio::spawn(async move {
+                    serve(stream, act, channel, recorded, index).await;
+                    *ended_writer.lock().expect("ended lock") += 1;
+                });
             }
             // Script exhausted: drop the listener so later attempts get a refusal
             // rather than an accepted-but-silent socket.
             drop(listener);
         });
 
-        Self { addr, transcripts }
+        Self {
+            addr,
+            transcripts,
+            ended,
+        }
+    }
+
+    /// How many connections have ended (client gone / socket dropped).
+    pub fn ended(&self) -> usize {
+        *self.ended.lock().expect("ended lock")
+    }
+
+    /// Wait until at least `n` connections have ended, or `timeout` elapses.
+    pub async fn wait_for_ended(&self, n: usize, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if self.ended() >= n {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.ended() >= n
     }
 
     /// The `ws://…/chat/v1` URL to point an agent at.
