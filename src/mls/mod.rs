@@ -21,6 +21,7 @@
 //! - [`session`] — encryption-mode pin + the chat-session facade (REQ-023).
 
 pub mod claim;
+pub mod epochop;
 pub mod group;
 pub mod keypackages;
 pub mod pins;
