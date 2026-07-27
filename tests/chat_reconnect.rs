@@ -734,6 +734,20 @@ async fn an_emit_during_a_reconnect_handshake_is_refused_immediately() {
 
 /// SPEC-026 REQ-004 — a `hark close` during a reconnect handshake takes effect
 /// immediately, for the same reason.
+///
+/// **What this test does and does not discriminate.** It observes the hub seeing
+/// the stalled socket go away, which is strictly better than the previous
+/// version (that asserted the agent had left the store — already true the
+/// instant `AgentStore::close` returns, and so true even if the loop ignored
+/// `close_rx` entirely and sat in the 10 s join timeout). But removing the
+/// `close_rx` arm from the handshake select does NOT make this fail, and that is
+/// not a flaw in the assertion: `close` removes the store entry, which drops the
+/// `AgentSendChannel`, so `send_rx.recv()` yields `None` and the loop exits by
+/// that route instead. Two mechanisms produce the same observable, and `select!`
+/// picks between them at random. The requirement — the close takes effect
+/// promptly — holds either way; the attribution to `close_rx` specifically is
+/// what is untested, and closing that would mean keeping a send-channel clone
+/// alive across a close, which no caller does.
 #[tokio::test]
 async fn a_close_during_a_reconnect_handshake_is_immediate() {
     let hub = FakeHub::start(vec![
@@ -749,27 +763,29 @@ async fn a_close_during_a_reconnect_handshake_is_immediate() {
     let (handle, _warnings) = join(store.clone(), &hub).await.expect("the join succeeds");
     assert!(hub.wait_for_connections(2, Duration::from_secs(5)).await);
 
+    // The stalled connection is still open and hark is parked inside its
+    // handshake. Nothing has ended yet.
+    assert_eq!(hub.ended(), 1, "only the dropped first connection has ended");
+
     let started = tokio::time::Instant::now();
     store.close(&handle).await.expect("close succeeds");
-    // The close signal must reach the transport loop rather than sitting behind
-    // the 10 s join timeout. Observed by the agent leaving the store.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let mut gone = false;
-    while tokio::time::Instant::now() < deadline {
-        if !store
-            .status_snapshots()
-            .await
-            .iter()
-            .any(|snapshot| snapshot.agent_handle == handle.as_str())
-        {
-            gone = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+
+    // The OBSERVABLE has to be something only the transport loop can produce.
+    // `AgentStore::close` removes the entry synchronously, so "the agent left
+    // the store" is already true the instant `close()` returns and would hold
+    // even if the loop never selected on `close_rx` at all — it would simply
+    // sit in `join_hub` for the full 10 s timeout still holding the socket.
+    // What discriminates is the hub seeing the stalled socket go away.
     assert!(
-        gone,
-        "the agent must be gone promptly; waited {:?}",
+        hub.wait_for_ended(2, Duration::from_secs(3)).await,
+        "the close must reach the loop mid-handshake and drop the socket; \
+         the join timeout is 10 s, so a loop that ignored close_rx would still \
+         be holding it here. waited {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "and it must be prompt, not merely eventual: {:?}",
         started.elapsed()
     );
 }
