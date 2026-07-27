@@ -1214,6 +1214,10 @@ async fn daemon_run() -> AppResult<()> {
     })?;
 
     let agents = AgentStore::new(AgentStoreConfig::from_config(&config));
+    // SPEC-026 REQ-008: bring back every agent the last daemon had, before the
+    // server is awaited and without blocking readiness on it. A restart used to
+    // drop every agent and require re-pairing by hand.
+    crate::local_api::rehydrate_paired_agents(agents.clone(), &config);
     let result = serve_local_api_with_agents(
         listener,
         record,
@@ -1303,6 +1307,16 @@ async fn daemon_status() -> AppResult<()> {
                 }
                 if let Some(detail) = agent.unhealthy_detail {
                     println!("  unhealthy_detail={detail}");
+                }
+                // SPEC-026 OBS-002: an agent riding out a hub outage. Reported
+                // separately from the unhealthy fields so an operator can tell
+                // "coming back" from "dead" at a glance — the whole point of
+                // giving the gap its own state.
+                if agent.reconnect_attempts > 0 {
+                    println!("  reconnect_attempts={}", agent.reconnect_attempts);
+                }
+                if let Some(detail) = agent.reconnect_detail {
+                    println!("  reconnect_detail={detail}");
                 }
             }
             Ok(())
@@ -1492,6 +1506,8 @@ mod tests {
             unhealthy_reason: None,
             unhealthy_detail: None,
             channel: Some("@research".to_owned()),
+            reconnect_attempts: 0,
+            reconnect_detail: None,
         }
     }
 

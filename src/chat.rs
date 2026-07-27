@@ -30,6 +30,7 @@ use crate::chat_responder::{Action, Responder, WindowOutcome};
 use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore, OutboundReject};
 use crate::identity::ChatIdentity;
 use crate::mls::session::{MlsSession, SessionEvent};
+use crate::reconnect::ReconnectSchedule;
 use crate::signed_transport::{SignedConn, parse_conn_bootstrap};
 
 pub const CHAT_WS_PATH: &str = "/chat/v1";
@@ -183,32 +184,66 @@ fn cap_part(cap: Option<&str>) -> String {
     }
 }
 
-/// Connect to `/chat/v1`, join `channel` as `agent_handle` with a signed
-/// `hello`, and spawn the receive loop. Returns the store handle for the
-/// connection (used by `recv`/`reply`).
+/// Everything needed to (re-)establish one agent's signed-member join
+/// ([[SPEC-026 CON-001]]).
 ///
-/// `cap` is the capability presented for a *private* channel: the channel's
-/// standing cap or a bounded invite token (the hub's `allow-join?` /
-/// `join-allowed?`, SPEC-001). Public channels ignore it; pass `None` to enter
-/// a public channel.
-#[allow(clippy::too_many_arguments)]
-pub async fn create_chat_agent(
-    store: AgentStore,
-    ws_url: &Url,
-    channel: &str,
-    agent_handle: &str,
+/// It exists because a reconnect is not a *new* join: it must reproduce the
+/// original one exactly — same channel, same wire handle, same advertised
+/// dialects, same capability, same provenance — or the agent comes back as
+/// somebody else, or as a member of nothing. Grouping the parameters is what
+/// makes "replay the join" a single call rather than six arguments threaded
+/// through the transport loop.
+#[derive(Debug, Clone)]
+pub(crate) struct JoinParams {
+    ws_url: Url,
+    channel: String,
+    wire_handle: String,
     dialects: Vec<String>,
     cap: Option<String>,
     added_by: Option<String>,
-    claim_window: Duration,
-    liveness_timeout: Duration,
-    identity: Arc<ChatIdentity>,
-    mut mls: Option<MlsSession>,
+}
+
+/// A joined member socket and the per-connection state that belongs to it
+/// ([[SPEC-026 CON-001]] post-conditions).
+struct Joined {
+    websocket: ChatSocket,
+    /// Primed from *this* connection's nonce: a `SignedConn` is not portable
+    /// across sockets, so a reconnect always brings a new one.
+    conn: SignedConn,
+    roomcfg: RoomCfg,
+    warnings: Vec<String>,
+}
+
+/// Run the signed-member join handshake for `params` ([[SPEC-026 CON-001]]).
+///
+/// This is the *single* implementation of the join: called once by
+/// [`create_chat_agent`] at first join, and once per attempt by the reconnect
+/// arm of the receive loop. Two clients of one handshake, not two handshakes —
+/// a reconnect that drifted from the original join path is a reconnect that
+/// eventually stops being accepted.
+///
+/// `mls_create` MUST be true at most once per agent, at first join only. A
+/// second `create_group_as_creator` would fork the group, so the reconnect path
+/// always passes `false`.
+///
+/// The error partition is load-bearing for the caller (REQ-005):
+/// [`ChatError::JoinRejected`] and [`ChatError::DowngradeRefused`] are terminal
+/// — the hub said no, or the encryption pin was violated. Everything else is a
+/// transport-level failure and is retryable.
+async fn join_hub(
+    params: &JoinParams,
+    identity: &ChatIdentity,
+    mut mls: Option<&mut MlsSession>,
     mls_create: bool,
-    receive_all: bool,
-) -> Result<(AgentHandle, Vec<String>), ChatError> {
-    AgentStore::validate_advertisement(&dialects)
-        .map_err(|error| ChatError::Store(error.to_string()))?;
+) -> Result<Joined, ChatError> {
+    let JoinParams {
+        ws_url,
+        channel,
+        wire_handle: agent_handle,
+        dialects,
+        cap,
+        added_by,
+    } = params;
     let (mut websocket, _response) = connect_async(ws_url.as_str())
         .await
         .map_err(|error| ChatError::ConnectionFailed(error.to_string()))?;
@@ -224,7 +259,7 @@ pub async fn create_chat_agent(
         cap_part(cap.as_deref()),
     );
     let payload = payload_bytes(&hello).map_err(ChatError::Hello)?;
-    let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
+    let frame = conn.sign_chat_frame(identity, &payload);
     websocket
         .send(WsMessage::Binary(frame.into()))
         .await
@@ -260,42 +295,12 @@ pub async fn create_chat_agent(
                 .map_err(|e| ChatError::Hello(format!("mls join frames: {e}")))?;
             for text in frames {
                 let payload = payload_bytes(&text).map_err(ChatError::Hello)?;
-                let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
+                let frame = conn.sign_chat_frame(identity, &payload);
                 websocket
                     .send(WsMessage::Binary(frame.into()))
                     .await
                     .map_err(|e| ChatError::HelloSendFailed(e.to_string()))?;
             }
-        }
-    }
-
-    // SPEC-024 (ADR-034/ADR-035): a room the hub marks `mls-ds/v1` activates the
-    // v1 posture on the session (H7 owner-removal rejection + CON-013 atomic
-    // persist) and runs the DS pull loop instead of relying on SPEC-013 push for
-    // the record log. The pull task feeds admitted records into the receive loop
-    // below, which owns the MlsSession for the apply + atomic commit.
-    let mut ds_pull: Option<crate::mls_ds::task::DsPullConfig> = None;
-    if roomcfg.mls_ds {
-        if let Some(session) = mls.as_mut() {
-            session
-                .mark_v1()
-                .map_err(|e| ChatError::Hello(format!("mls-ds/v1 activation: {e}")))?;
-            let initial_log = session
-                .load_v1_state()
-                .map(|(_, _, log)| log)
-                .unwrap_or_else(|| crate::mls_ds::ClientLog {
-                    cursor: 0,
-                    cursor_hash: crate::mls_ds::task::GENESIS_CURSOR_HASH.into(),
-                });
-            // The DS endpoint lives on the same hub as /chat/v1.
-            let ds_url = ws_url.as_str().replace("/chat/v1", "/mls-ds/v1");
-            ds_pull = Some(crate::mls_ds::task::DsPullConfig {
-                ds_url,
-                room: channel.to_owned(),
-                state_dir: session.v1_pins_dir(),
-                poll: Duration::from_secs(2),
-                initial_log,
-            });
         }
     }
 
@@ -308,7 +313,7 @@ pub async fn create_chat_agent(
             "channel {channel} declares no dialect menu (legacy hub); --speak validation skipped"
         )),
         Some(menu) => {
-            for dialect in &dialects {
+            for dialect in dialects {
                 if !menu.iter().any(|entry| entry.name == *dialect) {
                     return Err(ChatError::UndeclaredDialect {
                         dialect: dialect.clone(),
@@ -335,7 +340,7 @@ pub async fn create_chat_agent(
     // performative, not inferable from the handle). Sent once, right after
     // the join ack — a failure here is a failed join, not a silent
     // plain-member fallback.
-    let announce = build_announce_frame(channel, agent_handle, &dialects, added_by.as_deref());
+    let announce = build_announce_frame(channel, agent_handle, dialects, added_by.as_deref());
     // Enforce the announce is valid CBCL against the hub dialect the hub *taught*
     // us via its `(meta (define hub …))` advertisement — a real conformance check
     // against the grammar the peer actually declared, catching a malformed
@@ -358,29 +363,147 @@ pub async fn create_chat_agent(
         )),
     }
     let announce_payload = payload_bytes(&announce).map_err(ChatError::Hello)?;
-    let announce_frame = conn.sign_chat_frame(identity.as_ref(), &announce_payload);
+    let announce_frame = conn.sign_chat_frame(identity, &announce_payload);
     websocket
         .send(WsMessage::Binary(announce_frame.into()))
         .await
         .map_err(|error| ChatError::ConnectionFailed(error.to_string()))?;
 
-    let handle = AgentHandle::generate();
+    Ok(Joined {
+        websocket,
+        conn,
+        roomcfg,
+        warnings,
+    })
+}
+
+/// Connect to `/chat/v1`, join `channel` as `agent_handle` with a signed
+/// `hello`, and spawn the receive loop. Returns the store handle for the
+/// connection (used by `recv`/`reply`).
+///
+/// `cap` is the capability presented for a *private* channel: the channel's
+/// standing cap or a bounded invite token (the hub's `allow-join?` /
+/// `join-allowed?`, SPEC-001). Public channels ignore it; pass `None` to enter
+/// a public channel.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_chat_agent(
+    store: AgentStore,
+    ws_url: &Url,
+    channel: &str,
+    agent_handle: &str,
+    dialects: Vec<String>,
+    cap: Option<String>,
+    added_by: Option<String>,
+    claim_window: Duration,
+    liveness_timeout: Duration,
+    identity: Arc<ChatIdentity>,
+    mut mls: Option<MlsSession>,
+    mls_create: bool,
+    receive_all: bool,
+    resume: Option<AgentHandle>,
+) -> Result<(AgentHandle, Vec<String>), ChatError> {
+    AgentStore::validate_advertisement(&dialects)
+        .map_err(|error| ChatError::Store(error.to_string()))?;
+
+    let join = JoinParams {
+        ws_url: ws_url.clone(),
+        channel: channel.to_owned(),
+        wire_handle: agent_handle.to_owned(),
+        dialects: dialects.clone(),
+        cap,
+        added_by,
+    };
+    let Joined {
+        websocket,
+        conn,
+        roomcfg,
+        warnings,
+    } = join_hub(&join, identity.as_ref(), mls.as_mut(), mls_create).await?;
+
+    // SPEC-024 (ADR-034/ADR-035): a room the hub marks `mls-ds/v1` activates the
+    // v1 posture on the session (H7 owner-removal rejection + CON-013 atomic
+    // persist) and runs the DS pull loop instead of relying on SPEC-013 push for
+    // the record log. The pull task feeds admitted records into the receive loop
+    // below, which owns the MlsSession for the apply + atomic commit.
+    //
+    // Deliberately outside `join_hub`: the pull task is per *agent*, not per
+    // *connection*. It owns its own socket and its own bounded backoff, so it
+    // rides a hub restart on its own and must not be respawned by a chat
+    // reconnect (SPEC-026 REQ-003 — the re-join replays the chat handshake, not
+    // the whole agent).
+    let mut ds_pull: Option<crate::mls_ds::task::DsPullConfig> = None;
+    if roomcfg.mls_ds {
+        if let Some(session) = mls.as_mut() {
+            session
+                .mark_v1()
+                .map_err(|e| ChatError::Hello(format!("mls-ds/v1 activation: {e}")))?;
+            let initial_log = session
+                .load_v1_state()
+                .map(|(_, _, log)| log)
+                .unwrap_or_else(|| crate::mls_ds::ClientLog {
+                    cursor: 0,
+                    cursor_hash: crate::mls_ds::task::GENESIS_CURSOR_HASH.into(),
+                });
+            // The DS endpoint lives on the same hub as /chat/v1.
+            let ds_url = ws_url.as_str().replace("/chat/v1", "/mls-ds/v1");
+            ds_pull = Some(crate::mls_ds::task::DsPullConfig {
+                ds_url,
+                room: channel.to_owned(),
+                state_dir: session.v1_pins_dir(),
+                poll: Duration::from_secs(2),
+                initial_log,
+            });
+        }
+    }
+
+    // SPEC-026 ADR-006: a resumed agent keeps the handle it had before the
+    // daemon restarted, so an operator's exported `CBCL_AGENT_HANDLE` and any
+    // script holding it keep working. The handle is an opaque local identifier
+    // with no hub-side meaning, so reuse costs nothing.
     let (close_tx, close_rx) = oneshot::channel();
     let (send_tx, send_rx) = mpsc::channel(8);
     // The advertised dialects are both the store's record and the responder's
     // capability set (SPEC-003 REQ-002).
     let capability = dialects.clone();
-    store
-        .insert_connected_with_router_channels(
-            handle.clone(),
-            dialects,
-            Some(close_tx),
-            Some(AgentSendChannel::new(send_tx)),
-            Some(agent_handle.to_owned()), // the chat wire identity (@handle)
-            Some(channel.to_owned()),
-        )
-        .await
-        .map_err(|error| ChatError::Store(error.to_string()))?;
+    let handle = match resume {
+        // A resume ATTACHES to the placeholder registered before the first dial
+        // — it must not create one. The operator can close the agent at any
+        // point during the handshake; closing removes the placeholder, and an
+        // unconditional insert here would recreate the very handle they just
+        // gave up on, with this successful join behind it. `attach_connection`
+        // fails with `UnknownHandle` in exactly that case, and it updates the
+        // entry in place, so the placeholder's queue, notify and any waiting
+        // `recv` survive the transition rather than being replaced under them.
+        Some(handle) => {
+            store
+                .attach_connection(
+                    &handle,
+                    dialects,
+                    close_tx,
+                    AgentSendChannel::new(send_tx),
+                    agent_handle.to_owned(),
+                    Some(channel.to_owned()),
+                )
+                .await
+                .map_err(|error| ChatError::Store(error.to_string()))?;
+            handle
+        }
+        None => {
+            let handle = AgentHandle::generate();
+            store
+                .insert_connected_with_router_channels(
+                    handle.clone(),
+                    dialects,
+                    Some(close_tx),
+                    Some(AgentSendChannel::new(send_tx)),
+                    Some(agent_handle.to_owned()), // the chat wire identity (@handle)
+                    Some(channel.to_owned()),
+                )
+                .await
+                .map_err(|error| ChatError::Store(error.to_string()))?;
+            handle
+        }
+    };
 
     let responder = Responder::new(
         agent_handle.to_owned(),
@@ -413,6 +536,7 @@ pub async fn create_chat_agent(
         receive_all,
         wire_handle: agent_handle.to_owned(),
         ds_rx,
+        join,
     });
 
     Ok((handle, warnings))
@@ -516,6 +640,278 @@ struct ReceiveLoopArgs {
     /// CON-013 atomic commit happen here. Idle (sender dropped immediately)
     /// on non-v1 rooms.
     ds_rx: mpsc::Receiver<crate::mls_ds::task::DsApply>,
+    /// SPEC-026 REQ-003: the parameters of the original join, kept so the loop
+    /// can replay it after the socket ends. Without this the loop could
+    /// reconnect a *socket* but not rejoin a *channel*.
+    join: JoinParams,
+}
+
+/// A replacement connection produced by [`reconnect`].
+struct Reconnected {
+    websocket: ChatSocket,
+    conn: SignedConn,
+}
+
+/// How a reconnect attempt schedule ended ([[SPEC-026 REQ-001]], [[SPEC-026 REQ-005]]).
+enum Recovery {
+    /// The re-join succeeded: here is the replacement socket and its signer.
+    /// Boxed because a `ChatSocket` carries the TLS buffers — inlining it would
+    /// make every `Recovery` value, including the two small terminal ones, pay
+    /// for the successful case.
+    Reconnected(Box<Reconnected>),
+    /// The agent was closed while the schedule was waiting. A `hark close`
+    /// during an outage must not have to wait out the backoff.
+    Closed,
+    /// A terminal condition — the hub actively rejected the re-join, or it
+    /// would have violated the encryption pin (REQ-005). The schedule stops.
+    Terminal {
+        reason: &'static str,
+        detail: String,
+    },
+}
+
+/// How many recently-delivered frame identities are remembered, for
+/// [`ReplayGuard`]. Comfortably above the hub's `backfill_n` (50), so the whole
+/// replayed window can be recognised.
+const REPLAY_MEMORY: usize = 256;
+
+/// How many frames after a re-join are checked against that memory. The hub
+/// replays at most `backfill_n`; beyond that the socket is carrying live
+/// traffic, which must never be suppressed.
+const REPLAY_WINDOW: usize = 64;
+
+/// Suppresses the history a hub replays after a re-join ([[SPEC-026 REQ-003]]).
+///
+/// Every successful `hello` is answered with the room's recent history, on a
+/// reconnect exactly as on a first join. Without this, an outage re-delivers up
+/// to `backfill_n` messages to `recv` and re-contends for asks the responder
+/// already settled; repeated outages walk the inbound queue toward
+/// `queue_overflow`, which marks the handle unhealthy — the reconnect would
+/// reintroduce the very failure it exists to prevent.
+///
+/// Identity is the payload bytes. A frame the hub replays is byte-identical to
+/// the one already seen, so equality is exactly the right test, and it does not
+/// depend on the hub's signature being deterministic the way keying on the
+/// signature would.
+///
+/// The check is **windowed** rather than always-on, which is the whole reason
+/// the counter exists: two genuinely distinct messages can be byte-identical
+/// (`(tell @room "ok" :from @x)` twice), and suppressing the second would lose
+/// real traffic. Confining the check to the frames immediately following a
+/// re-join bounds that risk to the moment a replay is actually possible.
+struct ReplayGuard {
+    seen: std::collections::VecDeque<u64>,
+    remaining: usize,
+}
+
+impl ReplayGuard {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::VecDeque::with_capacity(REPLAY_MEMORY),
+            remaining: 0,
+        }
+    }
+
+    /// A re-join just completed: check the next [`REPLAY_WINDOW`] frames.
+    fn arm(&mut self) {
+        self.remaining = REPLAY_WINDOW;
+    }
+
+    /// Record `payload` and report whether it is a replay that should be
+    /// dropped. Outside the window this only records.
+    fn is_replay(&mut self, payload: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        payload.hash(&mut hasher);
+        let digest = hasher.finish();
+
+        let armed = self.remaining > 0;
+        self.remaining = self.remaining.saturating_sub(1);
+        if armed && self.seen.contains(&digest) {
+            return true;
+        }
+        if self.seen.len() == REPLAY_MEMORY {
+            self.seen.pop_front();
+        }
+        self.seen.push_back(digest);
+        false
+    }
+}
+
+/// Answer one outbound frame offered while the hub connection is down.
+///
+/// Returns `Some(terminal)` only when the send channel itself has closed — the
+/// agent is going away, and there is nothing left to reconnect for. Otherwise
+/// the frame is refused *retryably* so the caller re-offers it, which is what
+/// re-seals it against the epoch the group is actually in (ADR-003).
+fn refuse_during_gap(
+    outbound: Option<crate::daemon::OutboundFrame>,
+    last_error: &str,
+) -> Option<Recovery> {
+    let Some(outbound) = outbound else {
+        return Some(Recovery::Terminal {
+            reason: "local_send_failed",
+            detail: "chat send channel closed".to_owned(),
+        });
+    };
+    let _ = outbound
+        .result_tx
+        .send(Err(OutboundReject::reconnecting(format!(
+            "hub connection is down; reconnecting: {last_error}"
+        ))));
+    None
+}
+
+/// Re-establish the agent's hub connection ([[SPEC-026 REQ-001]]).
+///
+/// Loops on the [`ReconnectSchedule`] until the re-join succeeds, the agent is
+/// closed, or a terminal condition is reached. There is no attempt ceiling: a
+/// bound would reintroduce the failure this exists to fix, only later
+/// (SPEC-026 ADR-004). What an operator gets instead is visibility — the handle
+/// reports `reconnecting` with its attempt count throughout.
+///
+/// While waiting it keeps servicing two things, and both are load-bearing:
+/// `close_rx`, so a close during an outage is immediate rather than delayed by
+/// up to the ceiling; and `send_rx`, so an `emit` is answered with a *retryable*
+/// refusal instead of blocking on a loop that is not reading its channel.
+/// Outbound frames are deliberately refused rather than queued (SPEC-026
+/// ADR-003): in an encrypted channel a frame sealed before the gap may be
+/// sealed against an epoch the group has left by the time it flushes.
+#[allow(clippy::too_many_arguments)]
+async fn reconnect(
+    join: &JoinParams,
+    identity: &ChatIdentity,
+    mls: &mut Option<MlsSession>,
+    schedule: &mut ReconnectSchedule,
+    close_rx: &mut oneshot::Receiver<()>,
+    send_rx: &mut mpsc::Receiver<crate::daemon::OutboundFrame>,
+    store: &AgentStore,
+    handle: &AgentHandle,
+    cause: String,
+) -> Recovery {
+    let started = tokio::time::Instant::now();
+    // OBS-001: once per outage, not once per attempt.
+    tracing::warn!(
+        agent = handle.as_str(),
+        channel = join.channel,
+        cause = cause,
+        "hub connection lost; reconnecting"
+    );
+    let mut announced_ceiling = false;
+    let mut last_error = cause.clone();
+    // Zero *failed* attempts so far. The counter is published only after an
+    // attempt has actually failed (REQ-006): reporting one before the first
+    // dial, as an increment-then-publish would, tells the operator the hub has
+    // refused them when nothing has been tried yet.
+    let _ = store
+        .mark_reconnecting(handle, 0, Some(cause.clone()))
+        .await;
+
+    loop {
+        let delay = schedule.next_delay(rand::random::<f64>());
+
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut *close_rx => return Recovery::Closed,
+                () = &mut sleep => break,
+                outbound = send_rx.recv() => {
+                    match refuse_during_gap(outbound, &last_error) {
+                        Some(terminal) => return terminal,
+                        None => continue,
+                    }
+                }
+            }
+        }
+
+        // The re-join NEVER creates the MLS group: `create_group_as_creator` a
+        // second time would fork the group into two ciphertext worlds.
+        //
+        // Driven INSIDE the select rather than awaited on its own: a handshake
+        // can take two 10 s timeouts, or an unbounded connect, and a loop that
+        // stopped reading `send_rx` for that long would leave an `emit` blocked
+        // on a channel nobody is draining instead of refusing it immediately —
+        // the opposite of REQ-004. `close_rx` for the same reason: a `hark
+        // close` must not wait out a handshake against a hub that is gone.
+        let attempt = join_hub(join, identity, mls.as_mut(), false);
+        tokio::pin!(attempt);
+        let outcome = loop {
+            tokio::select! {
+                _ = &mut *close_rx => return Recovery::Closed,
+                result = &mut attempt => break result,
+                outbound = send_rx.recv() => {
+                    match refuse_during_gap(outbound, &last_error) {
+                        Some(terminal) => return terminal,
+                        None => continue,
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            Ok(joined) => {
+                tracing::info!(
+                    agent = handle.as_str(),
+                    channel = join.channel,
+                    attempts = schedule.attempts(),
+                    outage_ms = started.elapsed().as_millis() as u64,
+                    "hub connection re-established"
+                );
+                for warning in &joined.warnings {
+                    tracing::debug!(agent = handle.as_str(), warning, "re-join warning");
+                }
+                return Recovery::Reconnected(Box::new(Reconnected {
+                    websocket: joined.websocket,
+                    conn: joined.conn,
+                }));
+            }
+            // REQ-005(a): the hub gave a verdict. Retrying is a loop against a
+            // settled answer — the channel is gone, or this agent is not
+            // welcome in it.
+            Err(ChatError::JoinRejected(slug)) => {
+                return Recovery::Terminal {
+                    reason: "hub_rejected",
+                    detail: format!("hub rejected the re-join: {slug}"),
+                };
+            }
+            // REQ-005(b): SPEC-013 REQ-023. A hub offering plaintext for a
+            // channel pinned encrypted is misconfigured or hostile; either way
+            // the agent must not resume in the clear.
+            Err(ChatError::DowngradeRefused(detail)) => {
+                return Recovery::Terminal {
+                    reason: "downgrade_refused",
+                    detail: sanitize(&detail),
+                };
+            }
+            Err(error) => {
+                last_error = sanitize(&error.to_string());
+                // Published here, after the attempt actually failed, so the
+                // count an operator reads is failures rather than intentions.
+                let _ = store
+                    .mark_reconnecting(handle, schedule.attempts(), Some(last_error.clone()))
+                    .await;
+                tracing::debug!(
+                    agent = handle.as_str(),
+                    channel = join.channel,
+                    attempt = schedule.attempts(),
+                    error = last_error,
+                    "reconnect attempt failed"
+                );
+                if schedule.at_ceiling() && !announced_ceiling {
+                    announced_ceiling = true;
+                    // "This is an outage, not a blip" — said exactly once.
+                    tracing::warn!(
+                        agent = handle.as_str(),
+                        channel = join.channel,
+                        attempts = schedule.attempts(),
+                        error = last_error,
+                        "hub still unreachable at the backoff ceiling; still retrying"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// A scheduled responder timer fired by the receive loop (SPEC-003 REQ-005/007).
@@ -680,11 +1076,53 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         receive_all,
         wire_handle,
         mut ds_rx,
+        join,
     } = args;
     tokio::spawn(async move {
         // Pending Δ-window and liveness-fallback timers, fired into the select.
         let mut timers: FuturesUnordered<BoxFuture<'static, ClaimTimer>> = FuturesUnordered::new();
+        // SPEC-026 REQ-001. Every transport-level end of the socket — read side
+        // or write side — parks its cause here and loops; the top of the loop
+        // owns the single reconnect call site. One place to reason about, and
+        // no way for a new failure path to quietly reintroduce the `break` that
+        // was issue #25.
+        let mut schedule = ReconnectSchedule::default();
+        let mut pending_reconnect: Option<String> = None;
+        // SPEC-026 REQ-003: the hub replays the room's recent history after
+        // EVERY successful hello, including a re-join's.
+        let mut replay_guard = ReplayGuard::new();
         loop {
+            if let Some(cause) = pending_reconnect.take() {
+                match reconnect(
+                    &join,
+                    identity.as_ref(),
+                    &mut mls,
+                    &mut schedule,
+                    &mut close_rx,
+                    &mut send_rx,
+                    &store,
+                    &handle,
+                    cause,
+                )
+                .await
+                {
+                    Recovery::Reconnected(replacement) => {
+                        websocket = replacement.websocket;
+                        conn = replacement.conn;
+                        schedule.reset();
+                        replay_guard.arm();
+                        let _ = store.mark_connected(&handle).await;
+                    }
+                    Recovery::Closed => {
+                        let _ = websocket.close(None).await;
+                        break;
+                    }
+                    Recovery::Terminal { reason, detail } => {
+                        let _ = store.mark_unhealthy(&handle, reason, Some(detail)).await;
+                        break;
+                    }
+                }
+            }
             tokio::select! {
                 _ = &mut close_rx => {
                     let _ = websocket.close(None).await;
@@ -729,11 +1167,17 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
                     match websocket.send(WsMessage::Binary(frame.into())).await {
                         Ok(()) => { let _ = outbound.result_tx.send(Ok(())); }
+                        // SPEC-026 REQ-001/REQ-004: a failed write is the same
+                        // event as a failed read — the socket died — so it
+                        // schedules a reconnect rather than killing the handle.
+                        // The frame that lost the race is refused *retryably*
+                        // so the caller re-offers it, which re-seals it against
+                        // the epoch the group is actually in (ADR-003).
                         Err(error) => {
                             let detail = sanitize(&error.to_string());
-                            let _ = outbound.result_tx.send(Err(OutboundReject::fatal(detail.clone())));
-                            let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(detail)).await;
-                            break;
+                            let _ = outbound.result_tx.send(Err(OutboundReject::retryable(detail.clone())));
+                            pending_reconnect = Some(detail);
+                            continue;
                         }
                     }
                 }
@@ -812,22 +1256,41 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             }
                         }
                         Some(Ok(WsMessage::Text(text))) => text.to_string(),
+                        // SPEC-026 REQ-001: all three transport-level ends —
+                        // a close frame, an exhausted stream, an IO error —
+                        // schedule a reconnect. Marking the handle unhealthy
+                        // here is what made an ordinary hub redeploy fatal
+                        // (issue #25); the hub's durable state survives the
+                        // redeploy, so the membership is still ours.
                         Some(Ok(WsMessage::Close(frame))) => {
                             let detail = frame.map(|f| format!("code={:?} reason=\"{}\"", f.code, f.reason))
                                 .unwrap_or_else(|| "no close frame".to_owned());
-                            let _ = store.mark_unhealthy(&handle, "hub_closed", Some(sanitize(&detail))).await;
-                            break;
+                            pending_reconnect = Some(sanitize(&detail));
+                            continue;
                         }
                         None => {
-                            let _ = store.mark_unhealthy(&handle, "hub_closed", Some("hub WebSocket stream ended".to_owned())).await;
-                            break;
+                            pending_reconnect = Some("hub WebSocket stream ended".to_owned());
+                            continue;
                         }
                         Some(Ok(_)) => continue,
                         Some(Err(error)) => {
-                            let _ = store.mark_unhealthy(&handle, "hub_closed", Some(sanitize(&error.to_string()))).await;
-                            break;
+                            pending_reconnect = Some(sanitize(&error.to_string()));
+                            continue;
                         }
                     };
+                    // SPEC-026 REQ-003: drop the history the hub replayed after
+                    // the re-join. Checked before the session and the responder
+                    // see it — a replayed frame is one we have already fully
+                    // processed, so re-running either is duplicated work at
+                    // best and a duplicate delivery or a re-contended ask at
+                    // worst.
+                    if replay_guard.is_replay(&payload_text) {
+                        tracing::debug!(
+                            agent = handle.as_str(),
+                            "dropping a frame the hub replayed after the re-join"
+                        );
+                        continue;
+                    }
                     // SPEC-013: the MLS session consumes its frames first —
                     // welcome/deliver/keypkg/idkey/presence — decrypting
                     // content and emitting any protocol frames to send. In a
@@ -848,17 +1311,24 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             }
                             SessionEvent::Plaintext { text, .. } => Some(text),
                             SessionEvent::Handled { outbound } => {
-                                let mut failed = false;
+                                // SPEC-026 REQ-001: a write failure here is the
+                                // socket dying mid-MLS-exchange. Reconnect; the
+                                // re-join republishes the key material and the
+                                // peers re-drive the exchange, which is what
+                                // the browser client does on reopen.
+                                let mut dropped: Option<String> = None;
                                 for text in outbound {
                                     let Ok(payload) = payload_bytes(&text) else { continue };
                                     let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
                                     if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
-                                        let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(sanitize(&error.to_string()))).await;
-                                        failed = true;
+                                        dropped = Some(sanitize(&error.to_string()));
                                         break;
                                     }
                                 }
-                                if failed { break; }
+                                if let Some(detail) = dropped {
+                                    pending_reconnect = Some(detail);
+                                    continue;
+                                }
                                 None
                             }
                             SessionEvent::Dropped { reason, probable_fork } => {
@@ -892,19 +1362,32 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     }
                     // The responder decides: claim for answerable asks, deliver to
                     // `recv` only when elected, drop everything else (REQ-002).
-                    let mut send_failed = false;
+                    // SPEC-026 REQ-001: a claim that cannot be written means the
+                    // socket died. Reconnect rather than die — and FORFEIT the
+                    // claim. The responder has already inserted this agent as a
+                    // contender, so an ask left tracked with its timer running
+                    // would go on to win its own election after the reconnect
+                    // and answer an ask the hub never saw it claim (REQ-005 of
+                    // SPEC-003: election is over claims that were broadcast).
+                    let mut send_failed: Option<String> = None;
                     for action in responder.on_inbound(&responder_text) {
                         let Action::Claim { ask_id, frame_text } = action;
                         match payload_bytes(&frame_text) {
                             Ok(payload) => {
                                 let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
                                 if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
-                                    let _ = store.mark_unhealthy(&handle, "local_send_failed", Some(sanitize(&error.to_string()))).await;
-                                    send_failed = true;
+                                    send_failed = Some(sanitize(&error.to_string()));
+                                    responder.forget(&ask_id);
+                                    continue; // no timer for a claim nobody received
                                 }
                             }
-                            // Our own claim should always be valid CBCL; skip if not.
-                            Err(_) => continue,
+                            // Our own claim should always be valid CBCL; if it
+                            // is not, stop tracking the ask rather than leaving
+                            // a contender behind an election it cannot win.
+                            Err(_) => {
+                                responder.forget(&ask_id);
+                                continue;
+                            }
                         }
                         let delay = claim_window;
                         timers.push(async move {
@@ -912,7 +1395,10 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             ClaimTimer::Window(ask_id)
                         }.boxed());
                     }
-                    if send_failed { break; }
+                    if let Some(detail) = send_failed {
+                        pending_reconnect = Some(detail);
+                        continue;
+                    }
                 }
             }
         }

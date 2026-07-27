@@ -366,9 +366,13 @@ The handle is a local daemon routing key. The daemon maps it to:
 handle -> router agent-id -> WebSocket connection -> inbound queue
 ```
 
-No such mapping exists immediately after `daemon start`. A daemon with no
-agent handles has no router-visible identity and no router WebSocket
+No such mapping exists immediately after `daemon start` on a router-transport
+daemon, nor on a chat-transport daemon that has never joined anything. A daemon
+with no agent handles has no router-visible identity and no router WebSocket
 connections.
+
+A **chat**-transport daemon does rebuild its mappings at start, from the durable
+pairing store — see [Durable pairings](#durable-pairings) below.
 
 Agent handles should be generated as ULIDs or as an equivalent 128-bit random
 identifier encoded in Crockford base32. The MVP handle grammar is exactly 26
@@ -389,6 +393,51 @@ per-agent and are supplied by that agent's `init` request. The daemon has no
 daemon-level capability defaults. The CLI should reject `init` requests with no
 `--capability` value before calling the daemon, and the daemon should reject
 local API requests whose `capabilities` list is empty.
+
+## Durable pairings
+
+Normative source: [SPEC-026](SPEC-026-transport-resilience.md) REQ-007…REQ-010.
+Summarised here because it changes what "a daemon with no agent handles" means.
+
+Chat agent records are durable. Each successful chat join writes a record to:
+
+```text
+<chat.identity_dir>/paired-agents.json     # mode 0600 on Unix-like systems
+```
+
+The record holds the agent handle, wire handle, channel, advertised dialects,
+capability, adder, and receive-all mode — everything needed to re-establish the
+agent without a human. It lives beside the per-handle Ed25519 seeds rather than
+in the runtime directory, because the runtime directory is deliberately
+ephemeral (`$XDG_RUNTIME_DIR` is wiped on reboot) and because the record's
+capability field is a bearer credential of the same trust class as the seeds.
+
+On start the daemon re-establishes every recorded agent, preserving each agent's
+original handle, and reports ready **without** waiting for those joins. An agent
+whose hub is unreachable at start is registered in the `reconnecting` state and
+retried on the SPEC-026 backoff schedule; it is never dropped.
+
+Closing an agent deletes its record, so a deliberately closed agent does not
+return on the next start.
+
+The store is recognised in full before any record in it is used. A store that is
+unreadable, not well-formed, of an unknown version, or that contains any record
+failing the field grammar yields **no** agents and a diagnostic naming the file.
+There is no partial load: a valid record beside a malformed one yields zero, not
+one.
+
+### Agent state
+
+`daemon status` reports three agent states, not two:
+
+| State | Meaning |
+|-------|---------|
+| `connected` | The hub socket is up and the agent is a joined member. |
+| `reconnecting` | The socket ended and is being re-established. **Healthy**: `recv` keeps waiting and a send is refused *retryably* (`agent_not_ready`). Carries `reconnect_attempts` and `reconnect_detail`. |
+| `unhealthy` | Terminal. The hub actively rejected the agent, an encryption pin was violated, or a local invariant failed (e.g. queue overflow). Carries `unhealthy_reason` and `unhealthy_detail`. |
+
+An unreachable hub is never `unhealthy`. Distinguishing "coming back" from
+"dead" is the point: the second requires operator action and the first does not.
 
 ## Error Handling Principles
 

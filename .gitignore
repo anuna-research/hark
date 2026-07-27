@@ -3,3 +3,8 @@
 
 .DS_Store
 **/.DS_Store
+
+# Generated: the zetl vault index is rebuilt by `zetl check`/`zetl build`.
+/.zetl
+# Local agent tooling, not part of the project.
+/.claude

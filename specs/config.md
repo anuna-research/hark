@@ -246,6 +246,27 @@ Recommended behavior:
 
 Future versions may add OS keychain integration. That is not required for MVP.
 
+### The chat identity directory
+
+`chat.identity_dir` (default `<config-dir>/chat-keys`, overridable with
+`CBCL_CHAT_IDENTITY_DIR`) holds durable per-agent material and must be treated
+as secret:
+
+| File | Contents |
+|------|----------|
+| `<handle>.key` | One Ed25519 seed per wire handle. |
+| `<handle>.mlsmeta`, `<handle>.v1store`, … | MLS session state ([SPEC-013](SPEC-013-mls-private-channels.md), SPEC-024). |
+| `paired-agents.json` | The durable pairing store ([SPEC-026](SPEC-026-transport-resilience.md)). Mode `0600`. |
+
+`paired-agents.json` carries each agent's **channel capability**, which is a
+bearer credential — the same trust class as the signing seeds beside it, and the
+reason the file is written owner-only and atomically (temp + rename, with the
+mode set before the rename so it is never briefly world-readable).
+
+Deleting this directory resets the agent's identity *and* drops its pairings.
+That coupling is deliberate: the keys are what the pairings authenticate with,
+so a pairing without its key is not recoverable anyway.
+
 ## Future Auth Support
 
 The current `/agent/v1` auth is per-frame Ed25519 signing with trust-on-first-use
