@@ -76,6 +76,27 @@
   (extend deliver (enc epoch ct)
     (tell @room (mls-message :enc enc :epoch epoch :ct ct)))
 
+  ;; --- SPEC-061 REQ-007: the creator's admission grant, SEALED -----------
+  ;; The hub carries ciphertext it cannot read: the key lives only in the invite
+  ;; link, which is what lets that link be ~72 characters instead of ~382.
+  ;; `sealedgrant` is the deposit, `sealedgrantget` the fetch, `sealedgrantok`
+  ;; the hub's confirmation that it holds the bytes — a link is inert until then,
+  ;; so the minting client waits for it before showing anyone a URL.
+  ;;
+  ;; HERE AND NOT IN mls-epoch.cbcl, deliberately. That file's BYTES are the
+  ;; SPEC-063 protocol version — its sha256 is the capability name a client
+  ;; declares — so adding a verb to it is a protocol change that deactivates
+  ;; one-committer-per-epoch in every mixed room until both stacks carry the new
+  ;; bytes. These verbs move an invite's carriage, not a group's epoch, and have
+  ;; no business costing that. hub.cbcl is the general control plane and takes
+  ;; additions without versioning anything.
+  (extend sealedgrant (token sealed)
+    (tell @room (mls-sealed-grant :token token :sealed sealed)))
+  (extend sealedgrantget (token)
+    (tell @room (mls-sealed-grant-request :token token)))
+  (extend sealedgrantok (token)
+    (tell @room (mls-sealed-grant-stored :token token)))
+
   ;; --- SPEC-063 CON-004: room-wide capability negotiation ----------------
   ;; The capabilities EVERY member presently in the room declared — an
   ;; INTERSECTION, not a union, because a promise the room does not keep
