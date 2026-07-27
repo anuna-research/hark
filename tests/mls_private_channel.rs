@@ -163,18 +163,21 @@ fn epoch_churn_does_not_accumulate_secrets_on_disk() {
     let mut alice = MlsSession::open(&dir, "alice", "@research", "@alice", &wire, true).unwrap();
     alice.create_group_as_creator().unwrap();
 
+    // `alice.research.*`, not `alice.*`: MLS state is keyed on (wire handle,
+    // room) so two channels under one handle cannot overwrite each other
+    // (SPEC-026 review, S1).
     // Each encrypt persists; sample the state size across heavy ratchet use.
     alice
         .encrypt_outbound("(say @research :from @alice :text \"warmup\")")
         .unwrap();
-    let size_after_one = fs::metadata(dir.join("alice.mls")).unwrap().len();
+    let size_after_one = fs::metadata(dir.join("alice.research.mls")).unwrap().len();
 
     for i in 0..50 {
         alice
             .encrypt_outbound(&format!("(say @research :from @alice :text \"m{i}\")"))
             .unwrap();
     }
-    let size_after_many = fs::metadata(dir.join("alice.mls")).unwrap().len();
+    let size_after_many = fs::metadata(dir.join("alice.research.mls")).unwrap().len();
 
     assert!(
         size_after_many < size_after_one * 3,
