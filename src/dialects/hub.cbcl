@@ -12,7 +12,15 @@
 ;;
 ;; Covers the whole control plane EXCEPT the core CBCL verbs (tell/ask/reply/
 ;; error/ok/cancel/hello/bye — the base dialect) and the verbs that already
-;; have their own dialect (cite, propose/vote in poll, do in concierge).
+;; have their own dialect (cite, propose/vote in poll, do in concierge, and the
+;; MLS epoch-movement verbs in mls-epoch).
+;;
+;; The epoch-movement verbs are in their own grammar because that grammar's
+;; DIGEST is the epoch protocol's version and the capability name a client
+;; declares to say it implements it (SPEC-063 CON-004). Declaring them here would
+;; version them with the whole control plane, so adding an unrelated hub verb
+;; would silently change what "implements the epoch protocol" means. SPEC-063
+;; ADR-005.
 ;;
 ;; Verified well-formed (R1/R2/R3/R5) by cbcl_erl:verify_dialect at startup.
 
@@ -68,12 +76,11 @@
   (extend deliver (enc epoch ct)
     (tell @room (mls-message :enc enc :epoch epoch :ct ct)))
 
-  ;; --- SPEC-061 external-Commit admission -------------------------------
-  ;; The group state a client needs to admit ITSELF (RFC 9420 §12.4.3.2) when
-  ;; nobody is online to commit an Add for it. Declared here with the rest of
-  ;; the MLS control frames so an agent learns them from the hub's own grammar
-  ;; rather than by hard-coding, same as keypub/keyget/welcome.
-  (extend groupinfo (epoch gi)
-    (tell @room (mls-group-info :epoch epoch :gi gi)))
-  (extend groupinfoget ()
-    (tell @room (mls-group-info-request))))
+  ;; --- SPEC-063 CON-004: room-wide capability negotiation ----------------
+  ;; The capabilities EVERY member presently in the room declared — an
+  ;; INTERSECTION, not a union, because a promise the room does not keep
+  ;; unanimously is a false one. Generic: a capability name is opaque to the hub,
+  ;; which matches them and interprets none, so this belongs to the control plane
+  ;; rather than to any one protocol that happens to be negotiated with it.
+  (extend roomcaps (active)
+    (tell @room (room-capabilities :active active))))

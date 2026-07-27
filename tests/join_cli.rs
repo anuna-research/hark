@@ -304,6 +304,34 @@ fn hub_dialect_fixture_matches_the_canonical_cbcl_bus_grammar() {
     );
 }
 
+/// Drift guard for the epoch grammar, and this one is sharper than the hub's:
+/// `mls-epoch.cbcl`'s BYTES ARE THE PROTOCOL VERSION. Its sha256 is the
+/// capability name hark declares to say it implements SPEC-063, so a byte of
+/// drift does not merely mis-teach a test — it silently deactivates the epoch
+/// mechanism in every mixed room, because the room's capability intersection
+/// empties. Fail-closed and correct, and invisible unless something checks.
+#[test]
+fn mls_epoch_fixture_matches_the_canonical_cbcl_bus_grammar() {
+    let canonical = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../cbcl-bus/apps/cbcl_chat/priv/dialects/mls-epoch.cbcl");
+    if !canonical.exists() {
+        eprintln!(
+            "SKIPPED: no sibling cbcl-bus checkout at {} — epoch grammar drift not checked",
+            canonical.display()
+        );
+        return;
+    }
+    let canonical = std::fs::read(&canonical).expect("canonical grammar is readable");
+    let fixture = include_bytes!("../src/dialects/mls-epoch.cbcl");
+    assert_eq!(
+        String::from_utf8_lossy(&canonical),
+        String::from_utf8_lossy(fixture),
+        "src/dialects/mls-epoch.cbcl has drifted from the hub's canonical copy — \
+         copy it over. hark's declared capability is this file's digest, so drift \
+         deactivates the epoch protocol rather than breaking loudly."
+    );
+}
+
 /// The counterpart: a legacy hub that teaches no control dialect warns
 /// explicitly (never silently) and still completes the join.
 #[test]
