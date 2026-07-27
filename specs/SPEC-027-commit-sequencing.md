@@ -1,15 +1,15 @@
 ---
 id: SPEC-027
-title: Commit Sequencing — Honouring the Epoch Claim (RFC 9420 §14)
+title: Commit Sequencing — hark's obligations under the epoch claim (RFC 9420 §14)
 status: draft
 tier: 1 (MLS group state and admission — cross-model adversarial review AND human security sign-off REQUIRED before merge; green tests are not sufficient)
-version: 0.2.0
+version: 0.3.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 5)
 last-updated: 2026-07-27
 owner-repo: hark
-affects-repos: cbcl-bus (the hub serves the claim; the web client must honour it identically)
-depends-on: SPEC-013 (MLS private channels — REQ-012b elected committer), SPEC-061 (external Commit admission — REQ-005, the GroupInfo claim), SPEC-024 ADR-011 (`seq == head + 1`, the general form of this)
+affects-repos: none — cbcl-bus owns the protocol in SPEC-063; this document owns only what hark must do to honour it
+depends-on: SPEC-063 (one committer per epoch — cbcl-bus; OWNS the wire contract, the claim states and the activation rule), SPEC-013 (MLS private channels — REQ-012b elected committer), SPEC-061 (external Commit admission — REQ-005, the GroupInfo claim), SPEC-024 ADR-011 (`seq == head + 1`, which supersedes this for its own rooms)
 traces-to: "anuna-research/hark#27, raised from cbcl-bus#44; cbcl-bus PR#45 built the first half"
 ---
 
@@ -20,9 +20,13 @@ traces-to: "anuna-research/hark#27, raised from cbcl-bus#44; cbcl-bus PR#45 buil
 **Intent.** Two members of one MLS group can generate Commits for the same epoch at the same
 moment. RFC 9420 requires an application to have an *established* way to resolve that, and
 hark currently has none: it merges and persists its own Commit before anyone has accepted it.
-This specification gives hark a promise to hold — an exclusive, per-epoch claim served by the
-hub — so that its eager merge becomes the RFC-sanctioned behaviour it is today only by
-accident.
+The remedy is an exclusive per-epoch claim, and **[[SPEC-063-one-committer-per-epoch]]
+(cbcl-bus) owns it** — the wire verbs, the claim states, and when the behaviour activates.
+
+**This document owns hark's half and nothing else**: what hark must do to hold the promise
+honestly, what it must make durable, and what it must not do while holding one. Where a
+statement here would restate SPEC-063, it points instead — two documents describing one
+contract is how they drift.
 
 **Metaphor.** *A talking stick.* Anyone may want to speak; only the holder does. The stick
 does not decide who is right, and handing it over is not endorsement — it is only the rule
@@ -47,23 +51,21 @@ waiting to hear themselves back.
    merge + persist + send commit, THEN welcome (CON-003)
 ```
 
-**Decisions.** [[#ADR-001]] claim rather than stage · [[#ADR-002]] a distinct `epochclaim`
-verb rather than overloading `groupinfoget` · [[#ADR-003]] the claim is advisory to the hub and
-never an admission decision · [[#ADR-004]] bounded deferral with a starvation escape ·
-[[#ADR-005]] neither stack ships alone.
+**Decisions.** [[#ADR-001]] claim rather than stage · [[#ADR-004]] bounded deferral with a
+starvation escape. ([[#ADR-002]], [[#ADR-003]] and [[#ADR-005]] were settled here and are now
+owned by [[SPEC-063-one-committer-per-epoch]]; they are retained as the record of *why*.)
 
-**Load-bearing.** [[#REQ-001]] hold the claim before committing · [[#REQ-003]] the Welcome
-waits for acceptance · [[#REQ-005]] no partial adoption · [[#REQ-011]] the grant is
-authenticated · [[#REQ-012]] the promise survives a restart · [[#REQ-015]] activation is gated
-on live clients, not on merged repositories · [[#NFR-001]] starvation bound.
+**Load-bearing.** [[#REQ-001]] arm the claim before merging · [[#REQ-003]] the Welcome waits
+for acceptance · [[#REQ-012]] one durable operation record carrying the Commit *and* the
+Welcome · [[#REQ-014]] release only after both are out · [[#NFR-001]] starvation bound.
 
 **Open.** [[#OQ-001]] what a committer does against a hub that serves no claim; [[#OQ-002]]
 whether [[SPEC-024-mls-ds-v1]] rooms need this at all, given `seq == head + 1` already sequences
 them. ([[#OQ-003]], what counts as "accepted", was raised as blocking and is resolved — the
 hub fans a sender its own frame back, and that echo is the signal.)
 
-**Detail.** [[IMPL-027-commit-sequencing]] is the execution plan. The hub half amends
-[[SPEC-061]] REQ-005; this document owns hark's half and the cross-stack contract they share.
+**Detail.** [[IMPL-027-commit-sequencing]] is the execution plan.
+[[SPEC-063-one-committer-per-epoch]] is the protocol this implements.
 
 ---
 
@@ -169,59 +171,68 @@ member's handshake soon after.
 
 **Resolution:** [[#REQ-004]], verified by [[#TEST-006]].
 
-### 2.1 This supersedes a different proposal, deliberately
+### 2.1 Where this work lives, and why it moved
 
-[[SPEC-061]] **BUG-021** is the parent of this work. Its external-join half was fixed by
-REQ-005's second clause (the GroupInfo claim, cbcl-bus PR #45). Its still-open half is recorded
-there as needing *"a Delivery Service acceptance signal (SPEC-024 ADR-011 `seq == head + 1`)"* —
-a different resolution from the one specified here.
+[[SPEC-061]] BUG-021 is the parent. Its external-join half was fixed by REQ-005's second clause;
+its remaining half was recorded there as needing *"a Delivery Service acceptance signal (SPEC-024
+ADR-011 `seq == head + 1`)"*, and [[SPEC-061]] v0.8.0 said the artefact should be adopted by
+SPEC-024.
 
-Both are recorded because a reviewer will otherwise find two proposals and no statement of which
-governs. **This specification supersedes that note for the chat path**, on the following grounds,
-and issue #27 proposes the same:
+**Settled otherwise, by cbcl-bus, and this document defers to it.** The protocol lives in
+[[SPEC-063-one-committer-per-epoch]] — a separate spec rather than a SPEC-024 section, because
+folding a chat-path claim into SPEC-024 would put two sequencing mechanisms for two kinds of room
+in one document, and every later reader of ADR-011 would have to work out which applied to them.
 
-- The `seq == head + 1` mechanism belongs to [[SPEC-024-mls-ds-v1]], which the chat path does not
-  run. Requiring it here would mean either shipping the DS for every private channel, or building
-  a second acceptance channel beside it.
-- A DS acceptance signal *rules which Commit is canonical* — §14's second route. A claim
-  *prevents the conflict* — §14's first route, which the RFC lists first and which holds no forked
-  state ([[#ADR-001]]).
-- The claim mechanism already exists in the hub, in production, reviewed. The acceptance signal
-  does not.
-
-Where the DS *does* run, [[#OQ-002]] asks whether the claim should be skipped entirely rather
-than layered on top of a stronger guarantee.
+The substantive half of that question is also settled: **the chat path gets a claim now, and
+`mls-ds/v1` rooms are exempt** — `seq == head + 1` is a stronger and more general form of the same
+property, and layering both would be two mechanisms on one path. See [[#OQ-002]].
 
 ## 3. Scope
 
-**In scope.** The claim protocol shared by both stacks and its wire contract; hark taking the
-claim before every Commit it generates; hark's ordering of merge, Commit send, and Welcome
-send; the deferral and retry behaviour on refusal; the starvation bound; the stale-GroupInfo
-defect above; and the corresponding amendment to [[SPEC-061]] REQ-005 in cbcl-bus.
+**In scope — hark's obligations.** Arming before merging and the state machine that requires;
+the durable operation record and its recovery rules; the Welcome deferral and release discipline;
+deferral, retry and the starvation bound on refusal; rejecting an unauthenticated grant; and the
+stale-GroupInfo defect below.
 
-**Out of scope.** The election rule itself ([[SPEC-013-mls-private-channels]] REQ-012b decides
-*who* should commit; this decides *that only one does*). Any change to admission — see
-[[#ADR-003]]. The `mls-ds/v1` rooms of [[SPEC-024-mls-ds-v1]], pending [[#OQ-002]].
+**Owned by [[SPEC-063-one-committer-per-epoch]], not here.** The wire verbs and their grammar; the
+claim states and their release conditions; the hub's ingress refusal of member-authored hub verbs;
+the `epoch-claim/v1` capability negotiation and activation rule; and the hub-side durability of an
+armed claim.
+
+**Out of scope entirely.** The election rule ([[SPEC-013-mls-private-channels]] REQ-012b decides
+*who* should commit; this decides *that only one does*). `mls-ds/v1` rooms, which are exempt
+([[#OQ-002]]).
 
 hark **redeeming** an invitation is also out of scope, because hark does not do it: it declares
-`groupinfoget` in `src/dialects/hub.cbcl:78` and never sends one. Recorded here rather than
-omitted, because the day that changes two obligations attach at once and neither is obvious
-from hark's own code: `groupinfo-claimed` is a **retry**, distinct from `no-groupinfo`; and per
-cbcl-bus **BUG-022**, the grant MUST NOT be spent until the join is acknowledged — spending it
-early left a joiner that lost the race with no group *and* no grant, permanently unable to
-re-seat.
+`groupinfoget` in `src/dialects/hub.cbcl:78` and never sends one. Recorded rather than omitted,
+because the day that changes two obligations attach at once and neither is obvious from hark's own
+code: `groupinfo-claimed` is a **retry**, distinct from `no-groupinfo`; and per cbcl-bus
+**BUG-022**, the grant MUST NOT be spent until the join is acknowledged — spending it early left a
+joiner that lost the race with no group *and* no grant, permanently unable to re-seat.
 
 ## 4. Requirements
 
-### REQ-001 — Hold the claim before generating a Commit
+### REQ-001 — Arm the claim before merging
 
-hark SHALL obtain an exclusive claim on the group's current epoch before generating any Commit,
-and SHALL NOT call `add_members` or `remove_members` without holding it.
+hark SHALL hold a granted claim for the group's current epoch, and SHALL have **armed** it, before
+calling `merge_pending_commit`. It SHALL NOT arm and merge in parallel.
 
-The claim is what turns hark's existing eager merge from an accident into §3.2's promise. It is
-therefore REQUIRED *before generation*, not before sending: generation is the step §14 governs.
+The states are [[SPEC-063-one-committer-per-epoch]]'s: a *claimed* epoch is a reservation the hub
+may take back (the holder has merged nothing, so nothing is promised); an *armed* one is a
+declaration that the holder is about to merge, from which a release is a fork. Arming is therefore
+the moment hark acquires §3.2's promise, and merging before it is merging on nothing.
 
-Trace: [[#TEST-001]], [[#CON-001]], [[#CON-002]]
+Ordering, and why it is cheap here: `add_members` alone mutates nothing durable — OpenMLS stages
+into the in-memory provider, and hark's own `provider.persist()` sits *after*
+`merge_pending_commit` (`src/mls/group.rs`). The fork-visible boundary is that pair, so arming any
+time before `add_member` is called satisfies the rule with room to spare.
+
+**Consequence for the code, and it is the whole restructure.** `on_keypkg` is synchronous —
+`handle_frame` returns a `SessionEvent` and cannot await a hub round trip — so the Add path becomes
+a state machine: `keypkg` → record intent, emit `epochclaim` → granted → emit `epocharm` → armed →
+`add_member`.
+
+Trace: [[#TEST-001]], [[#CON-002]]
 
 ### REQ-002 — Defer, do not fail, on a refused claim
 
@@ -258,122 +269,116 @@ as it already does on merging another member's.
 
 Trace: [[#TEST-006]], [[#BUG-001]]
 
-### REQ-005 — Neither stack honours the claim alone
+### REQ-005 — hark declares the capability only when its half is complete
 
-The claim SHALL NOT be adopted by one stack without the other. An implementation MUST NOT be
-merged into either repository until the corresponding implementation in the other is ready to
-merge.
+hark SHALL NOT advertise the `epoch-claim/v1` capability on its `hello` until its own claim
+handling is implemented and reviewed.
 
-A claim honoured by one client is a promise the group does not keep. It is strictly worse than
-no claim, because §3.2 licenses a holder to advance its state eagerly on the strength of it:
-the honouring client would advance on a promise the other client is free to break. Partial
-adoption makes conformance worse, not better.
+*Reduced.* This began as "neither stack ships alone", enforced as a merge gate. That was the wrong
+mechanism and [[SPEC-063-one-committer-per-epoch]] REQ-006 replaces it with the right one: the hub
+computes a room's active set as the **intersection over present members** and refuses
+`epochclaim`/`epocharm` with `epoch-claim-inactive` unless the capability is unanimous. Merging a
+repository never upgraded a running daemon or an open tab, so a repository gate could never have
+delivered what it promised.
 
-Trace: [[#ADR-005]], and the merge gate in [[IMPL-027-commit-sequencing]]
+What remains hark's is the honesty of its own declaration: the capability is a claim to honour the
+protocol, and advertising it early makes every other client's promise false while looking like
+compliance.
 
-### REQ-006 — A held claim never survives the process that holds it
+Trace: [[#TEST-005]], [[SPEC-063-one-committer-per-epoch]] REQ-006
 
-hark SHALL hold a claim only for the duration of a single commit attempt, and SHALL release it
-— or allow it to be released — when the attempt completes, fails, or its connection dies.
+### REQ-006 — Release a claim hark no longer needs
 
-Trace: [[#TEST-007]], [[#CON-001]]
+hark SHALL release an armed claim as soon as its obligations under it are discharged
+([[#REQ-014]]), and SHALL release a *claimed* — not yet armed — epoch rather than holding it when
+it will not commit ([[#REQ-016]]).
 
-### REQ-011 — The hub refuses a member-authored grant
+*Restated.* The original read "a held claim never survives the process that holds it", which is
+true of a reservation and false of an armed claim: an armed claim survives death deliberately,
+because releasing it is a fork ([[SPEC-063-one-committer-per-epoch]]). The obligation that
+survives is hark's, not the hub's — nothing else can release it.
 
-The hub SHALL refuse an `epochclaim`-response verb (`epochgranted`) submitted by a member,
-and SHALL NOT fan it. A client SHALL independently reject any `epochgranted` bearing a `:from`,
-which a member-authored room frame must carry and a hub-originated frame does not.
+Trace: [[#TEST-006]], [[#REQ-012]]
 
-*Found in review of the first implementation.* The grant **is** [[#REQ-001]]'s promise, so a
-forged one is not a nuisance — it is a licence to merge eagerly with nothing behind it, which
-is the exact conflict this specification prevents, reached by trusting the mechanism that
-prevents it. Any member can publish arbitrary room frames and the hub fans them.
+### REQ-011 — Reject a grant that did not come from the hub
 
-Both halves are REQUIRED. A client-only check leaves the forgery on the wire for every other
-implementation to get wrong; a hub-only check makes every client's safety depend on the party
-[[#ADR-003]] declines to trust for anything else.
+hark SHALL reject any `epochgranted` bearing a `:from`, and SHALL treat only a grant naming its own
+room as a grant.
 
-Trace: [[#TEST-011]], [[#CON-001]]
+The grant **is** the promise, so a forged one is a licence to merge eagerly with nothing behind it
+— the conflict this exists to prevent, reached by trusting the mechanism that prevents it. The
+discriminator is the absence of `:from`: cbcl-chat requires it on every member-authored room frame
+and refuses one without it as `missing-from`, never fanning it, while hub-originated frames carry
+none.
 
-### REQ-012 — The promise survives a restart, or the merge does not happen
+*The hub half is [[SPEC-063-one-committer-per-epoch]]'s and is done* — and it was a wider hazard
+than reported here: unrecognised performatives were routed to the publish path and **fanned**, so
+the hub relayed forged `keypkg`, `invited`, `paircode`, `roomcfg` and `agent-removed` as well as
+grants. hark's check stands regardless: a client whose safety depends on the hub having got its
+ingress right has no defence the day it hasn't.
 
-Where hark has merged a Commit under a claim but not yet delivered it, that obligation SHALL be
-durable: on restart the system SHALL either resend the undelivered Commit and reacquire the
-claim for its epoch, or refuse to resume the group until it can.
+Trace: [[#TEST-011]], [[#CON-002]]
 
-*Found in review.* [[#ADR-001]]'s eager merge is sound only while the promise holds, and a
-connection-scoped claim dies with the connection. If the process dies after
-`merge_pending_commit` + `persist` but before the Commit is accepted, the claim is released,
-the durable state says epoch E+1, and the group is still at E — so another committer takes the
-claim and advances E differently. The agent restarts into a fork it created and cannot detect.
+### REQ-012 — One durable operation record, carrying the Commit **and** the Welcome
 
-In-memory retention of the unsent frames is **not** sufficient: it is exactly the thing a
-restart loses. This does not reopen [[#ADR-001]] — the answer is a durable *operation record*
-(the frames to resend plus the epoch to reclaim), not a staged Commit; the group state stays
-merged and no fork is held in memory.
+Before merging, hark SHALL make durable a single record of the operation it is about to perform,
+containing at least: the room, the epoch, the claim token, the serialised Commit, the serialised
+Welcome, and the target handle. The record SHALL be removed only when both frames have been
+delivered and the claim released.
 
-Trace: [[#TEST-012]], [[#CON-002]]
+**Why the Welcome must be in it, and this is settled by the code rather than by preference.**
+`add_member` produces the Commit and the Welcome from one `add_members` call and then merges
+(`src/mls/group.rs`). Once that has run the Welcome bytes exist only in the returned value, and
+they cannot be regenerated: the group has advanced, and re-running `add_members` for the same
+member is refused as *"already a member"* by the duplicate-leaf guard — which is cbcl-bus BUG-022's
+trap approached from the other side. A restart holding the Commit but not the Welcome therefore has
+an invitee in the ratchet tree it can **never** seat, and an armed claim it cannot legitimately
+release.
 
-### REQ-013 — A missing echo is ambiguous, and SHALL be reconciled rather than treated as refusal
+This subsumes what were two requirements. A missing echo is *ambiguous*, not a refusal — the
+commonest reason it does not arrive is that hark disconnected, and the hub may well have fanned the
+Commit anyway. So the record is also what reconciliation reads: on restart hark resends from it and
+re-observes acceptance, rather than discarding a Welcome and leaving the invitee added and mute.
 
-Where the acceptance signal of [[#OQ-003]] does not arrive, the system SHALL persist the
-pending Welcome and reconcile acceptance after reconnecting — by observing the group's epoch, or
-by re-sending. It SHALL NOT discard the Welcome, and SHALL NOT treat the missing echo as
-evidence the Commit was refused.
+**On recovery, per [[SPEC-063-one-committer-per-epoch]]'s residual.** A holder that arms, merges,
+then loses its connection *and* this record holds that room's epoch permanently, and there is
+deliberately no hub-side break — a break that exists gets reached for, and reaching for it is a
+fork. The primary recovery is hark's: on restart, read the record and **release** rather than
+reacquire when it shows no merge happened.
 
-*Found in review.* [[#REQ-003]] holds the Welcome until the Commit is accepted, and the echo is
-the signal. But the commonest reason the echo does not arrive is that *we* disconnected — and
-the hub may well have persisted and fanned the Commit regardless. Then the invitee is in the
-ratchet tree, visible to every member, holding none of the group's secrets and with no Welcome
-coming: added and mute, permanently. Suppressing the Welcome forever converts an ambiguous
-outcome into a certain failure, and it is the failure that looks to the invitee like a
-permissions problem.
+In-memory retention is not sufficient and is not a partial answer: it is precisely what a restart
+loses. This does not reopen [[#ADR-001]] — a durable *operation record* is not a staged Commit, and
+no fork is held.
 
-Trace: [[#TEST-013]], [[#CON-003]]
+Trace: [[#TEST-012]], [[#TEST-013]], [[#CON-002]], [[#CON-003]]
 
-### REQ-014 — The claim is held until the Welcome is ordered, not merely until the epoch advances
+### REQ-014 — Release only after the Commit is accepted **and** the Welcome is out
 
-A claim SHALL NOT be released while its holder has a Welcome outstanding for the Commit taken
-under it.
+hark SHALL NOT release an armed claim until it has observed acceptance of its Commit
+([[#OQ-003]]) and delivered the corresponding Welcome.
 
-*Found in review.* The release conditions of [[SPEC-061]] REQ-005 are epoch advance and
-connection death. The epoch advances the moment **another** member merges the Add and publishes
-GroupInfo for E+1 — which can happen before the committer has received its own echo and emitted
-the deferred Welcome. A waiting committer then takes the claim and advances to E+2. The invitee,
-still groupless, drops that Commit and later joins against a stale E+1. Holding the barrier
-through Welcome delivery, or buffering and replaying the Commits that land in between, is what
-closes it.
+The hub cannot infer this and does not try: `deliver` is opaque to it, so it can tell neither a
+Commit from a message nor a Welcome-bearing exchange from a bare one. Release-on-epoch-advance is
+therefore gone for armed claims, and the obligation is entirely hark's.
 
-Trace: [[#TEST-014]], [[#CON-001]]
+What it prevents: the epoch advances when *another* member merges and publishes GroupInfo for E+1,
+which can happen before hark has received its own echo and emitted the deferred Welcome. A third
+committer granted the claim then moves to E+2, and the invitee — still groupless — drops that
+Commit and later joins against a stale E+1.
 
-### REQ-015 — Activation is gated on every live committer, not on both repositories having merged
+Trace: [[#TEST-014]], [[#CON-003]]
 
-The claimed-eager-merge behaviour SHALL NOT be enabled for a room until every client that can
-commit in it honours the claim. Room-wide capability or version negotiation, or hub-side
-enforcement, is REQUIRED before activation.
+### REQ-016 — Release a grant hark took and will not spend
 
-*Found in review, and it is the sharpest form of [[#REQ-005]].* Merging both repositories does
-not upgrade a running hark daemon or an open browser tab. During any rollout a new client can
-hold a grant and merge eagerly while an old client, which never took a claim, emits a conflicting
-Commit for the same epoch. That is strictly worse than the status quo, because the new client has
-advanced its state on a promise the old one was never told about — the "false promise" of
-[[#ADR-005]] arriving through time rather than through a repository boundary.
+Where Commit generation fails after the grant, hark SHALL release the claim rather than hold it.
 
-Trace: [[#TEST-015]], [[#ADR-005]]
+Neither of the hub's automatic release conditions applies here: the epoch has not advanced and the
+connection is perfectly healthy. A holder that took a grant, failed to generate, and said nothing
+blocks every other committer in the room having done nothing at all. `epochrelease`
+([[SPEC-063-one-committer-per-epoch]]) is the verb; using it on every failure path is hark's
+obligation.
 
-### REQ-016 — A claim taken and not spent SHALL be releasable before sending
-
-The system SHALL be able to release a claim it holds without sending a Commit, and SHALL do so
-whenever Commit generation fails after the grant.
-
-*Found in review.* `add_members` / `remove_members` can fail after the grant — a validation
-refusal, a ledger rejection, a provider error. Neither release condition then applies: the epoch
-has not advanced, and the connection is perfectly healthy. The holder blocks every other
-committer in the room indefinitely, having done nothing at all. Without an explicit release the
-only remedy is to drop the connection, which is a poor thing to require of a client whose only
-error was to decline to commit.
-
-Trace: [[#TEST-016]], [[#CON-001]]
+Trace: [[#TEST-016]], [[#CON-002]]
 
 ## 5. Non-functional requirements
 
@@ -436,7 +441,7 @@ That dependency is a liveness dependency only, never a safety one — see [[#ADR
 that refuses every claim stops hark committing, which is the denial of service it could already
 achieve by dropping the Commit frames.
 
-### ADR-002 — A distinct `epochclaim` verb, not an overloaded `groupinfoget`
+### ADR-002 — A distinct `epochclaim` verb, not an overloaded `groupinfoget` *(adopted by SPEC-063)*
 
 **Context.** The hub already has exactly the mechanism needed: `cbcl-chat-groupinfo:claim/2`
 grants a room's current epoch to one live connection, releasing on epoch advance or holder
@@ -465,13 +470,20 @@ Two lesser reasons: a member does not want the GroupInfo (up to 256 KB on a path
 none), and a verb named `get` that mutates exclusive state is the kind of naming that survives
 into someone else's bug.
 
+**Outcome.** Adopted in [[SPEC-063-one-committer-per-epoch]] as `epochclaim` / `epocharm` /
+`epochrelease`, sharing one transaction with `groupinfoget` so both verbs contend for a single
+claim. cbcl-bus added a refinement this analysis missed: `groupinfoget` now answers `#(error none)`
+**without taking the claim**, so a joiner that cannot proceed does not hold a reservation against
+the committer who would publish the object it is waiting for — the same argument pointed the other
+way.
+
 **Consequences.** One new verb in the hub dialect and one new hub handler, both thin — the
 transaction, which is the part that is hard to get right, is shared verbatim. `groupinfoget`
 keeps its meaning and its behaviour, and both verbs contend for one claim, which is what "one
 committer per epoch" requires: an external joiner and a member committer must exclude each
 other, since both move the epoch.
 
-### ADR-003 — The claim is a sequencing device, never an admission decision
+### ADR-003 — The claim is a sequencing device, never an admission decision *(owned by SPEC-063)*
 
 **Decision.** Holding the claim confers no authority. Every member SHALL continue to validate
 every Commit exactly as it does today, and a Commit from a claim holder SHALL be admitted on
@@ -500,91 +512,84 @@ ADR-004: an operator cannot act on what they cannot see. Unlike that case, an un
 here is not merely invisible — a never-committed Add means a member who was invited never gets
 in, which looks to them like a permission problem.
 
-### ADR-005 — Neither stack ships alone
+### ADR-005 — Neither stack ships alone *(superseded by SPEC-063 REQ-006)*
 
 **Decision.** The hark and cbcl-bus implementations merge together or not at all, enforced as a
 merge gate on both pull requests rather than as an intention.
 
-**Rationale.** [[#REQ-005]]. Recorded as an ADR because the reasoning is the kind that gets lost:
-"we can land our half safely and the other side will follow" is true for most protocol changes
-and false for this one, precisely because the claim's value is a promise that licenses eager
-state advancement.
+**Rationale.** Recorded because the reasoning is the kind that gets lost: "we can land our half
+safely and the other side will follow" is true for most protocol changes and false for this one,
+precisely because the claim's value is a promise that licenses eager state advancement.
+
+**Superseded, and the mechanism was wrong even though the reasoning was right.** A merge gate
+between repositories says nothing about deployed software: merging never upgraded a running daemon
+or an open browser tab. [[SPEC-063-one-committer-per-epoch]] REQ-006 replaces it with capability
+negotiation — a room's active set is the intersection over present members, and the hub refuses
+`epochclaim`/`epocharm` when it is not unanimous — so a mixed room degrades to today's behaviour
+rather than to something new. hark's residual obligation is [[#REQ-005]]: do not declare the
+capability until the implementation is real.
 
 ## 7. Contracts
 
-### CON-001 — The epoch claim (wire)
+### CON-001 — The epoch claim (wire) — **owned by [[SPEC-063-one-committer-per-epoch]]**
 
-**Interface.**
+The verbs (`epochclaim` / `epocharm` / `epochrelease` / `epochgranted`), their grammar, the claim
+states and their release conditions, and the `epoch-claim/v1` activation rule are specified there
+and are not restated here. An earlier revision of this document carried a draft wire contract; it
+has been removed rather than kept in parallel, because two documents describing one protocol is
+how the two stacks end up disagreeing about it.
 
-```
-request   (epochclaim @room :epoch <n> :from @a)
-granted   (epochgranted @room :epoch <n>)
-refused   (error @room "groupinfo-claimed")     ; the existing slug, deliberately reused
-no-group  (error @room "no-group")              ; the room has no MLS group at all
-```
+What hark relies on from that contract, and would need re-checking if it changed:
 
-**Grammar** (the hub's recogniser; regular, and an extension of the existing hub dialect):
+- a grant names an epoch, and arming is a distinct, ordered step before merging ([[#REQ-001]]);
+- an armed claim survives the holder's connection and the hub's restart, and is released only by
+  the holder ([[#REQ-014]]);
+- a contended refusal is a **retry**, distinct from `epoch-claim-inactive`, which is not
+  ([[#REQ-002]]);
+- a claim can be released without spending it ([[#REQ-016]]).
 
-```abnf
-epochclaim = "(" %s"epochclaim" SP room SP %s":epoch" SP 1*DIGIT
-             SP %s":from" SP handle ")"
-room       = "@" 1*63(ALPHA / DIGIT / "-" / "_")
-handle     = room
-```
-
-**Pre-conditions.**
-- The requester is a member of the room (the hub's existing `current-member-pid` check).
-- `:epoch` is the epoch the requester intends to commit against. *(REQ-001)*
-
-**Post-conditions.**
-- On `epochgranted`, no other live connection holds this room at this epoch, and none will be
-  granted it until this connection dies or the epoch advances. *(REQ-001, REQ-006)*
-- On `groupinfo-claimed`, another live connection holds it. The requester MUST retry, not
-  fail. *(REQ-002)*
-- A grant is idempotent for the same connection: re-requesting after a lost reply succeeds
-  rather than self-blocking. *(REQ-002)*
-- A room with no GroupInfo published is **grantable** — unlike `groupinfoget`, which needs the
-  object itself. *(ADR-002)*
-- The grant confers no admission authority whatsoever. *(ADR-003)*
-
-**Error model.** `groupinfo-claimed` is a retry. `not-a-member` and `no-group` are terminal for
-this attempt. Any other error is treated as a refusal and retried under [[#NFR-001]]'s budget.
-
-Implements: [[#REQ-001]], [[#REQ-002]], [[#REQ-006]] · Verified by: [[#TEST-001]],
-[[#TEST-002]], [[#TEST-003]], [[#TEST-007]]
+Verified by: [[#TEST-011]], and cross-stack by SPEC-063's own interop tests.
 
 ### CON-002 — Claim-gated commit generation (hark)
 
-**Interface.** `add_member` and `remove_member` gain a claim precondition; neither generates a
-Commit without one.
+**Interface.** `add_member` and `remove_member` gain an armed-claim precondition and a durable
+record; neither generates a Commit without one.
 
-**Pre-conditions.** A grant for `group.epoch()` is held. *(REQ-001)*
-
-**Post-conditions.**
-- On a grant, generation, merge and persist proceed as today, under the §3.2 promise.
-  *(REQ-001, NFR-002)*
-- On a refusal, no Commit is generated, no state is modified, no handle is marked unhealthy,
-  and the operation is re-attempted later. *(REQ-002)*
-- The epoch named in the claim is the epoch the Commit is generated against; if the group's
-  epoch has moved between grant and generation, the attempt is abandoned and retried.
-  *(REQ-001)*
-
-Implements: [[#REQ-001]], [[#REQ-002]] · Verified by: [[#TEST-001]], [[#TEST-002]]
-
-### CON-003 — Commit and Welcome ordering (hark)
-
-**Interface.** The frames `MlsSession::on_keypkg` emits, and when.
-
-**Pre-conditions.** A Commit has been generated and merged under a held claim.
+**Pre-conditions.**
+- A grant for `group.epoch()` is held and **armed**. *(REQ-001)*
+- The [[#REQ-012]] operation record is durable *before* `merge_pending_commit`. *(REQ-012)*
+- The grant was authenticated as the hub's. *(REQ-011)*
 
 **Post-conditions.**
-- The `deliver` frame carrying the Commit is emitted immediately. *(REQ-001)*
-- The `welcome` frame is emitted **only** once the Commit is accepted. *(REQ-003)*
+- On success, generation, merge and persist proceed under §3.2's promise. *(REQ-001, NFR-002)*
+- On a refusal, no Commit is generated, no state is modified, no handle is marked unhealthy, and
+  the operation is re-attempted later. *(REQ-002)*
+- On a generation failure *after* the grant, the claim is released rather than held. *(REQ-016)*
+- If the group's epoch moved between grant and generation, the attempt is abandoned and retried
+  against the new epoch. *(REQ-001)*
+
+Implements: [[#REQ-001]], [[#REQ-002]], [[#REQ-011]], [[#REQ-012]], [[#REQ-016]] ·
+Verified by: [[#TEST-001]], [[#TEST-002]], [[#TEST-011]], [[#TEST-016]]
+
+### CON-003 — Commit, Welcome, and release ordering (hark)
+
+**Interface.** The frames the session emits after a merged Commit, and when.
+
+**Pre-conditions.** A Commit has been generated and merged under an armed claim, and the
+[[#REQ-012]] record is durable.
+
+**Post-conditions.**
+- The `deliver` carrying the Commit is emitted immediately. *(REQ-001)*
+- The `welcome` is emitted **only** once the Commit is accepted. *(REQ-003)*
 - A fresh `(groupinfo …)` for the new epoch is emitted on acceptance. *(REQ-004)*
-- If acceptance never arrives, no `welcome` is ever emitted. *(REQ-003)*
+- `epochrelease` is sent only after both the acceptance and the Welcome. *(REQ-014)*
+- The record is removed only after the release. *(REQ-012)*
+- If acceptance never arrives, no `welcome` is emitted **and the record is retained** for
+  reconciliation after reconnect — a missing echo is ambiguous, not a refusal. *(REQ-003, REQ-012)*
 
-Implements: [[#REQ-003]], [[#REQ-004]] · Verified by: [[#TEST-004]], [[#TEST-005]],
-[[#TEST-006]]
+Implements: [[#REQ-003]], [[#REQ-004]], [[#REQ-012]], [[#REQ-014]] ·
+Verified by: [[#TEST-004]], [[#TEST-005]], [[#TEST-006]], [[#TEST-012]], [[#TEST-013]],
+[[#TEST-014]]
 
 ## 8. Test specification
 
@@ -593,13 +598,14 @@ testing against a real hub** plus **property testing of exclusivity**; the order
 requirements are a state machine → **example-based testing with a scripted peer**; the
 cross-stack contract → **two vehicles, because neither alone reaches it**.
 
-**On the cross-stack vehicles, and why there are two.** SPEC-061 TEST-008's harness drives the
-web client from files emitted by hark (`hark emit → $DIR → node join.mjs → hark verify`); there
-is no hub process and no socket in it. It therefore cannot exercise a hub-served claim at all,
-and a test of contention written against it would be verifying nothing. Frame-level agreement is
-what it *can* prove ([[#TEST-009a]]); contention needs the TEST-011 vehicle, which has a real
-WebSocket pipeline ([[#TEST-009b]]). Conflating them is how a cross-stack requirement ends up
-with no cross-stack evidence.
+**On the cross-stack vehicle.** SPEC-061 TEST-008's harness drives the web client from files
+emitted by hark, with no hub process and no socket in it, so it can establish frame-level agreement
+and nothing about contention. That is why cross-stack contention is
+[[SPEC-063-one-committer-per-epoch]]'s TEST-006 against the WebSocket pipeline rather than an
+extension of TEST-008 — a test written against the wrong vehicle goes green while verifying
+nothing, which is what an earlier revision of this section specified.
+
+| TEST |
 
 | TEST | Validates | Type | Scenario |
 |------|-----------|------|----------|
@@ -607,17 +613,16 @@ with no cross-stack evidence.
 | **TEST-002** | [[#REQ-002]] | negative-input | The hub refuses the claim. No Commit is generated, no group state changes, no handle goes unhealthy, and the attempt is retried. |
 | **TEST-003** | [[#REQ-002]] | positive | After a refusal, the epoch advances (another member commits); the retry is granted and succeeds against the new epoch. |
 | **TEST-004** | [[#REQ-003]] | negative-output | A Commit that is never accepted produces **no** `welcome` frame, ever. |
-| **TEST-005** | [[#REQ-003]] | positive | On acceptance, the `welcome` is emitted, and not before the `deliver`. |
+| **TEST-005** | [[#REQ-003]], [[#REQ-005]] | positive | On acceptance, the `welcome` is emitted, and not before the `deliver`. hark does not advertise `epoch-claim/v1` until its half is complete. |
 | **TEST-006** | [[#REQ-004]], [[#BUG-001]] | positive | After hark commits its own Add, a `(groupinfo …)` for the NEW epoch is emitted. Regression for BUG-001. |
 | **TEST-007** | [[#REQ-006]], [[#CON-001]] | positive + negative-output | Two connections contend: exactly one grant. The loser is granted after the winner's connection dies, and after the epoch advances — but not while the winner lives at that epoch. |
 | **TEST-008** | [[#NFR-001]] | negative-output | Ten consecutive refusals produce one `warn` and a visible status, not a silent eleventh retry. |
-| **TEST-009a** | [[#REQ-005]], [[#CON-001]] | positive | **File-mediated** (the SPEC-061 TEST-008 vehicle): both stacks produce and recognise byte-identical `epochclaim` / `epochgranted` frames. This is all that harness can verify — it has no hub (see below). |
-| **TEST-009b** | [[#REQ-005]], [[#ADR-003]] | positive | **Hub-mediated** (the SPEC-061 TEST-011 vehicle — store level plus a real WebSocket): a hark connection and a web connection contend for one epoch against a running hub; exactly one is granted, the loser is refused with `groupinfo-claimed` and retries, and both stacks agree on membership and on the safety number afterwards. |
-| **TEST-011** | [[#REQ-011]] | negative-input | `(epochgranted @room :epoch 7 :from @mallory)` is not a grant, in any field order, including when `:from` is our own handle. The hub refuses to fan a member-authored one. |
-| **TEST-012** | [[#REQ-012]] | negative-output | Kill the process between the merge and the delivery. On restart the Commit is resent and the claim reacquired — the agent does NOT resume into a silently forked epoch. |
-| **TEST-013** | [[#REQ-013]] | positive | The Commit is fanned but the sender disconnects before its echo. After reconnecting, the Welcome is still delivered — the invitee is not left in the tree without secrets. |
-| **TEST-014** | [[#REQ-014]] | negative-output | Another member advances the epoch while a Welcome is outstanding. A third committer must NOT be granted the claim until that Welcome is ordered. |
-| **TEST-015** | [[#REQ-015]] | negative-output | A room containing one claim-honouring and one legacy client does not enable claimed eager merge. |
+| **TEST-009** | [[#REQ-001]] | positive | Cross-stack contention, owned by [[SPEC-063-one-committer-per-epoch]]'s interop tests rather than restated here. hark's obligation is to be one of the two stacks under test. The SPEC-061 TEST-008 harness cannot carry it — files, no hub, no socket — which is why SPEC-063 records it as TEST-006 against the WebSocket pipeline instead. |
+| **TEST-011** | [[#REQ-011]] | negative-input | `(epochgranted @room :epoch 7 :from @mallory)` is not a grant, in any field order, including when `:from` is our own handle. **Implemented and mutation-checked.** |
+| **TEST-012** | [[#REQ-012]] | negative-output | Kill the process between the merge and the delivery. On restart the record is read, the Commit resent and the claim reacquired — the agent does NOT resume into a silently forked epoch. A record showing no merge is **released**, not reacquired. |
+| **TEST-012b** | [[#REQ-012]] | negative-output | The record carries the Welcome: kill the process after the merge, restart, and the invitee is still seated. Without it the Welcome is unregenerable — `add_members` refuses the same member as "already a member" — so the invitee is in the tree and can never be seated. |
+| **TEST-013** | [[#REQ-012]] | positive | The Commit is fanned but the sender disconnects before its echo. After reconnecting, the Welcome is still delivered — the invitee is not left in the tree without secrets. |
+| **TEST-014** | [[#REQ-014]] | negative-output | `epochrelease` is not sent while a Welcome is outstanding — the acceptance alone does not release it. |
 | **TEST-016** | [[#REQ-016]] | positive | A grant taken, then Commit generation fails: the claim is released without a Commit and another committer is granted it promptly, on a healthy connection. |
 | **TEST-010** | [[#ADR-002]] | positive | A committer in a room with **no** published GroupInfo is granted the claim. This is the case overloading `groupinfoget` would have deadlocked. |
 
@@ -661,48 +666,38 @@ than the status quo, which sends the Welcome unconditionally and immediately. Wh
 [[SPEC-024-mls-ds-v1]] runs, `seq == head + 1` is a genuine acceptance signal and should be
 preferred — see [[#OQ-002]].
 
-### OQ-002 — Do `mls-ds/v1` rooms need this at all?
+### OQ-002 — Do `mls-ds/v1` rooms need this at all? **(RESOLVED — exempt)**
 
 [[SPEC-024-mls-ds-v1]] ADR-011 already sequences records with `seq == head + 1`, which is a
-stronger and more general form of the same property: the DS refuses a record that is not the
-exact next one. A v1 room may therefore already satisfy §14 without any claim.
+stronger and more general form of the same property. **v1 rooms are exempt**, per
+[[SPEC-063-one-committer-per-epoch]]; layering both would be two sequencing mechanisms on one path.
 
-**Leaning:** exempt v1 rooms and say so explicitly, rather than layering two sequencing
-mechanisms. **Owner:** hark. **Blocking:** no — v1 is not yet the default — but leaving it
-unstated would invite someone to add the claim there later "for consistency".
+What remains open is only the end state — whether the claim retires on migration or persists as the
+chat path's mechanism with the DS owning DS rooms — and that is SPEC-063 OQ-001, a decision for
+whoever migrates. Nothing here forecloses either.
 
-## 9a. Defects found in SPEC-061 while specifying this
+## 9a. Defects found in SPEC-061 while specifying this — **all fixed**
 
-Reported here so they reach cbcl-bus rather than being silently worked around; neither blocks
-this work, and neither is mine to fix unilaterally.
+Reported to cbcl-bus and resolved there; recorded because two of them mattered to this document
+rather than only to SPEC-061.
 
-- **TEST-011 verifies both the old lease rule and its replacement.** It asserts *"A claim older
-  than the lease no longer blocks"* (back-dating frees it) and, twenty lines later, *"A claim is
-  **not** released by elapsed time"*. REQ-005's normative clause says `SHALL NOT be released by
-  elapsed time`, so the first assertion contradicts the requirement it is attributed to. A test
-  suite that verifies both a rule and its negation cannot fail on that rule.
-- **CON-003 retains v0.6.0 lease language.** It still reads *"another requester holds an
-  **unexpired** claim"*, three paragraphs above the text stating release is never by a clock.
-- **TEST-008's harness passes when it checks nothing, and this one is load-bearing here.**
-  `run-spec061-interop.sh` opens with
-
-  ```bash
-  if [ ! -d "$HARK" ]; then
-    echo "SKIPPED: no hark checkout at $HARK — cross-stack parity NOT checked"
-    exit 0
-  fi
-  ```
-
-  The message is honest and the exit status is not: anything reading the status — CI, a release
-  gate, a person running it in a loop — sees a pass. It is how the harness went unrun against
-  cbcl-bus PR #45 and #46 twice without anyone noticing, which the cbcl-bus side found and
-  reported.
-
-  **Why it matters to this specification and not only to that one.** [[#REQ-005]] says neither
-  stack honours the claim alone, and the *evidence* for that claim is the cross-stack test. A
-  harness that reports success while skipping gives REQ-005 no enforcement whatsoever — the
-  merge gate would be satisfied by a run that checked nothing. Exiting non-zero (or requiring an
-  explicit `SPEC061_ALLOW_SKIP=1`) is a precondition for [[#TEST-009a]] being worth running.
+- **`run-spec061-interop.sh` printed "cross-stack parity NOT checked" and exited 0.** Fixed: a skip
+  now exits 1, with `SPEC061_ALLOW_SKIP=1` for someone who genuinely has no checkout. It was
+  load-bearing here and not merely hygiene — whatever spec owns the cross-stack requirement has
+  that test as its only evidence, and a harness reporting success while skipping leaves the
+  requirement unenforced.
+- **TEST-011 asserted a rule and its negation** — *"a claim older than the lease no longer blocks"*
+  and *"a claim is not released by elapsed time"*. Fixed. Worth keeping the diagnosis: the lease
+  assertion had already been deleted from the code and only the spec still claimed it, and a suite
+  asserting both P and ¬P is green either way, so nothing but a reader was ever going to surface
+  it.
+- **CON-003 kept v0.6.0 "unexpired claim" language.** Struck.
+- **Member-authored hub verbs were relayed, not ignored.** This is the one where the reported
+  finding was narrower than the defect: unrecognised performatives were routed to the publish path
+  and fanned, so the hub relayed forged `keypkg`, `invited`, `paircode`, `roomcfg` and
+  `agent-removed` as well as grants. Fixed hub-side as a refusal set consulted before the routing
+  table. [[#REQ-011]] keeps hark's own check regardless — a client whose safety depends on the hub
+  having got its ingress right has no defence the day it hasn't.
 
 ## 10. Review gate
 
@@ -721,7 +716,36 @@ strength of its own author's confidence.
 ## Changelog
 
 <details>
-<summary>Revision history — 0.1.0 → 0.2.0</summary>
+<summary>Revision history — 0.1.0 → 0.3.0</summary>
+
+- 0.3.0 — **reduced to hark's obligations.** cbcl-bus settled the home question this document was
+  blocked on: the protocol lives in [[SPEC-063-one-committer-per-epoch]], a separate spec rather
+  than a SPEC-024 section, because folding a chat-path claim into SPEC-024 would put two
+  sequencing mechanisms for two kinds of room in one document. So the draft wire contract
+  ([[#CON-001]]) is **removed rather than kept in parallel** — two documents describing one
+  protocol is how the stacks end up disagreeing about it — and [[#ADR-002]], [[#ADR-003]] and
+  [[#ADR-005]] are retained only as the record of why, marked as owned or superseded there.
+
+  Three corrections came back with that decision, and two of them are to things this document had
+  wrong:
+
+  - **[[#REQ-001]] is now "arm before merging", not "hold a claim".** SPEC-063 splits the claim
+    into *claimed* (a reservation the hub may take back — nothing is promised) and *armed* (the
+    holder has declared it will merge, from which a release is a fork). My flat "never released by
+    connection death" would have stranded a channel the first time an invitee closed a tab
+    mid-fetch — the common case, not the tail.
+  - **[[#REQ-005]] was the wrong mechanism.** I wrote the cross-stack constraint as a merge gate
+    between repositories; merging never upgraded a running daemon or an open tab. SPEC-063 REQ-006
+    replaces it with capability negotiation over the *present members*. What remains hark's is not
+    declaring `epoch-claim/v1` until its half is real, and [[#REQ-015]] is gone as a separate
+    requirement.
+  - **[[#REQ-012]] and REQ-013 are one durable operation record**, and it must carry the
+    **Welcome** as well as the Commit. Settled by hark's code rather than by preference:
+    `add_members` produces both in one call and then the group advances, so a restart holding only
+    the Commit has an invitee in the ratchet tree it can never seat — `add_members` refuses the
+    same member as "already a member", which is cbcl-bus BUG-022's trap from the other side.
+
+  [[#OQ-002]] closes: `mls-ds/v1` rooms are exempt, since `seq == head + 1` is the stronger form.
 
 - 0.2.0 — folded an external review of the first implementation. Six requirements added, and
   the first is a defect in shipped code rather than a gap in the text: [[#REQ-011]], because
