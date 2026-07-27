@@ -738,6 +738,48 @@ impl ReplayGuard {
     }
 }
 
+/// Frames a state-mutating exchange produced that have not reached the hub yet
+/// ([[SPEC-026 REQ-001]], S1 from the Tier-2 review).
+///
+/// `SessionEvent::Handled` frames are not all alike. An `idkey` re-broadcast or
+/// a `keyget` is a request — losing one costs a retry. But an Add produces its
+/// `deliver`(Commit) and `welcome` **after** `add_member` has already called
+/// `merge_pending_commit` and `provider.persist()`, so by the time the transport
+/// sees them this agent's group state has already advanced past them.
+///
+/// Dropping those on a write failure is what forked the group: the agent sat
+/// alone at epoch N+1, every peer frame at epoch N was undecryptable, and the
+/// half-added member could never be recovered — `add_member` refuses them as
+/// "already a member" and they never received a Welcome. Before the reconnect
+/// existed this at least surfaced, because the handle went unhealthy and an
+/// operator saw it; surviving the write failure is what made it silent.
+///
+/// So the frames are retained and flushed on the replacement socket. The
+/// invariant is that a Commit this agent has merged is eventually delivered, or
+/// the handle fails visibly — never that it is quietly forgotten.
+#[derive(Debug, Default)]
+struct PendingFrames {
+    frames: Vec<String>,
+}
+
+impl PendingFrames {
+    /// Keep everything from the frame that failed onward, in order. The failed
+    /// frame is included: a partial write is not a delivery.
+    fn retain_from(&mut self, remaining: &[String]) {
+        self.frames.extend_from_slice(remaining);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Take the queue for a flush attempt. On failure the caller re-retains
+    /// what is left, so nothing is lost by the act of trying.
+    fn take(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.frames)
+    }
+}
+
 /// Answer one outbound frame offered while the hub connection is down.
 ///
 /// Returns `Some(terminal)` only when the send channel itself has closed — the
@@ -1091,6 +1133,8 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         // SPEC-026 REQ-003: the hub replays the room's recent history after
         // EVERY successful hello, including a re-join's.
         let mut replay_guard = ReplayGuard::new();
+        // Frames from a state-mutating exchange that the socket died under.
+        let mut pending_frames = PendingFrames::default();
         loop {
             if let Some(cause) = pending_reconnect.take() {
                 match reconnect(
@@ -1112,6 +1156,39 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         schedule.reset();
                         replay_guard.arm();
                         let _ = store.mark_connected(&handle).await;
+                        // Flush anything the dead socket swallowed BEFORE serving
+                        // new traffic — it may be a Commit this agent has already
+                        // merged, and until it lands the group and this agent
+                        // disagree about the epoch.
+                        if !pending_frames.is_empty() {
+                            let queued = pending_frames.take();
+                            let mut failed: Option<String> = None;
+                            for (index, text) in queued.iter().enumerate() {
+                                let Ok(payload) = payload_bytes(text) else { continue };
+                                let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
+                                if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
+                                    failed = Some(sanitize(&error.to_string()));
+                                    pending_frames.retain_from(&queued[index..]);
+                                    break;
+                                }
+                            }
+                            match failed {
+                                Some(detail) => {
+                                    tracing::warn!(
+                                        agent = handle.as_str(),
+                                        error = detail,
+                                        "could not flush frames held over a reconnect; retrying"
+                                    );
+                                    pending_reconnect = Some(detail);
+                                    continue;
+                                }
+                                None => tracing::info!(
+                                    agent = handle.as_str(),
+                                    count = queued.len(),
+                                    "flushed frames held over a reconnect"
+                                ),
+                            }
+                        }
                     }
                     Recovery::Closed => {
                         let _ = websocket.close(None).await;
@@ -1323,11 +1400,21 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                                 // peers re-drive the exchange, which is what
                                 // the browser client does on reopen.
                                 let mut dropped: Option<String> = None;
-                                for text in outbound {
-                                    let Ok(payload) = payload_bytes(&text) else { continue };
+                                for (index, text) in outbound.iter().enumerate() {
+                                    let Ok(payload) = payload_bytes(text) else {
+                                        // Our own frame, built by our own session, did not
+                                        // encode. Silently skipping it can lose a Commit we
+                                        // have already merged, so at least say so.
+                                        tracing::warn!(frame = text, "dropping an unencodable session frame");
+                                        continue;
+                                    };
                                     let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
                                     if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
                                         dropped = Some(sanitize(&error.to_string()));
+                                        // Everything from here on is unsent, and some of it
+                                        // may follow a merge this agent has already made
+                                        // durable. Keep it for the replacement socket.
+                                        pending_frames.retain_from(&outbound[index..]);
                                         break;
                                     }
                                 }
@@ -1418,6 +1505,68 @@ fn sanitize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{build_announce_frame, cap_part, error_slug, frame_performative, payload_bytes};
+
+    /// S1 (SPEC-026 Tier-2 review) — frames from a state-mutating exchange
+    /// survive the socket that died under them.
+    ///
+    /// `add_member` merges and persists the Commit BEFORE the transport is
+    /// handed the `deliver`/`welcome` to send, so a write failure there leaves
+    /// this agent at epoch N+1 alone. Dropping the frames forks the group
+    /// permanently and makes the half-added member unrecoverable — `add_member`
+    /// refuses them as "already a member" and they never got a Welcome.
+    #[test]
+    fn frames_unsent_when_the_socket_died_are_retained_in_order() {
+        let mut pending = super::PendingFrames::default();
+        assert!(pending.is_empty(), "nothing is held before a failure");
+
+        let outbound = vec![
+            "(deliver @room :ct \"commit\")".to_owned(),
+            "(welcome @room :for @bo :ct \"w\")".to_owned(),
+        ];
+        // The write failed on the FIRST frame: both are unsent.
+        pending.retain_from(&outbound[0..]);
+        assert!(!pending.is_empty());
+        assert_eq!(
+            pending.take(),
+            outbound,
+            "the failed frame is retained too — a partial write is not a delivery"
+        );
+        assert!(pending.is_empty(), "taking hands the queue over");
+    }
+
+    /// The failure mid-sequence keeps the tail only, in order — the Welcome must
+    /// not be re-sent ahead of the Commit it belongs to.
+    #[test]
+    fn a_mid_sequence_failure_retains_the_tail_in_order() {
+        let mut pending = super::PendingFrames::default();
+        let outbound = [
+            "(deliver @room :ct \"commit\")".to_owned(),
+            "(welcome @room :for @bo :ct \"w\")".to_owned(),
+            "(groupinfo @room :epoch 2)".to_owned(),
+        ];
+        // The deliver landed; the welcome failed.
+        pending.retain_from(&outbound[1..]);
+        assert_eq!(pending.take(), outbound[1..].to_vec());
+    }
+
+    /// A flush that fails again re-retains what is left, so retrying cannot
+    /// lose frames by the act of trying.
+    #[test]
+    fn a_failed_flush_does_not_consume_the_queue() {
+        let mut pending = super::PendingFrames::default();
+        let outbound = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        pending.retain_from(&outbound);
+
+        let queued = pending.take();
+        assert!(pending.is_empty(), "taken for the attempt");
+        // The attempt sent "a" and failed on "b" — the caller re-retains.
+        pending.retain_from(&queued[1..]);
+        assert_eq!(
+            pending.take(),
+            vec!["b".to_owned(), "c".to_owned()],
+            "what is left is still held after a failed flush"
+        );
+    }
 
     #[test]
     fn parses_roomcfg_with_and_without_declared_dialects() {
