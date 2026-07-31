@@ -1,0 +1,220 @@
+#!/bin/sh
+# herd - supervise a herd of coding-agent CLIs from the bus.
+#
+#   herd up                  start the daemon, join the channel, park a handle
+#   herd listen              recv loop: an ask spawns an agent, done replies
+#   herd spawn <thr> <task>  spawn one worker directly (no bus; for testing)
+#   herd ls                  the herd view
+#   herd down                close the handle, kill the session
+#
+# Composition: tmux owns the panes, withdone owns completion, hark owns the
+# wire. Every state this reports is DECLARED by one of them -- nothing here
+# parses agent output.
+set -eu
+
+STATE="${HERD_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/herd}"
+SESSION="${HERD_SESSION:-herd}"
+AGENT_CMD="${HERD_AGENT_CMD:-opencode run --dangerously-skip-permissions}"
+SILENCE="${HERD_SILENCE:-120}"
+DIALECT="${HERD_DIALECT:-elf}"
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+die() { echo "herd: $*" >&2; exit 64; }
+log() { echo "herd: $*" >&2; }
+
+# --- the one seam ------------------------------------------------------------
+# HERD_PUBLISH=stub swaps hark for an append-only log so the tmux/withdone
+# machinery can be exercised without a hub. Everything else is identical.
+publish() {
+    kind=$1; form=$2
+    if [ "${HERD_PUBLISH:-hark}" = stub ]; then
+        printf '%s\t%s\n' "$kind" "$form" >>"$STATE/published.log"
+    else
+        CBCL_AGENT_HANDLE="$(cat "$STATE/handle")" hark "$kind" "$form"
+    fi
+}
+
+# CBCL string escaping: the form is built here, so only " and \ can break it.
+cbcl_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# --- up ----------------------------------------------------------------------
+cmd_up() {
+    mkdir -p "$STATE/jobs"
+    if [ "${HERD_PUBLISH:-hark}" = stub ]; then
+        echo 'stub-handle' >"$STATE/handle"
+    else
+        hark daemon start >/dev/null 2>&1 || true
+        # `*` is the receive-all sentinel: we want every channel message, not
+        # just asks addressed at a dialect we advertise.
+        hark init --dialect '*' --dialect "$DIALECT" \
+            | sed -n "s/^export CBCL_AGENT_HANDLE='\(.*\)'$/\1/p" >"$STATE/handle"
+        [ -s "$STATE/handle" ] || die "hark init produced no handle"
+    fi
+    mkdir -p "$STATE/windows"
+    tmux has-session -t "$SESSION" 2>/dev/null || {
+        tmux new-session -d -s "$SESSION" -n foreman
+        # NOT alert-silence: tmux delivers alerts through attached CLIENTS, so
+        # in a detached (headless) session the hook never fires even though
+        # #{window_silence_flag} is set correctly. We poll the flag instead.
+        tmux new-window -d -t "$SESSION" -n ticker \
+            -e HERD_STATE="$STATE" -e HERD_PUBLISH="${HERD_PUBLISH:-hark}" \
+            -e HERD_SESSION="$SESSION" -e HERD_TICK="${HERD_TICK:-2}" \
+            "$HERE/herd watch"
+    }
+    log "up: handle $(cat "$STATE/handle"), tmux session $SESSION"
+}
+
+# --- spawn -------------------------------------------------------------------
+cmd_spawn() {
+    thread=$1; task=$2
+    [ -f "$STATE/handle" ] || die "not up (run: herd up)"
+
+    job="$STATE/jobs/$thread"
+    [ -e "$job" ] && die "job $thread already exists"
+    mkdir -p "$job"
+
+    # withdone requires the sentinel NOT to exist at invocation.
+    sentinel="$job/sentinel"
+    printf '%s' "$task" >"$job/task"
+    printf 'spawned\n' >"$job/status"
+
+    # The completion instruction, verbatim from withdone's README. This is the
+    # contract: we mint the path, we teach the agent to write it.
+    cat >"$job/prompt" <<EOF
+$task
+
+When you have completed the task, signal completion via your bash tool by
+running exactly: echo <CODE> > $sentinel
+Where <CODE> is a single non-negative integer:
+  0 on success
+  1 if you could not complete the task
+  2+ for other non-zero codes describing specific failures
+Do not run this command until the task is genuinely done.
+EOF
+
+    # tmux windows inherit the SERVER's environment, not this shell's, so every
+    # variable the pane needs has to be forwarded explicitly.
+    set -- -e HERD_STATE="$STATE" -e HERD_PUBLISH="${HERD_PUBLISH:-hark}" \
+           -e HERD_AGENT_CMD="$AGENT_CMD" -e HERD_GRACE="${HERD_GRACE:-5}"
+    for var in ${HERD_PASS_ENV:-}; do
+        eval "val=\${$var:-}"
+        set -- "$@" -e "$var=$val"
+    done
+
+    win="w-$(printf '%s' "$thread" | tr -c 'a-zA-Z0-9' '-' | cut -c1-16)"
+    tmux new-window -d -t "$SESSION" -n "$win" "$@" \
+        "$HERE/herd-run '$thread' '$job'"
+
+    printf '%s\n' "$win" >"$job/window"
+    printf '%s\n' "$thread" >"$STATE/windows/$win"   # reverse map for session hooks
+
+    # Keep the pane (and its output) after the agent exits, so a failure is
+    # still readable in the herd view.
+    tmux set-option -p -t "$SESSION:$win" remain-on-exit on
+    # tmux's own declared idleness signal -- not a guess about agent state,
+    # just "no bytes for N seconds", which is exactly what it says.
+    tmux set-option -p -t "$SESSION:$win" monitor-silence "$SILENCE"
+    tmux set-hook -p -t "$SESSION:$win" pane-died \
+        "run-shell '$HERE/herd note $thread pane-died'"
+
+    log "spawn: $thread -> $SESSION:$win"
+}
+
+# --- note (called from tmux hooks) -------------------------------------------
+cmd_note() {
+    thread=$1; what=$2
+    job="$STATE/jobs/$thread"
+    [ -d "$job" ] || exit 0
+    # `done` is terminal: the agent has declared, so neither the silence during
+    # withdone's SIGTERM grace nor the subsequent pane-died is news.
+    [ "$(cat "$job/status" 2>/dev/null)" = done ] && exit 0
+    printf '%s\n' "$what" >"$job/status"
+    publish emit "(tell @herd \"$(cbcl_str "$thread $what")\")" || true
+}
+
+# --- tick / watch ------------------------------------------------------------
+# tmux is still the authority on silence -- monitor-silence decides it and sets
+# #{window_silence_flag}. We only read the flag; nothing here inspects output.
+cmd_tick() {
+    tmux list-windows -t "$SESSION" -F '#{window_name} #{window_silence_flag}' \
+        2>/dev/null | while read -r win flag; do
+        thread=$(cat "$STATE/windows/$win" 2>/dev/null) || continue
+        [ -n "$thread" ] || continue
+        status=$(cat "$STATE/jobs/$thread/status" 2>/dev/null || echo '')
+        case "$flag:$status" in
+            1:working) cmd_note "$thread" silent ;;
+            0:silent)  cmd_note "$thread" working ;;   # it spoke again
+        esac
+    done
+}
+
+cmd_watch() {
+    while :; do
+        cmd_tick || true
+        sleep "${HERD_TICK:-2}"
+    done
+}
+
+# --- listen ------------------------------------------------------------------
+cmd_listen() {
+    [ -f "$STATE/handle" ] || die "not up (run: herd up)"
+    handle=$(cat "$STATE/handle")
+    log "listen: handle $handle"
+    while :; do
+        msg=$(CBCL_AGENT_HANDLE="$handle" hark recv --timeout 30s 2>/dev/null) || {
+            sleep 1; continue
+        }
+        [ -n "$msg" ] || continue
+
+        # Threading is a CBCL contract (:thread on the ask), not a scrape.
+        thread=$(printf '%s' "$msg" | sed -n 's/.*:thread[[:space:]]*"\([^"]*\)".*/\1/p')
+        [ -n "$thread" ] || { log "no :thread, ignoring: $msg"; continue; }
+        [ -e "$STATE/jobs/$thread" ] && continue   # already running; recv is at-least-once
+
+        # First quoted string in the ask is the task.
+        task=$(printf '%s' "$msg" | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')
+        [ -n "$task" ] || { log "no task text, ignoring: $msg"; continue; }
+
+        cmd_spawn "$thread" "$task"
+    done
+}
+
+# --- ls ----------------------------------------------------------------------
+cmd_ls() {
+    [ -d "$STATE/jobs" ] || { echo "no jobs"; return 0; }
+    printf '%-24s %-12s %-10s %s\n' THREAD STATUS PANE TASK
+    for job in "$STATE/jobs"/*; do
+        [ -d "$job" ] || continue
+        thread=$(basename "$job")
+        status=$(cat "$job/status" 2>/dev/null || echo '?')
+        win=$(cat "$job/window" 2>/dev/null || echo '-')
+        # tmux is the inventory API: pane_dead is declared, not inferred.
+        pane=$(tmux list-panes -t "$SESSION:$win" \
+                 -F '#{?pane_dead,dead:#{pane_dead_status},live}' 2>/dev/null | head -1)
+        [ -n "$pane" ] || pane='gone'
+        printf '%-24s %-12s %-10s %s\n' \
+            "$thread" "$status" "$pane" "$(head -c 48 "$job/task" 2>/dev/null | tr '\n' ' ')"
+    done
+}
+
+# --- down --------------------------------------------------------------------
+cmd_down() {
+    [ "${HERD_PUBLISH:-hark}" = stub ] || {
+        CBCL_AGENT_HANDLE="$(cat "$STATE/handle" 2>/dev/null)" hark close 2>/dev/null || true
+    }
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    rm -f "$STATE/handle"
+    log "down"
+}
+
+case "${1:-}" in
+    up)     shift; cmd_up "$@" ;;
+    listen) shift; cmd_listen "$@" ;;
+    spawn)  shift; [ $# -eq 2 ] || die "usage: herd spawn <thread> <task>"; cmd_spawn "$@" ;;
+    note)   shift; [ $# -eq 2 ] || die "usage: herd note <thread> <what>"; cmd_note "$@" ;;
+    tick)   shift; cmd_tick "$@" ;;
+    watch)  shift; cmd_watch "$@" ;;
+    ls)     shift; cmd_ls "$@" ;;
+    down)   shift; cmd_down "$@" ;;
+    *)      die "usage: herd {up|listen|spawn|note|tick|watch|ls|down}" ;;
+esac

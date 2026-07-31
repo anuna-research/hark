@@ -1,0 +1,47 @@
+#!/bin/sh
+# herd-run <thread> <jobdir> - the body of one worker pane.
+#
+# Runs the agent CLI under withdone, then publishes the terminal state the
+# AGENT declared (its sentinel code), falling back to the exit status the
+# KERNEL declared. Nothing here reads the agent's output.
+set -eu
+
+thread=$1
+job=$2
+STATE="${HERD_STATE:?}"
+AGENT_CMD="${HERD_AGENT_CMD:?}"
+sentinel="$job/sentinel"
+
+publish() {
+    kind=$1; form=$2
+    if [ "${HERD_PUBLISH:-hark}" = stub ]; then
+        printf '%s\t%s\n' "$kind" "$form" >>"$STATE/published.log"
+    else
+        CBCL_AGENT_HANDLE="$(cat "$STATE/handle")" hark "$kind" "$form"
+    fi
+}
+cbcl_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+printf 'working\n' >"$job/status"
+publish progress "(tell @herd \"$(cbcl_str "$thread working")\")" || true
+
+# withdone watches $sentinel, kills the child on detection, and exits with the
+# code the agent wrote. </dev/null so a TUI agent doesn't block on stdin.
+set +e
+# shellcheck disable=SC2086
+withdone -s "$sentinel" --grace "${HERD_GRACE:-5}" -- $AGENT_CMD "$(cat "$job/prompt")" \
+    </dev/null >"$job/log" 2>&1
+code=$?
+set -e
+
+printf '%s\n' "$code" >"$job/code"
+printf 'done\n' >"$job/status"
+
+if [ "$code" -eq 0 ]; then
+    publish reply "(reply \"$(cbcl_str "$thread ok")\" :thread \"$(cbcl_str "$thread")\")"
+else
+    publish error "(error \"$(cbcl_str "$thread failed ($code)")\" :thread \"$(cbcl_str "$thread")\")"
+fi
+
+# The pane stays (remain-on-exit on) so the log is still readable.
+exit "$code"
