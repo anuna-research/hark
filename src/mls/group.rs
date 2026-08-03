@@ -119,6 +119,183 @@ pub struct ExternalAdmission {
     pub grant_json: String,
 }
 
+/// SPEC-061 CON-006: the PAIRING admission grant, as it travels. Serde field
+/// names are wire-visible and MUST match cbcl-bus's `PairingGrant`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PairingGrant {
+    /// The discriminator, and it is REQUIRED. A grant JSON without it is a CON-002
+    /// [`AdmissionGrant`] and is checked by those rules; the two never fall through
+    /// to each other, because a credential checked under whichever rules happen to
+    /// parse is a credential with the weaker of the two.
+    pub kind: String,
+    pub room: String,
+    pub signer_handle: String,
+    pub signer_key_b64: String,
+    pub subject_handle: String,
+    pub subject_key_b64: String,
+    pub not_after_ms: u64,
+    pub sig_b64: String,
+}
+
+impl PairingGrant {
+    /// Mint a grant authorising `(subject_handle, subject_key)` to seat itself in
+    /// `room`. hark does not currently call this — an agent is the SUBJECT of a
+    /// pairing grant, never its signer — and it exists because a verifier that
+    /// cannot also mint is a verifier whose parity with the other stack can only
+    /// be asserted against fixtures somebody typed in by hand.
+    pub fn mint<S: FrameSigner>(
+        signer: &S,
+        signer_handle: &str,
+        signer_key: &[u8; 32],
+        room: &str,
+        subject_handle: &str,
+        subject_key: &[u8; 32],
+        not_after_ms: u64,
+    ) -> Self {
+        let signed = super::pins::pairgrant_signing_bytes(
+            room,
+            signer_handle,
+            signer_key,
+            subject_handle,
+            subject_key,
+            not_after_ms,
+        );
+        Self {
+            kind: super::DS_MLS_PAIRGRANT.to_string(),
+            room: room.to_string(),
+            signer_handle: signer_handle.to_string(),
+            signer_key_b64: B64.encode(signer_key),
+            subject_handle: subject_handle.to_string(),
+            subject_key_b64: B64.encode(subject_key),
+            not_after_ms,
+            sig_b64: B64.encode(signer.sign(&signed)),
+        }
+    }
+
+    /// Verify against the group the commit is arriving at, and against the leaf the
+    /// joiner presents (SPEC-061 REQ-008 / CON-006). Every input that decides
+    /// anything comes from one of those two — never from the grant, never from the
+    /// hub — or the check is circular.
+    ///
+    /// Byte-for-byte the same policy as cbcl-bus's `PairingGrant::verify`, in the
+    /// same order, so a grant one stack admits is one the other admits.
+    pub fn verify(
+        &self,
+        group: &MlsGroup,
+        room: &str,
+        joiner_handle: &str,
+        joiner_key: &[u8],
+        now_ms: u64,
+    ) -> Result<(), MlsError> {
+        if self.kind != super::DS_MLS_PAIRGRANT {
+            return Err(MlsError::Rejected(format!(
+                "pairing grant has kind {}, not {} (SPEC-061 CON-006)",
+                self.kind,
+                super::DS_MLS_PAIRGRANT
+            )));
+        }
+        if self.room != room {
+            return Err(MlsError::Rejected(format!(
+                "pairing grant is bound to {}, not {room} (SPEC-061 REQ-008)",
+                self.room
+            )));
+        }
+        if self.not_after_ms <= now_ms {
+            return Err(MlsError::Rejected(
+                "pairing grant has expired (SPEC-061 REQ-008)".into(),
+            ));
+        }
+
+        // (2) The signer is a LIVE LEAF PAIR of THIS tree. Not a pin (a belief
+        // about a handle), not the genesis (which names one member), and nothing
+        // the hub said: the ratchet tree we are about to change.
+        //
+        // Exactly one leaf, because a handle on two leaves is a tree we do not
+        // understand, and picking either would be choosing whose authority to
+        // honour by iteration order.
+        let signer_key: [u8; 32] = B64
+            .decode(&self.signer_key_b64)
+            .ok()
+            .and_then(|k| <[u8; 32]>::try_from(k).ok())
+            .ok_or_else(|| MlsError::Rejected("pairing grant signer key is malformed".into()))?;
+        let mut seats = group.members().filter(|m| {
+            credential_handle(&m.credential)
+                .map(|h| h == self.signer_handle)
+                .unwrap_or(false)
+        });
+        match (seats.next(), seats.next()) {
+            (Some(seat), None) => {
+                if seat.signature_key != signer_key {
+                    return Err(MlsError::Rejected(format!(
+                        "pairing grant refused: {} is a live leaf, but not with the key the grant \
+                         signs under (SPEC-061 REQ-008)",
+                        self.signer_handle
+                    )));
+                }
+            }
+            (None, _) => {
+                return Err(MlsError::Rejected(format!(
+                    "pairing grant refused: {} is not a live leaf of this group, so it cannot \
+                     authorise an admission to it (SPEC-061 REQ-008 / NFR-001)",
+                    self.signer_handle
+                )));
+            }
+            (Some(_), Some(_)) => {
+                return Err(MlsError::Rejected(format!(
+                    "pairing grant refused: {} names more than one live leaf; refusing to choose",
+                    self.signer_handle
+                )));
+            }
+        }
+
+        // (4) The subject is exactly the leaf being seated. This is what lets the
+        // grant travel in the clear: it authorises a KEY, so a party that reads it
+        // and is not that key gains nothing it can use.
+        if self.subject_handle != joiner_handle {
+            return Err(MlsError::Rejected(format!(
+                "pairing grant authorises {}, but the joining leaf is {joiner_handle} \
+                 (SPEC-061 REQ-008)",
+                self.subject_handle
+            )));
+        }
+        let subject_key: [u8; 32] = B64
+            .decode(&self.subject_key_b64)
+            .ok()
+            .and_then(|k| <[u8; 32]>::try_from(k).ok())
+            .ok_or_else(|| MlsError::Rejected("pairing grant subject key is malformed".into()))?;
+        if subject_key.as_slice() != joiner_key {
+            return Err(MlsError::Rejected(format!(
+                "pairing grant authorises a different key for {joiner_handle} than the one its \
+                 leaf presents (SPEC-061 REQ-008 — the grant is bound to a key, not a name)"
+            )));
+        }
+
+        // (3) …and the signature covers all of it.
+        let sig = B64
+            .decode(&self.sig_b64)
+            .map_err(|e| MlsError::Rejected(format!("pairing grant signature: {e}")))?;
+        let signed = super::pins::pairgrant_signing_bytes(
+            room,
+            &self.signer_handle,
+            &signer_key,
+            &self.subject_handle,
+            &subject_key,
+            self.not_after_ms,
+        );
+        let vk = VerifyingKey::from_bytes(&signer_key)
+            .map_err(|_| MlsError::Rejected("pairing grant signer key is not a valid Ed25519 key".into()))?;
+        let sig = Signature::from_slice(&sig)
+            .map_err(|_| MlsError::Rejected("pairing grant signature is malformed".into()))?;
+        vk.verify(&signed, &sig).map_err(|_| {
+            MlsError::Rejected(
+                "pairing grant does not verify under the signing member's leaf key \
+                 (SPEC-061 REQ-008 / NFR-001)"
+                    .into(),
+            )
+        })
+    }
+}
+
 impl AdmissionGrant {
     /// Mint a grant for `room` over `token`, valid until `not_after_ms`.
     ///
@@ -588,6 +765,122 @@ pub(super) fn check_promise(
     }
 }
 
+/// A group this agent seated ITSELF into, plus the commit every existing member
+/// must be given before any of them can read from us.
+pub struct ExternalJoin {
+    pub group: MlsGroup,
+    /// MUST be sent. Until it lands and is merged, the members are at the old
+    /// epoch and we are alone at the new one.
+    pub commit: Vec<u8>,
+    pub genesis: GenesisAssertion,
+    pub trust: GenesisTrust,
+}
+
+/// SPEC-061 REQ-008 / CON-001: seat ourselves in `room`'s group by EXTERNAL
+/// COMMIT (RFC 9420 §12.4.3.2), redeeming a pairing grant signed by the member
+/// that paired us.
+///
+/// **hark has never minted one of these before**, and the asymmetry was
+/// deliberate: an agent is never the party redeeming an *invitation*, so it only
+/// ever needed to validate what somebody else built. REQ-008 makes the agent the
+/// party being authorised, which makes it the party that has to build.
+///
+/// Note what is NOT checked here: our own grant. We hold no group, so we have no
+/// tree to look the signer up in and no genesis to check anything against — the
+/// verification is the receivers' (`validate_external_commit`), and that is the
+/// right way round. A bad grant builds a commit every member refuses, and the
+/// refusal is where it belongs. What we DO check is the group we are joining: its
+/// genesis must bind the room we think we are in, or an untrusted hub could seat
+/// us in a group of its choosing and we would encrypt to it.
+///
+/// The grant travels in the commit's AAD, so our own signature over the
+/// FramedContent covers it and a relay cannot pair a valid grant with a different
+/// commit.
+pub fn join_by_grant(
+    provider: &DurableProvider,
+    identity: &MlsIdentity,
+    group_info_bytes: &[u8],
+    room: &str,
+    grant_json: &str,
+    pins: &mut PinStore,
+) -> Result<ExternalJoin, MlsError> {
+    use openmls::prelude::LeafNodeParameters;
+
+    let msg = MlsMessageIn::tls_deserialize_exact_bytes(group_info_bytes)
+        .map_err(|e| MlsError::Rejected(format!("group info deserialize: {e:?}")))?;
+    let verifiable = match msg.extract() {
+        MlsMessageBodyIn::GroupInfo(gi) => gi,
+        other => {
+            return Err(MlsError::Rejected(format!(
+                "expected a GroupInfo, got {other:?}"
+            )));
+        }
+    };
+
+    // The token half of the AAD is empty on this flavour. An invite grant is
+    // bearer and must at least be pinned to one invitation; a pairing grant
+    // authorises a KEY, which binds harder than any token could (SPEC-061 ADR-004).
+    let admission = ExternalAdmission {
+        token_b64: String::new(),
+        grant_json: grant_json.to_string(),
+    };
+    let aad = serde_json::to_vec(&admission)
+        .map_err(|e| MlsError::Rejected(format!("serialize admission: {e}")))?;
+
+    let (group, bundle) = MlsGroup::external_commit_builder()
+        .with_aad(aad)
+        .with_config(join_config())
+        .build_group(provider, verifiable, identity.credential.clone())
+        .map_err(|e| MlsError::Rejected(format!("external commit build_group: {e:?}")))?
+        .leaf_node_parameters(
+            LeafNodeParameters::builder()
+                .with_capabilities(genesis_capabilities())
+                .build(),
+        )
+        .load_psks(provider.storage())
+        .map_err(|e| MlsError::Rejected(format!("external commit psks: {e:?}")))?
+        .build(provider.rand(), provider.crypto(), &identity.signer, |_| true)
+        .map_err(|e| MlsError::Rejected(format!("external commit build: {e:?}")))?
+        .finalize(provider)
+        .map_err(|e| MlsError::Rejected(format!("external commit finalize: {e:?}")))?;
+
+    // REQ-016, on the group we have just adopted. A GroupInfo comes from the hub,
+    // and a hub that served us one for another channel — or one with no genesis at
+    // all — would have us encrypting into a group with no verified relationship to
+    // the room we joined. Rolled back rather than kept: a group we refuse to trust
+    // must not survive in the provider to be resumed later as if it were fine.
+    let group_id = group.group_id().as_slice().to_vec();
+    let genesis_bytes = match group.extensions().unknown(GENESIS_EXT_TYPE) {
+        Some(ext) => ext.0.clone(),
+        None => {
+            provider.rollback_to_disk()?;
+            return Err(MlsError::Rejected(
+                "the GroupInfo's group carries no genesis extension (REQ-016)".into(),
+            ));
+        }
+    };
+    let (genesis, trust) = match GenesisAssertion::from_bytes(&genesis_bytes)
+        .and_then(|g| g.verify(room, &group_id, pins).map(|t| (g, t)))
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            provider.rollback_to_disk()?;
+            return Err(e);
+        }
+    };
+
+    let (commit, _welcome, _group_info) = bundle.into_contents();
+    let commit = commit
+        .tls_serialize_detached()
+        .map_err(|e| MlsError::Rejected(format!("serialize external commit: {e:?}")))?;
+    Ok(ExternalJoin {
+        group,
+        commit,
+        genesis,
+        trust,
+    })
+}
+
 /// A validated, joined group plus the genesis trust grade.
 pub struct JoinOutcome {
     pub group: MlsGroup,
@@ -1030,6 +1323,179 @@ mod tests {
             "a refused promise must leave the group untouched — the whole point \
              is that state does not move without one"
         );
+    }
+
+    /// SPEC-061 REQ-008 / TEST-014 + TEST-015: an agent seats itself on a grant
+    /// signed by a member that is NOT the creator, and is refused four other ways.
+    ///
+    /// This is the production failure, in one function. `@bob` joined by
+    /// invitation, so it holds a leaf and cannot commit; it pairs an agent and
+    /// signs for it; `@alice`, who created the channel, is not consulted and does
+    /// not have to be online — she appears here only because somebody had to make
+    /// the group. The negatives run first so that every one of them is checked
+    /// against a GroupInfo that is still valid for the positive at the end.
+    #[test]
+    fn a_member_authorises_an_agent_that_seats_itself() {
+        use openmls_traits::OpenMlsProvider as _;
+        const NOW: u64 = 1_800_000_000_000;
+        const EXP: u64 = NOW + 86_400_000;
+
+        let mut alice = party("pg", 41, "@alice");
+        let mut bob = party("pg", 42, "@bob");
+        let mut agent = party("pg", 43, "@agent6");
+        let mallory = party("pg", 44, "@mallory");
+        // Same HANDLE as the agent, a different key: a hub that read the grant.
+        let mut impostor = party("pg-i", 45, "@agent6");
+        pin_each_other(&mut [&mut alice, &mut bob]);
+
+        let (mut group, genesis) =
+            create_group(&alice.provider, &alice.identity, "@research").unwrap();
+        let kp = super::super::keypackages::build_one_time(&bob.provider, &bob.identity, 1)
+            .unwrap()
+            .remove(0);
+        let outcome = add_member(
+            &alice.provider,
+            &alice.identity,
+            &mut group,
+            &kp.bytes,
+            "@bob",
+            &alice.pins,
+            &alice.ledger,
+            "@research",
+            crate::mls::claim::CommitPromise::Inactive,
+        )
+        .unwrap();
+        join_from_welcome(
+            &bob.provider,
+            &bob.identity,
+            &outcome.welcome_bytes,
+            "@research",
+            &mut bob.pins,
+            &mut bob.ledger,
+            None,
+        )
+        .unwrap();
+        assert_eq!(group.members().count(), 2);
+
+        let gi = group
+            .export_group_info(alice.provider.crypto(), &alice.identity.signer, true)
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap();
+
+        let agent_key = agent.wire.verifying_key_bytes();
+        let good = serde_json::to_string(&PairingGrant::mint(
+            &bob.wire,
+            "@bob",
+            &bob.wire.verifying_key_bytes(),
+            "@research",
+            "@agent6",
+            &agent_key,
+            EXP,
+        ))
+        .unwrap();
+
+        let mut fork = crate::mls::validation::ForkSignal::default();
+        let mut refused = |grant: &str, joiner: &mut Party, why: &str| {
+            let join = join_by_grant(
+                &joiner.provider,
+                &joiner.identity,
+                &gi,
+                "@research",
+                grant,
+                &mut joiner.pins,
+            )
+            .expect("the joiner always builds; the refusal is the members'");
+            let err = crate::mls::validation::process_inbound(
+                &alice.provider,
+                &mut group,
+                &join.commit,
+                "@research",
+                &mut alice.pins,
+                &genesis,
+                None,
+                &mut fork,
+                false,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{why}"));
+            assert_eq!(group.members().count(), 2, "a refusal must not seat anyone: {why}");
+            err.to_string()
+        };
+
+        // 1. The signer holds no leaf. A real key, a real signature, no seat.
+        let outsider = serde_json::to_string(&PairingGrant::mint(
+            &mallory.wire,
+            "@mallory",
+            &mallory.wire.verifying_key_bytes(),
+            "@research",
+            "@agent6",
+            &agent_key,
+            EXP,
+        ))
+        .unwrap();
+        let e = refused(&outsider, &mut agent, "a non-member cannot authorise an admission");
+        assert!(e.contains("not a live leaf"), "{e}");
+
+        // 2. The signer handle lifted onto another live member, key and all. The
+        //    live-leaf check passes — @alice IS one — so this reaches the
+        //    signature, which is why both handles are inside the signed bytes.
+        let lifted = good
+            .replace("\"signer_handle\":\"@bob\"", "\"signer_handle\":\"@alice\"")
+            .replace(
+                &format!("\"signer_key_b64\":\"{}\"", B64.encode(bob.wire.verifying_key_bytes())),
+                &format!("\"signer_key_b64\":\"{}\"", B64.encode(alice.wire.verifying_key_bytes())),
+            );
+        assert!(lifted.contains("@alice"), "the fixture must actually be rewritten");
+        let e = refused(&lifted, &mut agent, "a grant re-pointed at another member is refused");
+        assert!(e.contains("does not verify"), "{e}");
+
+        // 3. The right handle, the wrong key — a party that READ the grant and
+        //    tried to use it. This is the case cleartext carriage rests on.
+        let e = refused(&good, &mut impostor, "the grant is bound to a key, not a name");
+        assert!(e.contains("different key"), "{e}");
+
+        // 4. Expired. A real past instant, not `NOW - 1`: hark reads the wall
+        //    clock here (the crate takes `now_ms` as an argument because it
+        //    compiles to wasm and has none), so a fictional "now" would leave this
+        //    grant comfortably in the future and the case unexercised.
+        let stale = serde_json::to_string(&PairingGrant::mint(
+            &bob.wire,
+            "@bob",
+            &bob.wire.verifying_key_bytes(),
+            "@research",
+            "@agent6",
+            &agent_key,
+            1, // 1970
+        ))
+        .unwrap();
+        let e = refused(&stale, &mut agent, "an expired grant is refused");
+        assert!(e.contains("expired"), "{e}");
+
+        // …and the one that must work.
+        let join = join_by_grant(
+            &agent.provider,
+            &agent.identity,
+            &gi,
+            "@research",
+            &good,
+            &mut agent.pins,
+        )
+        .expect("the agent seats itself");
+        assert_eq!(join.genesis, genesis, "and on the room's own genesis");
+        crate::mls::validation::process_inbound(
+            &alice.provider,
+            &mut group,
+            &join.commit,
+            "@research",
+            &mut alice.pins,
+            &genesis,
+            None,
+            &mut fork,
+            false,
+        )
+        .expect("the member admits it");
+        assert_eq!(group.members().count(), 3, "the agent is a live leaf now");
     }
 
     #[test]

@@ -27,7 +27,8 @@ use openmls::prelude::MlsGroup;
 use rand::Rng as _;
 
 use super::group::{
-    GenesisAssertion, GenesisTrust, add_member, create_group, is_owner, join_from_welcome,
+    GenesisAssertion, GenesisTrust, add_member, create_group, is_owner, join_by_grant,
+    join_from_welcome,
 };
 use super::keypackages::{ConsumedLedger, ONE_TIME_POOL_TARGET, build_last_resort, build_one_time};
 use super::pins::{PinStore, idkey_signing_bytes};
@@ -62,6 +63,15 @@ struct SessionMeta {
     /// On a v1 room, owner-removal is deterministically rejected (H7) and the pull loop is active.
     #[serde(default)]
     protocol_version: u8,
+    /// SPEC-061 REQ-008: the pairing admission grant this agent holds, as JSON.
+    ///
+    /// Durable because the whole point of it is an admission that does not need
+    /// anybody present: the member that signed it may be gone by the time we can
+    /// use it, and a grant kept only in memory would be lost on exactly the
+    /// restart this is meant to survive. It is not a secret — it authorises one
+    /// key, ours — so it sits beside the genesis rather than with key material.
+    #[serde(default)]
+    pair_grant: Option<String>,
 }
 
 /// What an inbound frame turned out to be.
@@ -104,6 +114,11 @@ pub struct MlsSession {
     /// The wire identity (signs idkey/bye assertions — same key as the MLS
     /// leaf, different DS labels).
     wire_seed: [u8; 32],
+    /// SPEC-061 REQ-008: the pairing admission grant a member signed for us, as
+    /// JSON. Held whether or not we can use it yet — it arrives when its signer
+    /// is online and is redeemed when the hub will serve us a GroupInfo, and
+    /// those are not always the same moment.
+    pair_grant: Option<String>,
     /// The room roster from the last `presence` frame. Tracked so that when a
     /// NEW handle appears we re-broadcast our own `idkey` (REQ-019) — the
     /// hub fans an `idkey` only once at join, to then-connected members, so a
@@ -237,6 +252,7 @@ impl MlsSession {
             meta_path,
             is_v1: false,
             wire_seed: wire.signing_seed(),
+            pair_grant: None,
             present: std::collections::HashSet::new(),
         };
 
@@ -244,6 +260,7 @@ impl MlsSession {
             session.enc_pinned = session.enc_pinned || meta.enc_pinned;
             session.is_v1 = meta.protocol_version >= 1;
             session.genesis = meta.genesis;
+            session.pair_grant = meta.pair_grant;
             // Reload the persisted group (REQ-009): a missing/stale state
             // simply means re-join (logged by the provider open path).
             if let Some(group_id_b64) = meta.group_id_b64 {
@@ -320,6 +337,7 @@ impl MlsSession {
             genesis: self.genesis.clone(),
             tofu_pending: matches!(self.trust, Some(GenesisTrust::TofuRequiresSafetyNumber)),
             protocol_version: if self.is_v1 { 1 } else { 0 },
+            pair_grant: self.pair_grant.clone(),
         };
         let bytes = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
         if let Some(parent) = self.meta_path.parent() {
@@ -442,6 +460,20 @@ impl MlsSession {
         // SPEC-013 IB-3: announce "published, add me" so a web owner has an
         // explicit, re-drivable add trigger (not just presence timing).
         frames.push(self.keyready_frame());
+
+        // SPEC-061 REQ-008: if we are still not a member, ask whether somebody
+        // signed an admission for us while we were away. The fan that carries a
+        // fresh grant only reaches an agent that is connected, and the case this
+        // credential exists for is precisely the one where we were not.
+        //
+        // Asked on every join rather than only after a failure: an agent that
+        // cannot decrypt has no other moment to notice, and the answer is one
+        // small frame the hub refuses cheaply when there is nothing to give.
+        if self.group.is_none() {
+            frames.push(format!("(pairgrantget {} :for {} :from {})", self.room, self.handle, self.handle));
+        }
+        // …and if we already hold one, go straight for the GroupInfo.
+        frames.extend(self.self_seat_frames());
         Ok(frames)
     }
 
@@ -628,6 +660,9 @@ impl MlsSession {
             },
             "idkey" => self.on_idkey(text),
             "welcome" => self.on_welcome(text),
+            // SPEC-061 REQ-008 — the two halves of seating ourselves.
+            "pairgrant" => self.on_pairgrant(text),
+            "groupinfo" => self.on_groupinfo(text),
             "deliver" => self.on_deliver(text),
             "keypkg" => self.on_keypkg(text),
             "presence" if self.enc_pinned => self.on_presence(text),
@@ -666,6 +701,117 @@ impl MlsSession {
             },
             Err(e) => SessionEvent::Dropped {
                 reason: e.to_string(),
+                probable_fork: false,
+            },
+        }
+    }
+
+    /// SPEC-061 REQ-008: a member has signed an admission for us.
+    ///
+    /// Stored first and durably, then acted on. The two are separable in time —
+    /// the grant arrives when its signer is online, and it can only be redeemed
+    /// when the hub will serve us a GroupInfo — and treating them as one moment
+    /// is how an agent ends up holding an entitlement it forgot across a restart.
+    ///
+    /// Nothing is verified here, and there is nothing here that could be: a grant
+    /// is checked against the ratchet tree it authorises entry to, and we do not
+    /// have that tree yet. A grant that is junk, forged, or for somebody else
+    /// builds a commit every member refuses, which is where the check belongs.
+    /// What we DO check is that it names us — not for security, but because acting
+    /// on a grant for another agent means burning a GroupInfo claim to build a
+    /// commit that is certain to be rejected.
+    fn on_pairgrant(&mut self, text: &str) -> SessionEvent {
+        match kw_symbol(text, ":for") {
+            Some(subject) if subject == self.handle => {}
+            _ => return SessionEvent::Handled { outbound: vec![] },
+        }
+        let Some(grant) = kw_b64(text, ":grant")
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        else {
+            return SessionEvent::Dropped {
+                reason: "pairgrant :grant is not base64 of UTF-8".into(),
+                probable_fork: false,
+            };
+        };
+        self.pair_grant = Some(grant);
+        if let Err(e) = self.persist_meta() {
+            return SessionEvent::Dropped {
+                reason: e.to_string(),
+                probable_fork: false,
+            };
+        }
+        SessionEvent::Handled {
+            outbound: self.self_seat_frames(),
+        }
+    }
+
+    /// Ask for the GroupInfo we would need to seat ourselves, if that is our
+    /// situation. Empty in every other case, so a caller can send it unconditionally.
+    ///
+    /// The hub CLAIMS its epoch when it serves one (SPEC-063 REQ-001), and that
+    /// claim — not a roster check here — is what stops our external Commit racing
+    /// a member's Add for the same epoch. A client-side gate would be guessing from
+    /// a presence list the hub composes; the claim is one decision, taken in one
+    /// transaction, by the only party that sees every contender.
+    fn self_seat_frames(&self) -> Vec<String> {
+        if !self.enc_pinned || self.group.is_some() || self.pair_grant.is_none() {
+            return Vec::new();
+        }
+        vec![format!("(groupinfoget {} :from {})", self.room, self.handle)]
+    }
+
+    /// SPEC-061 REQ-008 / CON-001: the hub served a GroupInfo. If we hold a grant
+    /// and no group, this is the moment — nobody has to be online, which is the
+    /// whole point of the credential.
+    ///
+    /// The commit MUST go out. Until it does we are alone at an epoch nobody else
+    /// has, which reads to us exactly like being a member and to everybody else
+    /// like nothing happened.
+    fn on_groupinfo(&mut self, text: &str) -> SessionEvent {
+        if self.group.is_some() {
+            return SessionEvent::Handled { outbound: vec![] };
+        }
+        let Some(grant) = self.pair_grant.clone() else {
+            return SessionEvent::Handled { outbound: vec![] };
+        };
+        let Some(gi) = kw_b64(text, ":gi") else {
+            return SessionEvent::Dropped {
+                reason: "groupinfo missing :gi".into(),
+                probable_fork: false,
+            };
+        };
+        match join_by_grant(
+            &self.provider,
+            &self.identity,
+            &gi,
+            &self.room,
+            &grant,
+            &mut self.pins,
+        ) {
+            Ok(joined) => {
+                let commit = B64.encode(&joined.commit);
+                self.group = Some(joined.group);
+                self.genesis = Some(joined.genesis);
+                self.trust = Some(joined.trust);
+                if let Err(e) = self.persist_meta() {
+                    return SessionEvent::Dropped {
+                        reason: e.to_string(),
+                        probable_fork: false,
+                    };
+                }
+                tracing::info!(
+                    room = %self.room,
+                    "seated ourselves by external Commit on a pairing grant (SPEC-061 REQ-008)"
+                );
+                SessionEvent::Handled {
+                    outbound: vec![format!(
+                        "(deliver {} :enc mls :ct \"{}\" :from {})",
+                        self.room, commit, self.handle
+                    )],
+                }
+            }
+            Err(e) => SessionEvent::Dropped {
+                reason: format!("external join refused: {e}"),
                 probable_fork: false,
             },
         }
@@ -1384,7 +1530,12 @@ mod tests {
         let mut session =
             MlsSession::open(&dir, "aria", "@research", "@aria", &wire, true).unwrap();
         let frames = session.join_frames().unwrap();
-        assert_eq!(frames.len(), 3);
+        // SPEC-061 REQ-008 adds the fourth: with no group yet, ask whether anybody
+        // signed an admission for us while we were away. There is no fifth here —
+        // `self_seat_frames` stays empty until a grant actually arrives.
+        assert_eq!(frames.len(), 4);
+        assert!(frames[3].starts_with("(pairgrantget @research :for @aria"));
+        assert!(cbcl_parser::parse(&frames[3]).is_ok(), "pairgrantget parses");
         assert!(frames[0].starts_with("(keypub @hub :last \""));
         assert!(frames[0].contains(":onetime ("));
         assert!(cbcl_parser::parse(&frames[0]).is_ok(), "keypub parses");

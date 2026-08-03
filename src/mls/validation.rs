@@ -20,7 +20,8 @@ use tls_codec::{DeserializeBytes as _, Serialize as _};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
 use super::group::{
-    AdmissionGrant, ExternalAdmission, GenesisAssertion, credential_handle, elect_committer,
+    AdmissionGrant, ExternalAdmission, GenesisAssertion, PairingGrant, credential_handle,
+    elect_committer,
     group_genesis_creator, member_bindings,
 };
 use super::pins::PinStore;
@@ -244,7 +245,9 @@ pub fn process_inbound(
                 )?,
                 // SPEC-061: an external Commit, admitted only on the creator's
                 // signature over the invite it redeems.
-                None => validate_external_commit(&staged, &aad, room, pins, genesis, now_ms())?,
+                None => {
+                    validate_external_commit(group, &staged, &aad, room, pins, genesis, now_ms())?
+                }
             }
             // Collect TOFU pins for validated Adds before merging.
             let tofu: Vec<(String, [u8; 32])> = staged
@@ -345,6 +348,7 @@ fn now_ms() -> u64 {
 /// 2. **Authority** (REQ-002): the AAD MUST carry a `{token, grant}` pair whose
 ///    grant verifies under the key this group's OWN genesis names as creator.
 fn validate_external_commit(
+    group: &MlsGroup,
     staged: &StagedCommit,
     aad: &[u8],
     room: &str,
@@ -391,25 +395,10 @@ fn validate_external_commit(
         )));
     }
 
-    // (2) Authority — against the creator THIS group's genesis names.
-    let creator_key = genesis.creator_key()?;
-    let presented: ExternalAdmission = serde_json::from_slice(aad).map_err(|_| {
-        MlsError::Rejected(
-            "external Commit refused: its AAD carries no admission grant (SPEC-061 REQ-002)".into(),
-        )
-    })?;
-    let token = B64
-        .decode(&presented.token_b64)
-        .map_err(|e| MlsError::Rejected(format!("admission token: {e}")))?;
-    let grant: AdmissionGrant = serde_json::from_str(&presented.grant_json)
-        .map_err(|e| MlsError::Rejected(format!("admission grant json: {e}")))?;
-    grant.verify(room, &genesis.creator_handle, &creator_key, &token, now_ms)?;
-
-    // The joiner's own leaf still answers to the pin rules every other leaf does
-    // (REQ-012d). An external Commit MUST carry a path, and its path leaf IS the
-    // joiner. A grant says the creator invited SOMEBODY; it never says this key is
-    // who it claims to be, and conflating those turns a bearer credential into
-    // impersonation.
+    // (2) Authority. The joiner's leaf is read FIRST: a pairing grant is bound to
+    // it, so that flavour cannot be checked without knowing who is asking. An
+    // external Commit MUST carry a path (§12.4.3.2), and its path leaf IS the
+    // joiner — so the check has a subject even though the joiner is not a member.
     let leaf = staged.update_path_leaf_node().ok_or_else(|| {
         MlsError::Rejected(
             "external Commit refused: no path leaf — RFC 9420 §12.4.3.2 requires a full Commit"
@@ -417,6 +406,47 @@ fn validate_external_commit(
         )
     })?;
     let handle = credential_handle(leaf.credential())?;
+    let leaf_key = leaf.signature_key().as_slice();
+
+    let presented: ExternalAdmission = serde_json::from_slice(aad).map_err(|_| {
+        MlsError::Rejected(
+            "external Commit refused: its AAD carries no admission grant (SPEC-061 REQ-002)".into(),
+        )
+    })?;
+
+    // Which credential is this? The discriminator is REQUIRED on the newer flavour
+    // and absent on the older one, and the two are never tried in turn: a
+    // credential checked under whichever rules happen to parse is a credential with
+    // the weaker of the two rule sets. cbcl-bus dispatches on the same field in the
+    // same place (SPEC-061 OQ-001).
+    let kind = serde_json::from_str::<serde_json::Value>(&presented.grant_json)
+        .map_err(|e| MlsError::Rejected(format!("admission grant json: {e}")))?
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .map(str::to_owned);
+    if kind.as_deref() == Some(super::DS_MLS_PAIRGRANT) {
+        // SPEC-061 REQ-008: authorised by a member, bound to this exact leaf. No
+        // genesis is consulted — the authority is the tree we are holding.
+        let grant: PairingGrant = serde_json::from_str(&presented.grant_json)
+            .map_err(|e| MlsError::Rejected(format!("pairing grant json: {e}")))?;
+        grant.verify(group, room, &handle, leaf_key, now_ms)?;
+    } else {
+        // SPEC-061 REQ-002: authorised by the creator, bearer, bound to a token.
+        let creator_key = genesis.creator_key()?;
+        let token = B64
+            .decode(&presented.token_b64)
+            .map_err(|e| MlsError::Rejected(format!("admission token: {e}")))?;
+        let grant: AdmissionGrant = serde_json::from_str(&presented.grant_json)
+            .map_err(|e| MlsError::Rejected(format!("admission grant json: {e}")))?;
+        grant.verify(room, &genesis.creator_handle, &creator_key, &token, now_ms)?;
+    }
+
+    // The joiner's own leaf still answers to the pin rules every other leaf does
+    // (REQ-012d). A grant says SOMEBODY was authorised; on the invite flavour it
+    // never says this key is who it claims to be, and conflating those turns a
+    // bearer credential into impersonation. (A pairing grant has already made and
+    // checked that claim, so this is redundant there — and kept, because a rule
+    // that holds for every leaf is easier to keep true than one with an exception.)
     if let Some(pin) = pins.pinned(&handle) {
         if pin.key != leaf.signature_key().as_slice() {
             return Err(MlsError::Rejected(format!(
