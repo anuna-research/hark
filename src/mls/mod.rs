@@ -82,6 +82,26 @@ pub const DS_IDENTITY_SAFETY: &str = "cbcl-mls-identity-safety/v1";
 /// application-level permissions to add members".
 pub const DS_MLS_INVITE: &str = "cbcl-mls-invite/v1";
 
+/// Pairing admission-grant label (SPEC-061 REQ-008). MUST equal cbcl-bus's
+/// `DS_MLS_PAIRGRANT`.
+///
+/// The credential by which the member that PAIRED an agent authorises it to seat
+/// itself — the case [`DS_MLS_INVITE`] cannot serve, because an invited member may
+/// pair an agent and may not commit an Add for it, so it hands out a pairing it
+/// has no way to complete.
+///
+/// A separate credential rather than a second use of the invite grant, for a
+/// reason that is about carriage. An invite grant is bearer, and survives being
+/// carried by an untrusted hub only because it is sealed under a key that rides in
+/// the invite link. A pairing code cannot key such a seal: the hub mints the code
+/// and runs the SPAKE2 responder, so it holds password-equivalent material
+/// (SPEC-061 REQ-007 rules the idea out on exactly these grounds). So this grant is
+/// not secret — it is BOUND. Its signed context names the subject's handle and the
+/// subject's wire key, and every verifier requires the external Commit's path leaf
+/// to be that exact pair, which makes reading it worth nothing to a reader that
+/// does not hold the key.
+pub const DS_MLS_PAIRGRANT: &str = "cbcl-mls-pairgrant/v1";
+
 /// Leaf capabilities advertising the genesis extension type. REQ-016 obliges
 /// every hark and web-client KeyPackage/leaf to carry this; openmls then
 /// rejects (fail-closed) any member that cannot process the genesis

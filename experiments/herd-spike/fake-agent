@@ -1,0 +1,23 @@
+#!/bin/sh
+# fake-agent - stands in for a coding-agent CLI in the spike.
+#
+# Reads the completion instruction out of the prompt exactly as a compliant
+# agent would, then obeys it. FAKE_CODE sets the code it declares; FAKE_MUTE=1
+# makes it non-compliant (finishes without ever writing the sentinel), which is
+# the failure mode the whole design has to survive.
+set -eu
+prompt=$1
+sentinel=$(printf '%s' "$prompt" | sed -n 's/.*echo <CODE> > \(.*\)$/\1/p' | head -1)
+
+echo "fake-agent: working on: $(printf '%s' "$prompt" | head -1)"
+sleep "${FAKE_SLEEP:-1}"
+
+if [ "${FAKE_MUTE:-0}" = 1 ]; then
+    echo "fake-agent: finished but declaring nothing (non-compliant)"
+    exit "${FAKE_CODE:-0}"
+fi
+
+[ -n "$sentinel" ] || { echo "fake-agent: no sentinel in prompt" >&2; exit 3; }
+echo "${FAKE_CODE:-0}" > "$sentinel"
+echo "fake-agent: declared ${FAKE_CODE:-0} to $sentinel"
+sleep 30    # withdone must kill us; a real TUI agent would also keep running

@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-use super::{DS_IDKEY_ASSERT, DS_IDKEY_ROTATE, DS_MLS_INVITE, DS_MLS_RESYNC, MlsError};
+use super::{
+    DS_IDKEY_ASSERT, DS_IDKEY_ROTATE, DS_MLS_INVITE, DS_MLS_PAIRGRANT, DS_MLS_RESYNC, MlsError,
+};
 
 const PINS_VERSION: u32 = 1;
 
@@ -319,6 +321,43 @@ pub fn invite_signing_bytes(
     out
 }
 
+/// The `cbcl-mls-pairgrant/v1` signed context (SPEC-061 CON-006): `lp(label) ‖
+/// lp(room) ‖ lp(signer_handle) ‖ lp(signer_key) ‖ lp(subject_handle) ‖
+/// lp(subject_key) ‖ u64-be(not_after_ms)`. MUST be byte-identical to cbcl-bus's
+/// `pairgrant_signing_bytes` (crates/cbcl-mls-wasm).
+///
+/// The parity requirement bites harder here than it does for
+/// [`invite_signing_bytes`]. An invite may be minted and redeemed on the same
+/// stack; a pairing grant never is — a web member signs it and an agent redeems
+/// it — so a drift on either side is not a degraded path, it is every pairing
+/// admission refused, with no same-stack test able to see it.
+///
+/// BOTH handles are inside the signed bytes, which is where this departs from
+/// `invite_signing_bytes` (whose `creator_handle` is outside them). Here they are
+/// looked up rather than displayed: the verifier resolves `signer_handle` to a
+/// leaf of its own tree, and compares `subject_handle` to the joiner's credential.
+/// A handle outside the signature could be re-pointed at another member while the
+/// signature still verified — which would be asking about a different party than
+/// the one the signature covers.
+pub fn pairgrant_signing_bytes(
+    room: &str,
+    signer_handle: &str,
+    signer_key: &[u8; 32],
+    subject_handle: &str,
+    subject_key: &[u8; 32],
+    not_after_ms: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    lp(&mut out, DS_MLS_PAIRGRANT.as_bytes());
+    lp(&mut out, room.as_bytes());
+    lp(&mut out, signer_handle.as_bytes());
+    lp(&mut out, signer_key);
+    lp(&mut out, subject_handle.as_bytes());
+    lp(&mut out, subject_key);
+    out.extend_from_slice(&not_after_ms.to_be_bytes());
+    out
+}
+
 /// The `cbcl-idkey-rotate/v1` signed context (REQ-011): both keys sign this
 /// exact byte string.
 pub fn rekey_signing_bytes(
@@ -488,6 +527,54 @@ mod tests {
         // Domain separation: no other context can be replayed as an admission.
         assert_ne!(got, resync_signing_bytes("@research", &key, "@research", 0));
         assert_ne!(got, idkey_signing_bytes("@research", &key, "@research", 0));
+    }
+
+    /// SPEC-061 CON-006 / OQ-001: the PAIRING grant's signed context is
+    /// byte-identical to cbcl-bus's `pairgrant_signing_bytes`, and the same
+    /// literal is constructed by hand there.
+    ///
+    /// This vector carries more weight than the invite one above. An invite can be
+    /// minted and redeemed on a single stack, so a same-stack test would catch a
+    /// drift; a pairing grant NEVER is — a web member signs and an agent redeems —
+    /// so drift here is not a degraded path but every pairing admission refused,
+    /// with nothing on either side able to see it alone.
+    #[test]
+    fn pairgrant_signing_bytes_cross_stack_vector() {
+        let signer = [0xABu8; 32];
+        let subject = [0xCDu8; 32];
+        let got = pairgrant_signing_bytes(
+            "@research",
+            "@user-qp2zs",
+            &signer,
+            "@agent6",
+            &subject,
+            1_785_000_000_000,
+        );
+
+        // Independent manual construction:
+        // lp(label) ‖ lp(room) ‖ lp(signer_handle) ‖ lp(signer_key)
+        //           ‖ lp(subject_handle) ‖ lp(subject_key) ‖ u64-be(exp)
+        let mut want = Vec::new();
+        let label = b"cbcl-mls-pairgrant/v1"; // 21 bytes
+        want.extend_from_slice(&(label.len() as u32).to_be_bytes());
+        want.extend_from_slice(label);
+        want.extend_from_slice(&9u32.to_be_bytes());
+        want.extend_from_slice(b"@research");
+        want.extend_from_slice(&11u32.to_be_bytes());
+        want.extend_from_slice(b"@user-qp2zs");
+        want.extend_from_slice(&32u32.to_be_bytes());
+        want.extend_from_slice(&signer);
+        want.extend_from_slice(&7u32.to_be_bytes());
+        want.extend_from_slice(b"@agent6");
+        want.extend_from_slice(&32u32.to_be_bytes());
+        want.extend_from_slice(&subject);
+        want.extend_from_slice(&1_785_000_000_000u64.to_be_bytes());
+        assert_eq!(got, want, "pairing grant signing bytes match the cbcl-bus layout");
+
+        // A pairing grant's signature must never verify as an invite grant's: the
+        // two are checked under different authority rules, so a context that could
+        // be replayed across them would be checked under the weaker one.
+        assert_ne!(got, invite_signing_bytes("@research", &signer, &subject, 1_785_000_000_000));
     }
 
     /// REQ-019 nonce purpose: an assertion whose nonce predates the pin
