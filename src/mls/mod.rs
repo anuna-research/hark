@@ -110,7 +110,15 @@ pub fn genesis_capabilities() -> openmls::prelude::Capabilities {
     openmls::prelude::Capabilities::new(
         None,
         None,
-        Some(&[openmls::prelude::ExtensionType::Unknown(GENESIS_EXT_TYPE)]),
+        // LastResort is advertised because a last-resort KeyPackage CARRIES that
+        // extension, and `KeyPackageIn::validate` rejects a package using an
+        // extension its own leaf does not advertise (`UnsupportedExtension`).
+        // Without it the reusable package this module documents cannot even be
+        // parsed by the party meant to reuse it.
+        Some(&[
+            openmls::prelude::ExtensionType::Unknown(GENESIS_EXT_TYPE),
+            openmls::prelude::ExtensionType::LastResort,
+        ]),
         None,
         None,
     )

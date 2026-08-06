@@ -3592,6 +3592,64 @@ mod tests {
         );
     }
 
+    /// A LAST-RESORT package is reusable, so an Add must not burn it.
+    ///
+    /// `keypackages.rs` documents its bound as the short MLS lifetime, "enforced
+    /// by the primitive, not prose", and the one-time pool is republished only on
+    /// connect — so once it drains the directory serves the last-resort for every
+    /// subsequent Add. Marking it consumed would refuse every member addition in
+    /// the channel until somebody reconnected.
+    ///
+    /// This is only decidable by the adder because the flag now travels ON the
+    /// package. It used to be a local `bool` that changed nothing but the
+    /// lifetime, so a package documented as reusable was indistinguishable from a
+    /// single-use one to the party that has to decide whether to reuse it.
+    #[test]
+    fn an_add_burns_a_one_time_package_and_spares_the_last_resort() {
+        let (c_dir, c_wire) = setup("lastresort", 155, "@creator");
+        let (p_dir, p_wire) = setup("lastresort", 156, "@peer");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut peer = MlsSession::open(&p_dir, "peer", "@room", "@peer", &p_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let p_frames = peer.join_frames().unwrap();
+        creator.handle_frame(&p_frames[1]);
+        peer.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        let ref_of = |sess: &MlsSession, b64: &str| -> String {
+            let kp = validate_key_package_bytes(&sess.provider, &B64.decode(b64).unwrap()).unwrap();
+            B64.encode(kp.hash_ref(sess.provider.crypto()).unwrap().as_slice())
+        };
+        let last = kw_symbol(&p_frames[0], ":last").expect("a last-resort package");
+        let onetime = match kw_value(&p_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("package"),
+            },
+            _ => panic!("list"),
+        };
+        let last_ref = ref_of(&creator, &last);
+        let onetime_ref = ref_of(&creator, &onetime);
+
+        // Add with the LAST-RESORT package.
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{last}\")"))
+        else {
+            panic!("add with last-resort")
+        };
+        assert_eq!(outbound.len(), 2, "commit + welcome");
+        assert!(
+            !creator.ledger.is_consumed(&last_ref),
+            "the last-resort package is NOT burned — the pool drains to it, and burning it \
+             would refuse every later Add in the channel until a reconnect"
+        );
+        assert!(
+            !creator.ledger.is_consumed(&onetime_ref),
+            "and nothing else was burned either"
+        );
+    }
+
     /// The `mark_consumed` added to `add_member` — an ordinary Add refuses a
     /// package it has already spent.
     ///

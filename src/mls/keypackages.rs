@@ -161,9 +161,20 @@ fn build_key_package(
     lifetime_secs: u64,
     last_resort: bool,
 ) -> Result<BuiltKeyPackage, MlsError> {
-    let bundle = KeyPackage::builder()
+    // The last-resort flag has to reach the WIRE, or it is a fact only the
+    // publisher knows. It was a local `bool` that changed nothing but the
+    // lifetime, so a package the module documents as reusable was
+    // indistinguishable from a single-use one to the party that has to decide
+    // whether to reuse it — the adder. `mark_as_last_resort` puts the RFC 9420
+    // extension on the package itself, which is what makes
+    // `KeyPackage::last_resort()` mean anything on the receiving side.
+    let mut builder = KeyPackage::builder()
         .leaf_node_capabilities(genesis_capabilities())
-        .key_package_lifetime(Lifetime::new(lifetime_secs))
+        .key_package_lifetime(Lifetime::new(lifetime_secs));
+    if last_resort {
+        builder = builder.mark_as_last_resort();
+    }
+    let bundle = builder
         .build(
             super::CIPHERSUITE,
             provider,
