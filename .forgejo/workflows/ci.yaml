@@ -56,16 +56,38 @@ jobs:
           cargo --version
           cargo clippy --version
 
-      - name: Cache cargo registry and target
+      # Cache the DEPENDENCY SOURCES only — deliberately not `target`.
+      #
+      # `target` was cached here too, and it is what filled the runner's disk.
+      # A hark debug build is ~6.2 GB (3.2 GB of it `target/debug/deps`, across
+      # 24 test binaries) against ~1.5 GB for the registry, and the key is
+      # per-Cargo.lock — so every distinct lockfile minted another multi-gigabyte
+      # entry and the old ones stayed. The failure is not a clean "cache full"
+      # either: `tar` dies part-way through restoring `target/debug/deps/…` with
+      # ENOSPC, the step continues against a HALF-RESTORED target, and the build
+      # then fails with errors that point at the wrong thing entirely —
+      # `can't find crate for rand_core`, `could not compile crypto-common` —
+      # sending the reader after a dependency problem that does not exist.
+      #
+      # The registry is the part worth keeping: it is bounded, it is what the
+      # network time actually goes on, and it is reusable across lockfiles. A
+      # cold `target` costs compile time on every run; that is the trade, and a
+      # slower green run beats a fast red one that blames the wrong crate.
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('Cargo.lock') }}
+          # The prefix is versioned (`-v2-`) so this never restores one of the
+          # OLD entries, which were archived WITH `target` in them: `restore-keys`
+          # is a prefix match, so leaving it unchanged would let a stale
+          # multi-gigabyte entry come back and re-fill the disk the moment a
+          # lockfile missed the exact key. Bump it again if the cached set ever
+          # changes shape.
+          key: ${{ runner.os }}-cargo-ci-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-ci-
+            ${{ runner.os }}-cargo-ci-v2-
 
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --locked -- -D warnings
