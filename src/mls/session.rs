@@ -27,10 +27,13 @@ use openmls::prelude::MlsGroup;
 use rand::Rng as _;
 
 use super::group::{
-    GenesisAssertion, GenesisTrust, add_member, create_group, is_owner, join_by_grant,
-    join_from_welcome,
+    GenesisAssertion, GenesisTrust, add_member, create_group, group_genesis_creator, is_owner,
+    join_by_grant, join_from_welcome, member_bindings, verify_add_target,
 };
-use super::keypackages::{ConsumedLedger, ONE_TIME_POOL_TARGET, build_last_resort, build_one_time};
+use super::keypackages::{
+    ConsumedLedger, ONE_TIME_POOL_TARGET, build_last_resort, build_one_time,
+    validate_key_package_bytes,
+};
 use super::pins::{PinStore, idkey_signing_bytes};
 use super::provider::DurableProvider;
 use super::removal::{RemovalEvidence, remove_member};
@@ -74,6 +77,23 @@ struct SessionMeta {
     /// key, ours — so it sits beside the genesis rather than with key material.
     #[serde(default)]
     pair_grant: Option<String>,
+    /// REQ-026(a)(ii): the highest resync nonce honoured per requester.
+    ///
+    /// DURABLE, and that is the whole point of it. Held only in memory, the floor
+    /// resets to empty on every restart — so a hub that captured one valid resync
+    /// can replay it after any restart of ours and churn a member that is
+    /// perfectly healthy. A replay window that reopens on a restart is not a
+    /// replay defence; it is one that happens to be closed while nothing has
+    /// gone wrong.
+    #[serde(default)]
+    resync_nonces: std::collections::HashMap<String, u64>,
+    /// REQ-026(e): honoured resyncs per requester, as `(window index, count)`.
+    ///
+    /// Durable for the same reason: a budget that empties on restart bounds
+    /// nothing an attacker who can cause restarts cares about, and restarts are
+    /// ordinary — a deploy, a crash, a laptop lid.
+    #[serde(default)]
+    resync_honoured: std::collections::HashMap<String, (u64, u32)>,
 }
 
 /// What an inbound frame turned out to be.
@@ -182,7 +202,39 @@ pub struct MlsSession {
     /// join that ends it. The session's own view of whether it is diverged, so
     /// the transport loop can mirror a fact instead of inferring one.
     fork_active: bool,
+    /// REQ-026(a)(ii): the highest resync nonce honoured for each requester.
+    ///
+    /// A signed resync is capturable off the wire, and honouring one evicts and
+    /// re-adds its subject. Without a strictly-increasing floor per handle, a
+    /// captured request could be replayed at will to churn a healthy member out
+    /// of the group — the request is authentic, which is exactly why the
+    /// signature alone is not enough.
+    resync_nonces: std::collections::HashMap<String, u64>,
+    /// REQ-026(e): honoured resyncs per requester, as `(window index, count)`.
+    ///
+    /// Keyed on a wall-clock bucket and NOT on the MLS epoch. Each honoured
+    /// resync is itself a Remove plus an Add, so it bumps the epoch twice — an
+    /// epoch-keyed window would reset on its own trigger and bound nothing
+    /// (re-review #2).
+    resync_honoured: std::collections::HashMap<String, (u64, u32)>,
+    /// REQ-026(c): requesters whose fresh KeyPackage we are waiting for.
+    ///
+    /// The remove and the add are two Commits driven by frames that arrive at
+    /// different times, and the eviction MUST NOT happen until the re-add is
+    /// known to be completable (review F5). This is what remembers, between the
+    /// `keyget` and the `keypkg`, that this member is being healed rather than
+    /// added for the first time.
+    resync_heal: std::collections::HashSet<String>,
 }
+
+/// REQ-026(e): honoured resyncs allowed per requester per window.
+///
+/// Two is not a tuned number: a legitimate heal needs one, and the second covers
+/// a heal whose own Commit was lost. Beyond that the member is not recovering,
+/// it is draining the room's KeyPackages and churning its epoch.
+const RESYNC_RATE: u32 = 2;
+/// The wall-clock bucket [`RESYNC_RATE`] is counted against.
+const RESYNC_WINDOW_MS: u64 = 60 * 60 * 1000;
 
 /// Consecutive re-request attempts before the desync is surfaced as terminal
 /// (SPEC-013 REQ-025(c)).
@@ -346,6 +398,9 @@ impl MlsSession {
             last_resync_nonce: 0,
             resync_exhausted: false,
             fork_active: false,
+            resync_nonces: std::collections::HashMap::new(),
+            resync_honoured: std::collections::HashMap::new(),
+            resync_heal: std::collections::HashSet::new(),
         };
 
         if let Some(meta) = meta {
@@ -353,6 +408,11 @@ impl MlsSession {
             session.is_v1 = meta.protocol_version >= 1;
             session.genesis = meta.genesis;
             session.pair_grant = meta.pair_grant;
+            // REQ-026(a)(ii)/(e): restore the replay floor and the rate-limit
+            // budget. Without this a restart is a free reset of both, and a
+            // captured resync replays.
+            session.resync_nonces = meta.resync_nonces;
+            session.resync_honoured = meta.resync_honoured;
             // Reload the persisted group (REQ-009): a missing/stale state
             // simply means re-join (logged by the provider open path).
             if let Some(group_id_b64) = meta.group_id_b64 {
@@ -430,6 +490,8 @@ impl MlsSession {
             tofu_pending: matches!(self.trust, Some(GenesisTrust::TofuRequiresSafetyNumber)),
             protocol_version: if self.is_v1 { 1 } else { 0 },
             pair_grant: self.pair_grant.clone(),
+            resync_nonces: self.resync_nonces.clone(),
+            resync_honoured: self.resync_honoured.clone(),
         };
         let bytes = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
         if let Some(parent) = self.meta_path.parent() {
@@ -747,6 +809,10 @@ impl MlsSession {
             // they are ours; every other error still falls through to the
             // plaintext path so an operator keeps seeing them.
             "error" => self.on_error(text),
+            // SPEC-013 REQ-026: a member asking to be re-provisioned. Ignored
+            // entirely before this, which is why an all-agent channel had no
+            // re-provisioner and a forked agent could only be re-paired by hand.
+            "keyready" => self.on_keyready(text),
             "roomcfg" => match self.on_roomcfg(text) {
                 Ok(()) => SessionEvent::NotMls, // also a join ack; let the loop see it
                 Err(e) => SessionEvent::Dropped {
@@ -1133,7 +1199,297 @@ impl MlsSession {
         self.resync_exhausted
     }
 
-    /// SPEC-061 CON-003: a refusal on the path that seats us.
+    /// REQ-026(c): replace a resyncing member's stale leaf — validate, remove,
+    /// re-add, in that order and no other.
+    ///
+    /// Returns the Remove (carrying its REQ-014 evidence) and the Add's Commit
+    /// and Welcome. The Remove is fanned with evidence because every peer
+    /// verifies the eviction at merge; without it they reject the Commit and we
+    /// desync ourselves trying to help somebody else.
+    fn heal_member(&mut self, target: &str, kp_bytes: &[u8]) -> Result<Vec<String>, MlsError> {
+        // Validation happens against a borrowed group before anything mutates.
+        let group = self
+            .group
+            .as_mut()
+            .ok_or_else(|| MlsError::Rejected("heal without a group".into()))?;
+        let kp = validate_key_package_bytes(&self.provider, kp_bytes)?;
+        verify_add_target(&kp, target, &self.pins).map_err(|e| {
+            // The refusal an operator most needs to read: we asked for a package,
+            // got one, and it is not the one this member's pin says it should be.
+            // Nothing is removed.
+            MlsError::Rejected(format!(
+                "refusing to evict {target}: the fetched KeyPackage is not pin-valid, so the \
+                 re-add could not complete ({e}) — no eviction without a completable re-add"
+            ))
+        })?;
+        // REQ-013, and the pre-check is incomplete without it. `add_member`
+        // refuses a consumed ref — but it refuses it AFTER the Remove has
+        // committed, so a package that is pin-valid and already spent evicts the
+        // member and then fails to re-add them.
+        //
+        // That is not a rare shape: the hub owns the KeyPackage directory and
+        // answers this very `keyget`, so it can serve a previously-consumed
+        // package of the target's own and force-evict any member that asks to be
+        // healed. NFR-001 says no hub behaviour may change who is in a group;
+        // checking only the pin left the hub exactly that lever, dressed as a
+        // valid package.
+        let hash_ref = kp
+            .hash_ref(self.provider.crypto())
+            .map_err(MlsError::stack("hash ref"))?;
+        let ref_b64 = B64.encode(hash_ref.as_slice());
+        if self.ledger.is_consumed(&ref_b64) {
+            return Err(MlsError::Rejected(format!(
+                "refusing to evict {target}: the fetched KeyPackage ref {ref_b64} is already \
+                 consumed, so the re-add would be refused (REQ-013) — no eviction without a \
+                 completable re-add"
+            )));
+        }
+
+        // Only now is the eviction safe to commit.
+        let leaf = group
+            .members()
+            .find(|m| {
+                crate::mls::group::credential_handle(&m.credential)
+                    .map(|h| h == target)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| MlsError::Rejected(format!("{target} is not a live leaf")))?;
+        let leaf_key = <[u8; 32]>::try_from(leaf.signature_key.as_slice())
+            .map_err(|_| MlsError::Rejected("target leaf key is not 32 bytes".into()))?;
+        let leaf_index = leaf.index.u32();
+        let wire = ChatIdentity::from_seed(self.wire_seed);
+        let evidence = RemovalEvidence::mint(
+            &wire,
+            &self.handle,
+            &self.room,
+            group.group_id().as_slice(),
+            group.epoch().as_u64(),
+            target,
+            leaf_index,
+            &leaf_key,
+        );
+        let creator = group_genesis_creator(group)
+            .map(|(handle, _)| handle)
+            .unwrap_or_default();
+        let remove_ct = crate::mls::removal::remove_member(
+            &self.provider,
+            &self.identity,
+            group,
+            &self.room,
+            &evidence,
+            &self.pins,
+            &creator,
+            crate::mls::claim::CommitPromise::Inactive,
+        )?;
+        let evidence_json = serde_json::to_vec(&evidence)
+            .map_err(|e| MlsError::Rejected(format!("evidence serialize: {e}")))?;
+
+        // Re-add at the epoch the Remove just produced.
+        let group = self
+            .group
+            .as_mut()
+            .ok_or_else(|| MlsError::Rejected("heal lost its group".into()))?;
+        let outcome = add_member(
+            &self.provider,
+            &self.identity,
+            group,
+            kp_bytes,
+            target,
+            &self.pins,
+            &mut self.ledger,
+            &self.room,
+            crate::mls::claim::CommitPromise::Inactive,
+        )?;
+        self.persist_meta()?;
+        tracing::info!(
+            room = %self.room, target,
+            "re-provisioned a resyncing member: stale leaf removed, fresh leaf added (REQ-026)"
+        );
+        Ok(vec![
+            format!(
+                "(deliver {} :enc mls :ct \"{}\" :evidence \"{}\" :from {})",
+                self.room,
+                B64.encode(&remove_ct),
+                B64.encode(&evidence_json),
+                self.handle
+            ),
+            format!(
+                "(deliver {} :enc mls :ct \"{}\" :from {})",
+                self.room,
+                B64.encode(&outcome.commit_bytes),
+                self.handle
+            ),
+            format!(
+                "(welcome {} :for {} :ct \"{}\" :from {})",
+                self.room,
+                target,
+                B64.encode(&outcome.welcome_bytes),
+                self.handle
+            ),
+        ])
+    }
+
+    /// SPEC-013 REQ-026 — honour another member's request to be re-provisioned.    /// SPEC-013 REQ-026 — honour another member's request to be re-provisioned.
+    ///
+    /// A member whose group forked discards it and asks to be put back
+    /// ([[#REQ-025]]). Somebody has to answer, and before this hark never did:
+    /// it ignored `keyready` outright, so a channel whose only other members were
+    /// agents had no re-provisioner at all and a forked agent could be recovered
+    /// only by a human re-pairing it.
+    ///
+    /// Everything here is a refusal until proven otherwise, because honouring a
+    /// request EVICTS its subject. The order matters and is (a)'s: verify before
+    /// minting any evidence.
+    fn on_keyready(&mut self, text: &str) -> SessionEvent {
+        if !self.enc_pinned {
+            return SessionEvent::NotMls;
+        }
+        // REQ-026(d): only an explicit `:resync` marker asks for re-provisioning.
+        // A routine re-announce means "I have published my packages" and MUST
+        // NOT churn membership — treating the two alike would rebuild the group
+        // every time anybody reconnected.
+        if kw_u64(text, ":resync") != Some(1) {
+            return SessionEvent::NotMls;
+        }
+        let Some(requester) = kw_symbol(text, ":from") else {
+            return SessionEvent::Dropped {
+                reason: "resync missing :from".into(),
+                probable_fork: false,
+            };
+        };
+        if requester == self.handle {
+            return SessionEvent::Handled { outbound: vec![] }; // our own, fanned back
+        }
+        match self.admit_resync(text, &requester) {
+            Ok(outbound) => SessionEvent::Handled { outbound },
+            Err(reason) => {
+                // Refusing is the ordinary outcome, not an error condition: most
+                // of these are a member that is not ours to heal.
+                tracing::info!(room = %self.room, %requester, %reason, "resync request not honoured");
+                SessionEvent::Handled { outbound: vec![] }
+            }
+        }
+    }
+
+    /// The REQ-026 gate. `Ok` returns the frames to send; `Err` is why not.
+    fn admit_resync(&mut self, text: &str, requester: &str) -> Result<Vec<String>, String> {
+        let group = self.group.as_ref().ok_or("we hold no group to re-provision into")?;
+
+        // (b) Creator AND elected owner. Only the creator may mint the
+        // liveness-fallback removal evidence, and only the owner may commit — so
+        // when those principals differ, healing is unavailable here rather than
+        // half-possible. Any group admitting a member that sorts before the
+        // creator shifts the election away from it (review F3), and a Commit we
+        // are not entitled to make is one every peer rejects: we would evict
+        // nobody and desync ourselves.
+        let creator = group_genesis_creator(group)
+            .map(|(handle, _)| handle)
+            .ok_or("this group carries no genesis creator")?;
+        if creator != self.handle {
+            return Err(format!("we are not the room creator ({creator} is)"));
+        }
+        if !is_owner(group, &self.identity).map_err(|e| e.to_string())? {
+            return Err("we are not the elected owner of the current tree".into());
+        }
+
+        // (a)(i) Verify under the requester's PINNED key, never a key the frame
+        // supplies. A request that carries its own key proves only that whoever
+        // wrote it holds that key — which a hub does.
+        let nonce = kw_u64(text, ":nonce").ok_or("resync missing :nonce")?;
+        let sig = kw_b64(text, ":sig").ok_or("resync missing :sig")?;
+        let pin = self
+            .pins
+            .pinned(requester)
+            .ok_or("no pinned key for the requester")?;
+        let key = pin.key;
+        {
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            let signed = super::pins::resync_signing_bytes(requester, &key, &self.room, nonce);
+            let vk = VerifyingKey::from_bytes(&key)
+                .map_err(|_| "pinned key is not a valid Ed25519 key".to_owned())?;
+            let sig = Signature::from_slice(&sig)
+                .map_err(|_| "resync signature is malformed".to_owned())?;
+            vk.verify(&signed, &sig)
+                .map_err(|_| "resync signature does not verify under the pinned key".to_owned())?;
+        }
+
+        // (a)(ii) Strictly monotonic per requester. A signed resync is capturable,
+        // and replaying one evicts a healthy member — so freshness is not
+        // ceremony on top of the signature, it is the half the signature cannot
+        // provide.
+        if let Some(&last) = self.resync_nonces.get(requester) {
+            if nonce <= last {
+                return Err(format!("stale resync nonce {nonce} (last honoured {last})"));
+            }
+        }
+
+        // (d) A requester that is not a live leaf is not being re-provisioned —
+        // there is no stale leaf to evict. It may be addable as an ordinary
+        // member, which `keygets_for_addable` already covers, so this path
+        // declines rather than inventing a second way to add somebody.
+        let members = member_bindings(group).map_err(|e| e.to_string())?;
+        if !members.iter().any(|(handle, _)| handle == requester) {
+            return Err("requester is not a live leaf; nothing to re-provision".into());
+        }
+
+        // (e) Rate-limit, on a wall-clock bucket.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let window = now / RESYNC_WINDOW_MS;
+        let entry = self.resync_honoured.entry(requester.to_owned()).or_insert((window, 0));
+        if entry.0 != window {
+            *entry = (window, 0);
+        }
+        if entry.1 >= RESYNC_RATE {
+            return Err(format!(
+                "rate limit: {} resyncs already honoured for this member in this window",
+                entry.1
+            ));
+        }
+        // Both prior values kept, so a failed write restores exactly what was
+        // there. Clearing the entries instead would hand back a FULL budget and
+        // an empty nonce floor — turning a failed write into the reset an
+        // attacker wants.
+        let prior_nonce = self.resync_nonces.get(requester).copied();
+        let prior_budget = *entry;
+        entry.1 += 1;
+        self.resync_nonces.insert(requester.to_owned(), nonce);
+
+        // MADE DURABLE BEFORE THE REQUEST IS ACTED ON, not after. Crash between
+        // honouring and persisting and the floor is back where it was, so the
+        // same captured request replays — which is the failure this state exists
+        // to prevent, reached through a window instead of through memory.
+        //
+        // A request we cannot record as honoured is one we must not honour: the
+        // cost of refusing is that a genuine member asks again, and the cost of
+        // proceeding is a replay we can no longer detect.
+        if let Err(e) = self.persist_meta() {
+            match prior_nonce {
+                Some(n) => self.resync_nonces.insert(requester.to_owned(), n),
+                None => self.resync_nonces.remove(requester),
+            };
+            self.resync_honoured.insert(requester.to_owned(), prior_budget);
+            return Err(format!("could not record the resync as honoured ({e})"));
+        }
+
+        // (c) Validate BEFORE removing — so the eviction and the fetch are
+        // ordered, not merely both intended. The `keypkg` that answers this is
+        // what actually performs the remove-then-add, and only once the fetched
+        // package is pin-valid.
+        self.resync_heal.insert(requester.to_owned());
+        tracing::info!(
+            room = %self.room, requester, nonce,
+            "honouring a resync — fetching a fresh KeyPackage before evicting the stale leaf (REQ-026)"
+        );
+        Ok(vec![format!(
+            "(keyget @hub :for {requester} :from {})",
+            self.handle
+        )])
+    }
+
+    /// SPEC-061 CON-003: a refusal on the path that seats us.    /// SPEC-061 CON-003: a refusal on the path that seats us.
     ///
     /// The two slugs look alike and are nothing alike, and the difference is the
     /// only thing a retry can act on:
@@ -1428,6 +1784,28 @@ impl MlsSession {
                 .group
                 .as_mut()
                 .ok_or_else(|| MlsError::Rejected("keypkg before MLS join".into()))?;
+
+            // SPEC-013 REQ-026(c) — the heal path: this member is already a live
+            // leaf and we are replacing it, not seating it.
+            //
+            // VALIDATE FIRST. RFC 9420 §7.8 forbids two leaves sharing a
+            // signature key, so the stale leaf has to go before the fresh one can
+            // land — which means the eviction is committed before the re-add is
+            // attempted, and a re-add that then fails cannot be rolled back. So
+            // the fetched package is checked against the pin BEFORE anything is
+            // removed: no eviction without a completable re-add (review F5).
+            //
+            // The case this really guards is not a hostile hub but an ordinary
+            // one: a member that legitimately rotated its key while its `rekey`
+            // was dropped fetches clean and mismatches the pin. Evicting it on
+            // the strength of a package we had not checked would strand exactly
+            // the member we were trying to help.
+            if self.resync_heal.contains(&target) {
+                let outcome = self.heal_member(&target, &kp);
+                self.resync_heal.remove(&target);
+                return outcome;
+            }
+
             let outcome = add_member(
                 &self.provider,
                 &self.identity,
@@ -1435,7 +1813,7 @@ impl MlsSession {
                 &kp,
                 &target,
                 &self.pins,
-                &self.ledger,
+                &mut self.ledger,
                 &self.room,
                 // SPEC-027 REQ-001: no room declares the epoch capability yet,
                 // so no room has activated the protocol and every commit takes
@@ -2723,6 +3101,423 @@ mod tests {
             agent.resync_exhausted,
             "F4: the TERMINAL surface is reached, not dead code — the shipped web \
              client keyed it on decrypt failures that stop accruing after the discard"
+        );
+    }
+
+    /// Build a creator holding a group with `@peer` seated, and a signed resync
+    /// request from `@peer`. Returns (creator, peer wire identity, nonce).
+    fn resync_fixture(tag: &str) -> (MlsSession, ChatIdentity, PathBuf) {
+        let (c_dir, c_wire) = setup(tag, 120, "@creator");
+        let (p_dir, p_wire) = setup(tag, 121, "@peer");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut peer = MlsSession::open(&p_dir, "peer", "@room", "@peer", &p_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let p_frames = peer.join_frames().unwrap();
+        creator.handle_frame(&p_frames[1]);
+        peer.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+        // Seat the peer so it is a live leaf with a stale one to replace.
+        let peer_kp = match kw_value(&p_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("a one-time package"),
+            },
+            _ => panic!("a onetime list"),
+        };
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{peer_kp}\")"))
+        else {
+            panic!("seat the peer")
+        };
+        let welcome = outbound
+            .iter()
+            .find(|f| f.starts_with("(welcome @room"))
+            .expect("welcome");
+        peer.handle_frame(welcome);
+        (creator, p_wire, p_dir)
+    }
+
+    fn resync_frame(wire: &ChatIdentity, handle: &str, room: &str, nonce: u64) -> String {
+        let key = wire.verifying_key_bytes();
+        let sig = wire.sign(&super::super::pins::resync_signing_bytes(handle, &key, room, nonce));
+        format!(
+            "(keyready {room} :from {handle} :resync 1 :nonce {nonce} :sig \"{}\")",
+            B64.encode(sig)
+        )
+    }
+
+    /// [[SPEC-013-mls-private-channels#REQ-026]] — the happy path, which did not
+    /// exist: hark ignored `keyready` entirely, so a channel whose only other
+    /// members were agents had no re-provisioner and a forked member could be
+    /// recovered only by a human re-pairing it.
+    #[test]
+    fn a_signed_resync_from_a_live_member_is_honoured() {
+        let (mut creator, p_wire, _p_dir) = resync_fixture("req026-ok");
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&resync_frame(&p_wire, "@peer", "@room", 1_000))
+        else {
+            panic!("resync handled")
+        };
+        assert!(
+            outbound
+                .iter()
+                .any(|f| f == "(keyget @hub :for @peer :from @creator)"),
+            "REQ-026(c): a fresh KeyPackage is fetched BEFORE anything is evicted: {outbound:?}"
+        );
+    }
+
+    /// REQ-026(a)(i) — an unsigned or wrongly-signed request is not honoured, and
+    /// the key it is checked against is the PINNED one. A request carrying its
+    /// own key proves only that whoever wrote it holds that key, which a hub does.
+    #[test]
+    fn a_forged_or_unsigned_resync_evicts_nobody() {
+        let (mut creator, p_wire, _p_dir) = resync_fixture("req026-forged");
+        let (_o_dir, outsider) = setup("req026-forged-o", 122, "@outsider");
+
+        // Signed by somebody else entirely.
+        let forged = resync_frame(&outsider, "@peer", "@room", 1_000);
+        let SessionEvent::Handled { outbound } = creator.handle_frame(&forged) else {
+            panic!("handled")
+        };
+        assert!(outbound.is_empty(), "a forged resync fetches nothing: {outbound:?}");
+
+        // No signature at all.
+        let unsigned = "(keyready @room :from @peer :resync 1 :nonce 1000)";
+        let SessionEvent::Handled { outbound } = creator.handle_frame(unsigned) else {
+            panic!("handled")
+        };
+        assert!(outbound.is_empty(), "an unsigned resync fetches nothing: {outbound:?}");
+
+        // …and the honest one still works, so the refusals above are the check
+        // firing rather than the path being broken.
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&resync_frame(&p_wire, "@peer", "@room", 1_000))
+        else {
+            panic!("handled")
+        };
+        assert!(!outbound.is_empty(), "the genuine request is honoured");
+    }
+
+    /// REQ-026(a)(ii), re-review #1 — a replayed request evicts nobody.
+    ///
+    /// The captured frame is perfectly authentic, which is exactly why the
+    /// signature cannot be the whole check: replaying it would churn a healthy
+    /// member out of the group at will.
+    #[test]
+    fn a_replayed_resync_is_refused_even_though_it_verifies() {
+        let (mut creator, p_wire, _p_dir) = resync_fixture("req026-replay");
+        let frame = resync_frame(&p_wire, "@peer", "@room", 1_000);
+        let SessionEvent::Handled { outbound } = creator.handle_frame(&frame) else {
+            panic!("handled")
+        };
+        assert!(!outbound.is_empty(), "honoured once");
+
+        // The very same bytes again.
+        let SessionEvent::Handled { outbound } = creator.handle_frame(&frame) else {
+            panic!("handled")
+        };
+        assert!(outbound.is_empty(), "a replay is refused: {outbound:?}");
+
+        // An older nonce is equally refused — "not seen before" is not the test,
+        // "strictly greater" is.
+        let older = resync_frame(&p_wire, "@peer", "@room", 999);
+        let SessionEvent::Handled { outbound } = creator.handle_frame(&older) else {
+            panic!("handled")
+        };
+        assert!(outbound.is_empty(), "a lower nonce is refused: {outbound:?}");
+    }
+
+    /// REQ-026(d) — a routine re-announce must never churn membership, and a
+    /// resync from a handle that is not a live leaf has no stale leaf to replace.
+    #[test]
+    fn a_routine_announce_and_a_non_member_resync_change_nothing() {
+        let (mut creator, _p_wire, _p_dir) = resync_fixture("req026-routine");
+        assert!(
+            matches!(
+                creator.handle_frame("(keyready @room :from @peer)"),
+                SessionEvent::NotMls
+            ),
+            "a routine keyready is not a re-provisioning request"
+        );
+        let (_o_dir, outsider) = setup("req026-routine-o", 123, "@outsider");
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&resync_frame(&outsider, "@outsider", "@room", 1))
+        else {
+            panic!("handled")
+        };
+        assert!(
+            outbound.is_empty(),
+            "a non-member has no leaf to re-provision: {outbound:?}"
+        );
+    }
+
+    /// REQ-026(e), re-review #2 — the rate limit is keyed on WALL-CLOCK time.
+    ///
+    /// Each honoured resync is itself a Remove plus an Add, so it bumps the epoch
+    /// twice; an epoch-keyed window would reset on its own trigger and bound
+    /// nothing at all.
+    #[test]
+    fn honoured_resyncs_are_rate_limited_per_member() {
+        let (mut creator, p_wire, _p_dir) = resync_fixture("req026-rate");
+        for i in 1..=RESYNC_RATE as u64 {
+            let SessionEvent::Handled { outbound } =
+                creator.handle_frame(&resync_frame(&p_wire, "@peer", "@room", 1_000 + i))
+            else {
+                panic!("handled")
+            };
+            assert!(!outbound.is_empty(), "request {i} is within the budget");
+        }
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&resync_frame(&p_wire, "@peer", "@room", 9_999))
+        else {
+            panic!("handled")
+        };
+        assert!(
+            outbound.is_empty(),
+            "past the budget this is drain and churn, not recovery: {outbound:?}"
+        );
+    }
+
+    /// REQ-026(c) — validate, THEN remove, THEN re-add, end to end.
+    ///
+    /// The ordering is the requirement. RFC 9420 §7.8 forbids two leaves sharing
+    /// a signature key, so the stale leaf must go before the fresh one can land —
+    /// which means the eviction is committed before the re-add is attempted and
+    /// cannot be rolled back if it fails.
+    #[test]
+    fn honouring_a_resync_replaces_the_stale_leaf_and_reseats_the_member() {
+        let (c_dir, c_wire) = setup("req026-heal", 124, "@creator");
+        let (p_dir, p_wire) = setup("req026-heal", 125, "@peer");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut peer = MlsSession::open(&p_dir, "peer", "@room", "@peer", &p_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let p_frames = peer.join_frames().unwrap();
+        creator.handle_frame(&p_frames[1]);
+        peer.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        let packages = match kw_value(&p_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => items
+                .iter()
+                .filter_map(|i| match i {
+                    SExpr::Atom(Atom::Str(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => panic!("a onetime list"),
+        };
+        assert!(packages.len() >= 2, "need a second package for the re-add");
+
+        // Seat the peer.
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{}\")", packages[0]))
+        else {
+            panic!("seat")
+        };
+        peer.handle_frame(
+            outbound
+                .iter()
+                .find(|f| f.starts_with("(welcome @room"))
+                .unwrap(),
+        );
+        assert!(peer.group.is_some(), "peer seated");
+
+        // The peer forks and asks to be put back.
+        creator.handle_frame(&resync_frame(&p_wire, "@peer", "@room", 7_000));
+
+        // The hub answers with a FRESH package. Only now is the eviction safe.
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{}\")", packages[1]))
+        else {
+            panic!("heal")
+        };
+        assert_eq!(outbound.len(), 3, "remove + add commit + welcome: {outbound:?}");
+        assert!(
+            outbound[0].contains(":evidence \""),
+            "the Remove is fanned WITH its REQ-014 evidence, or every peer rejects it: {}",
+            outbound[0]
+        );
+
+        // The healed member opens its Welcome and is a live leaf again.
+        let mut healed =
+            MlsSession::open(&p_dir, "peer", "@room", "@peer", &p_wire, true).unwrap();
+        healed.handle_frame(&c_frames[1]);
+        let welcome = outbound
+            .iter()
+            .find(|f| f.starts_with("(welcome @room"))
+            .expect("the re-admission Welcome");
+        healed.handle_frame(welcome);
+        assert!(healed.group.is_some(), "the re-provisioned member is back in");
+        assert!(
+            creator
+                .member_handles()
+                .unwrap_or_default()
+                .iter()
+                .filter(|h| *h == "@peer")
+                .count()
+                == 1,
+            "exactly one leaf for the healed member — never two"
+        );
+    }
+
+    /// REQ-026(c), review F5 — NO EVICTION WITHOUT A COMPLETABLE RE-ADD.
+    ///
+    /// The case is not a hostile hub but an ordinary one: a member that
+    /// legitimately rotated its key while its `rekey` was dropped fetches clean
+    /// and mismatches the pin. Evicting on the strength of a package we had not
+    /// checked would strand exactly the member we were trying to help — and the
+    /// Remove is already committed by the time the Add fails, so there is
+    /// nothing to roll back.
+    #[test]
+    fn a_resync_whose_key_package_is_not_pin_valid_evicts_nobody() {
+        let (mut creator, p_wire, _p_dir) = resync_fixture("req026-f5");
+        // Somebody else's package, for a handle we are healing.
+        let (_o_dir, o_wire) = setup("req026-f5-o", 126, "@outsider");
+        let o_dir2 = std::env::temp_dir().join(format!("hark-f5-o2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&o_dir2);
+        fs::create_dir_all(&o_dir2).unwrap();
+        let mut outsider =
+            MlsSession::open(&o_dir2, "outsider", "@room", "@outsider", &o_wire, true).unwrap();
+        let o_frames = outsider.join_frames().unwrap();
+        let foreign_kp = match kw_value(&o_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("package"),
+            },
+            _ => panic!("list"),
+        };
+
+        creator.handle_frame(&resync_frame(&p_wire, "@peer", "@room", 8_000));
+        let before = creator.member_handles().unwrap_or_default();
+        assert!(before.iter().any(|h| h == "@peer"), "peer is seated to begin with");
+
+        let event = creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{foreign_kp}\")"));
+        assert!(
+            matches!(event, SessionEvent::Dropped { .. }),
+            "a package that is not pin-valid for the target is refused: {event:?}"
+        );
+        assert_eq!(
+            creator.member_handles().unwrap_or_default(),
+            before,
+            "and NOTHING was evicted — the roster is byte-identical"
+        );
+    }
+
+    /// REQ-013 + REQ-026(c) — a CONSUMED KeyPackage evicts nobody either.
+    ///
+    /// `add_member` refuses a consumed ref, but it refuses it after the Remove
+    /// has committed. So a package that is pin-valid and already spent used to
+    /// evict the member and then fail to re-add them — the exact outcome
+    /// "no eviction without a completable re-add" promises against.
+    ///
+    /// Not a rare shape: the hub owns the KeyPackage directory and answers this
+    /// very `keyget`, so it can serve a previously-consumed package of the
+    /// target's own and force-evict any member that asks to be healed. NFR-001
+    /// says no hub behaviour may change who is in a group; checking only the pin
+    /// left the hub precisely that lever, dressed as a valid package.
+    #[test]
+    fn a_consumed_key_package_evicts_nobody() {
+        let (c_dir, c_wire) = setup("req026-consumed", 130, "@creator");
+        let (p_dir, p_wire) = setup("req026-consumed", 131, "@peer");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut peer = MlsSession::open(&p_dir, "peer", "@room", "@peer", &p_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let p_frames = peer.join_frames().unwrap();
+        creator.handle_frame(&p_frames[1]);
+        peer.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        let first_kp = match kw_value(&p_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("package"),
+            },
+            _ => panic!("list"),
+        };
+        // Seat the peer — which CONSUMES that package.
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{first_kp}\")"))
+        else {
+            panic!("seat")
+        };
+        peer.handle_frame(
+            outbound.iter().find(|f| f.starts_with("(welcome @room")).unwrap(),
+        );
+
+        creator.handle_frame(&resync_frame(&p_wire, "@peer", "@room", 5_000));
+        let before = creator.member_handles().unwrap_or_default();
+        assert!(before.iter().any(|h| h == "@peer"), "seated to begin with");
+
+        // The hub answers the heal's keyget with the SAME package it already
+        // served — pin-valid, correct handle, and spent.
+        let event = creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{first_kp}\")"));
+        assert!(
+            matches!(event, SessionEvent::Dropped { .. }),
+            "a consumed package is refused BEFORE the Remove: {event:?}"
+        );
+        assert_eq!(
+            creator.member_handles().unwrap_or_default(),
+            before,
+            "and the healthy member is still seated — the hub does not get to evict \
+             anybody by choosing which package to serve (NFR-001)"
+        );
+    }
+
+    /// REQ-026(a)(ii)/(e) — the replay floor and the rate budget survive a
+    /// restart.
+    ///
+    /// Held only in memory they reset on every restart, so a hub that captured
+    /// one valid resync could replay it after any restart of ours and churn a
+    /// healthy member. A replay window that reopens on a restart is not a replay
+    /// defence — it is one that happens to be closed while nothing has gone
+    /// wrong. Restarts are ordinary: a deploy, a crash, a laptop lid.
+    #[test]
+    fn the_resync_replay_floor_survives_a_restart() {
+        let (c_dir, c_wire) = setup("req026-durable", 132, "@creator");
+        let (p_dir, p_wire) = setup("req026-durable", 133, "@peer");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut peer = MlsSession::open(&p_dir, "peer", "@room", "@peer", &p_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let p_frames = peer.join_frames().unwrap();
+        creator.handle_frame(&p_frames[1]);
+        peer.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+        let peer_kp = match kw_value(&p_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("package"),
+            },
+            _ => panic!("list"),
+        };
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{peer_kp}\")"))
+        else {
+            panic!("seat")
+        };
+        peer.handle_frame(
+            outbound.iter().find(|f| f.starts_with("(welcome @room")).unwrap(),
+        );
+
+        let captured = resync_frame(&p_wire, "@peer", "@room", 4_242);
+        let SessionEvent::Handled { outbound } = creator.handle_frame(&captured) else {
+            panic!("handled")
+        };
+        assert!(!outbound.is_empty(), "honoured once");
+        drop(creator);
+
+        // The creator restarts. The captured frame is replayed at it.
+        let mut restarted =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let SessionEvent::Handled { outbound } = restarted.handle_frame(&captured) else {
+            panic!("handled")
+        };
+        assert!(
+            outbound.is_empty(),
+            "the nonce floor survived the restart, so the replay is refused: {outbound:?}"
         );
     }
 

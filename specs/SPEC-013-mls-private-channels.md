@@ -547,10 +547,27 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
 >   request answerable at all, since the re-provisioner must be present to honour it. Annotated
 >   `SIMPLIFY:` at `resync_frames` with its ceiling (a quiet room spends its `RESYNC_CAP` early)
 >   and upgrade path.
-> - [[#REQ-026]] — the **creator** half — is not implemented. hark can ask to be re-admitted and
->   cannot yet honour another member's request, so an all-agent channel has no re-provisioner and
->   falls to manual re-pairing. This is the same asymmetry [[#REQ-026]](b) already describes for a
->   room whose creator is not the elected owner.
+> - [[#REQ-026]] — the **creator** half — is implemented in `src/mls/session.rs` (`on_keyready`,
+>   `admit_resync`, `heal_member`). Before it, hark ignored `keyready` outright, so an all-agent
+>   channel had no re-provisioner at all. Clause coverage: (a) signature verified under the
+>   requester's **pinned** key plus a strictly-monotonic nonce floor per requester; (b) the
+>   creator ∧ elected-owner precondition, which declines rather than half-acts when those
+>   principals differ; (c) validate-then-remove-then-add, with the fetched KeyPackage checked
+>   against the pin **before** anything is evicted; (d) a routine re-announce and a non-member
+>   request both change nothing; (e) `RESYNC_RATE = 2` per requester per wall-clock hour.
+>   Verified by `a_signed_resync_from_a_live_member_is_honoured`,
+>   `a_forged_or_unsigned_resync_evicts_nobody`,
+>   `a_replayed_resync_is_refused_even_though_it_verifies`,
+>   `a_routine_announce_and_a_non_member_resync_change_nothing`,
+>   `honoured_resyncs_are_rate_limited_per_member`,
+>   `honouring_a_resync_replaces_the_stale_leaf_and_reseats_the_member` and
+>   `a_resync_whose_key_package_is_not_pin_valid_evicts_nobody`.
+>
+>   `RESYNC_RATE` was not pinned by this specification; 2 per hour is chosen here and recorded so
+>   it can be argued with — a legitimate heal needs one, and the second covers a heal whose own
+>   Commit was lost. The residual of [[#REQ-026]](c) stands unchanged: the pin pre-check is not a
+>   full dry-run of the MLS Add, so a Remove that merges followed by an Add that fails for an
+>   unforeseen MLS-level reason still cannot be rolled back.
 >
 > The cross-vendor Principle-12 pass above remains **outstanding** and is not satisfied by the
 > implementing session, which cannot validate its own artefact.
