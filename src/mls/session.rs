@@ -999,7 +999,21 @@ impl MlsSession {
             "the encrypted session forked from the room and was discarded — \
              requesting re-admission (SPEC-013 REQ-025)"
         );
-        self.resync_frames()
+        // Two routes out, and they are not alternatives — take both.
+        //
+        // The resync asks a re-provisioner to remove-and-re-add us, which needs
+        // one to be online and willing ([[SPEC-013-mls-private-channels#REQ-026]]).
+        // The self-seat needs only a GroupInfo from the hub, because the grant
+        // already carries a member's permission — and after [[SPEC-061]] REQ-008
+        // the discard leaves that grant UNSPENT, so it is still redeemable.
+        //
+        // Emitting only the resync here left an agent that could seat itself
+        // waiting on a roster change to notice, which on a quiet channel is not a
+        // wait but a stall. Both frames are no-ops when their preconditions do
+        // not hold, so sending them together costs nothing when only one applies.
+        let mut frames = self.resync_frames();
+        frames.extend(self.self_seat_frames());
+        frames
     }
 
     /// REQ-025(b)/(c): one re-request, or nothing once the cap is spent.
@@ -2291,8 +2305,19 @@ mod tests {
         let a_frames = agent.join_frames().unwrap();
         creator.handle_frame(&a_frames[1]);
         agent.handle_frame(&c_frames[1]);
-        // The agent holds a group of its own to fork away from.
+        // The agent holds a group of its own to fork away from, and a grant it
+        // has not spent — the state SPEC-061 REQ-008 leaves it in.
         agent.create_group_as_creator().unwrap();
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        agent.pair_grant = Some(serde_json::to_string(&grant).unwrap());
         assert!(agent.group.is_some(), "precondition: we hold a group");
 
         // FORK_THRESHOLD consecutive undecryptable frames. Below it, a drop is
@@ -2329,6 +2354,13 @@ mod tests {
             .iter()
             .find(|f| f.starts_with("(keyready @room"))
             .expect("a re-admission request MUST go out");
+        // An agent holding an unspent grant takes BOTH routes out. Waiting for a
+        // roster change to notice it could seat itself is a stall on a quiet
+        // channel, and the grant survives the discard precisely so it need not.
+        assert!(
+            outbound.iter().any(|f| f.starts_with("(groupinfoget @room")),
+            "a grant-holding agent also asks for something to re-seat against: {outbound:?}"
+        );
         assert!(
             resync.contains(":resync 1"),
             "REQ-025(d): only an explicit marker requests re-provisioning — a routine \
