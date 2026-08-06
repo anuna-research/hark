@@ -1181,6 +1181,22 @@ impl MlsSession {
         self.group = Some(pending.group);
         self.genesis = Some(pending.genesis);
         self.trust = Some(pending.trust);
+        // PROVIDER FIRST, THEN META, and the order is the invariant.
+        //
+        // `join_by_grant` builds the group into the provider but does not persist
+        // it — the pre-SPEC-061 path got away with that because a later inbound
+        // frame persisted as a side effect. Installing at the echo has no such
+        // follow-up, so without this the group lives only in memory while the
+        // meta on disk names it: a restart then reads a meta pointing at records
+        // that are not there and reports `persisted group state missing`, which
+        // is a fresh way to be seated and unable to prove it.
+        //
+        // Meta-last is what makes a crash between the two writes survivable. The
+        // meta is the pointer; a pointer written before its target is a dangling
+        // one, and that is exactly the failure above.
+        if let Err(e) = self.provider.persist() {
+            tracing::warn!(room = %self.room, error = %e, "seat accepted but group state did not persist");
+        }
         if let Err(e) = self.persist_meta() {
             tracing::warn!(room = %self.room, error = %e, "seat accepted but meta did not persist");
         }
@@ -2083,6 +2099,20 @@ mod tests {
         // gets — and that is what seats us.
         agent.handle_frame(&commit);
         assert!(agent.group.is_some(), "the echo seats us");
+        // …durably. `join_by_grant` builds into the provider without persisting,
+        // and installing at the echo has no later frame to persist as a side
+        // effect — so a restart here read a meta naming records that were not on
+        // disk and reported `persisted group state missing`. Found on the live
+        // daemon, not in review.
+        drop(agent);
+        let resumed =
+            MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        assert!(
+            resumed.group.is_some(),
+            "a seated agent MUST survive a restart — the meta is a pointer, and \
+             writing it before its target is writing a dangling one"
+        );
+        let mut agent = resumed;
         assert!(
             agent.encrypt_outbound("(tell @room \"hi\" :from @agent)").is_ok(),
             "and only now may we send"
