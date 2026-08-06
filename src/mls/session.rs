@@ -2489,6 +2489,44 @@ mod tests {
         );
     }
 
+    /// A frame for somebody ELSE'S group is not evidence that ours has forked.
+    ///
+    /// The distinction only started to matter once recovery existed to be
+    /// triggered by it, which is why it survived until the fix was run against
+    /// live traffic: three replayed frames carrying an old group id crossed the
+    /// fork threshold, [[SPEC-013-mls-private-channels#REQ-025]] discarded a
+    /// perfectly healthy group, the agent re-seated, the hub replayed again — a
+    /// discard/re-seat loop that never converged. Observed on the live daemon.
+    #[test]
+    fn a_frame_for_another_group_never_counts_as_a_fork() {
+        let (a_dir, a_wire) = setup("foreign", 105, "@agent");
+        let (o_dir, o_wire) = setup("foreign", 106, "@other");
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let mut other = MlsSession::open(&o_dir, "other", "@room", "@other", &o_wire, true).unwrap();
+        agent.create_group_as_creator().unwrap();
+        // A DIFFERENT group for the same room name — the shape a recreated
+        // channel, or a replay from before a re-seat, actually delivers.
+        other.create_group_as_creator().unwrap();
+        let foreign = other
+            .encrypt_outbound("(tell @room \"not for you\" :from @other)")
+            .expect("the other group encrypts for itself");
+
+        // Well past the threshold: this must never accumulate.
+        for i in 0..(FORK_SIGNAL_THRESHOLD * 4) {
+            match agent.handle_frame(&foreign) {
+                SessionEvent::Dropped { probable_fork, .. } => assert!(
+                    !probable_fork,
+                    "frame {i} belongs to another group and must not count toward OUR fork signal"
+                ),
+                other => panic!("expected a plain drop, got {other:?}"),
+            }
+            assert!(
+                agent.group.is_some(),
+                "and the healthy group must never be discarded because of it"
+            );
+        }
+    }
+
     /// REQ-025(b), re-review #1 — the nonce is strictly monotonic, and it is NOT
     /// the pin epoch. The pin epoch is constant absent a rotation, so a captured
     /// resync could be replayed to evict a healthy member at will.

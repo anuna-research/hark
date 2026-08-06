@@ -13,7 +13,8 @@
 //! touch the immutable genesis extension.
 
 use openmls::prelude::{
-    LeafNode, MlsGroup, MlsMessageIn, ProcessedMessageContent, Sender, StagedCommit,
+    LeafNode, MlsGroup, MlsMessageIn, ProcessMessageError, ProcessedMessageContent, Sender,
+    StagedCommit, ValidationError,
 };
 use tls_codec::{DeserializeBytes as _, Serialize as _};
 
@@ -72,6 +73,20 @@ pub enum Inbound {
     Handshake,
     /// An undecryptable/unprocessable frame — dropped, counted (REQ-006).
     Dropped { reason: String, probable_fork: bool },
+}
+
+/// Was this frame addressed to a group other than the one we hold?
+///
+/// The distinction the [`ForkSignal`] turns on: a fork is OUR state diverging
+/// from the room's, and a frame carrying somebody else's group id says nothing
+/// about our state at all. Matched on the typed variant rather than on the Debug
+/// string, so a wording change upstream cannot silently turn this back into a
+/// counted failure.
+fn is_foreign_group<S>(error: &ProcessMessageError<S>) -> bool {
+    matches!(
+        error,
+        ProcessMessageError::ValidationError(ValidationError::WrongGroupId)
+    )
 }
 
 /// REQ-005: encrypt one outbound channel message as an MLS application
@@ -144,8 +159,29 @@ pub fn process_inbound(
     let processed = match group.process_message(provider, protocol) {
         Ok(p) => p,
         Err(e) => {
-            // Undecryptable / unprocessable: drop WITHOUT aborting, but
-            // count toward the fork signal (REQ-006).
+            // Undecryptable / unprocessable: drop WITHOUT aborting, and count it
+            // toward the fork signal (REQ-006) — UNLESS the frame was never ours
+            // to process.
+            //
+            // `WrongGroupId` says the frame belongs to a DIFFERENT group. That is
+            // not evidence that our group has diverged from the room's; it is
+            // evidence that this frame is not addressed to the group we hold. A
+            // room whose group was recreated, or a hub replaying history from
+            // before a re-seat, delivers these routinely.
+            //
+            // Counting them was a live-traffic defect and a nasty one, because it
+            // only appeared once recovery existed to be triggered: three replayed
+            // frames from an old group id crossed the threshold, REQ-025 discarded
+            // a group that was perfectly healthy, the agent re-seated, the hub
+            // replayed again — a discard/re-seat loop that never converged.
+            // Observed on the live daemon; the fork counter must measure OUR
+            // divergence, not somebody else's frame.
+            if is_foreign_group(&e) {
+                return Ok(Inbound::Dropped {
+                    reason: format!("process: {e:?} (not our group — not a fork)"),
+                    probable_fork: false,
+                });
+            }
             fork.record_failure();
             return Ok(Inbound::Dropped {
                 reason: format!("process: {e:?}"),
