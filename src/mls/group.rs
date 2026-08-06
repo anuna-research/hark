@@ -672,7 +672,7 @@ pub fn add_member(
     kp_bytes: &[u8],
     target_handle: &str,
     pins: &PinStore,
-    ledger: &ConsumedLedger,
+    ledger: &mut ConsumedLedger,
     room: &str,
     promise: super::claim::CommitPromise<'_>,
 ) -> Result<AddOutcome, MlsError> {
@@ -705,6 +705,8 @@ pub fn add_member(
         .hash_ref(provider.crypto())
         .map_err(MlsError::stack("hash ref"))?;
     let ref_b64 = B64.encode(hash_ref.as_slice());
+    // Captured before `kp` is moved into the Add.
+    let is_last_resort = kp.last_resort();
     if ledger.is_consumed(&ref_b64) {
         return Err(MlsError::Rejected(format!(
             "key package ref {ref_b64} already consumed; refusing replayed Add (REQ-013)"
@@ -727,6 +729,33 @@ pub fn add_member(
     group
         .merge_pending_commit(provider)
         .map_err(MlsError::stack("merge own add commit"))?;
+    // REQ-013: record what this Add SPENT.
+    //
+    // Without it the ledger only ever held refs consumed on the JOIN path — our
+    // own packages, as a joiner — so the check above compared a target's ref
+    // against a set it could never appear in. The guard read as live and matched
+    // nothing, and an adder had no memory of which of the directory's packages
+    // it had already used.
+    //
+    // That is the lever a hub wants on the REQ-026 heal path: it answers the
+    // `keyget`, so it can serve the same package twice. The second Welcome is
+    // sealed to an init key the target consumed the first time and can no longer
+    // open — so the eviction lands and the re-add produces a Welcome nobody can
+    // read. Marking here is what finally makes both this guard and the heal's
+    // pre-check mean something.
+    // ONE-TIME packages only. A last-resort package is reusable by design —
+    // `keypackages.rs` documents its bound as the short MLS lifetime, "enforced
+    // by the primitive, not prose" — and the pool is republished only on
+    // connect, so once it drains the directory serves the last-resort for every
+    // subsequent Add. Marking that consumed would refuse every member addition
+    // in the channel until somebody reconnected.
+    //
+    // This is only decidable here because the flag now travels on the package
+    // (see `build_key_package`); before that it was local state the adder could
+    // not see.
+    if !is_last_resort {
+        let _ = ledger.mark_consumed(&ref_b64);
+    }
     provider.persist()?;
     Ok(AddOutcome {
         commit_bytes: commit
@@ -1305,7 +1334,7 @@ mod tests {
             &kp.bytes,
             "@bob",
             &alice.pins,
-            &alice.ledger,
+            &mut alice.ledger,
             "@research",
             CommitPromise::Armed(&stale),
         )
@@ -1360,7 +1389,7 @@ mod tests {
             &kp.bytes,
             "@bob",
             &alice.pins,
-            &alice.ledger,
+            &mut alice.ledger,
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
         )
@@ -1524,7 +1553,7 @@ mod tests {
             &kp.bytes,
             "@bob",
             &alice.pins,
-            &alice.ledger,
+            &mut alice.ledger,
         
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
@@ -1585,7 +1614,7 @@ mod tests {
             &kp2.bytes,
             "@bob",
             &alice.pins,
-            &alice.ledger,
+            &mut alice.ledger,
         
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
@@ -1634,7 +1663,7 @@ mod tests {
                 &mallory_kp.bytes,
                 "@bob",
                 &alice.pins,
-                &alice.ledger,
+                &mut alice.ledger,
             
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
@@ -1652,7 +1681,7 @@ mod tests {
                 &forged.bytes,
                 "@bob",
                 &alice.pins,
-                &alice.ledger,
+                &mut alice.ledger,
             
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
@@ -1698,7 +1727,7 @@ mod tests {
             &kp.bytes,
             "@bob",
             &mallory.pins,
-            &mallory.ledger,
+            &mut mallory.ledger,
         
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
@@ -1730,7 +1759,7 @@ mod tests {
             &kp.bytes,
             "@bob",
             &alice.pins,
-            &alice.ledger,
+            &mut alice.ledger,
         
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
@@ -1773,7 +1802,7 @@ mod tests {
             &kp.bytes,
             "@bob",
             &alice.pins,
-            &alice.ledger,
+            &mut alice.ledger,
         
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
@@ -1838,7 +1867,7 @@ mod tests {
             &kp.bytes,
             "@bob",
             &alice.pins,
-            &alice.ledger,
+            &mut alice.ledger,
         
             "@research",
             crate::mls::claim::CommitPromise::Inactive,

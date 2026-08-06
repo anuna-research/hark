@@ -235,7 +235,7 @@ mod tests {
         let a_id = MlsIdentity::from_wire_identity(&a_wire, "@alice");
         let b_id = MlsIdentity::from_wire_identity(&b_wire, "@bob");
         let mut a_pins = PinStore::open(&dir.join("a.pins")).unwrap();
-        let a_ledger = ConsumedLedger::open(&dir.join("a.kpledger")).unwrap();
+        let mut a_ledger = ConsumedLedger::open(&dir.join("a.kpledger")).unwrap();
         a_pins
             .observe_verified("@bob", &b_wire.verifying_key_bytes())
             .unwrap();
@@ -267,7 +267,7 @@ mod tests {
             &kp.bytes,
             "@bob",
             &a_pins,
-            &a_ledger,
+            &mut a_ledger,
         
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
