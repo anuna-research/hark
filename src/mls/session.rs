@@ -125,6 +125,44 @@ pub struct MlsSession {
     /// late joiner would otherwise never receive an earlier member's key and
     /// could not pin it for the REQ-008 adder check.
     present: std::collections::HashSet<String>,
+    /// SPEC-061 REQ-008 — an external Commit we have built and sent but that
+    /// nobody has acknowledged yet.
+    ///
+    /// It is held HERE rather than in `group` because installing it there is what
+    /// spends the grant: `self_seat_frames` will not act while a group is held,
+    /// so a commit that lost the ordering race used to leave the agent with a
+    /// phantom epoch, no way to re-seat, and no way to tell. That is cbcl-bus
+    /// BUG-022 from the joiner's side — "the grant MUST NOT be spent until the
+    /// join is acknowledged".
+    ///
+    /// RFC 9420 §14 is explicit that a joiner's own build succeeds whether or not
+    /// the Commit is accepted, so holding the group is NOT evidence that anyone
+    /// agreed. The evidence is the hub fanning our own Commit back to us.
+    pending_seat: Option<PendingSeat>,
+    /// The highest GroupInfo epoch seen for this room.
+    ///
+    /// Every member republishes a GroupInfo after every merged handshake, so in a
+    /// room with several members a joiner receives several — including stale ones
+    /// from members that merged a moment ago. Building against the first one that
+    /// arrives is building against whichever member's frame won a race, which is
+    /// how a self-seating agent ends up committing at an epoch the room has
+    /// already left.
+    seen_gi_epoch: Option<u64>,
+}
+
+/// An external Commit awaiting acknowledgement (SPEC-061 REQ-008).
+struct PendingSeat {
+    /// The group as it will be once the Commit is accepted. Not installed until
+    /// then, and dropped if a newer GroupInfo makes this attempt stale.
+    group: MlsGroup,
+    genesis: GenesisAssertion,
+    trust: GenesisTrust,
+    /// The base64 Commit exactly as it went on the wire — the bytes the hub's
+    /// echo is matched against. Matched below the MLS layer deliberately: our own
+    /// session would reject its own echoed Commit as already-merged.
+    ct_b64: String,
+    /// The GroupInfo epoch this Commit was built against.
+    epoch: u64,
 }
 
 /// The on-disk stem for one agent's MLS state **in one room**.
@@ -254,6 +292,8 @@ impl MlsSession {
             wire_seed: wire.signing_seed(),
             pair_grant: None,
             present: std::collections::HashSet::new(),
+            pending_seat: None,
+            seen_gi_epoch: None,
         };
 
         if let Some(meta) = meta {
@@ -757,6 +797,13 @@ impl MlsSession {
         if !self.enc_pinned || self.group.is_some() || self.pair_grant.is_none() {
             return Vec::new();
         }
+        // An unacknowledged attempt is still an attempt. Asking again would build
+        // a second external Commit against a second GroupInfo while the first is
+        // still in flight — two Commits from us for one epoch, which is the
+        // conflict this path exists to avoid rather than cause.
+        if self.pending_seat.is_some() {
+            return Vec::new();
+        }
         vec![format!("(groupinfoget {} :from {})", self.room, self.handle)]
     }
 
@@ -780,6 +827,42 @@ impl MlsSession {
                 probable_fork: false,
             };
         };
+        // REQ-005 puts the epoch on the wire because the hub cannot parse a
+        // GroupInfo and so cannot tell which one is newest. Reading it is the
+        // difference between seating against the room's current state and
+        // seating against whichever member's republication reached us first.
+        //
+        // A GroupInfo is single-use (RFC 9420 §12.4.3.2) and every member
+        // republishes after every merged handshake, so several arrive and the
+        // older ones are already spent. Building on one of those produces a
+        // Commit every member refuses for `WrongEpoch` — and, before this, an
+        // agent that then believed it was a member.
+        let epoch = match kw_u64(text, ":epoch") {
+            Some(epoch) => epoch,
+            None => {
+                return SessionEvent::Dropped {
+                    reason: "groupinfo missing :epoch".into(),
+                    probable_fork: false,
+                };
+            }
+        };
+        if self.seen_gi_epoch.is_some_and(|seen| epoch < seen) {
+            return SessionEvent::Handled { outbound: vec![] }; // stale; a newer one is in hand
+        }
+        self.seen_gi_epoch = Some(epoch);
+        // A newer GroupInfo means the attempt in flight was built against an
+        // epoch the room has left, so it cannot be accepted. Drop it and build
+        // again — the grant was never spent, which is the point of holding it.
+        if let Some(pending) = &self.pending_seat {
+            if epoch <= pending.epoch {
+                return SessionEvent::Handled { outbound: vec![] };
+            }
+            tracing::info!(
+                room = %self.room, stale = pending.epoch, fresh = epoch,
+                "a newer GroupInfo arrived — rebuilding the external Commit against it"
+            );
+            self.pending_seat = None;
+        }
         match join_by_grant(
             &self.provider,
             &self.identity,
@@ -790,18 +873,22 @@ impl MlsSession {
         ) {
             Ok(joined) => {
                 let commit = B64.encode(&joined.commit);
-                self.group = Some(joined.group);
-                self.genesis = Some(joined.genesis);
-                self.trust = Some(joined.trust);
-                if let Err(e) = self.persist_meta() {
-                    return SessionEvent::Dropped {
-                        reason: e.to_string(),
-                        probable_fork: false,
-                    };
-                }
+                // NOT installed as `self.group`, and the meta is NOT persisted.
+                // Both of those are how the grant gets spent, and until the hub
+                // fans this Commit back there is no evidence anybody accepted it.
+                // A build that succeeds proves only that we can construct a
+                // Commit, which RFC 9420 §14 says is true whether or not it wins.
+                self.pending_seat = Some(PendingSeat {
+                    group: joined.group,
+                    genesis: joined.genesis,
+                    trust: joined.trust,
+                    ct_b64: commit.clone(),
+                    epoch,
+                });
                 tracing::info!(
-                    room = %self.room,
-                    "seated ourselves by external Commit on a pairing grant (SPEC-061 REQ-008)"
+                    room = %self.room, epoch,
+                    "sent an external Commit to seat ourselves (SPEC-061 REQ-008) — \
+                     awaiting the hub's echo before treating it as accepted"
                 );
                 SessionEvent::Handled {
                     outbound: vec![format!(
@@ -815,6 +902,40 @@ impl MlsSession {
                 probable_fork: false,
             },
         }
+    }
+
+    /// SPEC-061 REQ-008: the hub fanned our own external Commit back to us.
+    ///
+    /// `cbcl-chat-room:fanout/2` excludes nobody — it "fans out exactly once to
+    /// every present member (including the sender)" — so the echo is the only
+    /// acknowledgement this path has, and it is what finally spends the grant.
+    /// Correlated on the frame bytes rather than by MLS processing: our own
+    /// session would reject its own Commit as already-merged, so the signal has
+    /// to be read below the MLS layer.
+    ///
+    /// The limit, stated rather than glossed: the echo proves the HUB took and
+    /// fanned the Commit, not that every member applied it. That is strictly more
+    /// than the previous evidence, which was none.
+    fn note_own_seat_echo(&mut self, ct_b64: &str) -> bool {
+        let matches = self
+            .pending_seat
+            .as_ref()
+            .is_some_and(|p| p.ct_b64 == ct_b64);
+        if !matches {
+            return false;
+        }
+        let pending = self.pending_seat.take().expect("just matched");
+        self.group = Some(pending.group);
+        self.genesis = Some(pending.genesis);
+        self.trust = Some(pending.trust);
+        if let Err(e) = self.persist_meta() {
+            tracing::warn!(room = %self.room, error = %e, "seat accepted but meta did not persist");
+        }
+        tracing::info!(
+            room = %self.room, epoch = pending.epoch,
+            "our external Commit was accepted — seated (SPEC-061 REQ-008)"
+        );
+        true
     }
 
     /// REQ-001/REQ-012: a Welcome addressed to us.
@@ -856,6 +977,25 @@ impl MlsSession {
 
     /// REQ-006/REQ-017/REQ-018: an encrypted room frame.
     fn on_deliver(&mut self, text: &str) -> SessionEvent {
+        // Our own frame, fanned back. Checked FIRST and before the group guard,
+        // because the whole point of the pending seat is that we hold no group
+        // yet — the old order reported this as "deliver before MLS join" and
+        // discarded the only acknowledgement the self-seating path ever gets.
+        if kw_symbol(text, ":from").as_deref() == Some(self.handle.as_str()) {
+            if let Some(ct) = kw_str(text, ":ct") {
+                if self.note_own_seat_echo(&ct) {
+                    // Now that we hold the group, publish a GroupInfo for the
+                    // epoch we just moved the room to: ours spent the one the
+                    // hub was holding.
+                    return SessionEvent::Handled {
+                        outbound: self.group_info_frame().into_iter().collect(),
+                    };
+                }
+            }
+            // Any other echo of our own is not ours to process — MLS refuses to
+            // decrypt what it sent.
+            return SessionEvent::Handled { outbound: vec![] };
+        }
         let Some(group) = self.group.as_mut() else {
             return SessionEvent::Dropped {
                 reason: "deliver before MLS join".into(),
@@ -1234,6 +1374,18 @@ fn kw_u64(text: &str, key: &str) -> Option<u64> {
     }
 }
 
+/// A keyword's value as the RAW string on the wire, undecoded.
+///
+/// Distinct from [`kw_b64`] on purpose: the self-seat echo (SPEC-061 REQ-008) is
+/// correlated on the base64 TEXT we emitted, not on the bytes it decodes to, so
+/// that the comparison is against exactly what went on the wire.
+fn kw_str(text: &str, key: &str) -> Option<String> {
+    match kw_value(text, key)? {
+        SExpr::Atom(Atom::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
 fn kw_b64(text: &str, key: &str) -> Option<Vec<u8>> {
     match kw_value(text, key)? {
         SExpr::Atom(Atom::Str(s)) => B64.decode(s).ok(),
@@ -1570,6 +1722,212 @@ mod tests {
     /// creator agent + joining agent exchange keypkg/welcome/deliver frames
     /// exactly as the hub would fan them; content round-trips encrypted; a
     /// removal with bye evidence evicts; restart resumes the group (REQ-009).
+    /// SPEC-061 REQ-008 — a self-seat is not a membership until somebody says so.
+    ///
+    /// This is the test the shipped path did not have, and its absence is why an
+    /// agent could hold a phantom epoch for hours while `hark safety-number`
+    /// cheerfully printed it. Building an external Commit proves only that we can
+    /// build one: RFC 9420 §14 is explicit that a joiner's own build succeeds
+    /// whether or not the Commit is accepted.
+    #[test]
+    fn a_self_seat_is_not_a_membership_until_the_hub_echoes_it() {
+        let (c_dir, c_wire) = setup("seat", 90, "@creator");
+        let (a_dir, a_wire) = setup("seat", 91, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+
+        // Each pins the other from its own signed idkey assertion (REQ-019).
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        // The member that paired the agent signs its admission (REQ-008).
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        let grant_json = serde_json::to_string(&grant).unwrap();
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(grant_json)
+        );
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&pairgrant) else {
+            panic!("pairgrant handled")
+        };
+        assert!(
+            outbound.iter().any(|f| f.starts_with("(groupinfoget @room")),
+            "holding a grant, the agent asks for something to commit against: {outbound:?}"
+        );
+
+        // The hub serves a GroupInfo and the agent builds its Commit.
+        let gi = creator.group_info_frame().expect("creator publishes a GroupInfo");
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&gi) else {
+            panic!("groupinfo handled")
+        };
+        let commit = outbound
+            .iter()
+            .find(|f| f.starts_with("(deliver @room"))
+            .expect("the Commit MUST go out")
+            .clone();
+
+        // THE POINT. Nothing has acknowledged that Commit, so nothing is seated.
+        assert!(
+            agent.group.is_none(),
+            "an unacknowledged external Commit must not read as membership"
+        );
+        assert!(
+            matches!(
+                agent.encrypt_outbound("(tell @room \"hi\" :from @agent)"),
+                Err(MlsError::NotReady(_))
+            ),
+            "and sending must refuse RETRYABLY rather than encrypt at a phantom epoch"
+        );
+
+        // The hub fans our own Commit back — the only acknowledgement this path
+        // gets — and that is what seats us.
+        agent.handle_frame(&commit);
+        assert!(agent.group.is_some(), "the echo seats us");
+        assert!(
+            agent.encrypt_outbound("(tell @room \"hi\" :from @agent)").is_ok(),
+            "and only now may we send"
+        );
+    }
+
+    /// The lost race, which is the failure that was found live: our Commit never
+    /// comes back because somebody else's landed first. The agent must end up
+    /// with no group AND its grant intact, so it can try again — not with a
+    /// phantom group and a spent grant, which is permanent and silent.
+    #[test]
+    fn losing_the_ordering_race_leaves_the_grant_redeemable() {
+        let (c_dir, c_wire) = setup("race", 92, "@creator");
+        let (a_dir, a_wire) = setup("race", 93, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(serde_json::to_string(&grant).unwrap())
+        );
+        agent.handle_frame(&pairgrant);
+        let gi = creator.group_info_frame().unwrap();
+        agent.handle_frame(&gi);
+
+        // No echo ever arrives. Everything the agent needs to try again survives.
+        assert!(agent.group.is_none(), "no group");
+        assert!(agent.pair_grant.is_some(), "and the grant is NOT spent");
+
+        // A restart re-reads the grant from disk and can still act on it.
+        drop(agent);
+        let resumed =
+            MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        assert!(resumed.group.is_none());
+        assert!(
+            resumed.pair_grant.is_some(),
+            "a grant spent on a commit nobody took would strand this agent forever"
+        );
+    }
+
+    /// REQ-005 puts the epoch on the wire so a joiner can tell a fresh GroupInfo
+    /// from a spent one. A GroupInfo is single-use (RFC 9420 §12.4.3.2) and every
+    /// member republishes after every merged handshake, so several arrive at a
+    /// joiner and the older ones are already dead. Committing against one of
+    /// those is refused `WrongEpoch` by every member.
+    ///
+    /// Only the epoch DISPATCH is under test here — which frames start an attempt
+    /// and which are ignored — so the carried `:gi` blob is the same object
+    /// throughout; what varies is what the wire says about it.
+    #[test]
+    fn the_newest_groupinfo_wins_and_a_stale_one_is_ignored() {
+        let (c_dir, c_wire) = setup("gi", 94, "@creator");
+        let (a_dir, a_wire) = setup("gi", 95, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(serde_json::to_string(&grant).unwrap())
+        );
+        agent.handle_frame(&pairgrant);
+
+        let published = creator.group_info_frame().unwrap();
+        let epoch = kw_u64(&published, ":epoch").expect("a GroupInfo names its epoch");
+        let at = |e: u64| published.replace(&format!(":epoch {epoch}"), &format!(":epoch {e}"));
+
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&at(epoch)) else {
+            panic!("groupinfo handled")
+        };
+        assert!(
+            outbound.iter().any(|f| f.starts_with("(deliver @room")),
+            "the first GroupInfo starts an attempt"
+        );
+
+        // An OLDER republication is one we already have better than.
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&at(epoch.saturating_sub(1)))
+        else {
+            panic!("stale groupinfo handled")
+        };
+        assert!(
+            outbound.is_empty(),
+            "a stale GroupInfo must not start a second attempt: {outbound:?}"
+        );
+
+        // A NEWER one means the attempt in flight was built against an epoch the
+        // room has left, so it can never be accepted. Rebuild against the newer.
+        //
+        // This is the direction the pre-fix code could not take at all: it had
+        // already installed the group, so it returned early and sat forever on a
+        // Commit nobody would take.
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&at(epoch + 1)) else {
+            panic!("newer groupinfo handled")
+        };
+        assert!(
+            outbound.iter().any(|f| f.starts_with("(deliver @room")),
+            "a newer GroupInfo rebuilds the Commit: {outbound:?}"
+        );
+        assert!(
+            agent.group.is_none(),
+            "and none of this is membership until an echo says so"
+        );
+    }
+
     #[test]
     fn full_session_flow_over_frames() {
         let (a_dir, a_wire) = setup("flow", 86, "@alice");
