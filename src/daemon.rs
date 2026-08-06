@@ -77,6 +77,18 @@ pub struct AgentStatusSnapshot {
     /// SPEC-026 OBS-002: the transport error that ended the socket, for the
     /// operator. `None` unless reconnecting.
     pub reconnect_detail: Option<String>,
+    /// SPEC-013 REQ-006/REQ-021: the encrypted session's group state has
+    /// diverged from the room's — inbound Commits no longer process — and the
+    /// agent is re-establishing it.
+    ///
+    /// Kept apart from `unhealthy_reason` for exactly the reason
+    /// `reconnect_detail` is: that field means *dead*, and this state is not.
+    /// The agent is connected, its socket is fine, and its own recovery is
+    /// running. Reporting it as unhealthy would close the handle and turn a
+    /// self-healing condition into an outage; reporting nothing at all is what
+    /// let an agent sit forked and silent while `hark daemon status` said
+    /// `connected` and its safety number printed as though it were a member.
+    pub mls_fork_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -241,6 +253,9 @@ struct AgentEntry {
     /// [`AgentState::Reconnecting`].
     reconnect_attempts: u32,
     reconnect_detail: Option<String>,
+    /// SPEC-013 REQ-006: a non-terminal MLS divergence, or `None` when the group
+    /// is tracking the room.
+    mls_fork_detail: Option<String>,
     queue: VecDeque<QueuedMessage>,
     queued_bytes: usize,
     recv_waiter: Option<RecvWaiterId>,
@@ -560,6 +575,7 @@ impl AgentStore {
             unhealthy_detail: None,
             reconnect_attempts: 0,
             reconnect_detail: None,
+            mls_fork_detail: None,
             queue: VecDeque::new(),
             queued_bytes: 0,
             recv_waiter: None,
@@ -914,6 +930,31 @@ impl AgentStore {
         Ok(())
     }
 
+    /// SPEC-013 REQ-006/REQ-021: record — or clear — an MLS divergence.
+    ///
+    /// Deliberately *unlike* [`Self::mark_unhealthy`]: it changes no state, closes
+    /// no connection and drops no waiter. A forked group is a live agent whose
+    /// recovery is running (REQ-025), and marking the handle unhealthy would
+    /// close it — converting a self-healing condition into the outage the
+    /// operator was trying to avoid.
+    ///
+    /// It exists because the alternative was silence. A `tracing::warn!` that
+    /// nothing collects is not an observation, and an agent that is forked,
+    /// undeliverable and reported `connected` is the failure this makes visible.
+    pub async fn set_mls_fork(
+        &self,
+        handle: &AgentHandle,
+        detail: Option<String>,
+    ) -> Result<(), AgentError> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        entry.mls_fork_detail = detail;
+        Ok(())
+    }
+
     /// SPEC-026 REQ-008: register an agent that is being re-established after a
     /// daemon restart but has not reached the hub yet.
     ///
@@ -943,6 +984,7 @@ impl AgentStore {
             unhealthy_detail: None,
             reconnect_attempts: 0,
             reconnect_detail: detail,
+            mls_fork_detail: None,
             queue: VecDeque::new(),
             queued_bytes: 0,
             recv_waiter: None,
@@ -1246,6 +1288,7 @@ impl AgentEntry {
             channel: self.channel.clone(),
             reconnect_attempts: self.reconnect_attempts,
             reconnect_detail: self.reconnect_detail.clone(),
+            mls_fork_detail: self.mls_fork_detail.clone(),
         }
     }
 }
@@ -2028,6 +2071,62 @@ mod tests {
     /// the load-bearing half of the issue-#25 fix at the store level — the old
     /// behaviour marked the handle `unhealthy`, which is terminal and is what
     /// stranded the agent.
+    /// SPEC-013 REQ-006/REQ-021: a forked encrypted session is VISIBLE and
+    /// NON-TERMINAL, and those two properties are the whole requirement.
+    ///
+    /// Visible, because a `tracing::warn!` the daemon never collects is silence:
+    /// an agent could sit forked for hours, encrypt to an epoch nobody was on,
+    /// and report `connected` throughout — which is how one was found live.
+    ///
+    /// Non-terminal, because the socket is healthy and REQ-025 recovery is
+    /// running. Routing this through `mark_unhealthy` would close the handle and
+    /// convert a self-healing condition into an outage.
+    #[tokio::test]
+    async fn an_mls_fork_is_visible_without_being_terminal() {
+        let store = agent_store(10, 100);
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("agent should insert");
+
+        store
+            .set_mls_fork(&handle, Some("process: WrongEpoch".to_owned()))
+            .await
+            .expect("set_mls_fork should succeed");
+
+        let status = store.status_snapshots().await;
+        assert_eq!(
+            status[0].mls_fork_detail.as_deref(),
+            Some("process: WrongEpoch"),
+            "the divergence is reported"
+        );
+        // Negative-output: it is none of the OTHER things. An operator reading
+        // this must be able to tell "encrypted state diverged" from "dead" and
+        // from "the socket is coming back".
+        assert_eq!(status[0].state, super::AgentState::Connected);
+        assert_eq!(status[0].unhealthy_reason, None);
+        assert_eq!(status[0].unhealthy_detail, None);
+        assert_eq!(status[0].reconnect_detail, None);
+
+        // And the handle still works: a fork is a thing to recover from, not a
+        // reason to stop delivering.
+        assert_eq!(
+            store
+                .recv(&handle, Some(std::time::Duration::from_millis(1)))
+                .await
+                .expect_err("an empty queue still times out"),
+            super::AgentError::RecvTimeout,
+        );
+
+        // Processing a frame again clears it.
+        store
+            .set_mls_fork(&handle, None)
+            .await
+            .expect("clearing should succeed");
+        assert_eq!(store.status_snapshots().await[0].mls_fork_detail, None);
+    }
+
     #[tokio::test]
     async fn reconnecting_is_healthy_for_admission_and_reports_its_progress() {
         let store = agent_store(10, 100);

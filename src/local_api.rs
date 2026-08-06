@@ -246,6 +246,18 @@ pub struct AgentStatus {
     /// `unhealthy_detail`'s "dead".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconnect_detail: Option<String>,
+    /// SPEC-013 REQ-006/REQ-021: the encrypted session diverged from the room's
+    /// group and is re-establishing (REQ-025). Absent when the group is tracking
+    /// the room, so a healthy agent's status is unchanged.
+    ///
+    /// A third category on purpose, beside `unhealthy_detail` ("dead") and
+    /// `reconnect_detail` ("the socket is coming back"). This one is "the socket
+    /// is fine and the encryption is not" — an agent that can send frames the
+    /// room cannot read. Before it, that state was indistinguishable from
+    /// healthy: `hark daemon status` said `connected` while every message the
+    /// agent sent was sealed to an epoch nobody was on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mls_fork_detail: Option<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -1066,6 +1078,7 @@ async fn agents(
             channel: snapshot.channel,
             reconnect_attempts: snapshot.reconnect_attempts,
             reconnect_detail: snapshot.reconnect_detail,
+            mls_fork_detail: snapshot.mls_fork_detail,
         })
         .collect();
     let active_agent_handle = state

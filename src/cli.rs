@@ -1508,6 +1508,7 @@ mod tests {
             channel: Some("@research".to_owned()),
             reconnect_attempts: 0,
             reconnect_detail: None,
+            mls_fork_detail: None,
         }
     }
 

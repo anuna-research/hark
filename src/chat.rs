@@ -1392,7 +1392,15 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                                     Some(payload_text)
                                 }
                             }
-                            SessionEvent::Plaintext { text, .. } => Some(text),
+                            SessionEvent::Plaintext { text, .. } => {
+                                // REQ-025(d): a frame we could actually decrypt
+                                // means the group is tracking the room again.
+                                // Clearing here rather than on any inbound frame
+                                // is the point — the fork is defined by what we
+                                // cannot process, so only processing clears it.
+                                let _ = store.set_mls_fork(&handle, None).await;
+                                Some(text)
+                            }
                             SessionEvent::Handled { outbound } => {
                                 // SPEC-026 REQ-001: a write failure here is the
                                 // socket dying mid-MLS-exchange. Reconnect; the
@@ -1427,6 +1435,21 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             SessionEvent::Dropped { reason, probable_fork } => {
                                 if probable_fork {
                                     tracing::warn!(reason, "mls probable fork/equivocation signal (REQ-006); compare safety numbers");
+                                    // SPEC-013 REQ-006/REQ-021 — and the whole
+                                    // reason this is not just a log line. The
+                                    // daemon collects no logs, so a `warn!` here
+                                    // was indistinguishable from silence: an
+                                    // agent could sit forked for hours, encrypt
+                                    // happily to an epoch nobody was on, and
+                                    // report `connected` the entire time.
+                                    //
+                                    // NOT `mark_unhealthy`: that is terminal and
+                                    // closes the handle. A fork is recoverable
+                                    // (REQ-025) and the socket is healthy, so it
+                                    // gets its own non-terminal field.
+                                    let _ = store
+                                        .set_mls_fork(&handle, Some(sanitize(&reason)))
+                                        .await;
                                 } else {
                                     tracing::debug!(reason, "mls frame dropped");
                                 }
