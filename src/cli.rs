@@ -1318,6 +1318,19 @@ async fn daemon_status() -> AppResult<()> {
                 if let Some(detail) = agent.reconnect_detail {
                     println!("  reconnect_detail={detail}");
                 }
+                // SPEC-013 REQ-006/REQ-021: the encrypted session diverged from
+                // the room's group and is re-establishing.
+                //
+                // `hark daemon status` is the surface an operator actually
+                // reaches for, so a diagnostic that exists only in the local API
+                // is one they will not find. Reported here for the same reason
+                // the reconnect fields are reported separately from the unhealthy
+                // ones: a forked agent is neither dead nor fine, and printing it
+                // as plain `connected` is what let one sit undeliverable for
+                // hours while this command said everything was well.
+                if let Some(detail) = agent.mls_fork_detail {
+                    println!("  mls_fork_detail={detail}");
+                }
             }
             Ok(())
         }

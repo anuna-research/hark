@@ -1130,6 +1130,10 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         // was issue #25.
         let mut schedule = ReconnectSchedule::default();
         let mut pending_reconnect: Option<String> = None;
+        // SPEC-013 REQ-006: the reason the session last forked, kept so the
+        // operator-visible flag can be re-asserted from the session's own view
+        // without re-deriving why.
+        let mut fork_note = String::new();
         // SPEC-026 REQ-003: the hub replays the room's recent history after
         // EVERY successful hello, including a re-join's.
         let mut replay_guard = ReplayGuard::new();
@@ -1290,6 +1294,10 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         SessionEvent::Forked { reason, outbound } => {
                             tracing::warn!(reason, "ds-admitted record forked the group; requesting re-admission");
                             let _ = store.set_mls_fork(&handle, Some(sanitize(&reason))).await;
+                            // The DS path holds its cursor and `continue`s below,
+                            // so it never reaches the reconciliation block; set the
+                            // flag here and let that block correct it on the next
+                            // live frame.
                             for text in &outbound {
                                 let Ok(payload) = payload_bytes(text) else { continue };
                                 let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
@@ -1408,15 +1416,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                                     Some(payload_text)
                                 }
                             }
-                            SessionEvent::Plaintext { text, .. } => {
-                                // REQ-025(d): a frame we could actually decrypt
-                                // means the group is tracking the room again.
-                                // Clearing here rather than on any inbound frame
-                                // is the point — the fork is defined by what we
-                                // cannot process, so only processing clears it.
-                                let _ = store.set_mls_fork(&handle, None).await;
-                                Some(text)
-                            }
+                            SessionEvent::Plaintext { text, .. } => Some(text),
                             SessionEvent::Handled { outbound } => {
                                 // SPEC-026 REQ-001: a write failure here is the
                                 // socket dying mid-MLS-exchange. Reconnect; the
@@ -1478,7 +1478,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             // depend on anyone noticing a log line.
                             SessionEvent::Forked { reason, outbound } => {
                                 tracing::warn!(reason, "mls fork — discarded the group and requested re-admission (REQ-025)");
-                                let _ = store.set_mls_fork(&handle, Some(sanitize(&reason))).await;
+                                fork_note = sanitize(&reason);
                                 for text in &outbound {
                                     let Ok(payload) = payload_bytes(text) else { continue };
                                     let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
@@ -1491,6 +1491,40 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             }
                         },
                     };
+                    // SPEC-013 REQ-025(c)/(d) — reconcile the operator-visible
+                    // state with the session's own, after EVERY frame.
+                    //
+                    // Clearing on `Plaintext` alone was wrong twice over: a
+                    // re-admission Welcome and a processed Commit both report
+                    // `Handled`, so in a quiet room recovery completed while the
+                    // flag stayed set forever, and the same event type carries
+                    // every unrelated control frame, so there is nothing to infer
+                    // from. Mirroring a fact the session already knows is both
+                    // simpler and correct on paths that have not been written yet.
+                    if let Some(session) = mls.as_ref() {
+                        if session.recovery_exhausted() {
+                            // REQ-025(c): terminal, and terminal is what
+                            // `mark_unhealthy` is FOR. The agent holds no group,
+                            // has asked its full budget of times, and nothing more
+                            // will happen without a re-pair — reporting that as a
+                            // condition it is working through would be a lie the
+                            // operator acts on.
+                            let _ = store
+                                .mark_unhealthy(
+                                    &handle,
+                                    "mls_resync_exhausted",
+                                    Some(format!(
+                                        "the encrypted session for {} could not be re-established — re-pair this agent into the channel",
+                                        session.room
+                                    )),
+                                )
+                                .await;
+                        } else if session.fork_active() {
+                            let _ = store.set_mls_fork(&handle, Some(fork_note.clone())).await;
+                        } else {
+                            let _ = store.set_mls_fork(&handle, None).await;
+                        }
+                    }
                     let Some(responder_text) = responder_text else { continue };
                     // Receive-all (`*`): deliver EVERY channel content message to
                     // `recv`, not just answerable asks — the firehose a paired

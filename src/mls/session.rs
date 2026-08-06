@@ -178,6 +178,10 @@ pub struct MlsSession {
     last_resync_nonce: u64,
     /// REQ-025(c): the terminal surface has been reported; do not repeat it.
     resync_exhausted: bool,
+    /// SPEC-013 REQ-006: set when a fork is detected, cleared by the Commit or
+    /// join that ends it. The session's own view of whether it is diverged, so
+    /// the transport loop can mirror a fact instead of inferring one.
+    fork_active: bool,
 }
 
 /// Consecutive re-request attempts before the desync is surfaced as terminal
@@ -341,6 +345,7 @@ impl MlsSession {
             resync_attempts: 0,
             last_resync_nonce: 0,
             resync_exhausted: false,
+            fork_active: false,
         };
 
         if let Some(meta) = meta {
@@ -994,6 +999,7 @@ impl MlsSession {
         }
         self.resync_attempts = 0;
         self.resync_exhausted = false;
+        self.fork_active = true;
         tracing::warn!(
             room = %self.room,
             "the encrypted session forked from the room and was discarded — \
@@ -1088,6 +1094,43 @@ impl MlsSession {
     fn clear_resync_state(&mut self) {
         self.resync_attempts = 0;
         self.resync_exhausted = false;
+        self.fork_active = false;
+        // AND the detector itself, which is the half that mattered and was
+        // missing. `ForkSignal::record_success` is called only on the decrypted
+        // APPLICATION path in `process_inbound` — a processed Commit never reset
+        // it, and a re-admission Welcome does not go through `process_inbound` at
+        // all. So a recovered agent resumed still standing at or above
+        // FORK_SIGNAL_THRESHOLD, and the next single malformed frame from its own
+        // group crossed it again immediately: one bad frame, and the group it had
+        // just been re-admitted to was discarded.
+        //
+        // REQ-025(d) says the counters reset on the next successfully processed
+        // Commit or join, and this is the only place all three of those paths
+        // meet.
+        self.fork.record_success();
+    }
+
+    /// SPEC-013 REQ-006: is the encrypted session currently diverged?
+    ///
+    /// True from the moment a fork is detected until a Commit or a join lands.
+    /// Exposed so the transport loop can hold the operator-visible flag to the
+    /// session's own view rather than inferring it from event types — inference
+    /// is what left the flag set through a recovery that had already succeeded,
+    /// because a re-admission Welcome and a processed Commit both report
+    /// `Handled`, which is indistinguishable from any other control frame.
+    pub fn fork_active(&self) -> bool {
+        self.fork_active
+    }
+
+    /// SPEC-013 REQ-025(c): recovery is spent and this agent needs an operator.
+    ///
+    /// Distinct from [`Self::fork_active`], and the distinction is the whole
+    /// requirement: a fork is a condition the agent is working through, and this
+    /// is the admission that it cannot. Terminal — the agent holds no group, has
+    /// asked `RESYNC_CAP` times, and nothing further will happen without a
+    /// re-pair.
+    pub fn recovery_exhausted(&self) -> bool {
+        self.resync_exhausted
     }
 
     /// SPEC-061 CON-003: a refusal on the path that seats us.
@@ -2486,6 +2529,110 @@ mod tests {
         assert_eq!(
             agent.resync_attempts, 0,
             "REQ-025(d): a successful join resets the fork counters"
+        );
+    }
+
+    /// [[SPEC-013-mls-private-channels#REQ-025]](d) — recovery resets the
+    /// DETECTOR, not merely the retry bookkeeping.
+    ///
+    /// `ForkSignal::record_success` fires only on the decrypted APPLICATION path
+    /// in `process_inbound`: a processed Commit never reset it, and a
+    /// re-admission Welcome does not go through `process_inbound` at all. So a
+    /// recovered agent resumed still standing at the threshold, and the next
+    /// single malformed frame from its own group crossed it again immediately —
+    /// one bad frame and the group it had just been re-admitted to was discarded.
+    #[test]
+    fn recovery_resets_the_fork_detector_not_just_the_retry_counters() {
+        let (c_dir, c_wire) = setup("detector", 107, "@creator");
+        let (a_dir, a_wire) = setup("detector", 108, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+        let agent_kp = match kw_value(&a_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("a one-time package"),
+            },
+            _ => panic!("a onetime list"),
+        };
+
+        agent.create_group_as_creator().unwrap();
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for _ in 0..FORK_SIGNAL_THRESHOLD {
+            agent.handle_frame(&garbage);
+        }
+        assert!(agent.group.is_none(), "forked and discarded");
+        assert!(agent.fork_active(), "and reported as forked");
+
+        // Re-admitted.
+        let keypkg = format!("(keypkg @hub :for @agent :kp \"{agent_kp}\")");
+        let SessionEvent::Handled { outbound } = creator.handle_frame(&keypkg) else {
+            panic!("keypkg handled")
+        };
+        let welcome = outbound
+            .iter()
+            .find(|f| f.starts_with("(welcome @room"))
+            .expect("the re-admission Welcome");
+        agent.handle_frame(welcome);
+        assert!(agent.group.is_some(), "recovered");
+        assert!(
+            !agent.fork_active(),
+            "REQ-025(d): the join ends the fork, and the status must say so"
+        );
+
+        // THE POINT: one bad frame after recovery is noise, not a fresh fork.
+        // A detector left standing at the threshold would discard here.
+        match agent.handle_frame(&garbage) {
+            SessionEvent::Dropped { probable_fork, .. } => assert!(
+                !probable_fork,
+                "a single failure after recovery must not re-cross a threshold \
+                 that was never lowered"
+            ),
+            other => panic!("expected a plain drop, got {other:?}"),
+        }
+        assert!(
+            agent.group.is_some(),
+            "and the freshly re-admitted group must survive it"
+        );
+    }
+
+    /// REQ-025(c) — exhausted recovery is TERMINAL and must be readable as such.
+    ///
+    /// Distinct from an active fork, and the distinction is the requirement: a
+    /// fork is a condition the agent is working through, this is the admission
+    /// that it cannot. Reported only through `tracing::error!`, it reached
+    /// nobody — the daemon collects no logs, so an operator saw an agent
+    /// indefinitely "recovering" from something it had already given up on.
+    #[test]
+    fn exhausted_recovery_is_distinguishable_from_an_active_fork() {
+        let (a_dir, a_wire) = setup("exhausted", 109, "@agent");
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        agent.create_group_as_creator().unwrap();
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for _ in 0..FORK_SIGNAL_THRESHOLD {
+            agent.handle_frame(&garbage);
+        }
+        assert!(agent.fork_active(), "forked");
+        assert!(
+            !agent.recovery_exhausted(),
+            "but still trying — these are not the same state"
+        );
+
+        while !agent.resync_frames().is_empty() {}
+        assert!(
+            agent.recovery_exhausted(),
+            "REQ-025(c): the budget is spent and that fact is queryable, not only logged"
         );
     }
 
