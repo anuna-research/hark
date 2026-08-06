@@ -89,6 +89,25 @@ impl ConsumedLedger {
         self.consumed.contains(ref_b64)
     }
 
+    /// Fold another ledger file's refs into this one, ignoring duplicates.
+    ///
+    /// Used to consolidate the per-room ledgers this store used to be split
+    /// across. Forgetting a consumed ref is the failure mode that matters, so a
+    /// missing or unreadable file is skipped rather than fatal — but anything
+    /// that IS readable is absorbed.
+    pub fn absorb(&mut self, path: &Path) -> Result<(), MlsError> {
+        let Ok(bytes) = fs::read(path) else { return Ok(()) };
+        let Ok(file) = serde_json::from_slice::<LedgerFile>(&bytes) else {
+            return Ok(());
+        };
+        let before = self.consumed.len();
+        self.consumed.extend(file.consumed);
+        if self.consumed.len() != before {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
     /// Record a successful consume — called ONLY after a Welcome passed full
     /// validation and the join succeeded (REQ-013 step 4).
     pub fn mark_consumed(&mut self, ref_b64: &str) -> Result<(), MlsError> {
