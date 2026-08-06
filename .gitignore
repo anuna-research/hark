@@ -5,6 +5,10 @@
 **/.DS_Store
 
 # Generated: the zetl vault index is rebuilt by `zetl check`/`zetl build`.
-/.zetl
+# UNANCHORED on purpose. `/.zetl` matched only a vault at the repo root, and this
+# repo's vault is `specs/`, so `specs/.zetl/index.json` — 19k generated lines —
+# stayed untracked and was swept into a commit by a `git add -A`. A generated
+# index is generated wherever its vault is.
+.zetl/
 # Local agent tooling, not part of the project.
 /.claude
