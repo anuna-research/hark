@@ -37,6 +37,8 @@ use super::removal::{RemovalEvidence, remove_member};
 use super::safety::{SafetyNumbers, group_safety_numbers};
 use super::validation::{ForkSignal, Inbound, encrypt_message, enforce_sender, process_inbound};
 use super::{MlsError, MlsIdentity};
+use openmls_traits::OpenMlsProvider;
+
 use crate::chat_frame::FrameSigner;
 use crate::identity::ChatIdentity;
 
@@ -90,6 +92,17 @@ pub enum SessionEvent {
     /// The frame was dropped (undecryptable / failed validation); the
     /// reason is surfaced for logs and the fork flag for REQ-006/REQ-021.
     Dropped { reason: String, probable_fork: bool },
+    /// SPEC-013 REQ-025: the drop crossed the fork threshold, the forked group
+    /// has been discarded, and `outbound` is the signed re-admission request.
+    ///
+    /// Its own variant rather than a flag on [`Self::Dropped`] because it is a
+    /// different instruction to the caller: report the divergence AND put these
+    /// frames on the wire. A drop that silently carried recovery traffic in a
+    /// field most call sites ignore is how the recovery would get lost.
+    Forked {
+        reason: String,
+        outbound: Vec<String>,
+    },
 }
 
 /// The per-connection MLS session.
@@ -152,7 +165,24 @@ pub struct MlsSession {
     /// GroupInfo we can act on; bounded only so the condition becomes visible,
     /// never so that we stop trying.
     seat_refusals: u32,
+    /// SPEC-013 REQ-025(c): resync requests sent since the fork. Its own counter
+    /// and NOT the decrypt-failure counter, which is the F4 defect: once the
+    /// forked group is discarded nothing decrypts, so no further failures accrue
+    /// and a terminal branch keyed on them can never be reached. cbcl-bus shipped
+    /// exactly that, and the spec says hark SHALL NOT copy it.
+    resync_attempts: u32,
+    /// The last resync nonce we emitted, so the next is strictly greater.
+    /// Strictly monotonic and NOT the pin epoch (re-review #1): the pin epoch is
+    /// constant absent a rotation, so a captured resync could be replayed to
+    /// force an eviction.
+    last_resync_nonce: u64,
+    /// REQ-025(c): the terminal surface has been reported; do not repeat it.
+    resync_exhausted: bool,
 }
+
+/// Consecutive re-request attempts before the desync is surfaced as terminal
+/// (SPEC-013 REQ-025(c)).
+const RESYNC_CAP: u32 = 3;
 
 /// Another party holds the room's GroupInfo claim. Clears in seconds.
 const GROUPINFO_CLAIMED_SLUG: &str = "groupinfo-claimed";
@@ -308,6 +338,9 @@ impl MlsSession {
             pending_seat: None,
             seen_gi_epoch: None,
             seat_refusals: 0,
+            resync_attempts: 0,
+            last_resync_nonce: 0,
+            resync_exhausted: false,
         };
 
         if let Some(meta) = meta {
@@ -923,6 +956,126 @@ impl MlsSession {
         }
     }
 
+    /// SPEC-013 REQ-025 — fork recovery, member side.
+    ///
+    /// Our epoch has forked from the live group: we can no longer process its
+    /// Commits or read its messages, and nothing about that resolves by waiting.
+    /// Before this, hark warned and kept the dead group forever, which is the
+    /// state an agent was found in — encrypting happily to an epoch nobody was
+    /// on, for hours, reporting `connected`.
+    ///
+    /// **(a) Discard this group's records ONLY.** `MlsGroup::delete` is scoped to
+    /// the group id, and OpenMLS explicitly does not manage signature material,
+    /// so the identity keystore survives — as does every unconsumed KeyPackage
+    /// init private key, which is stored under its own hash ref rather than the
+    /// group's. Both are required to open the re-admission Welcome, and a
+    /// whole-provider wipe would permanently brick recovery (review F8).
+    ///
+    /// **(b) Ask to be re-admitted, authenticated.** An unsigned request is a
+    /// hub-forgeable eviction of a healthy member, so it is signed under the
+    /// dedicated `cbcl-mls-resync/v1` label — domain-separated from the idkey
+    /// assertion so neither can be replayed as the other.
+    fn begin_resync(&mut self) -> Vec<String> {
+        if let Some(group) = self.group.as_mut() {
+            if let Err(e) = group.delete(OpenMlsProvider::storage(&self.provider)) {
+                // Recovery is still worth attempting: the worst case is that the
+                // re-admission Welcome is refused `GroupAlreadyExists`, which is
+                // where we already are.
+                tracing::warn!(room = %self.room, error = ?e, "discarding the forked group failed");
+            }
+        }
+        self.group = None;
+        self.genesis = None;
+        self.trust = None;
+        self.pending_seat = None;
+        let _ = self.provider.persist();
+        if let Err(e) = self.persist_meta() {
+            tracing::warn!(room = %self.room, error = %e, "resync discard did not persist");
+        }
+        self.resync_attempts = 0;
+        self.resync_exhausted = false;
+        tracing::warn!(
+            room = %self.room,
+            "the encrypted session forked from the room and was discarded — \
+             requesting re-admission (SPEC-013 REQ-025)"
+        );
+        self.resync_frames()
+    }
+
+    /// REQ-025(b)/(c): one re-request, or nothing once the cap is spent.
+    ///
+    /// The cap is counted HERE rather than on decrypt failures. After the discard
+    /// there is no group, so no failures accrue and a budget keyed on them never
+    /// advances — the F4 defect, which left the shipped web client's terminal
+    /// branch unreachable. hark counts what it actually does.
+    ///
+    /// SIMPLIFY: re-requests are driven by roster changes rather than by
+    /// [[SPEC-013-mls-private-channels#REQ-025]](c)'s `RESYNC_WAIT_MS` interval.
+    /// `MlsSession` is synchronous — `handle_frame` returns a `SessionEvent` and
+    /// owns no timer — so a wall-clock interval needs the chat loop, and a roster
+    /// change is the event that can actually make the request answerable (the
+    /// re-provisioner has to be present to honour it).
+    /// **Ceiling:** a room whose roster never changes re-requests only
+    /// `RESYNC_CAP` times across the whole outage — on a quiet channel the
+    /// attempts are spent early and the terminal surface arrives late.
+    /// **Upgrade path:** a `RESYNC_WAIT_MS` timer in `crate::chat`'s select loop
+    /// calling `resync_frames`, which is already idempotent and cap-bounded.
+    fn resync_frames(&mut self) -> Vec<String> {
+        if self.group.is_some() || !self.enc_pinned {
+            return Vec::new();
+        }
+        if self.resync_attempts >= RESYNC_CAP {
+            if !self.resync_exhausted {
+                self.resync_exhausted = true;
+                tracing::error!(
+                    room = %self.room,
+                    attempts = self.resync_attempts,
+                    "the encrypted session could not be re-established after {RESYNC_CAP} \
+                     requests — re-pair this agent into the channel (SPEC-013 REQ-025c)"
+                );
+            }
+            return Vec::new();
+        }
+        self.resync_attempts += 1;
+        // Wall-clock millis, forced strictly upward: a verifier requires the
+        // nonce to exceed the last it honoured for us, so two requests inside one
+        // millisecond must not tie.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let nonce = now.max(self.last_resync_nonce.saturating_add(1));
+        self.last_resync_nonce = nonce;
+        let Ok(key) = <[u8; 32]>::try_from(self.identity.public_key()) else {
+            return Vec::new();
+        };
+        let wire = ChatIdentity::from_seed(self.wire_seed);
+        let sig = wire.sign(&super::pins::resync_signing_bytes(
+            &self.handle,
+            &key,
+            &self.room,
+            nonce,
+        ));
+        // REQ-025(d): the `:resync` marker is what distinguishes this from a
+        // routine re-announce. Only the explicit marker requests re-provisioning,
+        // so an ordinary announce can never churn membership.
+        vec![format!(
+            "(keyready {} :from {} :resync 1 :nonce {} :sig \"{}\")",
+            self.room,
+            self.handle,
+            nonce,
+            B64.encode(sig)
+        )]
+    }
+
+    /// REQ-025(d): a frame we could process means the group is tracking the room
+    /// again, so the fork counters go back to zero. Anything that leaves them set
+    /// would make the NEXT ordinary dropped frame look like a fresh fork.
+    fn clear_resync_state(&mut self) {
+        self.resync_attempts = 0;
+        self.resync_exhausted = false;
+    }
+
     /// SPEC-061 CON-003: a refusal on the path that seats us.
     ///
     /// The two slugs look alike and are nothing alike, and the difference is the
@@ -1050,6 +1203,12 @@ impl MlsSession {
             self.group = Some(outcome.group);
             self.genesis = Some(outcome.genesis);
             self.trust = Some(outcome.trust);
+            // REQ-025(d): a join is the other thing that ends a fork, and on the
+            // recovery path it is THE thing — a re-admission arrives as a Welcome,
+            // never as a Commit we could process. Resetting only on a processed
+            // Commit left a healed member carrying its fork counters, so the next
+            // ordinary dropped frame started from a raised baseline.
+            self.clear_resync_state();
             self.persist_meta()
         })();
         match result {
@@ -1123,6 +1282,7 @@ impl MlsSession {
                 plaintext,
                 sender_handle,
             }) => {
+                self.clear_resync_state();
                 let text = String::from_utf8_lossy(&plaintext).into_owned();
                 // REQ-018: the inner :from must match the MLS sender.
                 if let Some(from) = kw_symbol(&text, ":from") {
@@ -1139,6 +1299,7 @@ impl MlsSession {
                 }
             }
             Ok(Inbound::Handshake) => {
+                self.clear_resync_state();
                 let _ = self.persist_meta();
                 // SPEC-061 REQ-005: the epoch just moved, which spends whatever
                 // GroupInfo the room was holding. Publish one for the new epoch,
@@ -1153,15 +1314,29 @@ impl MlsSession {
             Ok(Inbound::Dropped {
                 reason,
                 probable_fork,
-            }) => SessionEvent::Dropped {
+            }) => self.drop_or_recover(reason, probable_fork),
+            Err(e) => {
+                let probable_fork = self.fork.probable_fork();
+                self.drop_or_recover(e.to_string(), probable_fork)
+            }
+        }
+    }
+
+    /// One undecryptable frame is noise; `FORK_THRESHOLD` in a row is a fork.
+    ///
+    /// Below the threshold this is the old behaviour — count it and move on,
+    /// because a single dropped frame is an ordinary event on a lossy path.
+    /// At it, REQ-025 recovery starts: the run of failures is the evidence that
+    /// our epoch and the room's have parted, and waiting does not mend that.
+    fn drop_or_recover(&mut self, reason: String, probable_fork: bool) -> SessionEvent {
+        if !probable_fork || !self.enc_pinned || self.group.is_none() {
+            return SessionEvent::Dropped {
                 reason,
                 probable_fork,
-            },
-            Err(e) => SessionEvent::Dropped {
-                reason: e.to_string(),
-                probable_fork: self.fork.probable_fork(),
-            },
+            };
         }
+        let outbound = self.begin_resync();
+        SessionEvent::Forked { reason, outbound }
     }
 
     /// REQ-003/REQ-008: the hub answered our `keyget` — add the member if we
@@ -1257,6 +1432,11 @@ impl MlsSession {
             outbound.push(self.keyready_frame());
         }
         outbound.extend(self.keygets_for_addable());
+        // REQ-025(c): the same roster change re-requests re-admission while we
+        // are groupless. A resync needs the re-provisioner to be PRESENT, so a
+        // roster change is not merely a convenient tick — it is the event that
+        // can actually make the request answerable.
+        outbound.extend(self.resync_frames());
         // SPEC-061 REQ-008 / CON-003: a roster change is the natural moment to
         // ask again for something to seat ourselves against. It is what makes a
         // refused attempt recover without a timer — `groupinfo-claimed` clears
@@ -1507,6 +1687,7 @@ fn presence_handles(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mls::validation::FORK_SIGNAL_THRESHOLD;
     use std::path::PathBuf;
 
     fn setup(tag: &str, seed: u8, handle: &str) -> (PathBuf, ChatIdentity) {
@@ -2088,6 +2269,213 @@ mod tests {
                 SessionEvent::NotMls
             ),
             "another room's refusal is not ours"
+        );
+    }
+
+    /// [[SPEC-013-mls-private-channels#REQ-025]] (a)/(b)/(d) — the desync
+    /// self-heal. A fork is the one failure that does not mend by waiting: our
+    /// epoch has parted from the room's, so every later Commit is undecryptable
+    /// and every message we send is sealed to an epoch nobody is on.
+    ///
+    /// Before this, hark warned and kept the dead group forever. An agent was
+    /// found live in exactly that state — reporting `connected`, accepting
+    /// `hark emit` with exit 0, for hours.
+    #[test]
+    fn a_forked_group_is_discarded_and_re_admission_is_requested() {
+        let (c_dir, c_wire) = setup("fork", 100, "@creator");
+        let (a_dir, a_wire) = setup("fork", 101, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        // The agent holds a group of its own to fork away from.
+        agent.create_group_as_creator().unwrap();
+        assert!(agent.group.is_some(), "precondition: we hold a group");
+
+        // FORK_THRESHOLD consecutive undecryptable frames. Below it, a drop is
+        // ordinary noise on a lossy path and must NOT tear down the group.
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for i in 1..FORK_SIGNAL_THRESHOLD {
+            let event = agent.handle_frame(&garbage);
+            assert!(
+                matches!(event, SessionEvent::Dropped { .. }),
+                "drop {i} is noise, not a fork"
+            );
+            assert!(agent.group.is_some(), "and must not discard the group");
+        }
+
+        let SessionEvent::Forked { outbound, .. } = agent.handle_frame(&garbage) else {
+            panic!("crossing the threshold is a fork, not another drop")
+        };
+
+        // (a) the forked group is gone…
+        assert!(agent.group.is_none(), "the forked group is discarded");
+        // …and the identity survives it, because the re-admission Welcome is
+        // opened with exactly that key material. A whole-provider wipe here
+        // would permanently brick recovery (review F8).
+        assert!(
+            agent.own_idkey_frame().is_ok(),
+            "the identity keystore MUST survive the discard"
+        );
+
+        // (b) the request is signed, marked, and nonced.
+        let resync = outbound
+            .iter()
+            .find(|f| f.starts_with("(keyready @room"))
+            .expect("a re-admission request MUST go out");
+        assert!(
+            resync.contains(":resync 1"),
+            "REQ-025(d): only an explicit marker requests re-provisioning — a routine \
+             re-announce must never churn membership: {resync}"
+        );
+        let nonce = kw_u64(resync, ":nonce").expect("a nonce");
+        let sig = kw_b64(resync, ":sig").expect("a signature");
+        let key = <[u8; 32]>::try_from(agent.identity.public_key()).unwrap();
+        // An unsigned request is a hub-forgeable eviction of a healthy member,
+        // so the verifier checks this against the requester's PINNED key.
+        {
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            let vk = VerifyingKey::from_bytes(&a_wire.verifying_key_bytes()).unwrap();
+            let signed =
+                super::super::pins::resync_signing_bytes(&agent.handle, &key, "@room", nonce);
+            assert!(
+                vk.verify(&signed, &Signature::from_slice(&sig).unwrap()).is_ok(),
+                "the resync MUST verify under the requester's own PINNED wire key — \
+                 an unsigned or wrongly-signed one is a hub-forgeable eviction"
+            );
+        }
+    }
+
+    /// [[SPEC-013-mls-private-channels#TEST-025]] positive + negative-output (F8)
+    /// — the whole point of the discard being SCOPED.
+    ///
+    /// A forked member must recover to the live epoch after re-admission, and it
+    /// can only do that if the discard left its identity keystore and its
+    /// unconsumed [[KeyPackage]] init private keys alone. A whole-provider wipe
+    /// looks like a tidier fix and permanently bricks recovery: the re-admission
+    /// Welcome is sealed to an init key the victim no longer holds.
+    ///
+    /// Asserted end to end rather than by inspecting storage, because "the keys
+    /// are still there" is only interesting if the Welcome actually opens.
+    #[test]
+    fn a_discarded_member_can_still_open_its_re_admission_welcome() {
+        let (c_dir, c_wire) = setup("heal", 103, "@creator");
+        let (a_dir, a_wire) = setup("heal", 104, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        // The agent's one-time packages, published BEFORE the fork. These are
+        // what the re-admission Welcome will be sealed to.
+        let agent_kp = match kw_value(&a_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("a one-time package"),
+            },
+            _ => panic!("a onetime list"),
+        };
+
+        // The agent holds a group and forks away from it.
+        agent.create_group_as_creator().unwrap();
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for _ in 0..FORK_SIGNAL_THRESHOLD {
+            agent.handle_frame(&garbage);
+        }
+        assert!(agent.group.is_none(), "precondition: forked and discarded");
+
+        // The creator honours the request by adding it at the live epoch.
+        let keypkg = format!("(keypkg @hub :for @agent :kp \"{agent_kp}\")");
+        let SessionEvent::Handled { outbound } = creator.handle_frame(&keypkg) else {
+            panic!("keypkg handled")
+        };
+        let welcome = outbound
+            .iter()
+            .find(|f| f.starts_with("(welcome @room"))
+            .expect("the re-admission Welcome");
+
+        // F8: if the discard had wiped the provider, this is where recovery would
+        // be permanently dead — the Welcome would be sealed to an init key the
+        // agent no longer holds.
+        agent.handle_frame(welcome);
+        assert!(
+            agent.group.is_some(),
+            "the re-admission Welcome MUST open — a scoped discard is the whole \
+             difference between recoverable and bricked (review F8)"
+        );
+        assert_eq!(
+            agent.safety_numbers().ok().map(|s| s.epoch_state),
+            creator.safety_numbers().ok().map(|s| s.epoch_state),
+            "and the healed member converges on the room's epoch (REQ-021/024)"
+        );
+        assert_eq!(
+            agent.resync_attempts, 0,
+            "REQ-025(d): a successful join resets the fork counters"
+        );
+    }
+
+    /// REQ-025(b), re-review #1 — the nonce is strictly monotonic, and it is NOT
+    /// the pin epoch. The pin epoch is constant absent a rotation, so a captured
+    /// resync could be replayed to evict a healthy member at will.
+    ///
+    /// REQ-025(c) — and the retry budget is spent on REQUESTS, not on decrypt
+    /// failures. That is the F4 defect the spec names: after the discard nothing
+    /// decrypts, so no failures accrue and a terminal branch keyed on them can
+    /// never be reached. cbcl-bus shipped exactly that; hark SHALL NOT copy it.
+    #[test]
+    fn resync_nonces_rise_and_the_retry_budget_is_finite() {
+        let (a_dir, a_wire) = setup("fork-cap", 102, "@agent");
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        agent.create_group_as_creator().unwrap();
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for _ in 0..FORK_SIGNAL_THRESHOLD {
+            agent.handle_frame(&garbage);
+        }
+        assert!(agent.group.is_none(), "forked and discarded");
+
+        let mut nonces = vec![agent.last_resync_nonce];
+        // The first request was spent by the fork itself; the cap covers the run.
+        let mut sent = 1;
+        for _ in 0..10 {
+            let frames = agent.resync_frames();
+            if frames.is_empty() {
+                break;
+            }
+            sent += 1;
+            nonces.push(agent.last_resync_nonce);
+        }
+        assert_eq!(
+            sent, RESYNC_CAP,
+            "the budget is finite and reachable while groupless (REQ-025c / review F4)"
+        );
+        assert!(
+            nonces.windows(2).all(|w| w[1] > w[0]),
+            "every nonce strictly exceeds the last: {nonces:?}"
+        );
+        assert!(
+            agent.resync_frames().is_empty(),
+            "and a spent budget stays spent rather than looping"
+        );
+        assert!(
+            agent.resync_exhausted,
+            "F4: the TERMINAL surface is reached, not dead code — the shipped web \
+             client keyed it on decrypt failures that stop accruing after the discard"
         );
     }
 

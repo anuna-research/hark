@@ -1283,6 +1283,22 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             tracing::warn!(reason, "ds-admitted record failed MLS apply; cursor NOT committed");
                             continue;
                         }
+                        // SPEC-013 REQ-025 on the DS path. The cursor is held for
+                        // the same reason a plain drop holds it — the record was
+                        // not applied — but the recovery request still has to go
+                        // out, or the group we just discarded is never rebuilt.
+                        SessionEvent::Forked { reason, outbound } => {
+                            tracing::warn!(reason, "ds-admitted record forked the group; requesting re-admission");
+                            let _ = store.set_mls_fork(&handle, Some(sanitize(&reason))).await;
+                            for text in &outbound {
+                                let Ok(payload) = payload_bytes(text) else { continue };
+                                let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
+                                if websocket.send(WsMessage::Binary(frame.into())).await.is_err() {
+                                    break;   // the reconnect path re-drives it
+                                }
+                            }
+                            continue;
+                        }
                     };
                     if let Err(error) = session.persist_v1_state(apply.generation, &apply.log) {
                         tracing::warn!(%error, "CON-013 persist failed; durable cursor holds");
@@ -1452,6 +1468,24 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                                         .await;
                                 } else {
                                     tracing::debug!(reason, "mls frame dropped");
+                                }
+                                None
+                            }
+                            // SPEC-013 REQ-025: the forked group has been
+                            // discarded and `outbound` is the signed re-admission
+                            // request. Reported as a fork AND sent — the whole
+                            // point of the variant is that the recovery does not
+                            // depend on anyone noticing a log line.
+                            SessionEvent::Forked { reason, outbound } => {
+                                tracing::warn!(reason, "mls fork — discarded the group and requested re-admission (REQ-025)");
+                                let _ = store.set_mls_fork(&handle, Some(sanitize(&reason))).await;
+                                for text in &outbound {
+                                    let Ok(payload) = payload_bytes(text) else { continue };
+                                    let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
+                                    if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
+                                        pending_reconnect = Some(sanitize(&error.to_string()));
+                                        break;
+                                    }
                                 }
                                 None
                             }
