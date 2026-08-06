@@ -435,6 +435,36 @@ mod tests {
         assert_eq!(r.tracked(), 0);
     }
 
+    /// cbcl-bus SPEC-070 REQ-004 — the hub now leads a backfilling join with a
+    /// `backfilltimes` control frame naming the admission time of each frame it
+    /// is about to replay. hark neither needs nor reads it, and this pins down
+    /// that receiving one is a NON-EVENT: no actions, nothing tracked, and no
+    /// error that could take the connection down with it.
+    ///
+    /// The frame is worth its own test rather than another entry in the list
+    /// above because it is the first performative hark has met that it has never
+    /// heard of at all — the others are verbs it knows and declines to answer.
+    /// A hub is free to add control frames; a client that fell over on one it
+    /// did not recognise would make every such addition a breaking change.
+    #[test]
+    fn an_unknown_hub_control_frame_is_a_non_event() {
+        let mut r = responder();
+        for frame in [
+            "(backfilltimes @general :times (1786007287642 1786007287643))",
+            "(backfilltimes @general :times (0))",
+            // A shape hark has no grammar for at all, malformed list included:
+            // still dropped, still not fatal.
+            "(backfilltimes @general :times ())",
+            "(somethingtheydidnotinventyet @general :whatever \"x\")",
+        ] {
+            assert!(
+                r.on_inbound(frame).is_empty(),
+                "an unknown hub control frame must be ignored: {frame}"
+            );
+        }
+        assert_eq!(r.tracked(), 0);
+    }
+
     #[test]
     fn non_capable_lang_dialect_is_dropped() {
         let mut r = responder();
