@@ -409,7 +409,7 @@ mod tests {
                 &kp.bytes,
                 "@bob",
                 &alice.pins,
-                &alice.ledger,
+                &mut alice.ledger,
             
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
@@ -606,7 +606,7 @@ mod tests {
                 &kp.bytes,
                 "@bob",
                 &alice.pins,
-                &alice.ledger,
+                &mut alice.ledger,
             
             "@research",
             crate::mls::claim::CommitPromise::Inactive,
@@ -676,7 +676,7 @@ mod tests {
                 &kp.bytes,
                 "@bob",
                 &alice.pins,
-                &alice.ledger,
+                &mut alice.ledger,
             
             "@research",
             crate::mls::claim::CommitPromise::Inactive,

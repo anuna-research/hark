@@ -89,6 +89,25 @@ impl ConsumedLedger {
         self.consumed.contains(ref_b64)
     }
 
+    /// Fold another ledger file's refs into this one, ignoring duplicates.
+    ///
+    /// Used to consolidate the per-room ledgers this store used to be split
+    /// across. Forgetting a consumed ref is the failure mode that matters, so a
+    /// missing or unreadable file is skipped rather than fatal — but anything
+    /// that IS readable is absorbed.
+    pub fn absorb(&mut self, path: &Path) -> Result<(), MlsError> {
+        let Ok(bytes) = fs::read(path) else { return Ok(()) };
+        let Ok(file) = serde_json::from_slice::<LedgerFile>(&bytes) else {
+            return Ok(());
+        };
+        let before = self.consumed.len();
+        self.consumed.extend(file.consumed);
+        if self.consumed.len() != before {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
     /// Record a successful consume — called ONLY after a Welcome passed full
     /// validation and the join succeeded (REQ-013 step 4).
     pub fn mark_consumed(&mut self, ref_b64: &str) -> Result<(), MlsError> {
@@ -142,9 +161,20 @@ fn build_key_package(
     lifetime_secs: u64,
     last_resort: bool,
 ) -> Result<BuiltKeyPackage, MlsError> {
-    let bundle = KeyPackage::builder()
+    // The last-resort flag has to reach the WIRE, or it is a fact only the
+    // publisher knows. It was a local `bool` that changed nothing but the
+    // lifetime, so a package the module documents as reusable was
+    // indistinguishable from a single-use one to the party that has to decide
+    // whether to reuse it — the adder. `mark_as_last_resort` puts the RFC 9420
+    // extension on the package itself, which is what makes
+    // `KeyPackage::last_resort()` mean anything on the receiving side.
+    let mut builder = KeyPackage::builder()
         .leaf_node_capabilities(genesis_capabilities())
-        .key_package_lifetime(Lifetime::new(lifetime_secs))
+        .key_package_lifetime(Lifetime::new(lifetime_secs));
+    if last_resort {
+        builder = builder.mark_as_last_resort();
+    }
+    let bundle = builder
         .build(
             super::CIPHERSUITE,
             provider,
