@@ -2423,6 +2423,38 @@ mod tests {
         );
     }
 
+    /// cbcl-bus SPEC-070 REQ-004 — the hub leads a backfilling join with a
+    /// `backfilltimes` control frame. `handle_frame` must classify it as
+    /// `NotMls` and pass it on untouched: an MLS session that treated an
+    /// unrecognised hub verb as anything else — a fork signal, a drop, an error
+    /// — would turn every future control frame the hub adds into an outage for
+    /// agents that predate it.
+    ///
+    /// Asserted on an ENCRYPTED session, which is the strict case: that is where
+    /// `handle_frame` consumes the most verbs and where a misclassification
+    /// would do real damage.
+    #[test]
+    fn an_unknown_hub_control_frame_is_not_mls() {
+        let (dir, wire) = setup("backfilltimes", 82, "@aria");
+        let mut session =
+            MlsSession::open(&dir, "aria", "@research", "@aria", &wire, true).unwrap();
+        assert!(session.encrypted(), "cap presence pins encrypted");
+
+        for frame in [
+            "(backfilltimes @research :times (1786007287642 1786007287643))",
+            "(backfilltimes @research :times (0))",
+            "(somethingtheydidnotinventyet @research :whatever \"x\")",
+        ] {
+            assert!(
+                matches!(session.handle_frame(frame), SessionEvent::NotMls),
+                "an unknown hub control frame must fall through to the plaintext \
+                 path, never be consumed or dropped: {frame}"
+            );
+        }
+        // …and the session is still usable: nothing about it was disturbed.
+        assert!(session.encrypted(), "the pin MUST survive an unknown frame");
+    }
+
     /// TEST-023 (REQ-023): the admission-path pin; `roomcfg :enc false` on a
     /// pinned channel is a refused downgrade and the session will not send.
     #[test]
