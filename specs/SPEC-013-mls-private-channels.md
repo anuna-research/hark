@@ -533,6 +533,27 @@ member** ([[#REQ-017]]); missing/stale persisted state → re-join, logged.
 > `RESYNC_RATE` honored resyncs per **wall-clock window** (NOT per MLS epoch — re-review #2). These
 > additions still require a **cross-vendor** Principle-12 pass before approval (both reviews so far
 > were same-family Claude; the round-6 precedent used GPT-5.x).
+>
+> **Implementation status (member half):** [[#REQ-025]] (a)–(d) are implemented in
+> `src/mls/session.rs` (`begin_resync`, `resync_frames`, `drop_or_recover`) and surfaced by
+> `SessionEvent::Forked` through `src/chat.rs`. Covered by
+> `a_forked_group_is_discarded_and_re_admission_is_requested`,
+> `resync_nonces_rise_and_the_retry_budget_is_finite` and
+> `a_discarded_member_can_still_open_its_re_admission_welcome`, all Red-Gated against the previous
+> warn-and-keep behaviour. Two deviations, both deliberate and neither closed:
+>
+> - `RESYNC_WAIT_MS` is **not** implemented as an interval. Re-requests are driven by roster
+>   changes instead — `MlsSession` owns no timer, and a roster change is the event that makes a
+>   request answerable at all, since the re-provisioner must be present to honour it. Annotated
+>   `SIMPLIFY:` at `resync_frames` with its ceiling (a quiet room spends its `RESYNC_CAP` early)
+>   and upgrade path.
+> - [[#REQ-026]] — the **creator** half — is not implemented. hark can ask to be re-admitted and
+>   cannot yet honour another member's request, so an all-agent channel has no re-provisioner and
+>   falls to manual re-pairing. This is the same asymmetry [[#REQ-026]](b) already describes for a
+>   room whose creator is not the elected owner.
+>
+> The cross-vendor Principle-12 pass above remains **outstanding** and is not satisfied by the
+> implementing session, which cannot validate its own artefact.
 
 - **REQ-025 — Fork recovery: desync self-heal (member side).** When the [[#REQ-006]]
   consecutive-decrypt-failure counter for the agent's own group reaches `FORK_THRESHOLD` — its
