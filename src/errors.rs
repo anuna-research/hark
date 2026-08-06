@@ -38,6 +38,18 @@ pub enum AppError {
     MissingAgentHandle,
     #[error("agent handle is not active or usable")]
     AgentHandleUnavailable,
+    /// The same condition as [`AppError::AgentHandleUnavailable`] — exit 7 —
+    /// but detected CLIENT-side, where we can say which name failed and how to
+    /// find the right one.
+    ///
+    /// It exists because the exit code is the contract and the message is not.
+    /// A handle the daemon rejects (`unknown_agent_handle`) and a wire name the
+    /// CLI cannot resolve are the same problem to a script, and both must be 7;
+    /// but the CLI knows the name the user typed and the daemon does not, so
+    /// collapsing this into the message-less variant would trade a good
+    /// diagnosis for a correct number. This keeps both.
+    #[error("{0}")]
+    AgentHandleUnknown(String),
     #[error("CBCL validation failed")]
     CbclValidation,
     #[error("router connection failed")]
@@ -64,7 +76,9 @@ impl AppError {
             Self::DaemonAlreadyRunning => ExitCode::DaemonAlreadyRunning,
             Self::StaleDaemonState => ExitCode::StaleDaemonState,
             Self::MissingAgentHandle => ExitCode::MissingAgentHandle,
-            Self::AgentHandleUnavailable => ExitCode::AgentHandleUnavailable,
+            Self::AgentHandleUnavailable | Self::AgentHandleUnknown(_) => {
+                ExitCode::AgentHandleUnavailable
+            }
             Self::CbclValidation => ExitCode::CbclValidation,
             Self::RouterConnection => ExitCode::RouterConnection,
             Self::Timeout => ExitCode::Timeout,
@@ -94,6 +108,12 @@ mod tests {
             (AppError::MissingAgentHandle, ExitCode::MissingAgentHandle),
             (
                 AppError::AgentHandleUnavailable,
+                ExitCode::AgentHandleUnavailable,
+            ),
+            // The client-side twin: a different message, deliberately the SAME
+            // code, so a script cannot tell which layer noticed the dead handle.
+            (
+                AppError::AgentHandleUnknown("no live agent named @ghost".into()),
                 ExitCode::AgentHandleUnavailable,
             ),
             (AppError::CbclValidation, ExitCode::CbclValidation),
