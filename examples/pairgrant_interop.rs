@@ -122,7 +122,26 @@ fn seat(dir: &Path) {
     std::fs::write(dir.join("commit.b64"), ct).unwrap();
     std::fs::write(dir.join("joiner.txt"), AGENT).unwrap();
 
+    // SPEC-061 REQ-008: building the Commit is not being seated. The hub fans a
+    // sender its own frame back, and that echo is the only acknowledgement this
+    // path gets — so the harness has to deliver it, exactly as the hub would, or
+    // it is testing a state the agent deliberately no longer enters.
+    match session.handle_frame(&commit) {
+        SessionEvent::Handled { .. } => {}
+        other => {
+            eprintln!("FAIL: the agent did not accept the echo of its own Commit: {other:?}");
+            std::process::exit(1);
+        }
+    }
+
+    // ASSERTED, not printed. This script previously reported PASS on a line it
+    // only displayed — and a harness that goes green while verifying nothing is
+    // the defect SPEC-027 §9a records having already been fixed once here.
     let members = session.member_handles().unwrap_or_default();
+    if !members.iter().any(|h| h == AGENT) {
+        eprintln!("FAIL: {AGENT} is not in its own ratchet tree after the echo: {members:?}");
+        std::process::exit(1);
+    }
     println!("PASS: hark seated itself by external Commit on a member-signed grant");
     println!("      members: {members:?}");
 }

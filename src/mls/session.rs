@@ -37,6 +37,8 @@ use super::removal::{RemovalEvidence, remove_member};
 use super::safety::{SafetyNumbers, group_safety_numbers};
 use super::validation::{ForkSignal, Inbound, encrypt_message, enforce_sender, process_inbound};
 use super::{MlsError, MlsIdentity};
+use openmls_traits::OpenMlsProvider;
+
 use crate::chat_frame::FrameSigner;
 use crate::identity::ChatIdentity;
 
@@ -90,6 +92,17 @@ pub enum SessionEvent {
     /// The frame was dropped (undecryptable / failed validation); the
     /// reason is surfaced for logs and the fork flag for REQ-006/REQ-021.
     Dropped { reason: String, probable_fork: bool },
+    /// SPEC-013 REQ-025: the drop crossed the fork threshold, the forked group
+    /// has been discarded, and `outbound` is the signed re-admission request.
+    ///
+    /// Its own variant rather than a flag on [`Self::Dropped`] because it is a
+    /// different instruction to the caller: report the divergence AND put these
+    /// frames on the wire. A drop that silently carried recovery traffic in a
+    /// field most call sites ignore is how the recovery would get lost.
+    Forked {
+        reason: String,
+        outbound: Vec<String>,
+    },
 }
 
 /// The per-connection MLS session.
@@ -125,6 +138,78 @@ pub struct MlsSession {
     /// late joiner would otherwise never receive an earlier member's key and
     /// could not pin it for the REQ-008 adder check.
     present: std::collections::HashSet<String>,
+    /// SPEC-061 REQ-008 — an external Commit we have built and sent but that
+    /// nobody has acknowledged yet.
+    ///
+    /// It is held HERE rather than in `group` because installing it there is what
+    /// spends the grant: `self_seat_frames` will not act while a group is held,
+    /// so a commit that lost the ordering race used to leave the agent with a
+    /// phantom epoch, no way to re-seat, and no way to tell. That is cbcl-bus
+    /// BUG-022 from the joiner's side — "the grant MUST NOT be spent until the
+    /// join is acknowledged".
+    ///
+    /// RFC 9420 §14 is explicit that a joiner's own build succeeds whether or not
+    /// the Commit is accepted, so holding the group is NOT evidence that anyone
+    /// agreed. The evidence is the hub fanning our own Commit back to us.
+    pending_seat: Option<PendingSeat>,
+    /// The highest GroupInfo epoch seen for this room.
+    ///
+    /// Every member republishes a GroupInfo after every merged handshake, so in a
+    /// room with several members a joiner receives several — including stale ones
+    /// from members that merged a moment ago. Building against the first one that
+    /// arrives is building against whichever member's frame won a race, which is
+    /// how a self-seating agent ends up committing at an epoch the room has
+    /// already left.
+    seen_gi_epoch: Option<u64>,
+    /// Consecutive refusals on the seating path (SPEC-061 CON-003). Reset by a
+    /// GroupInfo we can act on; bounded only so the condition becomes visible,
+    /// never so that we stop trying.
+    seat_refusals: u32,
+    /// SPEC-013 REQ-025(c): resync requests sent since the fork. Its own counter
+    /// and NOT the decrypt-failure counter, which is the F4 defect: once the
+    /// forked group is discarded nothing decrypts, so no further failures accrue
+    /// and a terminal branch keyed on them can never be reached. cbcl-bus shipped
+    /// exactly that, and the spec says hark SHALL NOT copy it.
+    resync_attempts: u32,
+    /// The last resync nonce we emitted, so the next is strictly greater.
+    /// Strictly monotonic and NOT the pin epoch (re-review #1): the pin epoch is
+    /// constant absent a rotation, so a captured resync could be replayed to
+    /// force an eviction.
+    last_resync_nonce: u64,
+    /// REQ-025(c): the terminal surface has been reported; do not repeat it.
+    resync_exhausted: bool,
+    /// SPEC-013 REQ-006: set when a fork is detected, cleared by the Commit or
+    /// join that ends it. The session's own view of whether it is diverged, so
+    /// the transport loop can mirror a fact instead of inferring one.
+    fork_active: bool,
+}
+
+/// Consecutive re-request attempts before the desync is surfaced as terminal
+/// (SPEC-013 REQ-025(c)).
+const RESYNC_CAP: u32 = 3;
+
+/// Another party holds the room's GroupInfo claim. Clears in seconds.
+const GROUPINFO_CLAIMED_SLUG: &str = "groupinfo-claimed";
+/// The room has published no GroupInfo. Clears when a member republishes, not
+/// with time — deliberately NOT the same thing as contention.
+const NO_GROUPINFO_SLUG: &str = "no-groupinfo";
+/// Refusals tolerated before the stall is logged at `warn` rather than `info`.
+/// Not a give-up: an agent that stops asking never gets in at all.
+const SEAT_REFUSAL_BUDGET: u32 = 10;
+
+/// An external Commit awaiting acknowledgement (SPEC-061 REQ-008).
+struct PendingSeat {
+    /// The group as it will be once the Commit is accepted. Not installed until
+    /// then, and dropped if a newer GroupInfo makes this attempt stale.
+    group: MlsGroup,
+    genesis: GenesisAssertion,
+    trust: GenesisTrust,
+    /// The base64 Commit exactly as it went on the wire — the bytes the hub's
+    /// echo is matched against. Matched below the MLS layer deliberately: our own
+    /// session would reject its own echoed Commit as already-merged.
+    ct_b64: String,
+    /// The GroupInfo epoch this Commit was built against.
+    epoch: u64,
 }
 
 /// The on-disk stem for one agent's MLS state **in one room**.
@@ -254,6 +339,13 @@ impl MlsSession {
             wire_seed: wire.signing_seed(),
             pair_grant: None,
             present: std::collections::HashSet::new(),
+            pending_seat: None,
+            seen_gi_epoch: None,
+            seat_refusals: 0,
+            resync_attempts: 0,
+            last_resync_nonce: 0,
+            resync_exhausted: false,
+            fork_active: false,
         };
 
         if let Some(meta) = meta {
@@ -651,6 +743,10 @@ impl MlsSession {
             return SessionEvent::NotMls;
         };
         match performative.as_str() {
+            // SPEC-061 CON-003 — the JOINER path's refusals. Consumed only when
+            // they are ours; every other error still falls through to the
+            // plaintext path so an operator keeps seeing them.
+            "error" => self.on_error(text),
             "roomcfg" => match self.on_roomcfg(text) {
                 Ok(()) => SessionEvent::NotMls, // also a join ack; let the loop see it
                 Err(e) => SessionEvent::Dropped {
@@ -757,6 +853,13 @@ impl MlsSession {
         if !self.enc_pinned || self.group.is_some() || self.pair_grant.is_none() {
             return Vec::new();
         }
+        // An unacknowledged attempt is still an attempt. Asking again would build
+        // a second external Commit against a second GroupInfo while the first is
+        // still in flight — two Commits from us for one epoch, which is the
+        // conflict this path exists to avoid rather than cause.
+        if self.pending_seat.is_some() {
+            return Vec::new();
+        }
         vec![format!("(groupinfoget {} :from {})", self.room, self.handle)]
     }
 
@@ -780,6 +883,43 @@ impl MlsSession {
                 probable_fork: false,
             };
         };
+        // REQ-005 puts the epoch on the wire because the hub cannot parse a
+        // GroupInfo and so cannot tell which one is newest. Reading it is the
+        // difference between seating against the room's current state and
+        // seating against whichever member's republication reached us first.
+        //
+        // A GroupInfo is single-use (RFC 9420 §12.4.3.2) and every member
+        // republishes after every merged handshake, so several arrive and the
+        // older ones are already spent. Building on one of those produces a
+        // Commit every member refuses for `WrongEpoch` — and, before this, an
+        // agent that then believed it was a member.
+        let epoch = match kw_u64(text, ":epoch") {
+            Some(epoch) => epoch,
+            None => {
+                return SessionEvent::Dropped {
+                    reason: "groupinfo missing :epoch".into(),
+                    probable_fork: false,
+                };
+            }
+        };
+        if self.seen_gi_epoch.is_some_and(|seen| epoch < seen) {
+            return SessionEvent::Handled { outbound: vec![] }; // stale; a newer one is in hand
+        }
+        self.seen_gi_epoch = Some(epoch);
+        self.seat_refusals = 0; // the room answered; the run of refusals is over
+        // A newer GroupInfo means the attempt in flight was built against an
+        // epoch the room has left, so it cannot be accepted. Drop it and build
+        // again — the grant was never spent, which is the point of holding it.
+        if let Some(pending) = &self.pending_seat {
+            if epoch <= pending.epoch {
+                return SessionEvent::Handled { outbound: vec![] };
+            }
+            tracing::info!(
+                room = %self.room, stale = pending.epoch, fresh = epoch,
+                "a newer GroupInfo arrived — rebuilding the external Commit against it"
+            );
+            self.pending_seat = None;
+        }
         match join_by_grant(
             &self.provider,
             &self.identity,
@@ -790,18 +930,22 @@ impl MlsSession {
         ) {
             Ok(joined) => {
                 let commit = B64.encode(&joined.commit);
-                self.group = Some(joined.group);
-                self.genesis = Some(joined.genesis);
-                self.trust = Some(joined.trust);
-                if let Err(e) = self.persist_meta() {
-                    return SessionEvent::Dropped {
-                        reason: e.to_string(),
-                        probable_fork: false,
-                    };
-                }
+                // NOT installed as `self.group`, and the meta is NOT persisted.
+                // Both of those are how the grant gets spent, and until the hub
+                // fans this Commit back there is no evidence anybody accepted it.
+                // A build that succeeds proves only that we can construct a
+                // Commit, which RFC 9420 §14 says is true whether or not it wins.
+                self.pending_seat = Some(PendingSeat {
+                    group: joined.group,
+                    genesis: joined.genesis,
+                    trust: joined.trust,
+                    ct_b64: commit.clone(),
+                    epoch,
+                });
                 tracing::info!(
-                    room = %self.room,
-                    "seated ourselves by external Commit on a pairing grant (SPEC-061 REQ-008)"
+                    room = %self.room, epoch,
+                    "sent an external Commit to seat ourselves (SPEC-061 REQ-008) — \
+                     awaiting the hub's echo before treating it as accepted"
                 );
                 SessionEvent::Handled {
                     outbound: vec![format!(
@@ -815,6 +959,295 @@ impl MlsSession {
                 probable_fork: false,
             },
         }
+    }
+
+    /// SPEC-013 REQ-025 — fork recovery, member side.
+    ///
+    /// Our epoch has forked from the live group: we can no longer process its
+    /// Commits or read its messages, and nothing about that resolves by waiting.
+    /// Before this, hark warned and kept the dead group forever, which is the
+    /// state an agent was found in — encrypting happily to an epoch nobody was
+    /// on, for hours, reporting `connected`.
+    ///
+    /// **(a) Discard this group's records ONLY.** `MlsGroup::delete` is scoped to
+    /// the group id, and OpenMLS explicitly does not manage signature material,
+    /// so the identity keystore survives — as does every unconsumed KeyPackage
+    /// init private key, which is stored under its own hash ref rather than the
+    /// group's. Both are required to open the re-admission Welcome, and a
+    /// whole-provider wipe would permanently brick recovery (review F8).
+    ///
+    /// **(b) Ask to be re-admitted, authenticated.** An unsigned request is a
+    /// hub-forgeable eviction of a healthy member, so it is signed under the
+    /// dedicated `cbcl-mls-resync/v1` label — domain-separated from the idkey
+    /// assertion so neither can be replayed as the other.
+    fn begin_resync(&mut self) -> Vec<String> {
+        if let Some(group) = self.group.as_mut() {
+            if let Err(e) = group.delete(OpenMlsProvider::storage(&self.provider)) {
+                // Recovery is still worth attempting: the worst case is that the
+                // re-admission Welcome is refused `GroupAlreadyExists`, which is
+                // where we already are.
+                tracing::warn!(room = %self.room, error = ?e, "discarding the forked group failed");
+            }
+        }
+        self.group = None;
+        self.genesis = None;
+        self.trust = None;
+        self.pending_seat = None;
+        let _ = self.provider.persist();
+        if let Err(e) = self.persist_meta() {
+            tracing::warn!(room = %self.room, error = %e, "resync discard did not persist");
+        }
+        self.resync_attempts = 0;
+        self.resync_exhausted = false;
+        self.fork_active = true;
+        tracing::warn!(
+            room = %self.room,
+            "the encrypted session forked from the room and was discarded — \
+             requesting re-admission (SPEC-013 REQ-025)"
+        );
+        // Two routes out, and they are not alternatives — take both.
+        //
+        // The resync asks a re-provisioner to remove-and-re-add us, which needs
+        // one to be online and willing ([[SPEC-013-mls-private-channels#REQ-026]]).
+        // The self-seat needs only a GroupInfo from the hub, because the grant
+        // already carries a member's permission — and after [[SPEC-061]] REQ-008
+        // the discard leaves that grant UNSPENT, so it is still redeemable.
+        //
+        // Emitting only the resync here left an agent that could seat itself
+        // waiting on a roster change to notice, which on a quiet channel is not a
+        // wait but a stall. Both frames are no-ops when their preconditions do
+        // not hold, so sending them together costs nothing when only one applies.
+        let mut frames = self.resync_frames();
+        frames.extend(self.self_seat_frames());
+        frames
+    }
+
+    /// REQ-025(b)/(c): one re-request, or nothing once the cap is spent.
+    ///
+    /// The cap is counted HERE rather than on decrypt failures. After the discard
+    /// there is no group, so no failures accrue and a budget keyed on them never
+    /// advances — the F4 defect, which left the shipped web client's terminal
+    /// branch unreachable. hark counts what it actually does.
+    ///
+    /// SIMPLIFY: re-requests are driven by roster changes rather than by
+    /// [[SPEC-013-mls-private-channels#REQ-025]](c)'s `RESYNC_WAIT_MS` interval.
+    /// `MlsSession` is synchronous — `handle_frame` returns a `SessionEvent` and
+    /// owns no timer — so a wall-clock interval needs the chat loop, and a roster
+    /// change is the event that can actually make the request answerable (the
+    /// re-provisioner has to be present to honour it).
+    /// **Ceiling:** a room whose roster never changes re-requests only
+    /// `RESYNC_CAP` times across the whole outage — on a quiet channel the
+    /// attempts are spent early and the terminal surface arrives late.
+    /// **Upgrade path:** a `RESYNC_WAIT_MS` timer in `crate::chat`'s select loop
+    /// calling `resync_frames`, which is already idempotent and cap-bounded.
+    fn resync_frames(&mut self) -> Vec<String> {
+        if self.group.is_some() || !self.enc_pinned {
+            return Vec::new();
+        }
+        if self.resync_attempts >= RESYNC_CAP {
+            if !self.resync_exhausted {
+                self.resync_exhausted = true;
+                tracing::error!(
+                    room = %self.room,
+                    attempts = self.resync_attempts,
+                    "the encrypted session could not be re-established after {RESYNC_CAP} \
+                     requests — re-pair this agent into the channel (SPEC-013 REQ-025c)"
+                );
+            }
+            return Vec::new();
+        }
+        self.resync_attempts += 1;
+        // Wall-clock millis, forced strictly upward: a verifier requires the
+        // nonce to exceed the last it honoured for us, so two requests inside one
+        // millisecond must not tie.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let nonce = now.max(self.last_resync_nonce.saturating_add(1));
+        self.last_resync_nonce = nonce;
+        let Ok(key) = <[u8; 32]>::try_from(self.identity.public_key()) else {
+            return Vec::new();
+        };
+        let wire = ChatIdentity::from_seed(self.wire_seed);
+        let sig = wire.sign(&super::pins::resync_signing_bytes(
+            &self.handle,
+            &key,
+            &self.room,
+            nonce,
+        ));
+        // REQ-025(d): the `:resync` marker is what distinguishes this from a
+        // routine re-announce. Only the explicit marker requests re-provisioning,
+        // so an ordinary announce can never churn membership.
+        vec![format!(
+            "(keyready {} :from {} :resync 1 :nonce {} :sig \"{}\")",
+            self.room,
+            self.handle,
+            nonce,
+            B64.encode(sig)
+        )]
+    }
+
+    /// REQ-025(d): a frame we could process means the group is tracking the room
+    /// again, so the fork counters go back to zero. Anything that leaves them set
+    /// would make the NEXT ordinary dropped frame look like a fresh fork.
+    fn clear_resync_state(&mut self) {
+        self.resync_attempts = 0;
+        self.resync_exhausted = false;
+        self.fork_active = false;
+        // AND the detector itself, which is the half that mattered and was
+        // missing. `ForkSignal::record_success` is called only on the decrypted
+        // APPLICATION path in `process_inbound` — a processed Commit never reset
+        // it, and a re-admission Welcome does not go through `process_inbound` at
+        // all. So a recovered agent resumed still standing at or above
+        // FORK_SIGNAL_THRESHOLD, and the next single malformed frame from its own
+        // group crossed it again immediately: one bad frame, and the group it had
+        // just been re-admitted to was discarded.
+        //
+        // REQ-025(d) says the counters reset on the next successfully processed
+        // Commit or join, and this is the only place all three of those paths
+        // meet.
+        self.fork.record_success();
+    }
+
+    /// SPEC-013 REQ-006: is the encrypted session currently diverged?
+    ///
+    /// True from the moment a fork is detected until a Commit or a join lands.
+    /// Exposed so the transport loop can hold the operator-visible flag to the
+    /// session's own view rather than inferring it from event types — inference
+    /// is what left the flag set through a recovery that had already succeeded,
+    /// because a re-admission Welcome and a processed Commit both report
+    /// `Handled`, which is indistinguishable from any other control frame.
+    pub fn fork_active(&self) -> bool {
+        self.fork_active
+    }
+
+    /// SPEC-013 REQ-025(c): recovery is spent and this agent needs an operator.
+    ///
+    /// Distinct from [`Self::fork_active`], and the distinction is the whole
+    /// requirement: a fork is a condition the agent is working through, and this
+    /// is the admission that it cannot. Terminal — the agent holds no group, has
+    /// asked `RESYNC_CAP` times, and nothing further will happen without a
+    /// re-pair.
+    pub fn recovery_exhausted(&self) -> bool {
+        self.resync_exhausted
+    }
+
+    /// SPEC-061 CON-003: a refusal on the path that seats us.
+    ///
+    /// The two slugs look alike and are nothing alike, and the difference is the
+    /// only thing a retry can act on:
+    ///
+    /// - `groupinfo-claimed` — another party holds the room's GroupInfo claim and
+    ///   is about to move the epoch. It clears when they are done, in seconds.
+    /// - `no-groupinfo` — the room has published none. It clears when some member
+    ///   merges a handshake and republishes, which no amount of asking by us will
+    ///   cause. A private channel whose members are all offline sits here.
+    ///
+    /// Neither is a failure and neither is terminal, so both re-arm rather than
+    /// give up: `self_seat_frames` asks again on the next roster change. What
+    /// they must NOT do is spin — an immediate retry loses the same race faster,
+    /// and against `no-groupinfo` it asks a question nothing has answered.
+    ///
+    /// Returns `NotMls` for anything else so the ordinary error path is unchanged.
+    fn on_error(&mut self, text: &str) -> SessionEvent {
+        let Some(items) = parse_list(text) else {
+            return SessionEvent::NotMls;
+        };
+        let addressed_to_us = matches!(
+            items.get(1),
+            Some(SExpr::Atom(Atom::Symbol(room))) if *room == self.room
+        );
+        if !addressed_to_us {
+            return SessionEvent::NotMls;
+        }
+        let slug = items.iter().find_map(|item| match item {
+            SExpr::Atom(Atom::Str(s)) => Some(s.clone()),
+            _ => None,
+        });
+        match slug.as_deref() {
+            Some(GROUPINFO_CLAIMED_SLUG) | Some(NO_GROUPINFO_SLUG) => {}
+            _ => return SessionEvent::NotMls,
+        }
+        // Only meaningful while we are trying to seat ourselves. A member that
+        // holds a group has no business reading these.
+        if self.group.is_some() || self.pair_grant.is_none() {
+            return SessionEvent::NotMls;
+        }
+        self.pending_seat = None; // whatever we were building is not going to land
+        self.seat_refusals = self.seat_refusals.saturating_add(1);
+        let contended = slug.as_deref() == Some(GROUPINFO_CLAIMED_SLUG);
+        if self.seat_refusals >= SEAT_REFUSAL_BUDGET {
+            // RFC 9420 §14 names starvation and leaves it to the application. The
+            // requirement is that it becomes visible, not that it resolve: an
+            // agent that never gets a turn looks to the person who invited it
+            // exactly like a permission problem.
+            tracing::warn!(
+                room = %self.room,
+                refusals = self.seat_refusals,
+                contended,
+                "still cannot seat this agent — it holds an admission grant but the room \
+                 has not served it a GroupInfo it could commit against"
+            );
+        } else {
+            tracing::info!(
+                room = %self.room,
+                refusals = self.seat_refusals,
+                contended,
+                "seat attempt refused; will ask again on the next roster change"
+            );
+        }
+        SessionEvent::Handled { outbound: vec![] }
+    }
+
+    /// SPEC-061 REQ-008: the hub fanned our own external Commit back to us.
+    ///
+    /// `cbcl-chat-room:fanout/2` excludes nobody — it "fans out exactly once to
+    /// every present member (including the sender)" — so the echo is the only
+    /// acknowledgement this path has, and it is what finally spends the grant.
+    /// Correlated on the frame bytes rather than by MLS processing: our own
+    /// session would reject its own Commit as already-merged, so the signal has
+    /// to be read below the MLS layer.
+    ///
+    /// The limit, stated rather than glossed: the echo proves the HUB took and
+    /// fanned the Commit, not that every member applied it. That is strictly more
+    /// than the previous evidence, which was none.
+    fn note_own_seat_echo(&mut self, ct_b64: &str) -> bool {
+        let matches = self
+            .pending_seat
+            .as_ref()
+            .is_some_and(|p| p.ct_b64 == ct_b64);
+        if !matches {
+            return false;
+        }
+        let pending = self.pending_seat.take().expect("just matched");
+        self.group = Some(pending.group);
+        self.genesis = Some(pending.genesis);
+        self.trust = Some(pending.trust);
+        // PROVIDER FIRST, THEN META, and the order is the invariant.
+        //
+        // `join_by_grant` builds the group into the provider but does not persist
+        // it — the pre-SPEC-061 path got away with that because a later inbound
+        // frame persisted as a side effect. Installing at the echo has no such
+        // follow-up, so without this the group lives only in memory while the
+        // meta on disk names it: a restart then reads a meta pointing at records
+        // that are not there and reports `persisted group state missing`, which
+        // is a fresh way to be seated and unable to prove it.
+        //
+        // Meta-last is what makes a crash between the two writes survivable. The
+        // meta is the pointer; a pointer written before its target is a dangling
+        // one, and that is exactly the failure above.
+        if let Err(e) = self.provider.persist() {
+            tracing::warn!(room = %self.room, error = %e, "seat accepted but group state did not persist");
+        }
+        if let Err(e) = self.persist_meta() {
+            tracing::warn!(room = %self.room, error = %e, "seat accepted but meta did not persist");
+        }
+        tracing::info!(
+            room = %self.room, epoch = pending.epoch,
+            "our external Commit was accepted — seated (SPEC-061 REQ-008)"
+        );
+        true
     }
 
     /// REQ-001/REQ-012: a Welcome addressed to us.
@@ -843,6 +1276,12 @@ impl MlsSession {
             self.group = Some(outcome.group);
             self.genesis = Some(outcome.genesis);
             self.trust = Some(outcome.trust);
+            // REQ-025(d): a join is the other thing that ends a fork, and on the
+            // recovery path it is THE thing — a re-admission arrives as a Welcome,
+            // never as a Commit we could process. Resetting only on a processed
+            // Commit left a healed member carrying its fork counters, so the next
+            // ordinary dropped frame started from a raised baseline.
+            self.clear_resync_state();
             self.persist_meta()
         })();
         match result {
@@ -856,6 +1295,25 @@ impl MlsSession {
 
     /// REQ-006/REQ-017/REQ-018: an encrypted room frame.
     fn on_deliver(&mut self, text: &str) -> SessionEvent {
+        // Our own frame, fanned back. Checked FIRST and before the group guard,
+        // because the whole point of the pending seat is that we hold no group
+        // yet — the old order reported this as "deliver before MLS join" and
+        // discarded the only acknowledgement the self-seating path ever gets.
+        if kw_symbol(text, ":from").as_deref() == Some(self.handle.as_str()) {
+            if let Some(ct) = kw_str(text, ":ct") {
+                if self.note_own_seat_echo(&ct) {
+                    // Now that we hold the group, publish a GroupInfo for the
+                    // epoch we just moved the room to: ours spent the one the
+                    // hub was holding.
+                    return SessionEvent::Handled {
+                        outbound: self.group_info_frame().into_iter().collect(),
+                    };
+                }
+            }
+            // Any other echo of our own is not ours to process — MLS refuses to
+            // decrypt what it sent.
+            return SessionEvent::Handled { outbound: vec![] };
+        }
         let Some(group) = self.group.as_mut() else {
             return SessionEvent::Dropped {
                 reason: "deliver before MLS join".into(),
@@ -897,6 +1355,7 @@ impl MlsSession {
                 plaintext,
                 sender_handle,
             }) => {
+                self.clear_resync_state();
                 let text = String::from_utf8_lossy(&plaintext).into_owned();
                 // REQ-018: the inner :from must match the MLS sender.
                 if let Some(from) = kw_symbol(&text, ":from") {
@@ -913,6 +1372,7 @@ impl MlsSession {
                 }
             }
             Ok(Inbound::Handshake) => {
+                self.clear_resync_state();
                 let _ = self.persist_meta();
                 // SPEC-061 REQ-005: the epoch just moved, which spends whatever
                 // GroupInfo the room was holding. Publish one for the new epoch,
@@ -927,15 +1387,29 @@ impl MlsSession {
             Ok(Inbound::Dropped {
                 reason,
                 probable_fork,
-            }) => SessionEvent::Dropped {
+            }) => self.drop_or_recover(reason, probable_fork),
+            Err(e) => {
+                let probable_fork = self.fork.probable_fork();
+                self.drop_or_recover(e.to_string(), probable_fork)
+            }
+        }
+    }
+
+    /// One undecryptable frame is noise; `FORK_THRESHOLD` in a row is a fork.
+    ///
+    /// Below the threshold this is the old behaviour — count it and move on,
+    /// because a single dropped frame is an ordinary event on a lossy path.
+    /// At it, REQ-025 recovery starts: the run of failures is the evidence that
+    /// our epoch and the room's have parted, and waiting does not mend that.
+    fn drop_or_recover(&mut self, reason: String, probable_fork: bool) -> SessionEvent {
+        if !probable_fork || !self.enc_pinned || self.group.is_none() {
+            return SessionEvent::Dropped {
                 reason,
                 probable_fork,
-            },
-            Err(e) => SessionEvent::Dropped {
-                reason: e.to_string(),
-                probable_fork: self.fork.probable_fork(),
-            },
+            };
         }
+        let outbound = self.begin_resync();
+        SessionEvent::Forked { reason, outbound }
     }
 
     /// REQ-003/REQ-008: the hub answered our `keyget` — add the member if we
@@ -1031,6 +1505,18 @@ impl MlsSession {
             outbound.push(self.keyready_frame());
         }
         outbound.extend(self.keygets_for_addable());
+        // REQ-025(c): the same roster change re-requests re-admission while we
+        // are groupless. A resync needs the re-provisioner to be PRESENT, so a
+        // roster change is not merely a convenient tick — it is the event that
+        // can actually make the request answerable.
+        outbound.extend(self.resync_frames());
+        // SPEC-061 REQ-008 / CON-003: a roster change is the natural moment to
+        // ask again for something to seat ourselves against. It is what makes a
+        // refused attempt recover without a timer — `groupinfo-claimed` clears
+        // when the holder finishes, and `no-groupinfo` clears when a member turns
+        // up and republishes, which IS a roster change. Empty unless we hold a
+        // grant, hold no group, and have nothing already in flight.
+        outbound.extend(self.self_seat_frames());
         SessionEvent::Handled { outbound }
     }
 
@@ -1234,6 +1720,18 @@ fn kw_u64(text: &str, key: &str) -> Option<u64> {
     }
 }
 
+/// A keyword's value as the RAW string on the wire, undecoded.
+///
+/// Distinct from [`kw_b64`] on purpose: the self-seat echo (SPEC-061 REQ-008) is
+/// correlated on the base64 TEXT we emitted, not on the bytes it decodes to, so
+/// that the comparison is against exactly what went on the wire.
+fn kw_str(text: &str, key: &str) -> Option<String> {
+    match kw_value(text, key)? {
+        SExpr::Atom(Atom::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
 fn kw_b64(text: &str, key: &str) -> Option<Vec<u8>> {
     match kw_value(text, key)? {
         SExpr::Atom(Atom::Str(s)) => B64.decode(s).ok(),
@@ -1262,6 +1760,7 @@ fn presence_handles(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mls::validation::FORK_SIGNAL_THRESHOLD;
     use std::path::PathBuf;
 
     fn setup(tag: &str, seed: u8, handle: &str) -> (PathBuf, ChatIdentity) {
@@ -1570,6 +2069,663 @@ mod tests {
     /// creator agent + joining agent exchange keypkg/welcome/deliver frames
     /// exactly as the hub would fan them; content round-trips encrypted; a
     /// removal with bye evidence evicts; restart resumes the group (REQ-009).
+    /// SPEC-061 REQ-008 — a self-seat is not a membership until somebody says so.
+    ///
+    /// This is the test the shipped path did not have, and its absence is why an
+    /// agent could hold a phantom epoch for hours while `hark safety-number`
+    /// cheerfully printed it. Building an external Commit proves only that we can
+    /// build one: RFC 9420 §14 is explicit that a joiner's own build succeeds
+    /// whether or not the Commit is accepted.
+    #[test]
+    fn a_self_seat_is_not_a_membership_until_the_hub_echoes_it() {
+        let (c_dir, c_wire) = setup("seat", 90, "@creator");
+        let (a_dir, a_wire) = setup("seat", 91, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+
+        // Each pins the other from its own signed idkey assertion (REQ-019).
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        // The member that paired the agent signs its admission (REQ-008).
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        let grant_json = serde_json::to_string(&grant).unwrap();
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(grant_json)
+        );
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&pairgrant) else {
+            panic!("pairgrant handled")
+        };
+        assert!(
+            outbound.iter().any(|f| f.starts_with("(groupinfoget @room")),
+            "holding a grant, the agent asks for something to commit against: {outbound:?}"
+        );
+
+        // The hub serves a GroupInfo and the agent builds its Commit.
+        let gi = creator.group_info_frame().expect("creator publishes a GroupInfo");
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&gi) else {
+            panic!("groupinfo handled")
+        };
+        let commit = outbound
+            .iter()
+            .find(|f| f.starts_with("(deliver @room"))
+            .expect("the Commit MUST go out")
+            .clone();
+
+        // THE POINT. Nothing has acknowledged that Commit, so nothing is seated.
+        assert!(
+            agent.group.is_none(),
+            "an unacknowledged external Commit must not read as membership"
+        );
+        assert!(
+            matches!(
+                agent.encrypt_outbound("(tell @room \"hi\" :from @agent)"),
+                Err(MlsError::NotReady(_))
+            ),
+            "and sending must refuse RETRYABLY rather than encrypt at a phantom epoch"
+        );
+
+        // The hub fans our own Commit back — the only acknowledgement this path
+        // gets — and that is what seats us.
+        agent.handle_frame(&commit);
+        assert!(agent.group.is_some(), "the echo seats us");
+        // …durably. `join_by_grant` builds into the provider without persisting,
+        // and installing at the echo has no later frame to persist as a side
+        // effect — so a restart here read a meta naming records that were not on
+        // disk and reported `persisted group state missing`. Found on the live
+        // daemon, not in review.
+        drop(agent);
+        let resumed =
+            MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        assert!(
+            resumed.group.is_some(),
+            "a seated agent MUST survive a restart — the meta is a pointer, and \
+             writing it before its target is writing a dangling one"
+        );
+        let mut agent = resumed;
+        assert!(
+            agent.encrypt_outbound("(tell @room \"hi\" :from @agent)").is_ok(),
+            "and only now may we send"
+        );
+    }
+
+    /// The lost race, which is the failure that was found live: our Commit never
+    /// comes back because somebody else's landed first. The agent must end up
+    /// with no group AND its grant intact, so it can try again — not with a
+    /// phantom group and a spent grant, which is permanent and silent.
+    #[test]
+    fn losing_the_ordering_race_leaves_the_grant_redeemable() {
+        let (c_dir, c_wire) = setup("race", 92, "@creator");
+        let (a_dir, a_wire) = setup("race", 93, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(serde_json::to_string(&grant).unwrap())
+        );
+        agent.handle_frame(&pairgrant);
+        let gi = creator.group_info_frame().unwrap();
+        agent.handle_frame(&gi);
+
+        // No echo ever arrives. Everything the agent needs to try again survives.
+        assert!(agent.group.is_none(), "no group");
+        assert!(agent.pair_grant.is_some(), "and the grant is NOT spent");
+
+        // A restart re-reads the grant from disk and can still act on it.
+        drop(agent);
+        let resumed =
+            MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        assert!(resumed.group.is_none());
+        assert!(
+            resumed.pair_grant.is_some(),
+            "a grant spent on a commit nobody took would strand this agent forever"
+        );
+    }
+
+    /// REQ-005 puts the epoch on the wire so a joiner can tell a fresh GroupInfo
+    /// from a spent one. A GroupInfo is single-use (RFC 9420 §12.4.3.2) and every
+    /// member republishes after every merged handshake, so several arrive at a
+    /// joiner and the older ones are already dead. Committing against one of
+    /// those is refused `WrongEpoch` by every member.
+    ///
+    /// Only the epoch DISPATCH is under test here — which frames start an attempt
+    /// and which are ignored — so the carried `:gi` blob is the same object
+    /// throughout; what varies is what the wire says about it.
+    #[test]
+    fn the_newest_groupinfo_wins_and_a_stale_one_is_ignored() {
+        let (c_dir, c_wire) = setup("gi", 94, "@creator");
+        let (a_dir, a_wire) = setup("gi", 95, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(serde_json::to_string(&grant).unwrap())
+        );
+        agent.handle_frame(&pairgrant);
+
+        let published = creator.group_info_frame().unwrap();
+        let epoch = kw_u64(&published, ":epoch").expect("a GroupInfo names its epoch");
+        let at = |e: u64| published.replace(&format!(":epoch {epoch}"), &format!(":epoch {e}"));
+
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&at(epoch)) else {
+            panic!("groupinfo handled")
+        };
+        assert!(
+            outbound.iter().any(|f| f.starts_with("(deliver @room")),
+            "the first GroupInfo starts an attempt"
+        );
+
+        // An OLDER republication is one we already have better than.
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&at(epoch.saturating_sub(1)))
+        else {
+            panic!("stale groupinfo handled")
+        };
+        assert!(
+            outbound.is_empty(),
+            "a stale GroupInfo must not start a second attempt: {outbound:?}"
+        );
+
+        // A NEWER one means the attempt in flight was built against an epoch the
+        // room has left, so it can never be accepted. Rebuild against the newer.
+        //
+        // This is the direction the pre-fix code could not take at all: it had
+        // already installed the group, so it returned early and sat forever on a
+        // Commit nobody would take.
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&at(epoch + 1)) else {
+            panic!("newer groupinfo handled")
+        };
+        assert!(
+            outbound.iter().any(|f| f.starts_with("(deliver @room")),
+            "a newer GroupInfo rebuilds the Commit: {outbound:?}"
+        );
+        assert!(
+            agent.group.is_none(),
+            "and none of this is membership until an echo says so"
+        );
+    }
+
+    /// SPEC-061 CON-003 — the two joiner refusals are neither failures nor the
+    /// same thing, and an agent that treats either as terminal never gets in.
+    #[test]
+    fn a_refused_seat_re_arms_and_asks_again_on_the_next_roster_change() {
+        let (c_dir, c_wire) = setup("refuse", 96, "@creator");
+        let (a_dir, a_wire) = setup("refuse", 97, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(serde_json::to_string(&grant).unwrap())
+        );
+        agent.handle_frame(&pairgrant);
+
+        for slug in ["groupinfo-claimed", "no-groupinfo"] {
+            let refusal = format!("(error @room \"{slug}\")");
+            assert!(
+                matches!(agent.handle_frame(&refusal), SessionEvent::Handled { .. }),
+                "{slug} is consumed, not rendered as a chat error"
+            );
+            // …and the next roster change asks again. Without this the agent
+            // holds an admission grant it will never present.
+            let SessionEvent::Handled { outbound } =
+                agent.handle_frame("(presence @room :members (@creator @agent))")
+            else {
+                panic!("presence handled")
+            };
+            assert!(
+                outbound.iter().any(|f| f.starts_with("(groupinfoget @room")),
+                "after {slug}, a roster change re-asks: {outbound:?}"
+            );
+            agent.present.clear(); // so the next loop iteration sees a fresh roster
+        }
+    }
+
+    /// An error that is not ours must still reach the operator. Consuming every
+    /// `(error …)` would silence the ones a person needs to see.
+    #[test]
+    fn an_unrelated_error_is_not_swallowed_by_the_seat_path() {
+        let (a_dir, a_wire) = setup("refuse-other", 98, "@agent");
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        assert!(matches!(
+            agent.handle_frame("(error @room \"forbidden-room\")"),
+            SessionEvent::NotMls
+        ));
+        assert!(
+            matches!(
+                agent.handle_frame("(error @other \"groupinfo-claimed\")"),
+                SessionEvent::NotMls
+            ),
+            "another room's refusal is not ours"
+        );
+    }
+
+    /// [[SPEC-013-mls-private-channels#REQ-025]] (a)/(b)/(d) — the desync
+    /// self-heal. A fork is the one failure that does not mend by waiting: our
+    /// epoch has parted from the room's, so every later Commit is undecryptable
+    /// and every message we send is sealed to an epoch nobody is on.
+    ///
+    /// Before this, hark warned and kept the dead group forever. An agent was
+    /// found live in exactly that state — reporting `connected`, accepting
+    /// `hark emit` with exit 0, for hours.
+    #[test]
+    fn a_forked_group_is_discarded_and_re_admission_is_requested() {
+        let (c_dir, c_wire) = setup("fork", 100, "@creator");
+        let (a_dir, a_wire) = setup("fork", 101, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        // The agent holds a group of its own to fork away from, and a grant it
+        // has not spent — the state SPEC-061 REQ-008 leaves it in.
+        agent.create_group_as_creator().unwrap();
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        agent.pair_grant = Some(serde_json::to_string(&grant).unwrap());
+        assert!(agent.group.is_some(), "precondition: we hold a group");
+
+        // FORK_THRESHOLD consecutive undecryptable frames. Below it, a drop is
+        // ordinary noise on a lossy path and must NOT tear down the group.
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for i in 1..FORK_SIGNAL_THRESHOLD {
+            let event = agent.handle_frame(&garbage);
+            assert!(
+                matches!(event, SessionEvent::Dropped { .. }),
+                "drop {i} is noise, not a fork"
+            );
+            assert!(agent.group.is_some(), "and must not discard the group");
+        }
+
+        let SessionEvent::Forked { outbound, .. } = agent.handle_frame(&garbage) else {
+            panic!("crossing the threshold is a fork, not another drop")
+        };
+
+        // (a) the forked group is gone…
+        assert!(agent.group.is_none(), "the forked group is discarded");
+        // …and the identity survives it, because the re-admission Welcome is
+        // opened with exactly that key material. A whole-provider wipe here
+        // would permanently brick recovery (review F8).
+        assert!(
+            agent.own_idkey_frame().is_ok(),
+            "the identity keystore MUST survive the discard"
+        );
+
+        // (b) the request is signed, marked, and nonced.
+        let resync = outbound
+            .iter()
+            .find(|f| f.starts_with("(keyready @room"))
+            .expect("a re-admission request MUST go out");
+        // An agent holding an unspent grant takes BOTH routes out. Waiting for a
+        // roster change to notice it could seat itself is a stall on a quiet
+        // channel, and the grant survives the discard precisely so it need not.
+        assert!(
+            outbound.iter().any(|f| f.starts_with("(groupinfoget @room")),
+            "a grant-holding agent also asks for something to re-seat against: {outbound:?}"
+        );
+        assert!(
+            resync.contains(":resync 1"),
+            "REQ-025(d): only an explicit marker requests re-provisioning — a routine \
+             re-announce must never churn membership: {resync}"
+        );
+        let nonce = kw_u64(resync, ":nonce").expect("a nonce");
+        let sig = kw_b64(resync, ":sig").expect("a signature");
+        let key = <[u8; 32]>::try_from(agent.identity.public_key()).unwrap();
+        // An unsigned request is a hub-forgeable eviction of a healthy member,
+        // so the verifier checks this against the requester's PINNED key.
+        {
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            let vk = VerifyingKey::from_bytes(&a_wire.verifying_key_bytes()).unwrap();
+            let signed =
+                super::super::pins::resync_signing_bytes(&agent.handle, &key, "@room", nonce);
+            assert!(
+                vk.verify(&signed, &Signature::from_slice(&sig).unwrap()).is_ok(),
+                "the resync MUST verify under the requester's own PINNED wire key — \
+                 an unsigned or wrongly-signed one is a hub-forgeable eviction"
+            );
+        }
+    }
+
+    /// [[SPEC-013-mls-private-channels#TEST-025]] positive + negative-output (F8)
+    /// — the whole point of the discard being SCOPED.
+    ///
+    /// A forked member must recover to the live epoch after re-admission, and it
+    /// can only do that if the discard left its identity keystore and its
+    /// unconsumed [[KeyPackage]] init private keys alone. A whole-provider wipe
+    /// looks like a tidier fix and permanently bricks recovery: the re-admission
+    /// Welcome is sealed to an init key the victim no longer holds.
+    ///
+    /// Asserted end to end rather than by inspecting storage, because "the keys
+    /// are still there" is only interesting if the Welcome actually opens.
+    #[test]
+    fn a_discarded_member_can_still_open_its_re_admission_welcome() {
+        let (c_dir, c_wire) = setup("heal", 103, "@creator");
+        let (a_dir, a_wire) = setup("heal", 104, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        // The agent's one-time packages, published BEFORE the fork. These are
+        // what the re-admission Welcome will be sealed to.
+        let agent_kp = match kw_value(&a_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("a one-time package"),
+            },
+            _ => panic!("a onetime list"),
+        };
+
+        // The agent holds a group and forks away from it.
+        agent.create_group_as_creator().unwrap();
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for _ in 0..FORK_SIGNAL_THRESHOLD {
+            agent.handle_frame(&garbage);
+        }
+        assert!(agent.group.is_none(), "precondition: forked and discarded");
+
+        // The creator honours the request by adding it at the live epoch.
+        let keypkg = format!("(keypkg @hub :for @agent :kp \"{agent_kp}\")");
+        let SessionEvent::Handled { outbound } = creator.handle_frame(&keypkg) else {
+            panic!("keypkg handled")
+        };
+        let welcome = outbound
+            .iter()
+            .find(|f| f.starts_with("(welcome @room"))
+            .expect("the re-admission Welcome");
+
+        // F8: if the discard had wiped the provider, this is where recovery would
+        // be permanently dead — the Welcome would be sealed to an init key the
+        // agent no longer holds.
+        agent.handle_frame(welcome);
+        assert!(
+            agent.group.is_some(),
+            "the re-admission Welcome MUST open — a scoped discard is the whole \
+             difference between recoverable and bricked (review F8)"
+        );
+        assert_eq!(
+            agent.safety_numbers().ok().map(|s| s.epoch_state),
+            creator.safety_numbers().ok().map(|s| s.epoch_state),
+            "and the healed member converges on the room's epoch (REQ-021/024)"
+        );
+        assert_eq!(
+            agent.resync_attempts, 0,
+            "REQ-025(d): a successful join resets the fork counters"
+        );
+    }
+
+    /// [[SPEC-013-mls-private-channels#REQ-025]](d) — recovery resets the
+    /// DETECTOR, not merely the retry bookkeeping.
+    ///
+    /// `ForkSignal::record_success` fires only on the decrypted APPLICATION path
+    /// in `process_inbound`: a processed Commit never reset it, and a
+    /// re-admission Welcome does not go through `process_inbound` at all. So a
+    /// recovered agent resumed still standing at the threshold, and the next
+    /// single malformed frame from its own group crossed it again immediately —
+    /// one bad frame and the group it had just been re-admitted to was discarded.
+    #[test]
+    fn recovery_resets_the_fork_detector_not_just_the_retry_counters() {
+        let (c_dir, c_wire) = setup("detector", 107, "@creator");
+        let (a_dir, a_wire) = setup("detector", 108, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+        let agent_kp = match kw_value(&a_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("a one-time package"),
+            },
+            _ => panic!("a onetime list"),
+        };
+
+        agent.create_group_as_creator().unwrap();
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for _ in 0..FORK_SIGNAL_THRESHOLD {
+            agent.handle_frame(&garbage);
+        }
+        assert!(agent.group.is_none(), "forked and discarded");
+        assert!(agent.fork_active(), "and reported as forked");
+
+        // Re-admitted.
+        let keypkg = format!("(keypkg @hub :for @agent :kp \"{agent_kp}\")");
+        let SessionEvent::Handled { outbound } = creator.handle_frame(&keypkg) else {
+            panic!("keypkg handled")
+        };
+        let welcome = outbound
+            .iter()
+            .find(|f| f.starts_with("(welcome @room"))
+            .expect("the re-admission Welcome");
+        agent.handle_frame(welcome);
+        assert!(agent.group.is_some(), "recovered");
+        assert!(
+            !agent.fork_active(),
+            "REQ-025(d): the join ends the fork, and the status must say so"
+        );
+
+        // THE POINT: one bad frame after recovery is noise, not a fresh fork.
+        // A detector left standing at the threshold would discard here.
+        match agent.handle_frame(&garbage) {
+            SessionEvent::Dropped { probable_fork, .. } => assert!(
+                !probable_fork,
+                "a single failure after recovery must not re-cross a threshold \
+                 that was never lowered"
+            ),
+            other => panic!("expected a plain drop, got {other:?}"),
+        }
+        assert!(
+            agent.group.is_some(),
+            "and the freshly re-admitted group must survive it"
+        );
+    }
+
+    /// REQ-025(c) — exhausted recovery is TERMINAL and must be readable as such.
+    ///
+    /// Distinct from an active fork, and the distinction is the requirement: a
+    /// fork is a condition the agent is working through, this is the admission
+    /// that it cannot. Reported only through `tracing::error!`, it reached
+    /// nobody — the daemon collects no logs, so an operator saw an agent
+    /// indefinitely "recovering" from something it had already given up on.
+    #[test]
+    fn exhausted_recovery_is_distinguishable_from_an_active_fork() {
+        let (a_dir, a_wire) = setup("exhausted", 109, "@agent");
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        agent.create_group_as_creator().unwrap();
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for _ in 0..FORK_SIGNAL_THRESHOLD {
+            agent.handle_frame(&garbage);
+        }
+        assert!(agent.fork_active(), "forked");
+        assert!(
+            !agent.recovery_exhausted(),
+            "but still trying — these are not the same state"
+        );
+
+        while !agent.resync_frames().is_empty() {}
+        assert!(
+            agent.recovery_exhausted(),
+            "REQ-025(c): the budget is spent and that fact is queryable, not only logged"
+        );
+    }
+
+    /// A frame for somebody ELSE'S group is not evidence that ours has forked.
+    ///
+    /// The distinction only started to matter once recovery existed to be
+    /// triggered by it, which is why it survived until the fix was run against
+    /// live traffic: three replayed frames carrying an old group id crossed the
+    /// fork threshold, [[SPEC-013-mls-private-channels#REQ-025]] discarded a
+    /// perfectly healthy group, the agent re-seated, the hub replayed again — a
+    /// discard/re-seat loop that never converged. Observed on the live daemon.
+    #[test]
+    fn a_frame_for_another_group_never_counts_as_a_fork() {
+        let (a_dir, a_wire) = setup("foreign", 105, "@agent");
+        let (o_dir, o_wire) = setup("foreign", 106, "@other");
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let mut other = MlsSession::open(&o_dir, "other", "@room", "@other", &o_wire, true).unwrap();
+        agent.create_group_as_creator().unwrap();
+        // A DIFFERENT group for the same room name — the shape a recreated
+        // channel, or a replay from before a re-seat, actually delivers.
+        other.create_group_as_creator().unwrap();
+        let foreign = other
+            .encrypt_outbound("(tell @room \"not for you\" :from @other)")
+            .expect("the other group encrypts for itself");
+
+        // Well past the threshold: this must never accumulate.
+        for i in 0..(FORK_SIGNAL_THRESHOLD * 4) {
+            match agent.handle_frame(&foreign) {
+                SessionEvent::Dropped { probable_fork, .. } => assert!(
+                    !probable_fork,
+                    "frame {i} belongs to another group and must not count toward OUR fork signal"
+                ),
+                other => panic!("expected a plain drop, got {other:?}"),
+            }
+            assert!(
+                agent.group.is_some(),
+                "and the healthy group must never be discarded because of it"
+            );
+        }
+    }
+
+    /// REQ-025(b), re-review #1 — the nonce is strictly monotonic, and it is NOT
+    /// the pin epoch. The pin epoch is constant absent a rotation, so a captured
+    /// resync could be replayed to evict a healthy member at will.
+    ///
+    /// REQ-025(c) — and the retry budget is spent on REQUESTS, not on decrypt
+    /// failures. That is the F4 defect the spec names: after the discard nothing
+    /// decrypts, so no failures accrue and a terminal branch keyed on them can
+    /// never be reached. cbcl-bus shipped exactly that; hark SHALL NOT copy it.
+    #[test]
+    fn resync_nonces_rise_and_the_retry_budget_is_finite() {
+        let (a_dir, a_wire) = setup("fork-cap", 102, "@agent");
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        agent.create_group_as_creator().unwrap();
+        let garbage = format!(
+            "(deliver @room :enc mls :ct \"{}\" :from @creator)",
+            B64.encode([0xAAu8; 96])
+        );
+        for _ in 0..FORK_SIGNAL_THRESHOLD {
+            agent.handle_frame(&garbage);
+        }
+        assert!(agent.group.is_none(), "forked and discarded");
+
+        let mut nonces = vec![agent.last_resync_nonce];
+        // The first request was spent by the fork itself; the cap covers the run.
+        let mut sent = 1;
+        for _ in 0..10 {
+            let frames = agent.resync_frames();
+            if frames.is_empty() {
+                break;
+            }
+            sent += 1;
+            nonces.push(agent.last_resync_nonce);
+        }
+        assert_eq!(
+            sent, RESYNC_CAP,
+            "the budget is finite and reachable while groupless (REQ-025c / review F4)"
+        );
+        assert!(
+            nonces.windows(2).all(|w| w[1] > w[0]),
+            "every nonce strictly exceeds the last: {nonces:?}"
+        );
+        assert!(
+            agent.resync_frames().is_empty(),
+            "and a spent budget stays spent rather than looping"
+        );
+        assert!(
+            agent.resync_exhausted,
+            "F4: the TERMINAL surface is reached, not dead code — the shipped web \
+             client keyed it on decrypt failures that stop accruing after the discard"
+        );
+    }
+
     #[test]
     fn full_session_flow_over_frames() {
         let (a_dir, a_wire) = setup("flow", 86, "@alice");
