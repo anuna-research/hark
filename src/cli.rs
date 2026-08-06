@@ -1005,7 +1005,12 @@ fn select_by_wire_name(
         .filter(|agent| agent.router_agent_id == name)
         .collect();
     match matches.as_slice() {
-        [] => Err(AppError::Usage(format!(
+        // Exit 7, not 2: "the handle you named is not usable" is a state, and a
+        // recoverable one (a daemon restart drops connections), not a malformed
+        // invocation. The daemon already answers `unknown_agent_handle` with 7,
+        // so classifying the client-side miss as a usage error made the code a
+        // script saw depend on which layer noticed first.
+        [] => Err(AppError::AgentHandleUnknown(format!(
             "no live agent named {name} on this daemon; run `hark daemon status` to list them \
              (CBCL_AGENT_HANDLE accepts a wire @name or an internal handle)"
         ))),
@@ -1499,7 +1504,7 @@ mod tests {
         escape_cbcl_string, parse_recv_timeout_ms, select_by_wire_name,
         validate_init_advertisement,
     };
-    use crate::errors::AppError;
+    use crate::errors::{AppError, ExitCode};
 
     #[test]
     fn command_tree_matches_mvp_surface() {
@@ -1533,11 +1538,37 @@ mod tests {
         assert!(selection.warning.is_none());
     }
 
+    /// An unknown wire name exits 7, not 2.
+    ///
+    /// This test previously asserted `AppError::Usage` — exit 2, "usage error or
+    /// malformed local request" — which contradicted hark's own published
+    /// contract, where 7 is "agent handle is unknown, unhealthy, or busy". The
+    /// same condition already exited 7 when the DAEMON noticed it
+    /// (`unknown_agent_handle` → `AgentHandleUnavailable`), so the code a script
+    /// saw depended on which layer happened to catch it first.
+    ///
+    /// That is precisely the distinction the exit code exists to make: 2 means
+    /// "you invoked me wrongly", 7 means "the handle you named is not usable" —
+    /// the second is a normal, recoverable state for an agent whose daemon was
+    /// restarted, and it must be distinguishable without parsing prose.
+    ///
+    /// Asserted on the EXIT CODE rather than the variant, because the exit code
+    /// is the contract; the variant is an implementation detail.
     #[test]
-    fn unknown_wire_name_is_a_usage_error() {
+    fn unknown_wire_name_exits_as_an_unusable_handle() {
         let agents = [chat_agent("HANDLEA", "@hark-a")];
         let error = select_by_wire_name(&agents, None, "@ghost").expect_err("no such name");
-        assert!(matches!(error, AppError::Usage(_)), "got {error:?}");
+        assert_eq!(
+            error.exit_code(),
+            ExitCode::AgentHandleUnavailable,
+            "an unknown handle is exit 7 per the CLI contract, not a usage error: {error:?}"
+        );
+        // The diagnosis must survive the reclassification — the message is how a
+        // human finds the handle they meant.
+        assert!(
+            error.to_string().contains("no live agent named @ghost"),
+            "the helpful message must not be lost: {error}"
+        );
     }
 
     #[test]
