@@ -1504,7 +1504,7 @@ mod tests {
         escape_cbcl_string, parse_recv_timeout_ms, select_by_wire_name,
         validate_init_advertisement,
     };
-    use crate::errors::{AppError, ExitCode};
+    use crate::errors::ExitCode;
 
     #[test]
     fn command_tree_matches_mvp_surface() {
