@@ -148,7 +148,20 @@ pub struct MlsSession {
     /// how a self-seating agent ends up committing at an epoch the room has
     /// already left.
     seen_gi_epoch: Option<u64>,
+    /// Consecutive refusals on the seating path (SPEC-061 CON-003). Reset by a
+    /// GroupInfo we can act on; bounded only so the condition becomes visible,
+    /// never so that we stop trying.
+    seat_refusals: u32,
 }
+
+/// Another party holds the room's GroupInfo claim. Clears in seconds.
+const GROUPINFO_CLAIMED_SLUG: &str = "groupinfo-claimed";
+/// The room has published no GroupInfo. Clears when a member republishes, not
+/// with time — deliberately NOT the same thing as contention.
+const NO_GROUPINFO_SLUG: &str = "no-groupinfo";
+/// Refusals tolerated before the stall is logged at `warn` rather than `info`.
+/// Not a give-up: an agent that stops asking never gets in at all.
+const SEAT_REFUSAL_BUDGET: u32 = 10;
 
 /// An external Commit awaiting acknowledgement (SPEC-061 REQ-008).
 struct PendingSeat {
@@ -294,6 +307,7 @@ impl MlsSession {
             present: std::collections::HashSet::new(),
             pending_seat: None,
             seen_gi_epoch: None,
+            seat_refusals: 0,
         };
 
         if let Some(meta) = meta {
@@ -691,6 +705,10 @@ impl MlsSession {
             return SessionEvent::NotMls;
         };
         match performative.as_str() {
+            // SPEC-061 CON-003 — the JOINER path's refusals. Consumed only when
+            // they are ours; every other error still falls through to the
+            // plaintext path so an operator keeps seeing them.
+            "error" => self.on_error(text),
             "roomcfg" => match self.on_roomcfg(text) {
                 Ok(()) => SessionEvent::NotMls, // also a join ack; let the loop see it
                 Err(e) => SessionEvent::Dropped {
@@ -850,6 +868,7 @@ impl MlsSession {
             return SessionEvent::Handled { outbound: vec![] }; // stale; a newer one is in hand
         }
         self.seen_gi_epoch = Some(epoch);
+        self.seat_refusals = 0; // the room answered; the run of refusals is over
         // A newer GroupInfo means the attempt in flight was built against an
         // epoch the room has left, so it cannot be accepted. Drop it and build
         // again — the grant was never spent, which is the point of holding it.
@@ -902,6 +921,73 @@ impl MlsSession {
                 probable_fork: false,
             },
         }
+    }
+
+    /// SPEC-061 CON-003: a refusal on the path that seats us.
+    ///
+    /// The two slugs look alike and are nothing alike, and the difference is the
+    /// only thing a retry can act on:
+    ///
+    /// - `groupinfo-claimed` — another party holds the room's GroupInfo claim and
+    ///   is about to move the epoch. It clears when they are done, in seconds.
+    /// - `no-groupinfo` — the room has published none. It clears when some member
+    ///   merges a handshake and republishes, which no amount of asking by us will
+    ///   cause. A private channel whose members are all offline sits here.
+    ///
+    /// Neither is a failure and neither is terminal, so both re-arm rather than
+    /// give up: `self_seat_frames` asks again on the next roster change. What
+    /// they must NOT do is spin — an immediate retry loses the same race faster,
+    /// and against `no-groupinfo` it asks a question nothing has answered.
+    ///
+    /// Returns `NotMls` for anything else so the ordinary error path is unchanged.
+    fn on_error(&mut self, text: &str) -> SessionEvent {
+        let Some(items) = parse_list(text) else {
+            return SessionEvent::NotMls;
+        };
+        let addressed_to_us = matches!(
+            items.get(1),
+            Some(SExpr::Atom(Atom::Symbol(room))) if *room == self.room
+        );
+        if !addressed_to_us {
+            return SessionEvent::NotMls;
+        }
+        let slug = items.iter().find_map(|item| match item {
+            SExpr::Atom(Atom::Str(s)) => Some(s.clone()),
+            _ => None,
+        });
+        match slug.as_deref() {
+            Some(GROUPINFO_CLAIMED_SLUG) | Some(NO_GROUPINFO_SLUG) => {}
+            _ => return SessionEvent::NotMls,
+        }
+        // Only meaningful while we are trying to seat ourselves. A member that
+        // holds a group has no business reading these.
+        if self.group.is_some() || self.pair_grant.is_none() {
+            return SessionEvent::NotMls;
+        }
+        self.pending_seat = None; // whatever we were building is not going to land
+        self.seat_refusals = self.seat_refusals.saturating_add(1);
+        let contended = slug.as_deref() == Some(GROUPINFO_CLAIMED_SLUG);
+        if self.seat_refusals >= SEAT_REFUSAL_BUDGET {
+            // RFC 9420 §14 names starvation and leaves it to the application. The
+            // requirement is that it becomes visible, not that it resolve: an
+            // agent that never gets a turn looks to the person who invited it
+            // exactly like a permission problem.
+            tracing::warn!(
+                room = %self.room,
+                refusals = self.seat_refusals,
+                contended,
+                "still cannot seat this agent — it holds an admission grant but the room \
+                 has not served it a GroupInfo it could commit against"
+            );
+        } else {
+            tracing::info!(
+                room = %self.room,
+                refusals = self.seat_refusals,
+                contended,
+                "seat attempt refused; will ask again on the next roster change"
+            );
+        }
+        SessionEvent::Handled { outbound: vec![] }
     }
 
     /// SPEC-061 REQ-008: the hub fanned our own external Commit back to us.
@@ -1171,6 +1257,13 @@ impl MlsSession {
             outbound.push(self.keyready_frame());
         }
         outbound.extend(self.keygets_for_addable());
+        // SPEC-061 REQ-008 / CON-003: a roster change is the natural moment to
+        // ask again for something to seat ourselves against. It is what makes a
+        // refused attempt recover without a timer — `groupinfo-claimed` clears
+        // when the holder finishes, and `no-groupinfo` clears when a member turns
+        // up and republishes, which IS a roster change. Empty unless we hold a
+        // grant, hold no group, and have nothing already in flight.
+        outbound.extend(self.self_seat_frames());
         SessionEvent::Handled { outbound }
     }
 
@@ -1925,6 +2018,76 @@ mod tests {
         assert!(
             agent.group.is_none(),
             "and none of this is membership until an echo says so"
+        );
+    }
+
+    /// SPEC-061 CON-003 — the two joiner refusals are neither failures nor the
+    /// same thing, and an agent that treats either as terminal never gets in.
+    #[test]
+    fn a_refused_seat_re_arms_and_asks_again_on_the_next_roster_change() {
+        let (c_dir, c_wire) = setup("refuse", 96, "@creator");
+        let (a_dir, a_wire) = setup("refuse", 97, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(serde_json::to_string(&grant).unwrap())
+        );
+        agent.handle_frame(&pairgrant);
+
+        for slug in ["groupinfo-claimed", "no-groupinfo"] {
+            let refusal = format!("(error @room \"{slug}\")");
+            assert!(
+                matches!(agent.handle_frame(&refusal), SessionEvent::Handled { .. }),
+                "{slug} is consumed, not rendered as a chat error"
+            );
+            // …and the next roster change asks again. Without this the agent
+            // holds an admission grant it will never present.
+            let SessionEvent::Handled { outbound } =
+                agent.handle_frame("(presence @room :members (@creator @agent))")
+            else {
+                panic!("presence handled")
+            };
+            assert!(
+                outbound.iter().any(|f| f.starts_with("(groupinfoget @room")),
+                "after {slug}, a roster change re-asks: {outbound:?}"
+            );
+            agent.present.clear(); // so the next loop iteration sees a fresh roster
+        }
+    }
+
+    /// An error that is not ours must still reach the operator. Consuming every
+    /// `(error …)` would silence the ones a person needs to see.
+    #[test]
+    fn an_unrelated_error_is_not_swallowed_by_the_seat_path() {
+        let (a_dir, a_wire) = setup("refuse-other", 98, "@agent");
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        assert!(matches!(
+            agent.handle_frame("(error @room \"forbidden-room\")"),
+            SessionEvent::NotMls
+        ));
+        assert!(
+            matches!(
+                agent.handle_frame("(error @other \"groupinfo-claimed\")"),
+                SessionEvent::NotMls
+            ),
+            "another room's refusal is not ours"
         );
     }
 
