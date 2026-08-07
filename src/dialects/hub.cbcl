@@ -28,8 +28,10 @@
   (:resource-requirements ((max-depth 8) (max-expansion-size 512) (verification-time 10)))
 
   ;; --- SPEC-016 agent pairing + legibility ------------------------------
-  (extend announce (agent dialects added-by)
-    (tell @room (agent-presence :agent agent :dialects dialects :added-by added-by)))
+  ;; SPEC-053 CON-005: `:did` is additive transport only.  The hub does not
+  ;; resolve, validate semantically, or use it for membership decisions.
+  (extend announce (agent dialects added-by did)
+    (tell @room (agent-presence :agent agent :dialects dialects :added-by added-by :did did)))
   (extend addagent (name dialects)
     (tell @room (pair-request :name name :dialects dialects)))
   (extend paircode (name id code)
@@ -96,6 +98,26 @@
     (tell @room (mls-sealed-grant-request :token token)))
   (extend sealedgrantok (token)
     (tell @room (mls-sealed-grant-stored :token token)))
+
+  ;; --- SPEC-053 CON-007: Selfsame device-grant ceremony -----------------
+  ;; `grant` and `grantproof` are normal signed-member frames (their universal
+  ;; :from and :key envelope fields are intentionally not repeated here).  The
+  ;; hub alone mints `grantchallenge`; ingress rejects that performative before
+  ;; routing, so clients cannot counterfeit a successful challenge.
+  (extend grant (did vc)
+    (tell @room (selfsame-grant :did did :vc vc)))
+  (extend grantproof (sig)
+    (tell @room (selfsame-grant-proof :sig sig)))
+  (extend grantchallenge (nonce)
+    (tell @room (selfsame-grant-challenge :nonce nonce)))
+  ;; Hub-originated, opaque peer-verification carriage.  Recipients verify the
+  ;; compact VC locally; the hub makes no account/key assertion beyond delivery.
+  (extend grantpub (for did vc)
+    (tell @room (selfsame-grant-publication :for for :did did :vc vc)))
+  ;; REQ-033: emitted only after a confirmed account migration commits.  This
+  ;; visible notice is never credential evidence or peer-attribution authority.
+  (extend account-linked (for did)
+    (tell @room (selfsame-account-linked :for for :did did)))
 
   ;; --- SPEC-063 CON-004: room-wide capability negotiation ----------------
   ;; The capabilities EVERY member presently in the room declared — an
