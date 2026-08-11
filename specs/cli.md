@@ -26,10 +26,10 @@ with exit code `6`.
 Consulted by:
 
 * `recv`
+* `tell`
 * `reply`
 * `error`
-* `progress`
-* `emit`
+* `send`
 * `dialect …`
 * `close`
 
@@ -146,17 +146,20 @@ session's active handle — no `eval`, no exported variable (REQ-003).
 Prints a single human-readable success line to stdout
 (`joined @channel as @handle · speaking: …`); warnings go to stderr.
 
-### `emit` (SPEC-016 REQ-004)
+### `tell` and `send` (SPEC-016 REQ-014…REQ-018)
 
-`hark emit <text|cbcl>`
+`hark tell <text>` · `hark send <frame>`
 
-The proactive plain-chat verb over the existing local-API `kind=emit` path.
-Plain text is wrapped into a valid CBCL `(tell @<channel> "<text>")` against
-the agent's joined chat channel; an input that already looks like a CBCL form
-(leading `(`) is validated (full R1–R5, no reply shape, `meta` refused) and
-sent as-is. The wire frame is always valid CBCL — there are no raw-text
-frames. Plain text on a router-transport agent (which has no channel) is a
-usage error suggesting a full CBCL form.
+The two verbs that replaced `emit`, one per contract, both over the local-API
+`kind=send` path. `tell` wraps literal text into a valid CBCL
+`(tell @<channel> "<text>" :from @<handle>)` against the agent's joined chat
+channel, and never parses that text as CBCL. `send` transmits a caller-supplied
+frame of any performative unchanged, validated by the full R1–R5 pipeline with
+no reply shape and `meta` refused. The wire frame is always valid CBCL — there
+are no raw-text frames. `tell` on a router-transport agent (which has no
+channel) is a usage error naming `send`.
+
+Full rules are in the message-minting surface section below.
 
 ### `init`
 
@@ -265,7 +268,12 @@ Operators can correlate drops via the daemon's `tracing` events under target
 `hark::r5`. See [router-protocol.md](router-protocol.md) for the policy
 details.
 
-### `reply`, `error`, and `progress`
+### The message-minting surface: `tell`, `reply`, `error`, and `send`
+
+SPEC-016 ADR-008 fixes how these four are named. A verb that constrains its
+frame to one performative bears that performative's name; a verb that transmits
+a caller-supplied frame of any performative bears the transport name `send`.
+No other verb on this surface mints an agent-authored frame.
 
 `reply` and `error` read CBCL from stdin or an argument, validate it with
 `cbcl-rs`, check that the message matches the selected command, and send it
@@ -273,8 +281,8 @@ over the WebSocket connection selected by `CBCL_AGENT_HANDLE`.
 
 MVP input rules:
 
-* `reply [MESSAGE]` and `error [MESSAGE]` accept at most one positional CBCL
-  message argument.
+* `reply [MESSAGE]`, `error [MESSAGE]`, and `send [FRAME]` accept at most one
+  positional CBCL message argument.
 * If the positional argument is present, the command uses it as the complete
   CBCL message and does not read stdin.
 * If the positional argument is absent, the command reads the complete CBCL
@@ -283,67 +291,97 @@ MVP input rules:
   command fails with a usage error instead of waiting silently.
 * `--file` is not part of the MVP; callers can use shell redirection instead.
 
-`progress` builds a CBCL progress message from flags, validates the generated
-message with `cbcl-rs`, and sends it over the same handle-selected WebSocket
-path.
-
 Examples:
 
 ```bash
+hark tell "looking into it"
 hark reply < reply.cbcl
 hark error '(lang elf (error @router "failed" :thread "rcp-..."))'
-hark progress --thread rcp-... --text "running tests"
+hark send '(lang elf (tell @router "progress" :thread "rcp-..." :text "running tests"))'
 ```
 
 Command-specific message rules:
 
+* `tell` takes **literal text**, never CBCL. See the section below.
 * `reply` accepts only CBCL whose performative, after unwrapping any `(lang ...)`
   dialect wrapper, is `reply`.
 * `error` accepts only CBCL whose performative, after unwrapping any `(lang ...)`
   dialect wrapper, is `error`.
-* `progress` builds a CBCL message whose performative, after unwrapping the
-  generated `(lang ...)` dialect wrapper, is `tell`, recipient is `@router`, and
-  content is the string `"progress"`.
-* all sent messages require a `:thread` parameter so router receipt storage can
-  correlate the message with a dispatched ask.
+* `send` accepts any performative, core or custom. See the section below.
+* `reply` and `error` require a `:thread` parameter so router receipt storage
+  can correlate the message with a dispatched ask. `tell` and `send` do not.
 
-Thread validation is deliberately stricter than the current router fallback
-behavior. After unwrapping any `(lang ...)` dialect wrapper, the inner message
-must contain exactly one `:thread` parameter, and that value must be a non-empty
-CBCL string. Missing, empty, non-string, or duplicate `:thread` values are
-validation failures and must not be sent to the router.
+Thread validation on `reply` and `error` is deliberately stricter than the
+current router fallback behavior. After unwrapping any `(lang ...)` dialect
+wrapper, the inner message must contain exactly one `:thread` parameter, and
+that value must be a non-empty CBCL string. Missing, empty, non-string, or
+duplicate `:thread` values are validation failures and must not be sent to the
+router.
 
 Bare CBCL messages and dialect-wrapped CBCL messages are both accepted for
 `reply` and `error` as long as they pass `cbcl-rs` validation and the unwrapped
 performative matches the command.
 
-Useful `progress` options:
+### `tell`
 
-* `--thread <receipt-id>` - required.
-* `--text <text>` - optional human-readable progress detail.
-* `--dialect <id>` - optional dialect wrapper; defaults to `elf`.
-
-The generated progress frame is still validated with `cbcl-rs` before it is
-sent to the daemon.
-
-`progress` always generates a dialect-wrapped message:
+`tell [TEXT]` sends plain chat text. It wraps the argument into
 
 ```text
-(lang <dialect> (tell @router "progress" :thread "<receipt-id>"))
+(tell @<channel> "<text>" :from @<handle>)
 ```
 
-If `--text <text>` is supplied, `progress` includes exactly one additional
-`:text` parameter:
+against the agent's joined chat channel, escaping the text as a CBCL string.
+
+**The argument is always literal text, whatever character it starts with.**
+`hark tell '(tell @x "y")'` sends a frame whose *body is that string*; it does
+not send a frame addressed to `@x`. Callers with a frame to transmit want
+`send`. This is the whole point of the `tell`/`send` split: the verb decides how
+the argument is read, never the argument's first character.
+
+`tell` needs a chat-hub agent with a channel. On the router transport it fails
+with a usage error naming `send` as the alternative.
+
+### `send`
+
+`send [FRAME]` transmits a caller-supplied CBCL frame unchanged. It accepts any
+performative — core or custom — bare or carried in a `(lang ...)`,
+`(envelope ...)`, `(signed ...)`, or `(with-limits ...)` envelope. It never
+wraps, rewrites, reorders, or injects a parameter; the only transformation is
+trimming whitespace the shell or stdin adds.
+
+A `(meta ...)` form is refused: teaching a dialect is `dialect publish`, not a
+message.
+
+`send` is the only route for a hand-built frame, including the progress frame
+the retired `progress` verb used to mint:
 
 ```text
 (lang <dialect> (tell @router "progress" :thread "<receipt-id>" :text "<text>"))
 ```
 
-Progress messages are non-terminal. A successful `progress` command means the
-daemon validated the generated CBCL and successfully wrote the frame to the
-selected WebSocket. The current router does not send an application-level ACK
-for progress frames, so success does not prove receipt persistence. Agents
-should still send a later `reply` or `error` for the same `:thread`.
+The caller supplies the dialect. Progress frames are non-terminal, and the
+router sends no application-level ACK for them, so a successful `send` does not
+prove receipt persistence. Agents still send a later `reply` or `error` for the
+same `:thread`.
+
+Because hark no longer mints progress frames, the client-side obligation in
+[router-protocol.md](router-protocol.md) — reject a progress message without
+`:thread`, to avoid orphaning a receipt entry — binds whoever authors the frame.
+`send` does not check it.
+
+### Retired and deprecated verbs
+
+`progress` is **retired** (SPEC-016 ADR-010). It was never a CBCL performative,
+only the content string `"progress"` on a `tell`, so every way of getting it
+wrong failed silently. Build the frame and use `send`.
+
+`emit` is **replaced** by `tell` and `send` (SPEC-016 ADR-009). It selected
+between the two contracts by testing whether the argument began with `(`.
+
+Both remain accepted as hidden aliases for exactly one minor release. Each
+writes a single-line deprecation notice to stderr naming its replacement, and
+each preserves its previous exit codes, so a script breaks visibly rather than
+silently. Neither appears in `--help`.
 
 Stdout:
 
@@ -478,7 +516,7 @@ on common failure modes:
 * `7` - unknown, unhealthy, or busy agent handle
 * `8` - CBCL validation or command-kind validation failure, including R1–R5
   well-formedness failures on `dialect publish` and R5 runtime shape or
-  causal-protocol violations on outbound `reply`, `error`, and `progress`
+  causal-protocol violations on outbound `tell`, `reply`, `error`, and `send`
   (local API codes `cbcl_validation_failed`, `shape_violation`, and
   `causal_violation`)
 * `9` - router connection or router authentication failure

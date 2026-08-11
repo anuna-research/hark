@@ -9,11 +9,13 @@ use cbcl_parser::{
 };
 use thiserror::Error;
 
+/// The CLI's fixed-performative verbs. `send` is deliberately absent: it
+/// accepts any performative and is validated by [`validate_for_emit`]
+/// (SPEC-016 ADR-009). `Progress` was removed with the verb (ADR-010).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MessageKind {
     Reply,
     Error,
-    Progress,
 }
 
 impl MessageKind {
@@ -21,7 +23,6 @@ impl MessageKind {
         match self {
             MessageKind::Reply => CorePerformative::Reply,
             MessageKind::Error => CorePerformative::Error,
-            MessageKind::Progress => CorePerformative::Tell,
         }
     }
 
@@ -29,7 +30,6 @@ impl MessageKind {
         match self {
             MessageKind::Reply => "reply",
             MessageKind::Error => "error",
-            MessageKind::Progress => "progress",
         }
     }
 }
@@ -63,10 +63,6 @@ pub enum CbclValidationError {
     EmptyThread,
     #[error("CBCL :thread value must be a string")]
     NonStringThread,
-    #[error("progress messages must be sent to @router")]
-    InvalidProgressRecipient,
-    #[error("progress messages must have string content \"progress\"")]
-    InvalidProgressContent,
     /// R5 shape constraint violation surfaced from `run_pipeline_full`
     /// (REQ-220, REQ-231 step 6b). Phase A plumbing: variant added so
     /// outbound/inbound paths can carry the structured error once they
@@ -97,8 +93,6 @@ impl CbclValidationError {
             CbclValidationError::DuplicateThread => "cbcl_thread_duplicate",
             CbclValidationError::EmptyThread => "cbcl_thread_empty",
             CbclValidationError::NonStringThread => "cbcl_thread_non_string",
-            CbclValidationError::InvalidProgressRecipient => "cbcl_progress_recipient",
-            CbclValidationError::InvalidProgressContent => "cbcl_progress_content",
             CbclValidationError::ShapeViolation { .. } => "shape_violation",
             CbclValidationError::CausalViolation { .. } => "causal_violation",
         }
@@ -442,13 +436,7 @@ fn validate_thread(expr: &SExpr) -> Result<String, CbclValidationError> {
 }
 
 fn validate_kind(message: &Message, expected_kind: MessageKind) -> Result<(), CbclValidationError> {
-    let Message::Simple {
-        performative,
-        recipient,
-        content,
-        ..
-    } = message
-    else {
+    let Message::Simple { performative, .. } = message else {
         unreachable!("caller only passes simple messages");
     };
 
@@ -459,15 +447,6 @@ fn validate_kind(message: &Message, expected_kind: MessageKind) -> Result<(), Cb
             performative.name().to_owned(),
             expected_performative,
         ));
-    }
-
-    if expected_kind == MessageKind::Progress {
-        if recipient.as_ref().and_then(|r| r.as_single()) != Some("@router") {
-            return Err(CbclValidationError::InvalidProgressRecipient);
-        }
-        if !matches!(content, SExpr::Atom(Atom::Str(text)) if text == "progress") {
-            return Err(CbclValidationError::InvalidProgressContent);
-        }
     }
 
     Ok(())
@@ -673,34 +652,80 @@ mod tests {
         );
     }
 
+    /// The `send` validator, with the lightweight context the CLI uses.
+    fn validate_send(input: &str) -> Result<(), CbclValidationError> {
+        let registry = DialectRegistry::default();
+        let mut store = ThreadedMessageStore::new();
+        validate_for_emit(input, &registry, &mut store)
+    }
+
+    /// SPEC-016 TEST-016: `send` accepts any performative, bare or wrapped —
+    /// including the frames the retired `progress` verb used to mint, and the
+    /// `Wrapped` envelopes `validate_for_send` rejects.
     #[test]
-    fn cbcl_validation_accepts_valid_progress() {
-        let validated = validate(
+    fn send_accepts_any_performative_bare_or_wrapped() {
+        for frame in [
+            // what `hark progress` used to build — now just a frame
             r#"(lang elf (tell @router "progress" :thread "rcp-3"))"#,
-            MessageKind::Progress,
-        )
-        .unwrap();
-
-        assert_eq!(validated.kind, MessageKind::Progress);
-        assert_eq!(validated.thread, "rcp-3");
-    }
-
-    #[test]
-    fn cbcl_validation_rejects_progress_with_invalid_recipient() {
-        assert_error_code(
+            // a recipient the retired @router rule would have refused
             r#"(tell @worker "progress" :thread "rcp-3")"#,
-            MessageKind::Progress,
-            "cbcl_progress_recipient",
+            // content the retired rule would have refused
+            r#"(tell @router "working" :thread "rcp-3")"#,
+            // hark's own router control frames (review finding V-01)
+            r#"(lang cbcl-router (tell @router "hello" :agent-id "a" :dialects ("elf")))"#,
+            r#"(lang cbcl-router (tell @router "heartbeat"))"#,
+            // bare, no envelope, no :thread
+            r#"(ask @bob "what is the status")"#,
+            // a Wrapped envelope — REQ-016; validate_for_send rejects these
+            r#"(signed "sig" (reply "done" :thread "rcp-1"))"#,
+        ] {
+            validate_send(frame).unwrap_or_else(|error| panic!("{frame} should pass: {error}"));
+        }
+    }
+
+    /// SPEC-016 TEST-018 (negative-input): `send` refuses dialect teaching.
+    ///
+    /// The input MUST be a `(meta …)` form that *parses*, or the pipeline
+    /// refuses it as malformed and the `Message::Meta` guard is never reached —
+    /// a test that passes whether or not the guard exists. Asserting the
+    /// guard's own message rather than its error code is the other half:
+    /// a parse failure and the guard both surface as `cbcl_malformed`.
+    #[test]
+    fn send_refuses_meta_forms() {
+        let frame = "(meta (teach @local-agent (define arena-v1 (cbcl) @author)))";
+
+        // Precondition: the frame parses, so the guard is what rejects it.
+        assert!(
+            matches!(run_pipeline(frame), PipelineResult::Success(_)),
+            "the test input must parse, or it exercises the parser and not the guard"
+        );
+
+        let error = validate_send(frame).expect_err("a (meta …) form must be refused");
+        assert!(
+            error.to_string().contains("not a (meta …) form"),
+            "expected the emit guard's refusal, got: {error}"
         );
     }
 
+    /// SPEC-016 TEST-019 (prohibited-action): no progress-specific error code
+    /// survives the retirement. A frame the retired rules rejected is now the
+    /// caller's problem, not hark's.
     #[test]
-    fn cbcl_validation_rejects_progress_with_invalid_content() {
-        assert_error_code(
-            r#"(tell @router "working" :thread "rcp-3")"#,
-            MessageKind::Progress,
-            "cbcl_progress_content",
-        );
+    fn no_progress_specific_validation_remains() {
+        for frame in [
+            r#"(tell @worker "progress" :thread "rcp-3")"#,
+            r#"(tell @router "progres" :thread "rcp-3")"#,
+            r#"(tell @router "progress")"#,
+        ] {
+            let result = validate_send(frame);
+            if let Err(error) = result {
+                assert!(
+                    !error.code().starts_with("cbcl_progress"),
+                    "{frame} produced a retired progress error: {}",
+                    error.code()
+                );
+            }
+        }
     }
 
     #[test]

@@ -269,10 +269,10 @@ task="$(hark recv --timeout 30s)"
 Timeout units are `ms`, `s`, `m`, and `h`; the maximum finite timeout is
 `2160h`.
 
-Send progress and a terminal reply:
+Send a non-terminal progress note and a terminal reply:
 
 ```bash
-hark progress --thread rcp-123 --text "running tests"
+hark send '(lang elf (tell @router "progress" :thread "rcp-123" :text "running tests"))'
 hark reply '(lang elf (reply "done" :thread "rcp-123"))'
 ```
 
@@ -282,8 +282,8 @@ Send an error:
 hark error '(lang elf (error "failed" :thread "rcp-123"))'
 ```
 
-`reply` and `error` accept one positional CBCL message or read the complete
-message from stdin:
+`reply`, `error`, and `send` accept one positional CBCL message or read the
+complete message from stdin:
 
 ```bash
 hark reply < reply.cbcl
@@ -318,8 +318,8 @@ handle persists in the daemon (no `eval`):
 
 ```bash
 hark join @demo --as @aria --speak cite
-hark emit "shipped the report"            # wrapped into (tell @demo "…")
-hark emit '(cite @demo :doi "10.1/x" :from @aria)'
+hark tell "shipped the report"            # wrapped into (tell @demo "…")
+hark send '(cite @demo :doi "10.1/x" :from @aria)'
 ```
 
 To be added *by a channel member* instead, redeem the pairing code the web
@@ -462,18 +462,23 @@ is repeatable. Duplicate dialects are rejected before the daemon is called.
 Requires `CBCL_AGENT_HANDLE`. Blocks until one CBCL message is available, then
 prints only that message to stdout.
 
-### `reply`, `error`, and `progress`
+### `tell`, `reply`, `error`, and `send`
 
 Require `CBCL_AGENT_HANDLE`. The CLI validates CBCL locally, the daemon
 validates again, and the daemon returns success only after the frame is written
 to the selected router WebSocket.
 
+A verb that pins its frame to one performative is named for that performative;
+the verb that carries anything is named for the transport.
+
 Validation rules:
 
+* `tell` takes literal text and never parses it as CBCL.
 * `reply` requires an unwrapped CBCL `reply` performative.
 * `error` requires an unwrapped CBCL `error` performative.
-* `progress` builds a `(lang <dialect> (tell @router "progress" ...))` message.
-* all outbound messages require exactly one non-empty string `:thread`.
+* `send` accepts any performative, core or custom, and refuses `(meta ...)`.
+* `reply` and `error` require exactly one non-empty string `:thread`. `tell`
+  and `send` do not.
 
 ### `dialect publish`
 
@@ -526,11 +531,22 @@ render the member as an agent. `--speak` advertises only the listed dialects
 undeclared `--speak` is rejected. The joined handle becomes the session's
 active agent — follow-up commands need no exported env var.
 
-### `emit`
+### `tell` and `send`
 
-`hark emit [message]` (or stdin) — proactive send into the joined channel.
-Plain text is wrapped into a valid CBCL `(tell @channel "…")`; a full CBCL
-form passes through as-is. The wire frame is always valid CBCL.
+`hark tell [text]` (or stdin) — proactive plain chat into the joined channel.
+The text is wrapped into a valid CBCL `(tell @channel "…" :from @handle)`, and
+is **never** parsed as CBCL: `hark tell '(tell @x "y")'` sends that string as
+the message body, not as a form.
+
+`hark send [frame]` (or stdin) — transmit a frame you wrote yourself. Any
+performative, core or custom, bare or wrapped in `(lang ...)`, `(envelope ...)`,
+`(signed ...)`, or `(with-limits ...)`. It never wraps, rewrites, or injects a
+parameter. The wire frame is always valid CBCL.
+
+These replaced `emit`, which chose between the two contracts by testing whether
+the argument began with `(`. `progress` is retired: build the frame and use
+`send`. Both remain as hidden aliases for one minor release, warning on stderr.
+See [SPEC-016](docs/decisions/SPEC-016-cli-verb-set-cbcl-merge.md).
 
 ### `pair`
 
@@ -605,9 +621,9 @@ not return in lockstep onto the machine that just came up — replaying the whol
 signed join: the `hello` with its original capability, the MLS key publication
 on an encrypted channel, and the `announce`. The schedule never gives up.
 
-During the gap the handle stays usable. `hark recv` keeps waiting; `hark emit`
-is refused as *retryable* (`agent_not_ready`), not as a death, so re-offering
-the message is the right response. Nothing is queued behind the gap — in an
+During the gap the handle stays usable. `hark recv` keeps waiting; an outbound
+`hark tell` or `hark send` is refused as *retryable* (`agent_not_ready`), not as
+a death, so re-offering the message is the right response. Nothing is queued behind the gap — in an
 encrypted channel a message sealed before the outage may be sealed against an
 epoch the group has already left, so re-offering is what re-seals it correctly.
 
@@ -724,7 +740,9 @@ exactly one non-empty string `:thread`.
   [decision record](docs/decisions/SPEC-013-tier1-signoff.md)); implementation
   (IMPL-013) not yet started. Affects `cbcl-bus` and `cbcl-chat`.
 * [SPEC-016 — agent onboarding DX](specs/SPEC-016-agent-onboarding-dx.md)
-  — one-shot join, SPAKE2 pairing (Tier-1 piece cleared with SPEC-013), `hark emit`.
+  — one-shot join, SPAKE2 pairing (Tier-1 piece cleared with SPEC-013), and the
+  `tell`/`send` verb set that replaced `emit`
+  ([ADR-008…010](docs/decisions/SPEC-016-cli-verb-set-cbcl-merge.md)).
 * [SPEC-026 — transport resilience](specs/SPEC-026-transport-resilience.md)
   — hub reconnect on a bounded jittered schedule and durable pairing, so a hub
   redeploy or a daemon restart no longer needs a human. See

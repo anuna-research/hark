@@ -60,13 +60,18 @@ fn e2e_mvp_happy_path_start_init_recv_progress_reply_close_stop() {
         format!("{DISPATCH}\n")
     );
 
+    // SPEC-016 ADR-010: `progress` is retired. The frame is unchanged on the
+    // wire; the caller now authors it and routes it through `send`.
     let progress = env
         .command_with_handle(
-            ["progress", "--thread", "rcp-1", "--text", "running"],
+            [
+                "send",
+                r#"(lang elf (tell @router "progress" :thread "rcp-1" :text "running"))"#,
+            ],
             &handle,
         )
         .output()
-        .expect("progress runs");
+        .expect("send runs");
     assert_success(&progress);
     assert!(progress.stdout.is_empty(), "{}", output_debug(&progress));
 
