@@ -160,15 +160,15 @@ fn cli_emit_sends_full_cbcl_form_upstream() {
         .to_owned();
 
     let message = r#"(tell @general "hi" :from @probe)"#;
-    let emit = env
-        .command_with_handle(["emit", message], &handle)
+    let sent = env
+        .command_with_handle(["send", message], &handle)
         .output()
-        .expect("emit runs");
-    assert_success(&emit);
-    assert!(emit.stdout.is_empty(), "{}", output_debug(&emit));
+        .expect("send runs");
+    assert_success(&sent);
+    assert!(sent.stdout.is_empty(), "{}", output_debug(&sent));
 
-    // The payload reaches the router unchanged inside its signed frame:
-    // a full CBCL form passes through.
+    // SPEC-016 TEST-017 (scope-invariant): the payload reaches the router
+    // unchanged inside its signed frame — `send` never wraps or rewrites.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         if router
@@ -215,15 +215,15 @@ fn cli_emit_plain_text_requires_chat_channel() {
         .to_owned();
 
     // A router agent has no chat channel to wrap a plain-text tell for.
-    let emit = env
-        .command_with_handle(["emit", "looking into it"], &handle)
+    let tell = env
+        .command_with_handle(["tell", "looking into it"], &handle)
         .output()
-        .expect("emit runs");
-    assert_eq!(emit.status.code(), Some(2), "{}", output_debug(&emit));
+        .expect("tell runs");
+    assert_eq!(tell.status.code(), Some(2), "{}", output_debug(&tell));
     assert!(
-        String::from_utf8_lossy(&emit.stderr).contains("chat"),
+        String::from_utf8_lossy(&tell.stderr).contains("chat"),
         "{}",
-        output_debug(&emit)
+        output_debug(&tell)
     );
 
     assert_success(&env.command(["daemon", "stop"]).output().expect("stop runs"));

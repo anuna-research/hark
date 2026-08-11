@@ -79,23 +79,22 @@ pub struct SendRequest {
 pub enum SendMessageKind {
     Reply,
     Error,
-    Progress,
-    /// A proactive, agent-initiated outbound that is *not* a reply/error/progress
-    /// — e.g. a `(lang <dialect> (<perf> …))` the agent originates on its own
-    /// (SPEC-003 REQ-011, ADR-007). Validated by `validate_for_emit` (full R1–R5,
-    /// but no reply shape, and `Dialect`/`Wrapped` envelopes allowed).
-    Emit,
+    /// A caller-supplied frame of any performative, core or custom, bare or
+    /// carried in a `(lang …)`/`(envelope …)`/`(signed …)`/`(with-limits …)`
+    /// envelope (SPEC-016 ADR-009, REQ-016). Validated by `validate_for_emit`
+    /// (full R1–R5, no fixed performative, envelopes allowed, `(meta …)`
+    /// refused). Renamed from `Emit` at `LOCAL_API_VERSION` 4.
+    Send,
 }
 
 impl SendMessageKind {
-    /// The reply/error/progress validation kind, or `None` for `Emit` (which is
+    /// The fixed-performative validation kind, or `None` for `Send` (which is
     /// validated by `validate_for_emit` rather than a fixed performative).
     pub(crate) fn message_kind(self) -> Option<MessageKind> {
         match self {
             SendMessageKind::Reply => Some(MessageKind::Reply),
             SendMessageKind::Error => Some(MessageKind::Error),
-            SendMessageKind::Progress => Some(MessageKind::Progress),
-            SendMessageKind::Emit => None,
+            SendMessageKind::Send => None,
         }
     }
 }
