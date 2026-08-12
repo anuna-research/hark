@@ -1,0 +1,75 @@
+{
+  "spec": "SPEC-053 CON-005",
+  "what": "The closed grammar for an announced account value, as BOTH stacks must read it.",
+  "why": "CON-005 says a malformed value is treated as absent, which makes disagreement between implementations invisible: one stack renders attribution and the other renders an unmarked member, and neither reports an error. A shared vector file is the only way that divergence shows up as a failing test rather than as two clients disagreeing about who somebody is. This is the same device successor-pointer-vector.json uses for REQ-039.",
+  "authority": "apps/cbcl_chat/priv/web/announce-did.mjs — the browser recogniser. A second stack agrees with it or the vector fails there.",
+  "grammar": "^did:crdt:[0-9a-f]{64}$",
+  "accept": [
+    {
+      "value": "did:crdt:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "why": "the canonical form: lowercase hex, exactly 64 characters"
+    },
+    {
+      "value": "did:crdt:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "why": "every hex digit appears; nothing about the alphabet is positional"
+    },
+    {
+      "value": "did:crdt:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "why": "the upper bound of the digest space is not a special case"
+    }
+  ],
+  "reject": [
+    {
+      "value": "did:crdt:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "why": "uppercase hex — one account MUST NOT have two spellings, or a pin keyed on the string forks"
+    },
+    {
+      "value": "did:crdt:aAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaA",
+      "why": "mixed case, for the same reason; a case-folding reader would accept it and key on a different string"
+    },
+    {
+      "value": "did:crdt:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "why": "63 characters — a truncated digest is not a shorter account, it is a different one"
+    },
+    {
+      "value": "did:crdt:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "why": "65 characters"
+    },
+    {
+      "value": "did:crdt:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+      "why": "outside the hex alphabet, at the right length"
+    },
+    {
+      "value": "DID:crdt:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "why": "the scheme is matched literally, not case-insensitively as RFC 3986 would allow — this is a wire token, not a URI to dereference"
+    },
+    {
+      "value": "did:CRDT:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "why": "the method name likewise"
+    },
+    {
+      "value": "did:crdt:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+      "why": "a trailing space — the anchor is the point, and a reader that trims would accept a value the other stack rejects"
+    },
+    {
+      "value": " did:crdt:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "why": "a leading space, likewise"
+    },
+    {
+      "value": "did:crdt:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+      "why": "a trailing newline — a line-oriented reader is the likeliest way a second stack diverges here"
+    },
+    {
+      "value": "did:web:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "why": "another DID method at the right shape — CON-005 admits exactly one"
+    },
+    {
+      "value": "did:crdt:",
+      "why": "the prefix alone"
+    },
+    {
+      "value": "",
+      "why": "empty"
+    }
+  ]
+}

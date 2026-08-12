@@ -1,3 +1,4 @@
+pub mod announced_did;
 pub mod cbcl_validation;
 pub mod chat;
 pub mod chat_frame;
