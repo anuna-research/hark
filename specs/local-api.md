@@ -132,7 +132,7 @@ Response:
 {
   "ok": true,
   "version": "0.1.0",
-  "api_version": 1
+  "api_version": 4
 }
 ```
 
@@ -140,7 +140,18 @@ The CLI is compatible with a daemon only when the daemon reports the same
 `api_version`. Patch and minor binary version differences are allowed under the
 same API version. If `api_version` differs or is missing, the CLI should treat
 the daemon as incompatible, report both versions when available, and suggest
-restarting the daemon with the current binary.
+restarting the daemon with the current binary. In the implementation this is
+`DiscoveryState::ApiIncompatible`, surfacing as exit code `12` with that hint.
+
+`api_version` history. This document recorded `1` while the implementation had
+already reached `3`; the gap is closed here rather than papered over by the jump
+to `4`.
+
+| version | change |
+| --- | --- |
+| 1 | initial local API |
+| 2, 3 | shipped in the implementation while this document still said `1` — the intervening changes are not reconstructed here |
+| 4 | `kind` enum: `emit` → `send`, `progress` dropped (SPEC-016 ADR-009, ADR-010) |
 
 ### `POST /v1/agents`
 
@@ -212,7 +223,7 @@ Response:
     "pid": 12345,
     "addr": "127.0.0.1:49152",
     "version": "0.1.0",
-    "api_version": 1
+    "api_version": 4
   },
   "agents": [
     {
@@ -294,7 +305,7 @@ Request:
 
 Fields:
 
-* `kind` - one of `reply`, `error`, or `progress`.
+* `kind` - one of `reply`, `error`, or `send`.
 * `message` - CBCL text to send over the router WebSocket.
 
 The CLI should validate the CBCL with `cbcl-rs` before making this request. The
@@ -307,9 +318,17 @@ The daemon must enforce that `kind` matches the message:
   ...)` dialect wrapper.
 * `error` requires a CBCL performative of `error` after unwrapping any `(lang
   ...)` dialect wrapper.
-* `progress` requires a CBCL performative of `tell` after unwrapping any `(lang
-  ...)` dialect wrapper, recipient `@router`, and content `"progress"`.
-* all three kinds require a `:thread` parameter.
+* `send` accepts any performative, core or custom, bare or carried in a `(lang
+  ...)`, `(envelope ...)`, `(signed ...)`, or `(with-limits ...)` envelope. It
+  is validated by the full R1–R5 pipeline with no fixed performative; a `(meta
+  ...)` form is refused. It is not rewritten.
+* `reply` and `error` require a `:thread` parameter. `send` does not — a
+  proactive frame need not belong to a dispatched ask.
+
+`kind` history (SPEC-016 ADR-009, ADR-010): `emit` was renamed to `send`, and
+`progress` was dropped with the CLI verb. A `progress` frame is now an ordinary
+`send` payload, byte-identical on the wire. Both changes ride
+`api_version` 4.
 
 The required `:thread` parameter must appear exactly once after unwrapping any
 `(lang ...)` dialect wrapper. Its value must be a non-empty CBCL string.
@@ -317,9 +336,9 @@ Missing, empty, non-string, or duplicate `:thread` values must return `422`
 with a stable validation error code and must not be forwarded to the router.
 
 Bare CBCL messages and dialect-wrapped CBCL messages are valid inputs for
-`reply` and `error` if they pass validation and kind checking. The CLI-generated
-`progress` message is always dialect-wrapped, but the daemon should validate the
-unwrapped shape rather than relying on that CLI behavior.
+`reply`, `error`, and `send` if they pass validation and kind checking. The
+daemon validates the unwrapped shape rather than relying on any CLI behavior;
+a `send` payload is caller-authored and carries no CLI-imposed shape at all.
 
 If validation or kind checking fails, the daemon must return an error and must
 not send the frame to the router.
@@ -357,15 +376,15 @@ The daemon does not track dispatched `:thread` values in the MVP. It only
 requires the local `:thread` shape defined above. The router remains responsible
 for authoritative receipt correlation.
 
-For `progress`, successful local send means the daemon wrote the frame to the
-selected WebSocket. The current router does not send an application-level ACK
-for progress frames, so the local API cannot confirm receipt persistence
-synchronously.
+For a progress frame carried by `send`, successful local send means the daemon
+wrote the frame to the selected WebSocket. The current router does not send an
+application-level ACK for progress frames, so the local API cannot confirm
+receipt persistence synchronously.
 
-The CLI `progress` command builds its CBCL message from command-line flags and
-then calls this endpoint with `kind = "progress"`. The local API remains
-message-based so the daemon has one validation and forwarding path for all
-agent-originated frames.
+The CLI no longer builds progress frames: `progress` is retired (SPEC-016
+ADR-010) and the caller authors the frame. The local API remains message-based
+so the daemon has one validation and forwarding path for all agent-originated
+frames.
 
 Response:
 

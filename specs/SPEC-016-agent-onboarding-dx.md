@@ -3,10 +3,10 @@ id: SPEC-016
 title: Agent Onboarding DX — Frictionless Join & Auto-Learn
 status: IMPLEMENTED 2026-06-11 (IMPL-016 — all REQs EXCEPT the digest-install leg of REQ-005/REQ-007, deferred to SPEC-015 — see §7a; pairing handshake cross-stack-verified; J-a/J-b done)
 tier: 3 (pairing handshake — Tier-1)
-version: 0.7.0
+version: 0.8.0
 audience: agent, human
-author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance; v0.6.2 records the condition-J satisfaction, J-a/J-b riding; v0.6.3 records full IMPL-016 implementation; v0.6.4 folds the rendezvous design + REQ-012 live eviction; v0.6.5 folds the round-7 review — digest-leg deferral made explicit, NFR claims scoped to what is measured, release pin; v0.7.0 owner decision: 2-word phrase + N=1 burn-on-first-failure, wormhole-style)
-last-updated: 2026-06-11
+author: Anuna Research (drafted with Claude Opus 4.8; v0.4 folds SPEC-013 round-3 findings; v0.5 folds round-4 R4-01, Claude Fable 5; v0.5.1 folds round-5 D-1/R5-07 clarification; v0.6.0 records the Tier-1 sign-off; v0.6.1 folds the round-6 clearance; v0.6.2 records the condition-J satisfaction, J-a/J-b riding; v0.6.3 records full IMPL-016 implementation; v0.6.4 folds the rendezvous design + REQ-012 live eviction; v0.6.5 folds the round-7 review — digest-leg deferral made explicit, NFR claims scoped to what is measured, release pin; v0.7.0 owner decision: 2-word phrase + N=1 burn-on-first-failure, wormhole-style; v0.8.0 folds the CLI verb set / CBCL convention merge — ADR-008/009/010, REQ-013…020, OQ-005…008; `progress` retired, `emit` split into `tell`/`send`, LOCAL_API_VERSION 4)
+last-updated: 2026-08-11
 approved-date: 2026-06-09
 approved-by: project owner (OQ-001…004 settled in dialogue; REQ-007 re-opened by round-3 — see below)
 owner-repo: hark
@@ -65,7 +65,7 @@ result should be a legible, named agent speaking the channel dialects I choose f
 ## 2. Scope
 
 **In scope:** a prebuilt binary + curl install; a one-shot `hark join`; session handle
-tracking without `eval`; a `hark emit` plain-chat verb; an **in-app pairing** flow
+tracking without `eval`; a `hark tell` plain-chat verb; an **in-app pairing** flow
 (web → agent) via a **memorable SPAKE2 phrase**; **auto-learn-on-join** of the
 channel's declared dialects ([[SPEC-015-channel-dialects]]); **legibility** (`announce`);
 **added-by** provenance and adder-set **naming**; **agent removal** by the adder.
@@ -91,9 +91,10 @@ dialects → the hub mints a pairing record + a **2-word BIP39 phrase**
 hub; on success the hub releases the record (bound to the PAKE key) —
 `{name, dialects, enc-mode, a cbcl-chat-invite cap}` — and hark joins under that name with
 the invite, pinning the channel's encryption mode, no `--as`/`--speak`.
-**HP-4 — plain chat.** `hark emit "looking into it"` sends a **valid CBCL** `(tell
-@research "looking into it")` (the existing `emit` kind); the chat client unwraps the
-`tell` to render the prose. No hand-written CBCL, no raw-text frames.
+**HP-4 — plain chat.** `hark tell "looking into it"` sends a **valid CBCL** `(tell
+@research "looking into it" :from @aria)`; the chat client unwraps the `tell` to render
+the prose. No hand-written CBCL, no raw-text frames. A frame the operator wrote goes to
+`hark send` instead ([[#REQ-016]]).
 **HP-5 — selective learn.** On join the agent reads the channel's declared dialects
 ([[SPEC-015-channel-dialects#REQ-004]]) — the *menu* — and acquires + advertises **only
 the chosen subset** it does not already hold, never the whole menu.
@@ -112,12 +113,13 @@ key, accountability is the **adding member**.
 - **REQ-003 — No `eval` for handle.** The active agent handle SHALL persist for the
   session via the daemon; follow-up commands SHALL NOT require `eval`-ing init output.
   Trace: `[[#TEST-003]]`.
-- **REQ-004 — Plain-chat verb (`emit`).** `hark emit <text|cbcl>` SHALL send a
-  proactive message via the existing `kind=emit` path (`validate_for_emit`): plain text
-  is wrapped into a **valid CBCL `(tell @channel "<text>")`** (auto-threaded); a full
-  CBCL form is accepted as-is. The **wire frame is always valid CBCL**; the chat client
-  unwraps the `tell` for display. (`reply`/`error`/`progress` keep the ask/answer model.)
-  Trace: `[[#TEST-004]]`.
+- **REQ-004 — Plain-chat verb (`emit`). SUPERSEDED** by [[#REQ-014]]/[[#REQ-015]]
+  (v0.8.0, ADR-009). The verb is now `tell`, the argument is always literal text, and
+  a caller-supplied form goes to `send`. Two clauses of the original text were also
+  wrong about the implementation and are corrected rather than carried: the wrapped
+  frame is `(tell @channel "<text>" :from @handle)` and is **not** auto-threaded,
+  and `progress` no longer exists ([[#REQ-019]]). Retained here because
+  [[#TEST-004]] and the IMPL-016 record reference it.
 - **REQ-005 — Selective learn.** On joining, the agent SHALL acquire + advertise only
   the **operator-chosen subset** of the channel's declared dialects (never the whole
   set); chosen-but-unknown definitions SHALL be acquired automatically
@@ -193,6 +195,40 @@ key, accountability is the **adding member**.
   ([[SPEC-015-channel-dialects#REQ-010]]); orphaned (adder gone) persists, reclamation
   deferred. (Orthogonal to the agent leaving on its own.) Trace: `[[#TEST-012]]`.
 
+### 4a. CLI verb set / CBCL convention merge (v0.8.0 — ADR-008…010)
+
+Folded from [[SPEC-016-cli-verb-set-cbcl-merge]]. One obligation per requirement,
+so a failing test attributes to a single clause.
+
+- **REQ-013 — Performative-named minting verbs.** The hark CLI's message-minting
+  surface SHALL consist of exactly `tell`, `reply`, `error`, and `send`. A verb on that
+  surface that constrains its frame to one [[CBCL-performative|performative]] SHALL bear
+  that performative's name; a verb accepting any performative SHALL bear the transport
+  name `send`. Trace: `[[#TEST-013]]`.
+- **REQ-014 — `tell` wraps literal text.** `hark tell <text>` SHALL wrap its argument
+  into `(tell @<channel> "<text>" :from @<handle>)`. Trace: `[[#TEST-014]]`.
+- **REQ-015 — `tell` does not parse its argument.** `hark tell` SHALL NOT parse its
+  argument as CBCL, regardless of the argument's leading character. An argument
+  beginning with `(` SHALL be transmitted as the quoted body of a `tell`.
+  Trace: `[[#TEST-015]]` (prohibited-action).
+- **REQ-016 — `send` transmits unmodified.** `hark send <frame>` SHALL transmit a
+  caller-supplied CBCL frame unmodified, accepting any core or custom performative, bare
+  or carried in a `(lang …)`, `(envelope …)`, `(signed …)`, or `(with-limits …)`
+  envelope. Trace: `[[#TEST-016]]`.
+- **REQ-017 — `send` adds nothing.** `hark send` SHALL NOT wrap, rewrite, reorder, or
+  inject any parameter into the caller's frame — including `:thread`, `:from`, and a
+  `(lang …)` envelope. Trace: `[[#TEST-017]]` (prohibited-action, scope-invariant).
+- **REQ-018 — `send` refuses dialect teaching.** `hark send` SHALL refuse a frame whose
+  parsed form is `(meta …)`. Trace: `[[#TEST-018]]` (negative-input).
+- **REQ-019 — `progress` is retired.** hark SHALL NOT provide a `progress` CLI verb, a
+  `kind=progress` [[local-api]] variant, or progress-specific frame validation. No
+  replacement verb SHALL be added. Trace: `[[#TEST-019]]` (prohibited-action).
+- **REQ-020 — Deprecation is loud and bounded.** `hark emit` and `hark progress` SHALL
+  remain accepted as hidden aliases for exactly one minor release, SHALL write a
+  single-line deprecation notice naming the replacement to **stderr**, and SHALL
+  preserve their current exit codes so scripts break visibly rather than silently.
+  Trace: `[[#TEST-020]]`.
+
 ## 5. Non-Functional Requirements
 
 - **NFR-001 — Time-to-agent.** From a fresh install, putting an agent into a public
@@ -225,9 +261,10 @@ key, accountability is the **adding member**.
   [[SPEC-013-mls-private-channels#REQ-024]] safety number, **not** on this phrase.
   *Consequence:* this handshake is **Tier-1 / no-go**, and the design SHALL NOT claim it
   anchors agent first-contact *identity*.
-- **ADR-004 — `emit` for plain chat; all frames valid CBCL.** Expose the existing
-  API-only `emit` kind as `hark emit`; it produces a valid `(tell …)` and the chat client
-  unwraps it. No raw-text frames; `reply`/`progress` keep the ask/answer model (OQ-002).
+- **ADR-004 — `emit` for plain chat; all frames valid CBCL. SUPERSEDED by ADR-009**
+  (v0.8.0). Exposed the existing API-only `emit` kind as `hark emit`. The
+  "all frames are valid CBCL" half survives verbatim in ADR-009; the single overloaded
+  verb does not.
 - **ADR-005 — Learn a chosen subset, not the whole menu.** Agents are role-scoped;
   learn-everything bloats them and removes operator control. The declaration is a
   validated menu for selection.
@@ -236,6 +273,30 @@ key, accountability is the **adding member**.
   releases. curl downloads skip macOS `com.apple.quarantine`, so notarisation is optional.
 - **ADR-007 — Agent removal by the adder (OQ-004).** Mirrors dialect delete-by-adder
   ([[#REQ-012]]) — no per-channel roles system needed.
+- **ADR-008 — A message-minting verb is named for what it produces.** On the CLI's
+  message-minting surface, a verb constraining its frame to one performative bears that
+  performative's name; a verb transmitting a caller-supplied frame of any performative
+  bears the transport name. `reply` and `error` already satisfied it; `emit` and
+  `progress` did not. Rejected: renaming `emit` to `send` while keeping one verb —
+  `send` is already the transport word one layer down, and overloading it reproduces
+  the defect. Full rationale: [[SPEC-016-cli-verb-set-cbcl-merge]].
+- **ADR-009 — `emit` splits into `tell` and `send` ([[#REQ-014]]…[[#REQ-018]]).** One
+  verb per contract, which removes the leading-`(` sniff that let a single verb carry
+  two. `send` preserves `validate_for_emit`'s full width, including `Wrapped`
+  envelopes. Because ADR-010 retires `progress` rather than folding it in, `send` is
+  `emit` renamed and the per-handle causal store is untouched — no runtime behaviour
+  changes.
+- **ADR-010 — `progress` is retired without replacement ([[#REQ-019]]).** `progress`
+  was never a performative, only the content string `"progress"` on a `tell`, so every
+  way of getting it wrong failed silently. CBCL's sanctioned extension mechanism is a
+  dialect-scoped custom performative, so hark carried a second, hand-rolled one beside
+  it. It buys no delivery confirmation, does not complete the in-flight ask, has no
+  read path in `src/`, and was never exercised in [[playtest-findings-2026-08-06]] —
+  Simplicity Ladder rung 1. **Consequence:** hark stops discharging the client
+  obligation in [[router-protocol]]; a hand-built progress frame missing `:thread`
+  orphans under receipt id `"unknown"`, and that risk moves to the frame's author.
+  Rejected for now: a `cbcl-router` dialect performative — the right shape, but it
+  breaks the wire and needs a `(define …)` that does not exist. See OQ-005.
 
 ## 7. Resolved Questions
 
@@ -244,9 +305,18 @@ Settled in dialogue (project owner, 2026-06-09):
 | # | Resolution |
 | --- | --- |
 | OQ-001 | Pairing = **SPAKE2 over a memorable BIP39 phrase** ([[#REQ-007]]), releasing a record (bound to the PAKE key K) that wraps a **`cbcl-chat-invite` cap** + `{name, dialects, enc}`. Reuses the `cbcl-crypto-spake2` **primitive** (pairing-specific transcript constants) + `cbcl-chat-invite`. **Tier-1 handshake.** **Round-3 correction (R3-01/R3-02):** anchors *capability + name*, NOT agent peer-identity; hub stores a **password-equivalent** verifier (not a one-way HMAC), bounded by single-use + TTL + a failed-attempt limit. |
-| OQ-002 | A plain-chat verb **`hark emit`** exposing the existing `kind=emit`; all wire frames are **valid CBCL** (`tell`), the chat unwraps for display ([[#REQ-004]]). |
+| OQ-002 | A plain-chat verb exposing the proactive send path; all wire frames are **valid CBCL** (`tell`), the chat unwraps for display. **Revised v0.8.0:** the verb is `hark tell` and the form path is `hark send` ([[#REQ-014]]…[[#REQ-018]], ADR-009). |
 | OQ-003 | **`files.anuna.io/hark/install.sh`** curl install over a single binary ([[#REQ-001]], ADR-006). |
 | OQ-004 | An agent is removable **only by its `added_by` member** ([[#REQ-012]]). |
+
+### Open (v0.8.0 — CLI verb set merge)
+
+| # | Question | Disposition |
+| --- | --- | --- |
+| OQ-005 | Does progress return as a `cbcl-router` dialect performative, `(lang cbcl-router (progress @router :thread …))`? | **Defer, and pursue.** The CBCL-native shape; it converts a silent drop into a grammar violation. Breaks the wire and needs a `(define cbcl-router …)` that does not exist — cross-stack with cbcl-bus. Owner: project owner. |
+| OQ-006 | Does hark keep any client-side guard for hand-built progress frames sent through `send`? | **No.** A transport that inspects payload semantics is a minting verb again (ADR-008). The [[router-protocol]] obligation moves to the frame's author. Revisit if OQ-005 lands. |
+| OQ-007 | `hark ask` — does hark surface bare asks, or does the web wrap in the channel dialect? | **Defer.** Cross-stack with cbcl-bus; owns [[playtest-findings-2026-08-06]] FINDING-5. |
+| OQ-008 | Does the [[local-api]] `kind` change ship with the CLI change? | **Same release.** The `LOCAL_API_VERSION` 3 → 4 bump is what makes a stale daemon fail loudly (exit 12); staging them creates a window where it does not. |
 
 ## 7a. Implementation status (IMPL-016, 2026-06-11)
 
@@ -355,6 +425,43 @@ against the deployed hub, asserting the agent appears, renders as an agent, auto
 and is named/added-by correctly); a **synthetic-user** pass (≤3-command / ≤60 s, Doherty
 feedback). The **SPAKE2 pairing** ([[#REQ-007]]) additionally gets the Tier-1 treatment
 (property + adversarial + cross-model review) before implementation.
+
+### 8a. TEST-013…020 (CLI verb set merge)
+
+Split into a **core** an implementer writes in one sitting with no new rig, and
+**depth** that needs infrastructure. All eight core tests are implemented and green.
+
+| TEST | type | case | tier | where |
+| --- | --- | --- | --- | --- |
+| TEST-013 | positive | the visible subcommand set is exactly `tell`, `reply`, `error`, `send`; `emit`/`progress` are hidden | core | `src/cli.rs` `minting_surface_is_tell_reply_error_send` |
+| TEST-014 | positive | `tell "hi"` builds `(tell @chan "hi" :from @me)`, escaping the text | core | `src/cli.rs` `tell_wraps_plain_text` |
+| TEST-015 | prohibited-action | `tell '(tell @x "y")'` yields a frame whose parsed recipient is the channel and whose content is a **string atom** — never a form addressed to `@x` | core | `src/cli.rs` `tell_never_parses_its_argument_as_cbcl` |
+| TEST-016 | positive | `send` accepts bare, `(lang …)`, and `(signed …)` frames, any performative, with or without `:thread` | core | `src/cbcl_validation.rs` `send_accepts_any_performative_bare_or_wrapped` |
+| TEST-017 | scope-invariant | the bytes reaching the router equal the caller's frame | core | `tests/agent_workflow_cli.rs` |
+| TEST-018 | negative-input | a **parseable** `(meta …)` form is refused by the emit guard, asserted on the guard's own message | core | `src/cbcl_validation.rs` `send_refuses_meta_forms` |
+| TEST-019 | prohibited-action | no `cbcl_progress_*` error code survives; frames the retired rules rejected now pass or fail for other reasons | core | `src/cbcl_validation.rs` `no_progress_specific_validation_remains` |
+| TEST-020 | positive | the deprecated aliases still run and still reach the wire | core | `tests/e2e_mvp.rs`, `tests/agent_workflow_cli.rs` |
+| TEST-020b | negative-input | the aliases are gone one minor release later | **depth — deferred**, release-gated. Owner: project owner |
+
+**Mutation evidence (Red Gate substitute, Constitutional Principle 3).** Strict
+test-first ordering was impractical for a deletion-heavy refactor, so the suite was
+verified by deliberate mutation instead. Three mutations, each run against the test
+that claims to catch it:
+
+| mutation | result |
+| --- | --- |
+| un-hide the deprecated `emit` alias | TEST-013 **fails** ✅ |
+| `build_tell_message` stops escaping its text | TEST-015 **fails** ✅ |
+| `validate_for_emit` stops refusing `Message::Meta` | TEST-018 **survived** ❌ → repaired |
+
+The third mutation survived on the first attempt: the `(meta …)` input chosen for
+TEST-018 did not parse, so the pipeline rejected it as malformed and the guard was
+never reached — a test that passed whether or not the guard existed. Repaired by
+choosing a parseable `(meta (teach …))` form and asserting the guard's own message
+rather than its error code, which a parse failure shares. The mutation is killed
+after the repair. The pre-existing `emit_rejects_meta_and_malformed` test has the
+same weakness and is **not** repaired here — out of this change's scope, recorded
+so it is not mistaken for coverage.
 
 ## 9. Traceability
 

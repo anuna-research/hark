@@ -156,7 +156,7 @@ connection:
 ```bash
 hark reply
 hark error
-hark progress
+hark send
 ```
 
 `reply` and `error` should:
@@ -168,14 +168,14 @@ hark progress
 5. send the frame through the daemon over that handle's WebSocket as a binary
    CBCL frame
 
-`progress` should build a CBCL `tell @router "progress"` frame from flags,
-validate the generated CBCL with `cbcl-rs`, resolve `CBCL_AGENT_HANDLE`, and
-send the frame through the daemon over that handle's WebSocket as a binary CBCL
-frame.
+`send` should do the same, minus step 3: it accepts any performative and does
+not rewrite the caller's frame (SPEC-016 ADR-009). It is the route for a
+non-terminal progress frame, which the CLI no longer builds.
 
-Terminal messages must be CBCL `reply` or `error` messages. Progress messages
-must be CBCL `tell` messages to `@router` whose content is the string
-`"progress"`.
+Terminal messages must be CBCL `reply` or `error` messages. A progress message
+must be a CBCL `tell` message to `@router` whose content is the string
+`"progress"` — a shape the router requires and, since SPEC-016 ADR-010, the
+frame's author is responsible for producing.
 
 The daemon must repeat validation and command-kind checking before forwarding
 the frame to the router.
@@ -183,7 +183,7 @@ the frame to the router.
 `reply` and `error` may be bare CBCL messages or dialect-wrapped CBCL messages.
 Kind checking is performed after unwrapping any `(lang ...)` wrapper.
 
-Example progress frame:
+Example progress frame, as a caller now writes it for `hark send`:
 
 ```lisp
 (lang elf
@@ -201,7 +201,8 @@ If no progress text is supplied, the generated frame omits `:text`:
 ```
 
 Both forms are valid CBCL under the local `cbcl-rs` parser; `:thread` is
-mandatory for router receipt correlation, and `:text` is optional.
+mandatory for router receipt correlation, and `:text` is optional. hark does not
+check either on the `send` path — see the receipt-correlation section below.
 
 ## Thread and Receipt Correlation
 
@@ -249,6 +250,24 @@ Current router behavior:
 If `:thread` is missing, the current router stores the frame under receipt id
 `"unknown"`. The client must reject progress messages without `:thread` to
 avoid orphaning receipt entries.
+
+**Who "the client" is, since SPEC-016 ADR-010.** hark no longer mints progress
+frames: the `progress` verb and the `kind=progress` local-API variant are
+retired, and a progress frame is now an ordinary caller-authored payload carried
+by `hark send`. `send` transmits what it is given without inspecting it — a
+transport that enforced progress semantics would be a minting verb again
+(ADR-008). The obligation above therefore binds **whoever authors the frame**,
+not hark. Two failure modes follow, and both are the author's to avoid:
+
+* a missing `:thread` orphans the entry under receipt id `"unknown"`, and
+* a content string other than `"progress"` is ignored entirely, because
+  non-progress `tell` frames from agents are dropped (see above, except for
+  `hello`), so a typo vanishes without an error anywhere.
+
+Returning this obligation to a checked position is the open question SPEC-016
+records as OQ-005: a `cbcl-router` dialect that declares `progress` as a custom
+performative makes both failure modes grammar violations rather than silent
+drops. That is a cross-stack change and is not taken here.
 
 ## R5 Runtime Behavioural Verification
 

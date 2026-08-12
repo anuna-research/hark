@@ -6,10 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use tokio::net::TcpListener;
 
-use crate::cbcl_validation::{MessageKind, validate_for_emit, validate_for_send};
+use crate::cbcl_validation::{validate_for_emit, validate_for_send};
 use crate::config::{SAMPLE_CONFIG, default_config_file, validate_dialect_id};
 use crate::constants::{COMMAND_NAME, DEFAULT_PROGRESS_DIALECT, MAX_RECV_TIMEOUT_MS};
 use crate::daemon::{
@@ -55,12 +55,25 @@ pub enum Command {
     Reply(MessageInputArgs),
     #[command(about = "Validate and send a CBCL error message")]
     Error(MessageInputArgs),
-    #[command(about = "Build and send a non-terminal progress message")]
-    Progress(ProgressArgs),
     #[command(
-        about = "Send a proactive message: plain text becomes (tell @channel \"…\"), a CBCL form passes through"
+        about = "Send plain chat text as (tell @channel \"…\"); the argument is never parsed as CBCL"
     )]
+    Tell(TellArgs),
+    #[command(about = "Transmit a caller-supplied CBCL frame unchanged, of any performative")]
+    Send(MessageInputArgs),
+    // SIMPLIFY: deprecation shims (SPEC-016 REQ-020). `emit` keeps its
+    // leading-`(` sniff and `progress` keeps its frame builder, so scripts
+    // written against v0.2 keep working for exactly one minor release. Ceiling:
+    // the release after the one that ships `tell`/`send`. Upgrade path: delete
+    // both arms, `emit_input_is_cbcl_form`, `ProgressArgs`, and
+    // `build_progress_message` (trace: SPEC-016 REQ-020, ADR-010).
+    #[command(hide = true, about = "Deprecated: use `hark tell` or `hark send`")]
     Emit(MessageInputArgs),
+    #[command(
+        hide = true,
+        about = "Deprecated: build the frame yourself and use `hark send`"
+    )]
+    Progress(ProgressArgs),
     #[command(about = "Dialect discovery, subscription, and publication")]
     #[command(subcommand)]
     Dialect(DialectCommand),
@@ -239,6 +252,15 @@ pub struct MessageInputArgs {
     pub message: Option<String>,
 }
 
+/// SPEC-016 REQ-014/REQ-015: `tell` takes **literal text**, never a CBCL form.
+/// A separate type from [`MessageInputArgs`] so the help text cannot imply
+/// otherwise — an argument beginning with `(` is still literal text.
+#[derive(Debug, Args)]
+pub struct TellArgs {
+    #[arg(help = "Literal chat text; if absent, read stdin until EOF. Never parsed as CBCL")]
+    pub text: Option<String>,
+}
+
 #[derive(Debug, Args)]
 pub struct ProgressArgs {
     #[arg(long = "thread", help = "Receipt thread id from the dispatched ask")]
@@ -251,13 +273,6 @@ pub struct ProgressArgs {
         help = "Dialect wrapper for the generated progress message"
     )]
     pub dialect: String,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-pub enum SendKind {
-    Reply,
-    Error,
-    Progress,
 }
 
 pub async fn run(cli: Cli) -> AppResult<()> {
@@ -279,8 +294,19 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Recv(args) => recv_command(args).await,
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args).await,
         Command::Error(args) => send_message_command(SendMessageKind::Error, args).await,
-        Command::Progress(args) => progress_command(args).await,
-        Command::Emit(args) => emit_command(args).await,
+        Command::Tell(args) => tell_command(args).await,
+        Command::Send(args) => send_frame_command(args).await,
+        Command::Emit(args) => {
+            deprecation_notice("emit", "hark tell <text>` for chat or `hark send <frame>");
+            emit_command(args).await
+        }
+        Command::Progress(args) => {
+            deprecation_notice(
+                "progress",
+                "hark send '(lang <d> (tell @router \"progress\" …))'",
+            );
+            progress_command(args).await
+        }
         Command::Dialect(command) => match command {
             DialectCommand::Publish(args) => dialect_publish_command(args).await,
             DialectCommand::Query(args) => dialect_query_command(args).await,
@@ -717,10 +743,11 @@ fn validate_init_advertisement(dialects: &[String]) -> AppResult<()> {
 
 async fn send_message_command(kind: SendMessageKind, args: MessageInputArgs) -> AppResult<()> {
     let message = read_message_input(args.message)?;
-    // The CLI only sends reply/error/progress; emit is API-only (kind=emit).
+    // The CLI's fixed-performative verbs are reply and error; `send` carries
+    // everything else and is validated by `validate_for_emit`.
     let expected_kind = kind
         .message_kind()
-        .expect("CLI send commands use reply/error/progress");
+        .expect("CLI fixed-performative commands use reply/error");
     validate_for_send(&message, expected_kind).map_err(|error| {
         eprintln!("{}: {error}", error.code());
         AppError::CbclValidation
@@ -728,51 +755,70 @@ async fn send_message_command(kind: SendMessageKind, args: MessageInputArgs) -> 
     send_validated_message(kind, message).await
 }
 
-async fn progress_command(args: ProgressArgs) -> AppResult<()> {
-    validate_dialect_id(&args.dialect).map_err(|error| AppError::Usage(error.to_string()))?;
-    let message = build_progress_message(&args.thread, args.text.as_deref(), &args.dialect);
-    validate_for_send(&message, MessageKind::Progress).map_err(|error| {
-        eprintln!("{}: {error}", error.code());
-        AppError::CbclValidation
-    })?;
-    send_validated_message(SendMessageKind::Progress, message).await
+/// SPEC-016 REQ-020: one-line deprecation notice on stderr, naming the
+/// replacement. Stdout stays clean so piped scripts are unaffected, and the
+/// exit code of the underlying command is preserved.
+fn deprecation_notice(verb: &str, replacement: &str) {
+    eprintln!("hark: `{verb}` is deprecated and will be removed; use `{replacement}`");
 }
 
-/// REQ-004 (SPEC-016): `hark emit` — the proactive plain-chat verb. Plain text
-/// is wrapped into a valid CBCL `(tell @<channel> "<text>")` against the
-/// agent's joined chat channel; an input that already looks like a CBCL form
-/// (leading `(`) is validated and sent as-is. The wire frame is always valid
-/// CBCL — there are no raw-text frames.
-async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
-    let input = read_message_input(args.message)?;
-    let input = input.trim();
-    if input.is_empty() {
+/// SPEC-016 REQ-014/REQ-015: `hark tell` — the plain-chat verb. The argument is
+/// **always literal text**, whatever character it starts with, and is wrapped
+/// into `(tell @<channel> "<text>" :from @<handle>)`. A leading `(` buys the
+/// caller nothing here: that is what `hark send` is for.
+async fn tell_command(args: TellArgs) -> AppResult<()> {
+    let text = read_message_input(args.text)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(AppError::Usage("tell requires non-empty text".to_owned()));
+    }
+
+    let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
+    let (channel, wire_handle) = agent_chat_channel(&client, &handle).await?;
+    let channel = channel.ok_or_else(|| {
+        AppError::Usage(
+            "tell needs a chat-hub agent with a channel; \
+             on the router transport use `hark send` with a full CBCL form"
+                .to_owned(),
+        )
+    })?;
+
+    let message = build_tell_message(text, &channel, &wire_handle);
+    transmit_frame(&client, &handle, message).await
+}
+
+/// SPEC-016 REQ-016/REQ-017/REQ-018: `hark send` — the transport verb. It
+/// transmits a caller-supplied frame of any performative, core or custom, bare
+/// or carried in a `(lang …)`/`(envelope …)`/`(signed …)`/`(with-limits …)`
+/// envelope. It never wraps, rewrites, reorders, or injects a parameter; the
+/// only transformation is trimming the surrounding whitespace a shell or stdin
+/// adds. A `(meta …)` form is refused by `validate_for_emit`.
+async fn send_frame_command(args: MessageInputArgs) -> AppResult<()> {
+    let frame = read_message_input(args.message)?;
+    let frame = frame.trim();
+    if frame.is_empty() {
         return Err(AppError::Usage(
-            "emit requires a non-empty message".to_owned(),
+            "send requires a non-empty frame".to_owned(),
         ));
     }
 
     let client = discover_live_client().await?;
     let handle = resolve_session_handle(&client).await?;
+    transmit_frame(&client, &handle, frame.to_owned()).await
+}
 
-    let message = if emit_input_is_cbcl_form(input) {
-        input.to_owned()
-    } else {
-        let (channel, wire_handle) = agent_chat_channel(&client, &handle).await?;
-        let channel = channel.ok_or_else(|| {
-            AppError::Usage(
-                "plain-text emit needs a chat-hub agent with a channel; \
-                 on the router transport pass a full CBCL form instead"
-                    .to_owned(),
-            )
-        })?;
-        build_emit_message(input, &channel, &wire_handle)
-    };
-
-    // Mirror reply/error/progress: validate locally before bothering the
-    // daemon. An empty registry + fresh store is the lightweight context —
-    // unknown dialects fall back to the base pipeline, exactly like the
-    // daemon's fallback for not-yet-installed dialects.
+/// Validate locally, then hand the frame to the daemon unchanged.
+///
+/// Local validation mirrors `reply`/`error`: refuse a malformed frame before
+/// bothering the daemon. An empty registry + fresh store is the lightweight
+/// context — unknown dialects fall back to the base pipeline, exactly like the
+/// daemon's fallback for not-yet-installed dialects.
+async fn transmit_frame(
+    client: &LocalApiClient,
+    handle: &AgentHandle,
+    message: String,
+) -> AppResult<()> {
     let registry = cbcl_core::dialect::DialectRegistry::default();
     let mut store = cbcl_core::store::ThreadedMessageStore::new();
     validate_for_emit(&message, &registry, &mut store).map_err(|error| {
@@ -782,9 +828,9 @@ async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
 
     client
         .send(
-            &handle,
+            handle,
             &SendRequest {
-                kind: SendMessageKind::Emit,
+                kind: SendMessageKind::Send,
                 message,
             },
         )
@@ -811,20 +857,69 @@ async fn agent_chat_channel(
     Ok((agent.channel, agent.router_agent_id))
 }
 
-/// `true` when the emit input is already a CBCL form rather than plain text.
-fn emit_input_is_cbcl_form(input: &str) -> bool {
-    input.trim_start().starts_with('(')
-}
-
 // `:from` identifies the signed-member sender — the hub's dispatch resolves
 // the sender handle from it on EVERY frame and rejects a frame without one
 // (`missing-from`, cbcl-chat-session-ws:dispatch). Same contract the announce
 // frame carries; found live — mock hubs don't enforce it.
-fn build_emit_message(text: &str, channel: &str, from: &str) -> String {
+fn build_tell_message(text: &str, channel: &str, from: &str) -> String {
     format!(
         "(tell {channel} \"{}\" :from {from})",
         escape_cbcl_string(text)
     )
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-016 REQ-020 — deprecation shims.
+//
+// SIMPLIFY: `emit` and `progress` keep their v0.2 behaviour for exactly one
+// minor release, so existing scripts warn rather than break. Ceiling: the
+// release after the one that ships `tell`/`send`. Upgrade path: delete this
+// block, `ProgressArgs`, and the `Emit`/`Progress` arms of `Command`
+// (trace: SPEC-016 REQ-020, ADR-009, ADR-010).
+// ---------------------------------------------------------------------------
+
+/// `true` when the emit input is already a CBCL form rather than plain text.
+///
+/// This leading-`(` sniff is the defect ADR-009 removes. It survives only
+/// inside the `emit` shim, where changing it would break the scripts the shim
+/// exists to keep working.
+fn emit_input_is_cbcl_form(input: &str) -> bool {
+    input.trim_start().starts_with('(')
+}
+
+/// Deprecated alias: routes to `tell` or `send` by the leading-`(` sniff.
+async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
+    let input = read_message_input(args.message)?;
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(AppError::Usage(
+            "emit requires a non-empty message".to_owned(),
+        ));
+    }
+    if emit_input_is_cbcl_form(input) {
+        send_frame_command(MessageInputArgs {
+            message: Some(input.to_owned()),
+        })
+        .await
+    } else {
+        tell_command(TellArgs {
+            text: Some(input.to_owned()),
+        })
+        .await
+    }
+}
+
+/// Deprecated alias: builds the progress frame and transmits it through the
+/// `send` path. The wire frame is byte-identical to the retired verb's, so a
+/// script keeps working; the progress-specific *validation* is gone with
+/// `MessageKind::Progress`, which is safe here because the CLI builds the frame
+/// and cannot build it wrong.
+async fn progress_command(args: ProgressArgs) -> AppResult<()> {
+    validate_dialect_id(&args.dialect).map_err(|error| AppError::Usage(error.to_string()))?;
+    let message = build_progress_message(&args.thread, args.text.as_deref(), &args.dialect);
+    let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
+    transmit_frame(&client, &handle, message).await
 }
 
 async fn send_validated_message(kind: SendMessageKind, message: String) -> AppResult<()> {
@@ -975,7 +1070,8 @@ async fn resolve_wire_name(client: &LocalApiClient, name: &str) -> AppResult<Age
         .agents()
         .await
         .map_err(|error| map_client_error(error, "daemon agents query failed"))?;
-    let selection = select_by_wire_name(&agents.agents, agents.active_agent_handle.as_deref(), name)?;
+    let selection =
+        select_by_wire_name(&agents.agents, agents.active_agent_handle.as_deref(), name)?;
     if let Some(warning) = selection.warning {
         eprintln!("warning: {warning}");
     }
@@ -1500,7 +1596,7 @@ mod tests {
 
     use super::{
         AgentStatus, Cli, Command, ConfigCommand, DaemonCommand, build_chat_config_toml,
-        build_emit_message, build_progress_message, choose_agent_handle, emit_input_is_cbcl_form,
+        build_progress_message, build_tell_message, choose_agent_handle, emit_input_is_cbcl_form,
         escape_cbcl_string, parse_recv_timeout_ms, select_by_wire_name,
         validate_init_advertisement,
     };
@@ -1532,7 +1628,10 @@ mod tests {
 
     #[test]
     fn wire_name_resolves_to_internal_handle() {
-        let agents = [chat_agent("HANDLEA", "@hark-a"), chat_agent("HANDLEB", "@hark-b")];
+        let agents = [
+            chat_agent("HANDLEA", "@hark-a"),
+            chat_agent("HANDLEB", "@hark-b"),
+        ];
         let selection = select_by_wire_name(&agents, None, "@hark-b").expect("resolves");
         assert_eq!(selection.handle, "HANDLEB");
         assert!(selection.warning.is_none());
@@ -1575,12 +1674,18 @@ mod tests {
     fn duplicate_wire_name_prefers_active_and_warns() {
         // Two connections share one wire identity (a re-pair with the same
         // invite): the active handle wins and the ambiguity is surfaced.
-        let agents = [chat_agent("OLDCONN", "@hark-a"), chat_agent("NEWCONN", "@hark-a")];
-        let selection =
-            select_by_wire_name(&agents, Some("NEWCONN"), "@hark-a").expect("resolves");
+        let agents = [
+            chat_agent("OLDCONN", "@hark-a"),
+            chat_agent("NEWCONN", "@hark-a"),
+        ];
+        let selection = select_by_wire_name(&agents, Some("NEWCONN"), "@hark-a").expect("resolves");
         assert_eq!(selection.handle, "NEWCONN");
         assert!(
-            selection.warning.as_deref().unwrap_or_default().contains("share the wire name"),
+            selection
+                .warning
+                .as_deref()
+                .unwrap_or_default()
+                .contains("share the wire name"),
             "ambiguity must warn: {:?}",
             selection.warning
         );
@@ -1764,31 +1869,96 @@ mod tests {
         assert!(choose_agent_handle(None, None).is_err());
     }
 
+    /// SPEC-016 TEST-013: the message-minting surface is exactly
+    /// `tell`, `reply`, `error`, `send`. `progress` is retired and `emit` is
+    /// a hidden deprecation alias — neither appears in `--help`.
     #[test]
-    fn parses_emit_arguments() {
-        let cli = Cli::parse_from(["hark", "emit", "looking into it"]);
-        let Command::Emit(args) = cli.command else {
-            panic!("expected emit command");
-        };
-        assert_eq!(args.message.as_deref(), Some("looking into it"));
+    fn minting_surface_is_tell_reply_error_send() {
+        let visible: Vec<String> = Cli::command()
+            .get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
+            .map(|sub| sub.get_name().to_owned())
+            .collect();
+
+        for verb in ["tell", "reply", "error", "send"] {
+            assert!(visible.contains(&verb.to_owned()), "{verb} must be visible");
+        }
+        for retired in ["emit", "progress"] {
+            assert!(
+                !visible.contains(&retired.to_owned()),
+                "{retired} must not appear in --help"
+            );
+        }
     }
 
     #[test]
-    fn wraps_plain_text_emit_into_tell() {
+    fn parses_tell_arguments() {
+        let cli = Cli::parse_from(["hark", "tell", "looking into it"]);
+        let Command::Tell(args) = cli.command else {
+            panic!("expected tell command");
+        };
+        assert_eq!(args.text.as_deref(), Some("looking into it"));
+    }
+
+    #[test]
+    fn parses_send_arguments() {
+        let cli = Cli::parse_from(["hark", "send", r#"(ask @bob "q")"#]);
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+        assert_eq!(args.message.as_deref(), Some(r#"(ask @bob "q")"#));
+    }
+
+    /// SPEC-016 TEST-014: `tell` wraps its argument into a `tell` frame.
+    #[test]
+    fn tell_wraps_plain_text() {
         // `:from` is required by the hub's per-frame sender resolution
         // (`missing-from` rejection) — a tell without it is silently useless.
         assert_eq!(
-            build_emit_message("looking into it", "@research", "@aria"),
+            build_tell_message("looking into it", "@research", "@aria"),
             r#"(tell @research "looking into it" :from @aria)"#
         );
         assert_eq!(
-            build_emit_message("say \"hi\"\nnow", "@general", "@bot"),
+            build_tell_message("say \"hi\"\nnow", "@general", "@bot"),
             r#"(tell @general "say \"hi\"\nnow" :from @bot)"#
         );
     }
 
+    /// SPEC-016 TEST-015 (prohibited-action): an argument that *looks* like a
+    /// CBCL form is still literal text. Verified against the parser rather than
+    /// by string matching — the argument's own `@x` appears inside the quoted
+    /// body, so a substring check would assert the wrong property.
     #[test]
-    fn detects_full_cbcl_emit_input() {
+    fn tell_never_parses_its_argument_as_cbcl() {
+        use cbcl_core::sexpr::{Atom, SExpr};
+        use cbcl_parser::{PipelineResult, run_pipeline};
+
+        let argument = r#"(tell @x "y")"#;
+        let framed = build_tell_message(argument, "@research", "@aria");
+
+        assert_eq!(
+            framed, r#"(tell @research "(tell @x \"y\")" :from @aria)"#,
+            "the form must appear as an escaped string body"
+        );
+
+        let PipelineResult::Success(message) = run_pipeline(&framed) else {
+            panic!("the generated frame must parse: {framed}");
+        };
+
+        // The prohibition, stated over the parsed frame: the recipient is the
+        // channel, never the argument's `@x`, and the content is the argument
+        // as an opaque string rather than a nested form.
+        assert_eq!(message.recipient(), Some("@research"));
+        assert_eq!(
+            message.content(),
+            Some(&SExpr::Atom(Atom::Str(argument.to_owned()))),
+            "the argument must survive as a string atom, not a parsed form"
+        );
+    }
+
+    /// The leading-`(` sniff survives only inside the `emit` deprecation shim.
+    #[test]
+    fn emit_shim_still_sniffs_for_backwards_compatibility() {
         assert!(emit_input_is_cbcl_form(r#"(tell @a "x")"#));
         assert!(emit_input_is_cbcl_form(
             "  (lang elf (ask @router \"work\" :thread \"rcp-9\"))  "
