@@ -747,3 +747,8 @@ exactly one non-empty string `:thread`.
   — hub reconnect on a bounded jittered schedule and durable pairing, so a hub
   redeploy or a daemon restart no longer needs a human. See
   [Recovery](#recovery).
+
+## Licence
+
+Copyright 2026 Anuna Research Pty Ltd. Licensed under the Apache License,
+Version 2.0 ([LICENSE](LICENSE) or <https://www.apache.org/licenses/LICENSE-2.0>).
