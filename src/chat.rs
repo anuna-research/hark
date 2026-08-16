@@ -646,6 +646,21 @@ struct ReceiveLoopArgs {
     join: JoinParams,
 }
 
+/// Read from an optional channel that feeds the receive loop.
+///
+/// SPEC-028 CON-001: a closure is observed once, then disables this branch.
+/// An absent receiver stays pending so the receive loop can await other work.
+async fn next_optional_apply<T>(receiver: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
+    let apply = match receiver.as_mut() {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    };
+    if apply.is_none() {
+        *receiver = None;
+    }
+    apply
+}
+
 /// A replacement connection produced by [`reconnect`].
 struct Reconnected {
     websocket: ChatSocket,
@@ -1117,10 +1132,13 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         mut mls,
         receive_all,
         wire_handle,
-        mut ds_rx,
+        ds_rx,
         join,
     } = args;
     tokio::spawn(async move {
+        // SPEC-028 REQ-001/REQ-002: an ordinary room has no DS pull sender.
+        // A closed receiver must leave the select after one closure event.
+        let mut ds_rx = Some(ds_rx);
         // Pending Δ-window and liveness-fallback timers, fired into the select.
         let mut timers: FuturesUnordered<BoxFuture<'static, ClaimTimer>> = FuturesUnordered::new();
         // SPEC-026 REQ-001. Every transport-level end of the socket — read side
@@ -1276,8 +1294,14 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                 // commits provider snapshot + cursor in ONE manifest flip (CON-013).
                 // An apply failure holds the durable cursor: on restart the same
                 // record is re-pulled (immutable log, idempotent).
-                maybe_apply = ds_rx.recv() => {
-                    let Some(apply) = maybe_apply else { continue };
+                maybe_apply = next_optional_apply(&mut ds_rx) => {
+                    let Some(apply) = maybe_apply else {
+                        tracing::debug!(
+                            agent = handle.as_str(),
+                            "mls DS apply channel closed; disabling receive branch"
+                        );
+                        continue;
+                    };
                     let Some(session) = mls.as_mut() else { continue };
                     let applied_text = match session.handle_frame(&apply.payload) {
                         SessionEvent::Plaintext { text, .. } => Some(text),
@@ -1596,6 +1620,9 @@ fn sanitize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{build_announce_frame, cap_part, error_slug, frame_performative, payload_bytes};
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
 
     /// S1 (SPEC-026 Tier-2 review) — frames from a state-mutating exchange
     /// survive the socket that died under them.
@@ -1834,5 +1861,51 @@ mod tests {
     #[test]
     fn rejects_non_cbcl() {
         assert!(payload_bytes("not (((valid").is_err());
+    }
+
+    /// TEST-001 / TEST-002 (SPEC-028): closure removes an optional input.
+    #[tokio::test]
+    async fn a_closed_optional_receiver_is_disabled_after_its_closure_event() {
+        let (sender, receiver) = mpsc::channel::<()>(1);
+        drop(sender);
+        let mut receiver = Some(receiver);
+
+        assert!(super::next_optional_apply(&mut receiver).await.is_none());
+        assert!(
+            receiver.is_none(),
+            "closure must disable the receive branch"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                super::next_optional_apply(&mut receiver),
+            )
+            .await
+            .is_err(),
+            "a disabled input must stay pending instead of polling closure again"
+        );
+    }
+
+    /// TEST-003 (SPEC-028): buffered applies remain observable after closure.
+    #[tokio::test]
+    async fn a_buffered_optional_value_is_delivered_before_closure() {
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send("apply").await.expect("receiver is open");
+        drop(sender);
+        let mut receiver = Some(receiver);
+
+        assert_eq!(
+            super::next_optional_apply(&mut receiver).await,
+            Some("apply")
+        );
+        assert!(
+            receiver.is_some(),
+            "a buffered value must not disable the branch"
+        );
+        assert!(super::next_optional_apply(&mut receiver).await.is_none());
+        assert!(
+            receiver.is_none(),
+            "the receiver becomes absent after its buffered values drain"
+        );
     }
 }

@@ -1,0 +1,53 @@
+phase: 3
+spec: SPEC-028
+gates:
+  - gate: "Red Gate: closed optional receiver fails before the repair"
+    mechanism: "cargo test chat::tests::a_closed_optional_receiver_is_disabled_after_its_closure_event"
+    result: pass
+    evidence: "2026-08-16: pre-repair run failed because closure left the receiver enabled."
+  - gate: "TEST-001 through TEST-003: optional-receiver lifecycle"
+    mechanism: "cargo test chat::tests"
+    result: pass
+    evidence: "2026-08-16: 16 chat unit tests passed, including the three SPEC-028 scenarios."
+  - gate: "Mutation: disabled optional receiver stays pending"
+    mechanism: "replace pending branch with immediate None; run TEST-002"
+    result: pass
+    evidence: "2026-08-16: the deliberate mutation made TEST-002 fail because the disabled receiver completed immediately."
+  - gate: "Regression suite"
+    mechanism: "cargo test"
+    result: pass
+    evidence: "2026-08-16: command exited 0; 344 library tests and available integration tests passed. Live-hub tests remained explicitly ignored."
+  - gate: "Static analysis"
+    mechanism: "cargo clippy --all-targets -- -D warnings"
+    result: pass
+    evidence: "2026-08-16: command exited 0."
+  - gate: "Diff integrity"
+    mechanism: "git diff --check"
+    result: pass
+    evidence: "2026-08-16: command exited 0."
+  - gate: "Controlled language"
+    mechanism: "usdd-lint.sh --type descriptive"
+    result: pass
+    evidence: "2026-08-16: SPEC-028 and IMPL-028 each reported 0 errors and 0 warnings."
+  - gate: "Repository formatting"
+    mechanism: "cargo fmt --check"
+    result: fail
+    evidence: "2026-08-16: pre-existing formatting differences across the repository include unchanged lines in examples and source files."
+  - gate: "Vault traceability"
+    mechanism: "zetl check --fail-on error"
+    result: fail
+    evidence: "2026-08-16: existing vault state reports 153 dead links and one SPL error. New SPEC-028 adds no Tokio dead-link target."
+  - gate: "Tier-2 fresh-context adversarial review"
+    mechanism: "fresh-context reviewer /root/adversarial_review"
+    result: pass
+    evidence: "2026-08-16: reviewer found no correctness blocker; documentation and test-traceability findings were repaired."
+  - gate: "Tier-2 cross-model and human review"
+    mechanism: "cross-model reviewer and Hark maintainer"
+    result: unverified
+    evidence: "No cross-model reviewer or human maintainer review is available in this session."
+    owner: "Hark maintainer"
+  - gate: "Theory task selection"
+    mechanism: "elephant 0.1.6 status, explain, and describe"
+    result: unverified
+    evidence: "The clean spec-028 theory confirms the first task ready and sourced. Installed Elephant 0.1.6 lacks the required next subcommand."
+    owner: "Hark maintainer"
