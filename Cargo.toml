@@ -22,6 +22,9 @@ base64 = "0.22"
 # commit once the role layer lands (closes IMPL-024 ADR-021).
 cbcl-core = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034", features = ["mls-ds-proof"] }
 cbcl-parser = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034" }
+# SPEC-054 shared wire/crypto recognizers. Development checkout: keep cbcl-bus
+# beside hark; archive-source.sha records the reviewed source commit.
+cbcl-archive-core = { path = "../cbcl-bus/crates/cbcl-archive-core" }
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 config = "0.15"

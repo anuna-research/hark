@@ -31,7 +31,7 @@ use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore, OutboundReject};
 use crate::identity::ChatIdentity;
 use crate::mls::session::{MlsSession, SessionEvent};
 use crate::reconnect::ReconnectSchedule;
-use crate::signed_transport::{SignedConn, parse_conn_bootstrap};
+use crate::signed_transport::SignedConn;
 
 pub const CHAT_WS_PATH: &str = "/chat/v1";
 
@@ -588,28 +588,24 @@ async fn recv_bootstrap(ws: &mut ChatSocket) -> Result<SignedConn, ChatError> {
         Ok(Some(Err(error))) => return Err(ChatError::ConnectionFailed(error.to_string())),
         Ok(Some(Ok(msg))) => msg,
     };
-    // The chat hub bare-frames its hub->client frames (len ‖ payload ‖ sig), so
-    // strip the framing before reading the payload text (unlike the router, whose
-    // hub->agent frames are raw payload bytes).
-    let payload = match &msg {
-        WsMessage::Binary(bytes) => decode_payload(bytes).ok_or_else(|| {
-            ChatError::ConnectionFailed("malformed conn-nonce bootstrap frame".into())
-        })?,
-        WsMessage::Text(text) => text.as_bytes(),
-        other => {
-            return Err(ChatError::ConnectionFailed(format!(
-                "unexpected first frame (expected conn-nonce bootstrap): {other:?}"
-            )));
-        }
+    // SPEC-054 CON-006: recognize the complete ordinary binary frame before
+    // installing any nonce/hub state. Reuse the browser's shared recognizer.
+    let WsMessage::Binary(bytes) = msg else {
+        return Err(ChatError::ConnectionFailed(
+            "expected binary conn-nonce bootstrap".into(),
+        ));
     };
-    let text = String::from_utf8_lossy(payload).into_owned();
-    parse_conn_bootstrap(&text)
-        .map(|boot| SignedConn::from_bootstrap(&boot))
-        .ok_or_else(|| {
-            ChatError::ConnectionFailed(format!(
-                "first frame was not a conn-nonce bootstrap: {text}"
-            ))
-        })
+    let boot = cbcl_archive_core::source_delivery::read_bootstrap(&bytes)
+        .map_err(|_| ChatError::ConnectionFailed("malformed conn-nonce bootstrap frame".into()))?;
+    // No source/flow offer is sent until the native receive and persistence
+    // paths can own CSD1 envelopes and ACK1 ordinals. Never accept unsolicited
+    // selection or carry a previous socket's selection through reconnect.
+    if boot.source_version != 0 || boot.flow_version != 0 {
+        return Err(ChatError::ConnectionFailed(
+            "unoffered archive source selection".into(),
+        ));
+    }
+    Ok(SignedConn::new(boot.hub.into_bytes(), boot.nonce.to_vec()))
 }
 
 struct ReceiveLoopArgs {
@@ -1596,6 +1592,69 @@ fn sanitize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{build_announce_frame, cap_part, error_slug, frame_performative, payload_bytes};
+
+    async fn archive_bootstrap_frame(message: super::WsMessage) -> bool {
+        use futures_util::SinkExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            socket.send(message).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/chat/v1"))
+            .await
+            .unwrap();
+        let accepted = super::recv_bootstrap(&mut socket).await.is_ok();
+        server.await.unwrap();
+        accepted
+    }
+
+    fn archive_bootstrap_wire(payload: &str) -> Vec<u8> {
+        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(payload.as_bytes());
+        frame.extend_from_slice(&[0; 64]);
+        frame
+    }
+
+    #[tokio::test]
+    async fn archive_bootstrap_accepts_only_complete_current_socket_grammar() {
+        let good = "(tell @client \"conn-nonce\" :from @cbcl-chat :nonce \"BwcHBwcHBwcHBwcHBwcHBw==\" :hub \"cbcl-chat\")";
+        assert!(
+            archive_bootstrap_frame(super::WsMessage::Binary(
+                archive_bootstrap_wire(good).into()
+            ))
+            .await
+        );
+        for payload in [
+            good.replace(
+                ":hub \"cbcl-chat\"",
+                ":hub \"cbcl-chat\" :hub \"cbcl-chat\"",
+            ),
+            good.replace(":from @cbcl-chat", ":from @foreign"),
+            good.replace("BwcHBwcHBwcHBwcHBwcHBw==", "Bw=="),
+            good.replace(":hub \"cbcl-chat\"", ":hub \"cbcl-chat\" :unknown true"),
+            good.replace(
+                ":hub \"cbcl-chat\"",
+                ":hub \"cbcl-chat\" :archive-source \"csd1\"",
+            ),
+        ] {
+            assert!(
+                !archive_bootstrap_frame(super::WsMessage::Binary(
+                    archive_bootstrap_wire(&payload).into()
+                ))
+                .await,
+                "malformed or unoffered bootstrap was accepted: {payload}"
+            );
+        }
+        assert!(!archive_bootstrap_frame(super::WsMessage::Text(good.into())).await);
+        let mut nonzero_signature = archive_bootstrap_wire(good);
+        *nonzero_signature.last_mut().unwrap() = 1;
+        assert!(!archive_bootstrap_frame(super::WsMessage::Binary(nonzero_signature.into())).await);
+        let mut trailing = archive_bootstrap_wire(good);
+        trailing.push(0);
+        assert!(!archive_bootstrap_frame(super::WsMessage::Binary(trailing.into())).await);
+    }
 
     /// S1 (SPEC-026 Tier-2 review) — frames from a state-mutating exchange
     /// survive the socket that died under them.
