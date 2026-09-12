@@ -42,6 +42,8 @@ pub enum Act {
     /// backfill-on-join, which a real hub replays after every successful
     /// `hello` (`backfill_n`, 50 by default).
     AcceptAndSend { enc: bool, send: Vec<String> },
+    /// Send exact binary messages, including deliberately malformed frames.
+    AcceptAndSendBinary { enc: bool, send: Vec<Vec<u8>> },
     /// `AcceptAndSend`, then drop the socket. The redeploy that happens after
     /// the client has already seen some history.
     AcceptThenDropAfterSending { enc: bool, send: Vec<String> },
@@ -272,6 +274,7 @@ async fn serve(
                 Act::Accept { enc }
                 | Act::AcceptThenDrop { enc, .. }
                 | Act::AcceptAndSend { enc, .. }
+                | Act::AcceptAndSendBinary { enc, .. }
                 | Act::AcceptThenDropAfterSending { enc, .. } => {
                     format!("(roomcfg {channel} :enc {enc})")
                 }
@@ -304,6 +307,13 @@ async fn serve(
                     // socket disappears under it.
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     return;
+                }
+            }
+            if let Act::AcceptAndSendBinary { send, .. } = &act {
+                for bytes in send {
+                    if ws.send(Message::Binary(bytes.clone().into())).await.is_err() {
+                        return;
+                    }
                 }
             }
             if let Act::AcceptThenDrop {

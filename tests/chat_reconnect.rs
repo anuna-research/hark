@@ -32,6 +32,57 @@ fn identity() -> Arc<ChatIdentity> {
     Arc::new(ChatIdentity::from_seed([7u8; 32]))
 }
 
+#[tokio::test]
+async fn malformed_ordinary_binary_is_dropped_without_losing_later_chat() {
+    let text = "(tell @general \"after malformed\" :from @bo)";
+    let mut frame = (text.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(text.as_bytes());
+    frame.extend_from_slice(&[0; 64]);
+    let hub = FakeHub::start(vec![Act::AcceptAndSendBinary {
+        enc: false,
+        send: vec![vec![0, 0, 0, 2, 0], frame],
+    }])
+    .await;
+    let store = store();
+    let (handle, _) = join(store.clone(), &hub).await.unwrap();
+    let received = store.recv(&handle, Some(Duration::from_secs(2))).await;
+    assert!(
+        received.is_ok(),
+        "valid chat after a malformed ordinary frame was lost: {received:?}"
+    );
+    assert_eq!(received.unwrap(), text);
+    assert_eq!(state_of(&store, &handle).await, AgentState::Connected);
+    assert_eq!(hub.connections(), 1);
+}
+
+#[tokio::test]
+async fn a_repeated_bootstrap_replaces_the_socket_without_delivering_it() {
+    let repeated = "(tell @client \"conn-nonce\" :from @cbcl-chat :nonce \"BwcHBwcHBwcHBwcHBwcHBw==\" :hub \"cbcl-chat\")";
+    let hub = FakeHub::start(vec![
+        Act::AcceptAndSend {
+            enc: false,
+            send: vec![repeated.into()],
+        },
+        Act::Accept { enc: false },
+    ])
+    .await;
+    let store = store();
+    let (handle, _) = join(store.clone(), &hub).await.unwrap();
+    assert!(
+        hub.wait_for_frame(1, "(announce", Duration::from_secs(4))
+            .await,
+        "a second bootstrap must close its original receiver"
+    );
+    assert_eq!(state_of(&store, &handle).await, AgentState::Connected);
+    assert!(
+        matches!(
+            store.recv(&handle, Some(Duration::from_millis(100))).await,
+            Err(hark::daemon::AgentError::RecvTimeout)
+        ),
+        "the repeated bootstrap must never reach the agent's message queue"
+    );
+}
+
 /// Join the fake hub as `@aria` on `@general`, advertising `cite`, with a
 /// capability so the re-join has something non-trivial to replay.
 async fn join(

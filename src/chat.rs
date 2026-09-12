@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use url::Url;
 
-use crate::chat_frame::{decode_frame, decode_payload};
+use crate::archive_source::{ReceiveError, ReceivedFrame};
 use crate::chat_responder::{Action, Responder, WindowOutcome};
 use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore, OutboundReject};
 use crate::identity::ChatIdentity;
@@ -271,7 +271,7 @@ async fn join_hub(
     // this would hand back a "joined" handle the agent is not actually a member
     // of. On rejection or timeout the websocket drops here, before any store
     // entry exists — nothing to mark unhealthy or clean up.
-    let (ack, roomcfg, learned_hub) = await_join_ack(&mut websocket).await?;
+    let (ack, roomcfg, learned_hub) = await_join_ack(&mut websocket, channel).await?;
 
     // SPEC-013: judge the ack against the encryption-mode pin (REQ-023) —
     // a `roomcfg :enc false` on a pinned-encrypted channel is a refused
@@ -986,8 +986,10 @@ enum HubTeaching {
 /// never come.
 async fn await_join_ack(
     websocket: &mut ChatSocket,
+    channel: &str,
 ) -> Result<(String, RoomCfg, HubTeaching), ChatError> {
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+    let source_channel = format!("room:{}", channel.strip_prefix('@').unwrap_or(channel));
     // The hub leads the join with a `(meta (define hub …))` advertising its
     // control dialect (SPEC-016): we learn it here, before the verdict, so the
     // agent can validate its own control-plane frames against the grammar the
@@ -1006,12 +1008,16 @@ async fn await_join_ack(
                 return Err(ChatError::ConnectionFailed(sanitize(&error.to_string())));
             }
         };
-        let text = match message {
-            WsMessage::Binary(bytes) => match decode_payload(&bytes) {
-                Some(payload) => String::from_utf8_lossy(payload).into_owned(),
-                None => continue, // malformed frame: ignore, keep waiting for the verdict
-            },
-            WsMessage::Text(text) => text.to_string(),
+        let (text, _received_frame) = match message {
+            WsMessage::Binary(bytes) => {
+                let frame = match ReceivedFrame::read(&bytes, false, &source_channel) {
+                    Ok(frame) => frame,
+                    Err(ReceiveError::LegacyFrame) => continue,
+                    Err(error) => return Err(ChatError::ConnectionFailed(error.to_string())),
+                };
+                (frame.text().to_owned(), Some(frame))
+            }
+            WsMessage::Text(text) => (text.to_string(), None),
             WsMessage::Close(frame) => {
                 let detail = frame
                     .map(|f| format!("code={:?} reason=\"{}\"", f.code, f.reason))
@@ -1117,6 +1123,10 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         join,
     } = args;
     tokio::spawn(async move {
+        let source_channel = format!(
+            "room:{}",
+            join.channel.strip_prefix('@').unwrap_or(&join.channel)
+        );
         // Pending Δ-window and liveness-fallback timers, fired into the select.
         let mut timers: FuturesUnordered<BoxFuture<'static, ClaimTimer>> = FuturesUnordered::new();
         // SPEC-026 REQ-001. Every transport-level end of the socket — read side
@@ -1347,18 +1357,21 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     }
                 }
                 message = websocket.next() => {
-                    let payload_text = match message {
+                    let (payload_text, _received_frame) = match message {
                         Some(Ok(WsMessage::Binary(bytes))) => {
-                            // CON-012 (IMPL-025): decode with the receive-frame that RETAINS the
-                            // outer signature. `frame.signature` is available for mls-ds/v1
-                            // DS-response verification under the pinned DS key; SPEC-013 frames
-                            // continue unchanged through the session path below.
-                            match decode_frame(&bytes) {
-                                Some(frame) => String::from_utf8_lossy(frame.payload).into_owned(),
-                                None => continue, // malformed frame: drop, keep the connection
+                            // Keep complete frame bytes through processing, before presentation
+                            // replay suppression or MLS. CSD1 stays unselected until durable
+                            // capture and ACK ownership are integrated into this receive actor.
+                            match ReceivedFrame::read(&bytes, false, &source_channel) {
+                                Ok(frame) => (frame.text().to_owned(), Some(frame)),
+                                Err(ReceiveError::LegacyFrame) => continue,
+                                Err(error) => {
+                                    pending_reconnect = Some(error.to_string());
+                                    continue;
+                                }
                             }
                         }
-                        Some(Ok(WsMessage::Text(text))) => text.to_string(),
+                        Some(Ok(WsMessage::Text(text))) => (text.to_string(), None),
                         // SPEC-026 REQ-001: all three transport-level ends —
                         // a close frame, an exhausted stream, an IO error —
                         // schedule a reconnect. Marking the handle unhealthy

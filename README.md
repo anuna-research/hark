@@ -126,8 +126,10 @@ or a matching `subscribe` push.
 On the SPEC-054 development branch, keep a clean `cbcl-bus` checkout beside
 `hark`, at the commit recorded in `archive-source.sha`. The shared archive core
 is a local path dependency during integration. This branch currently adopts its
-strict chat bootstrap recognizer; native archive capture and convergence are
-still under implementation. The recorded commit is a development reference,
+strict chat bootstrap recognizer and retains complete binary frames through
+chat processing. Archive source negotiation, capture and convergence are still
+under implementation. Existing `hark pair <code>` channel pairing is unchanged;
+personal archive enrollment is a separate operation. The recorded commit is a development reference,
 not an enforced release dependency pin.
 
 From this directory:

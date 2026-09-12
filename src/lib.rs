@@ -1,4 +1,5 @@
 pub mod announced_did;
+mod archive_source;
 pub mod cbcl_validation;
 pub mod chat;
 pub mod chat_frame;
