@@ -1696,14 +1696,37 @@ impl MlsSession {
             Some(target) if target == self.handle => {}
             _ => return SessionEvent::Handled { outbound: vec![] },
         }
-        let result = (|| -> Result<(), MlsError> {
-            let ct = kw_b64(text, ":ct")
-                .ok_or_else(|| MlsError::Rejected("welcome missing :ct".into()))?;
+        // An external admission already has provider records, although it is
+        // not membership until its echo arrives. Let a competing Welcome stage
+        // without GroupAlreadyExists, but preserve the pending records if it
+        // fails. Rolling back to disk alone loses this not-yet-durable group.
+        let checkpoint = if self.pending_seat.is_some() {
+            match self.provider.snapshot_bytes() {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    return SessionEvent::Dropped {
+                        reason: e.to_string(),
+                        probable_fork: false,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let result = (|| -> Result<super::group::JoinOutcome, MlsError> {
+            let ct =
+                kw_b64(text, ":ct").ok_or_else(|| MlsError::Rejected("welcome missing :ct".into()))?;
             let existing = self
                 .group
                 .as_ref()
                 .map(|g| g.group_id().as_slice().to_vec());
-            let outcome = join_from_welcome(
+            if let Some(pending) = self.pending_seat.as_mut() {
+                pending
+                    .group
+                    .delete(OpenMlsProvider::storage(&self.provider))
+                    .map_err(MlsError::stack("clear pending admission for Welcome"))?;
+            }
+            join_from_welcome(
                 &self.provider,
                 &self.identity,
                 &ct,
@@ -1711,24 +1734,44 @@ impl MlsSession {
                 &mut self.pins,
                 &mut self.ledger,
                 existing.as_deref(),
-            )?;
-            self.group = Some(outcome.group);
-            self.genesis = Some(outcome.genesis);
-            self.trust = Some(outcome.trust);
-            // REQ-025(d): a join is the other thing that ends a fork, and on the
-            // recovery path it is THE thing — a re-admission arrives as a Welcome,
-            // never as a Commit we could process. Resetting only on a processed
-            // Commit left a healed member carrying its fork counters, so the next
-            // ordinary dropped frame started from a raised baseline.
-            self.clear_resync_state();
-            self.persist_meta()
+            )
         })();
         match result {
-            Ok(()) => SessionEvent::Handled { outbound: vec![] },
-            Err(e) => SessionEvent::Dropped {
-                reason: e.to_string(),
-                probable_fork: false,
-            },
+            Ok(outcome) => {
+                // A Welcome completes admission. An outstanding external Commit
+                // echo must not later replace this group with the competing seat.
+                self.pending_seat = None;
+                self.group = Some(outcome.group);
+                self.genesis = Some(outcome.genesis);
+                self.trust = Some(outcome.trust);
+                // REQ-025(d): a join is the other thing that ends a fork, and on the
+                // recovery path it is THE thing — a re-admission arrives as a Welcome,
+                // never as a Commit we could process. Resetting only on a processed
+                // Commit left a healed member carrying its fork counters, so the next
+                // ordinary dropped frame started from a raised baseline.
+                self.clear_resync_state();
+                match self.persist_meta() {
+                    Ok(()) => SessionEvent::Handled { outbound: vec![] },
+                    Err(e) => SessionEvent::Dropped {
+                        reason: e.to_string(),
+                        probable_fork: false,
+                    },
+                }
+            }
+            Err(e) => {
+                if let Some(checkpoint) = checkpoint {
+                    if let Err(restore) = self.provider.restore_snapshot_bytes(&checkpoint) {
+                        return SessionEvent::Dropped {
+                            reason: restore.to_string(),
+                            probable_fork: false,
+                        };
+                    }
+                }
+                SessionEvent::Dropped {
+                    reason: e.to_string(),
+                    probable_fork: false,
+                }
+            }
         }
     }
 
@@ -2653,6 +2696,164 @@ mod tests {
             agent.encrypt_outbound("(tell @room \"hi\" :from @agent)").is_ok(),
             "and only now may we send"
         );
+    }
+
+    #[test]
+    fn a_rejected_welcome_preserves_pending_external_admission() {
+        welcome_during_pending_admission(false);
+    }
+
+    #[test]
+    fn an_accepted_welcome_supersedes_pending_external_admission() {
+        welcome_during_pending_admission(true);
+    }
+
+    fn welcome_during_pending_admission(accept_welcome: bool) {
+        let tag = if accept_welcome {
+            "welcome-seat-accepted"
+        } else {
+            "welcome-seat-rejected"
+        };
+        let (c_dir, c_wire) = setup(tag, 90, "@creator");
+        let (a_dir, a_wire) = setup(tag, 91, "@agent");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+
+        // Each pins the other from its own signed idkey assertion (REQ-019).
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]);
+        creator.create_group_as_creator().unwrap();
+
+        // The member that paired the agent signs its admission (REQ-008).
+        let grant = super::super::group::PairingGrant::mint(
+            &c_wire,
+            "@creator",
+            &c_wire.verifying_key_bytes(),
+            "@room",
+            "@agent",
+            &a_wire.verifying_key_bytes(),
+            u64::MAX,
+        );
+        let grant_json = serde_json::to_string(&grant).unwrap();
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(grant_json)
+        );
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&pairgrant) else {
+            panic!("pairgrant handled")
+        };
+        assert!(
+            outbound
+                .iter()
+                .any(|f| f.starts_with("(groupinfoget @room")),
+            "holding a grant, the agent asks for something to commit against: {outbound:?}"
+        );
+
+        // The hub serves a GroupInfo and the agent builds its Commit.
+        let gi = creator
+            .group_info_frame()
+            .expect("creator publishes a GroupInfo");
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&gi) else {
+            panic!("groupinfo handled")
+        };
+        let commit = outbound
+            .iter()
+            .find(|f| f.starts_with("(deliver @room"))
+            .expect("the Commit MUST go out")
+            .clone();
+
+        // THE POINT. Nothing has acknowledged that Commit, so nothing is seated.
+        assert!(
+            agent.group.is_none(),
+            "an unacknowledged external Commit must not read as membership"
+        );
+        assert!(
+            matches!(
+                agent.encrypt_outbound("(tell @room \"hi\" :from @agent)"),
+                Err(MlsError::NotReady(_))
+            ),
+            "and sending must refuse RETRYABLY rather than encrypt at a phantom epoch"
+        );
+
+        // A concurrent Add supplies a Welcome while the external Commit awaits
+        // its echo. Test both a valid Welcome and a corrupted ciphertext that
+        // forces staging to reject and restore the pending admission.
+        let agent_kp = match kw_value(&a_frames[0], ":onetime") {
+            Some(SExpr::List(items)) => match &items[0] {
+                SExpr::Atom(Atom::Str(s)) => s.clone(),
+                _ => panic!("package"),
+            },
+            _ => panic!("packages"),
+        };
+        let SessionEvent::Handled { outbound } =
+            creator.handle_frame(&format!("(keypkg @hub :for @agent :kp \"{agent_kp}\")"))
+        else {
+            panic!("add handled")
+        };
+        let welcome = outbound
+            .iter()
+            .find(|f| f.starts_with("(welcome "))
+            .unwrap();
+        let mut bytes = kw_b64(welcome, ":ct").unwrap();
+        if !accept_welcome {
+            *bytes.last_mut().unwrap() ^= 1;
+        }
+        let welcome_result = agent.handle_frame(&format!(
+            "(welcome @room :for @agent :ct \"{}\" :from @creator)",
+            B64.encode(bytes)
+        ));
+        if accept_welcome {
+            assert!(
+                matches!(welcome_result, SessionEvent::Handled { .. }),
+                "{welcome_result:?}"
+            );
+            assert!(
+                agent.pending_seat.is_none(),
+                "Welcome supersedes the pending seat"
+            );
+        } else {
+            assert!(matches!(welcome_result, SessionEvent::Dropped { .. }));
+        }
+        let welcome_numbers = agent.safety_numbers().ok().map(|s| s.epoch_state);
+
+        // The hub fans our own Commit back — the only acknowledgement this path
+        // gets — and that is what seats us.
+        agent.handle_frame(&commit);
+        assert!(agent.group.is_some(), "the echo seats us");
+        if accept_welcome {
+            assert_eq!(
+                agent.safety_numbers().unwrap().epoch_state,
+                welcome_numbers.unwrap(),
+                "a delayed external echo must not replace the Welcome group"
+            );
+        }
+        offline_safety_numbers(&a_dir, "agent", "@room").expect("group records must exist");
+        // …durably. `join_by_grant` builds into the provider without persisting,
+        // and installing at the echo has no later frame to persist as a side
+        // effect — so a restart here read a meta naming records that were not on
+        // disk and reported `persisted group state missing`. Found on the live
+        // daemon, not in review.
+        drop(agent);
+        let resumed = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        assert!(
+            resumed.group.is_some(),
+            "a seated agent MUST survive a restart — the meta is a pointer, and \
+             writing it before its target is writing a dangling one"
+        );
+        let mut agent = resumed;
+        let delivery = agent.encrypt_outbound("(tell @room \"hi\" :from @agent)").unwrap();
+        if accept_welcome {
+            match creator.handle_frame(&delivery) {
+                SessionEvent::Plaintext { text, sender } => {
+                    assert_eq!(sender, "@agent");
+                    assert_eq!(text, "(tell @room \"hi\" :from @agent)");
+                }
+                other => panic!("expected readable post-restart message, got {other:?}"),
+            }
+        }
     }
 
     /// The lost race, which is the failure that was found live: our Commit never

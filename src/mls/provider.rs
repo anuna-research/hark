@@ -136,6 +136,16 @@ impl DurableProvider {
         Ok(serde_json::to_vec(&state).map_err(std::io::Error::other)?)
     }
 
+    /// Restore a live checkpoint after a rejected operation. The durable snapshot
+    /// may predate an external admission awaiting its echo, so disk rollback
+    /// would erase valid pending group records.
+    pub(crate) fn restore_snapshot_bytes(&self, bytes: &[u8]) -> Result<(), MlsError> {
+        let values = Self::decode(bytes)
+            .map_err(|reason| MlsError::Storage(std::io::Error::other(reason)))?;
+        *self.storage.values.write().unwrap() = values;
+        Ok(())
+    }
+
     pub fn persist(&self) -> Result<(), MlsError> {
         let bytes = self.snapshot_bytes()?;
 
