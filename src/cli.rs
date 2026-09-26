@@ -296,7 +296,7 @@ pub struct ObjectCheckArgs {
     #[arg(
         long = "define",
         value_name = "FILE|JSON",
-        help = "The definition to validate (see docs/object-definitions.md)"
+        help = "The definition to validate: a path to a JSON file or inline JSON, in any form `open --define` accepts (see docs/object-definitions.md)"
     )]
     pub define: String,
     #[arg(long = "cbcl", help = "Print only the native CBCL dialect the contract compiles to")]
@@ -330,7 +330,7 @@ pub struct ObjectOpenArgs {
     #[arg(
         long = "define",
         value_name = "FILE|JSON",
-        help = "The definition: a path to a JSON file, or inline JSON — an SDK authoring definition ({name, verbs, project}) or a version-2 contract"
+        help = "The definition: a path to a JSON file, or inline JSON — an SDK authoring definition ({name, verbs, project, view?}), a version-2 contract, or a contract-and-view bundle. Version 1 is refused"
     )]
     pub define: String,
     #[arg(long = "thread", help = "The new object's thread id")]
