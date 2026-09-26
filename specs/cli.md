@@ -150,7 +150,11 @@ Prints a single human-readable success line to stdout
 default): every `object-*` message in the channel — the agent's own and
 replayed history included — reaches `recv` with an attestation record,
 independent of `--speak`. It is persisted with the pairing, so a daemon restart
-resumes it; rejoin without the flag to roll it back.
+resumes it; rejoin without the flag to roll it back. An object dialect
+(`object-<64hex>`) given to `--speak` means the same thing and is never
+advertised. `hark pair` takes `--objects` too, and turns the subscription on
+by itself when the pairing record lists an object dialect — the adder chose
+an object from the room's menu.
 
 ### `tell` and `send` (SPEC-016 REQ-014…REQ-018)
 

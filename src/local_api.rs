@@ -945,7 +945,13 @@ async fn create_agent(
     // channel to observe.
     let mut request = request;
     let receive_all = take_receive_all(&mut request.dialects);
-    let objects = request.objects.unwrap_or(false);
+    // SPEC-086 CON-003: an object dialect in the dialect set IS the object
+    // subscription. A pairing record lists what the adder chose from the
+    // room's menu, and a room's menu lists its objects by contract digest, so
+    // a paired agent whose adder picked an object arrives subscribed. The
+    // digests are stripped before advertisement validation: they are not
+    // capabilities, and they exceed the dialect-id grammar.
+    let objects = request.objects.unwrap_or(false) | take_objects(&mut request.dialects);
     AgentStore::validate_advertisement(&request.dialects).map_err(agent_error_to_api)?;
     // The configured hub URL's path decides the transport (config::transport).
     match state.config.transport().map_err(config_error_to_api)? {
@@ -970,6 +976,15 @@ async fn create_agent(
         }
         Transport::Chat => create_chat_transport_agent(state, request, receive_all, objects).await,
     }
+}
+
+/// Strip every object dialect (`object-<64hex>`) from an advertised dialect
+/// set, returning whether any was present (SPEC-086 CON-003).
+fn take_objects(dialects: &mut Vec<String>) -> bool {
+    use crate::object_transport::is_object_dialect_name;
+    let present = dialects.iter().any(|dialect| is_object_dialect_name(dialect));
+    dialects.retain(|dialect| !is_object_dialect_name(dialect));
+    present
 }
 
 /// Strip the receive-all sentinel `*` from an advertised dialect set, returning
@@ -2891,6 +2906,19 @@ mod tests {
         chat_key_filename, serve_local_api_with_agents, take_receive_all,
     };
 
+    /// SPEC-086 CON-003: object dialects in the set mean the subscription and
+    /// are never advertised.
+    #[test]
+    fn take_objects_strips_object_dialects_and_reports_presence() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut dialects = vec!["cite".to_owned(), format!("object-{hex}"), "vote".to_owned()];
+        assert!(super::take_objects(&mut dialects));
+        assert_eq!(dialects, ["cite", "vote"]);
+        let mut none = vec!["cite".to_owned(), "object-short".to_owned()];
+        assert!(!super::take_objects(&mut none));
+        assert_eq!(none.len(), 2);
+    }
+
     #[test]
     fn take_receive_all_strips_wildcard_and_reports_presence() {
         let mut dialects = vec!["cite".to_owned(), "*".to_owned(), "vote".to_owned()];
@@ -3532,6 +3560,7 @@ mod tests {
             .attach_objects(crate::objects::runtime::spawn(
                 store.clone(),
                 tokio::runtime::Handle::current(),
+                None,
             ))
             .await;
         let unsubscribed = authed_get(&server, &path).await;
@@ -3574,6 +3603,7 @@ mod tests {
             .attach_objects(crate::objects::runtime::spawn(
                 store.clone(),
                 tokio::runtime::Handle::current(),
+                None,
             ))
             .await;
         let server = TestServer::start_with_store(None, store.clone()).await;
@@ -3677,6 +3707,7 @@ mod tests {
             .attach_objects(crate::objects::runtime::spawn(
                 store.clone(),
                 tokio::runtime::Handle::current(),
+                None,
             ))
             .await;
         let checked =

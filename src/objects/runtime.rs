@@ -13,7 +13,11 @@
 //! decode. A rejected promise surfaces as [`ObjectsError::Failed`] carrying
 //! the SDK's own message.
 
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rquickjs::loader::{BuiltinLoader, BuiltinResolver};
 use rquickjs::{Context, Ctx, Exception, Function, Module, Object, Persistent, Promise, Runtime};
@@ -65,15 +69,176 @@ const PRELUDE: &str = include_str!("js/hark/prelude.js");
 /// in-flight slot (SPEC-086 CON-002); the same window the API uses.
 const HISTORY_WINDOW: Duration = Duration::from_secs(5);
 
+/// The QuickJS heap ceiling. Contracts are data and the vendored code is
+/// fixed, so this bounds a pathological projection over a large history, not
+/// hostile code; hitting it fails the one command with an exception.
+const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+
+/// The QuickJS stack ceiling (deep recursion in a projection).
+const STACK_LIMIT: usize = 4 * 1024 * 1024;
+
+/// How long one command may run JavaScript before the interrupt handler
+/// stops it. Host calls that block (a send awaiting the hub's ack) extend
+/// the deadline when they return, so a slow hub does not count as a runaway
+/// script.
+const COMMAND_DEADLINE: Duration = Duration::from_secs(20);
+
+/// The moment after which the interrupt handler stops the running script.
+type Deadline = Arc<Mutex<Option<Instant>>>;
+
+fn bump(deadline: &Deadline, budget: Duration) {
+    if let Ok(mut slot) = deadline.lock() {
+        *slot = Some(Instant::now() + budget);
+    }
+}
+
+/// The per-agent, per-room journal of delivered object messages (SPEC-086
+/// CON-004).
+///
+/// A controller's state lives in the runtime. In a cleartext room it rebuilds
+/// from the hub's backfill and history replies; in an MLS room it cannot —
+/// replayed frames from earlier epochs do not decrypt, and this member's own
+/// sends never did. So every object message delivered to a subscribed agent
+/// is appended here, as the plaintext and the attested signer, and replayed
+/// into a fresh controller before it serves its first command. The runtime
+/// deduplicates by cid on replay, so the journal need only avoid repeating
+/// identical lines. It lives beside the identity keys and the pairing
+/// store, owner-only, because private-room plaintext is of that trust class.
+struct Journal {
+    dir: PathBuf,
+    seen: HashMap<(String, String), HashSet<[u8; 32]>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct JournalLine {
+    signer: String,
+    text: String,
+}
+
+impl Journal {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            seen: HashMap::new(),
+        }
+    }
+
+    fn path(&self, me: &str, room: &str) -> PathBuf {
+        self.dir
+            .join(file_stem(me))
+            .join(format!("{}.jsonl", file_stem(room)))
+    }
+
+    fn digest(signer: &str, text: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(signer.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(text.as_bytes());
+        hasher.finalize().into()
+    }
+
+    /// Every line for (`me`, `room`), oldest first, and remember them.
+    fn load(&mut self, me: &str, room: &str) -> Vec<JournalLine> {
+        let path = self.path(me, room);
+        let seen = self
+            .seen
+            .entry((me.to_owned(), room.to_owned()))
+            .or_default();
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        for raw in body.lines() {
+            let Ok(line) = serde_json::from_str::<JournalLine>(raw) else {
+                tracing::warn!(target: "hark::objects", path = %path.display(), "skipping a malformed journal line");
+                continue;
+            };
+            if seen.insert(Self::digest(&line.signer, &line.text)) {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    /// Append one delivered message unless an identical one is journalled.
+    fn record(&mut self, me: &str, room: &str, signer: &str, text: &str) {
+        let seen = self
+            .seen
+            .entry((me.to_owned(), room.to_owned()))
+            .or_default();
+        if !seen.insert(Self::digest(signer, text)) {
+            return;
+        }
+        let path = self.path(me, room);
+        let result = (|| -> std::io::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+                }
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            let line = serde_json::to_string(&JournalLine {
+                signer: signer.to_owned(),
+                text: text.to_owned(),
+            })
+            .map_err(std::io::Error::other)?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")
+        })();
+        if let Err(error) = result {
+            tracing::warn!(target: "hark::objects", path = %path.display(), %error, "could not journal an object message");
+        }
+    }
+}
+
+/// A handle or room as a filename: strip the `@`, keep filename-safe
+/// characters (the same rule as the identity key files).
+fn file_stem(handle: &str) -> String {
+    let name: String = handle
+        .trim_start_matches('@')
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.is_empty() {
+        "agent".to_owned()
+    } else {
+        name
+    }
+}
+
 /// Start the runtime on its own thread. `tokio` is the daemon's runtime
 /// handle: the host `send` and `history` functions block on it from the actor
 /// thread, which is not a tokio worker, so that is permitted and cannot
 /// starve the executor.
-pub fn spawn(store: AgentStore, tokio: tokio::runtime::Handle) -> ObjectsClient {
+///
+/// `journal_dir` is where delivered object messages are journalled per agent
+/// and room (CON-004); `None` keeps state in memory only.
+pub fn spawn(
+    store: AgentStore,
+    tokio: tokio::runtime::Handle,
+    journal_dir: Option<PathBuf>,
+) -> ObjectsClient {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("hark-objects".to_owned())
-        .spawn(move || run(rx, store, tokio))
+        .spawn(move || run(rx, store, tokio, journal_dir))
         .expect("the object runtime thread spawns");
     ObjectsClient::new(tx)
 }
@@ -85,10 +250,28 @@ pub(crate) fn spawn_with_hooks(
     on_send: impl Fn(&str, &str) -> bool + Send + 'static,
     on_history: impl Fn(&str, &str) -> bool + Send + 'static,
 ) -> ObjectsClient {
+    spawn_with_options(on_send, on_history, None, COMMAND_DEADLINE)
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_with_options(
+    on_send: impl Fn(&str, &str) -> bool + Send + 'static,
+    on_history: impl Fn(&str, &str) -> bool + Send + 'static,
+    journal_dir: Option<PathBuf>,
+    deadline: Duration,
+) -> ObjectsClient {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("hark-objects-test".to_owned())
-        .spawn(move || run_with(rx, Box::new(on_send), Box::new(on_history)))
+        .spawn(move || {
+            run_with(
+                rx,
+                Box::new(on_send),
+                Box::new(on_history),
+                journal_dir,
+                deadline,
+            )
+        })
         .expect("the object runtime thread spawns");
     ObjectsClient::new(tx)
 }
@@ -96,7 +279,12 @@ pub(crate) fn spawn_with_hooks(
 type SendHook = Box<dyn Fn(&str, &str) -> bool + Send>;
 type HistoryHook = Box<dyn Fn(&str, &str) -> bool + Send>;
 
-fn run(rx: mpsc::UnboundedReceiver<Command>, store: AgentStore, tokio: tokio::runtime::Handle) {
+fn run(
+    rx: mpsc::UnboundedReceiver<Command>,
+    store: AgentStore,
+    tokio: tokio::runtime::Handle,
+    journal_dir: Option<PathBuf>,
+) {
     let send_store = store.clone();
     let send_tokio = tokio.clone();
     let on_send: SendHook = Box::new(move |agent: &str, canonical: &str| {
@@ -132,11 +320,41 @@ fn run(rx: mpsc::UnboundedReceiver<Command>, store: AgentStore, tokio: tokio::ru
             }
         }
     });
-    run_with(rx, on_send, on_history);
+    run_with(rx, on_send, on_history, journal_dir, COMMAND_DEADLINE);
 }
 
-fn run_with(mut rx: mpsc::UnboundedReceiver<Command>, on_send: SendHook, on_history: HistoryHook) {
+fn run_with(
+    mut rx: mpsc::UnboundedReceiver<Command>,
+    on_send: SendHook,
+    on_history: HistoryHook,
+    journal_dir: Option<PathBuf>,
+    budget: Duration,
+) {
     let rt = Runtime::new().expect("QuickJS runtime");
+    rt.set_memory_limit(MEMORY_LIMIT);
+    rt.set_max_stack_size(STACK_LIMIT);
+    let deadline: Deadline = Arc::new(Mutex::new(None));
+    let watched = Arc::clone(&deadline);
+    rt.set_interrupt_handler(Some(Box::new(move || {
+        watched
+            .lock()
+            .map(|slot| slot.is_some_and(|at| Instant::now() > at))
+            .unwrap_or(false)
+    })));
+    // A host call that blocks on the hub is not JavaScript running away:
+    // give the script its full budget back once the call returns.
+    let (send_deadline, history_deadline) = (Arc::clone(&deadline), Arc::clone(&deadline));
+    let on_send: SendHook = Box::new(move |agent, canonical| {
+        let sent = on_send(agent, canonical);
+        bump(&send_deadline, budget);
+        sent
+    });
+    let on_history: HistoryHook = Box::new(move |agent, room| {
+        let requested = on_history(agent, room);
+        bump(&history_deadline, budget);
+        requested
+    });
+    let mut journal = journal_dir.map(Journal::new);
     let mut resolver = BuiltinResolver::default();
     let mut loader = BuiltinLoader::default();
     for (name, source) in vendored_files().into_iter().chain(hark_files()) {
@@ -158,10 +376,14 @@ fn run_with(mut rx: mpsc::UnboundedReceiver<Command>, on_send: SendHook, on_hist
     });
 
     while let Some(command) = rx.blocking_recv() {
+        bump(&deadline, budget);
         ctx.with(|ctx| {
             let module = glue.clone().restore(&ctx).expect("glue module restores");
-            dispatch(&ctx, &module, command);
+            dispatch(&ctx, &module, command, journal.as_mut());
         });
+        if let Ok(mut slot) = deadline.lock() {
+            *slot = None;
+        }
     }
 }
 
@@ -297,18 +519,47 @@ fn call<'js>(
         .map_err(|error| ObjectsError::Failed(describe(ctx, error)))
 }
 
+/// Make sure the agent's controller exists; on creation, replay its journal
+/// so a restarted daemon serves the state it had (CON-004).
 fn ensure<'js>(
     ctx: &Ctx<'js>,
     module: &Object<'js>,
     who: &AgentIdentity,
+    journal: Option<&mut Journal>,
 ) -> Result<(), ObjectsError> {
-    call(
+    let created = call(
         ctx,
         module,
         "ensure",
         (who.agent.as_str(), who.me.as_str(), who.room.as_str()),
-    )
-    .map(|_| ())
+    )?;
+    if created.as_deref() != Some("created") {
+        return Ok(());
+    }
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    let lines = journal.load(&who.me, &who.room);
+    let count = lines.len();
+    for line in lines {
+        if let Err(error) = call(
+            ctx,
+            module,
+            "ingest",
+            (
+                who.agent.as_str(),
+                line.text.as_str(),
+                line.signer.as_str(),
+                who.room.as_str(),
+            ),
+        ) {
+            tracing::debug!(target: "hark::objects", agent = who.agent.as_str(), %error, "journal line not ingested");
+        }
+    }
+    if count > 0 {
+        tracing::info!(target: "hark::objects", agent = who.agent.as_str(), room = who.room, count, "replayed the object journal");
+    }
+    Ok(())
 }
 
 fn decode<T: serde::de::DeserializeOwned>(text: Option<String>) -> Result<Option<T>, ObjectsError> {
@@ -320,10 +571,18 @@ fn decode<T: serde::de::DeserializeOwned>(text: Option<String>) -> Result<Option
     }
 }
 
-fn dispatch<'js>(ctx: &Ctx<'js>, module: &Object<'js>, command: Command) {
+fn dispatch<'js>(
+    ctx: &Ctx<'js>,
+    module: &Object<'js>,
+    command: Command,
+    mut journal: Option<&mut Journal>,
+) {
     match command {
         Command::Ingest { who, signer, text } => {
-            if let Err(error) = ensure(ctx, module, &who).and_then(|()| {
+            if let Some(journal) = journal.as_deref_mut() {
+                journal.record(&who.me, &who.room, &signer, &text);
+            }
+            if let Err(error) = ensure(ctx, module, &who, journal).and_then(|()| {
                 call(
                     ctx,
                     module,
@@ -340,13 +599,13 @@ fn dispatch<'js>(ctx: &Ctx<'js>, module: &Object<'js>, command: Command) {
             }
         }
         Command::Read { who, thread, reply } => {
-            let result = ensure(ctx, module, &who)
+            let result = ensure(ctx, module, &who, journal)
                 .and_then(|()| call(ctx, module, "read", (who.agent.as_str(), thread.as_str())))
                 .and_then(decode::<ObjectState>);
             let _ = reply.send(result);
         }
         Command::List { who, reply } => {
-            let result = ensure(ctx, module, &who)
+            let result = ensure(ctx, module, &who, journal)
                 .and_then(|()| call(ctx, module, "list", (who.agent.as_str(),)))
                 .and_then(decode::<Vec<ObjectSummary>>)
                 .map(Option::unwrap_or_default);
@@ -359,7 +618,7 @@ fn dispatch<'js>(ctx: &Ctx<'js>, module: &Object<'js>, command: Command) {
             fields,
             reply,
         } => {
-            let result = ensure(ctx, module, &who)
+            let result = ensure(ctx, module, &who, journal)
                 .and_then(|()| {
                     call(
                         ctx,
@@ -386,7 +645,7 @@ fn dispatch<'js>(ctx: &Ctx<'js>, module: &Object<'js>, command: Command) {
             fields,
             reply,
         } => {
-            let result = ensure(ctx, module, &who)
+            let result = ensure(ctx, module, &who, journal)
                 .and_then(|()| {
                     call(
                         ctx,
@@ -408,6 +667,10 @@ fn dispatch<'js>(ctx: &Ctx<'js>, module: &Object<'js>, command: Command) {
         }
         Command::Close { agent } => {
             let _ = call(ctx, module, "close", (agent.as_str(),));
+        }
+        #[cfg(test)]
+        Command::Spin { reply } => {
+            let _ = reply.send(call(ctx, module, "__spin", ()).map(|_| ()));
         }
         Command::Check { definition, reply } => {
             let result = call(ctx, module, "check", (definition.to_string(),))
@@ -751,6 +1014,148 @@ mod tests {
         );
         let error = client.check(bad).await.expect_err("refused");
         assert!(error.to_string().contains("unknown view field"), "{error}");
+    }
+
+    /// CON-004: everything delivered to a subscribed agent is journalled per
+    /// room, owner-only, and a fresh runtime replays it before serving its
+    /// first command — so a restarted daemon in a private room still knows
+    /// the opener and this member's own acts, which no replay can decrypt.
+    #[tokio::test]
+    async fn the_journal_restores_object_state_into_a_fresh_runtime() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let journal_dir = dir.path().join("objects");
+        let agent = AgentHandle::generate();
+        {
+            let first = spawn_with_options(
+                |_, _| true,
+                |_, _| true,
+                Some(journal_dir.clone()),
+                COMMAND_DEADLINE,
+            );
+            let opened = first
+                .open(
+                    who(&agent),
+                    checklist(),
+                    "list-4".to_owned(),
+                    serde_json::json!({ "title": "Camp" }),
+                )
+                .await
+                .unwrap();
+            // Delivered messages (the opener's echo, an action) are journalled
+            // on ingest; the optimistic local copy is not the journal's source.
+            first.ingest(who(&agent), "@aria".into(), opened.message.clone().unwrap());
+            let acted = first
+                .act(
+                    who(&agent),
+                    "list-4".to_owned(),
+                    "check".to_owned(),
+                    serde_json::json!({ "item": "stove", "done": true }),
+                )
+                .await
+                .unwrap();
+            assert!(acted.ok);
+            // The hub's echo of the action, journalled too; a duplicate delivery
+            // adds no second line.
+            let action = format!(
+                "(lang {} (check @general () :item \"stove\" :done #t :from @aria :thread \"list-4\" :caused-by sha256-{}))",
+                opened.dialect.clone().unwrap(),
+                opened.cid.clone().unwrap()
+            );
+            first.ingest(who(&agent), "@aria".into(), action.clone());
+            first.ingest(who(&agent), "@aria".into(), action);
+            let state = first
+                .read(who(&agent), "list-4".to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state.state,
+                serde_json::json!({ "title": "Camp", "items": { "stove": true } })
+            );
+        }
+        let path = journal_dir.join("aria").join("general.jsonl");
+        let body = std::fs::read_to_string(&path).expect("the journal was written");
+        assert_eq!(
+            body.lines().count(),
+            2,
+            "one line per distinct delivery: {body}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        // A new runtime — a restarted daemon — with nothing delivered yet.
+        let second = spawn_with_options(
+            |_, _| true,
+            |_, _| true,
+            Some(journal_dir.clone()),
+            COMMAND_DEADLINE,
+        );
+        let state = second
+            .read(who(&agent), "list-4".to_owned())
+            .await
+            .unwrap()
+            .expect("replayed from the journal");
+        assert_eq!(
+            state.state,
+            serde_json::json!({ "title": "Camp", "items": { "stove": true } })
+        );
+        // And the broker now knows this member's earlier write: a new act on
+        // the same key replaces it rather than sitting beside it.
+        let acted = second
+            .act(
+                who(&agent),
+                "list-4".to_owned(),
+                "check".to_owned(),
+                serde_json::json!({ "item": "stove", "done": false }),
+            )
+            .await
+            .unwrap();
+        assert!(acted.ok, "{acted:?}");
+        let state = second
+            .read(who(&agent), "list-4".to_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state["items"], serde_json::json!({ "stove": false }));
+        // Without a journal, a fresh runtime knows nothing.
+        let bare = spawn_with_hooks(|_, _| true, |_, _| true);
+        assert_eq!(
+            bare.read(who(&agent), "list-4".to_owned()).await.unwrap(),
+            None
+        );
+    }
+
+    /// A script that never yields is stopped at the command deadline and
+    /// reported as a failure; the runtime keeps serving afterwards.
+    #[tokio::test]
+    async fn a_runaway_script_is_interrupted_at_the_deadline() {
+        let client = spawn_with_options(|_, _| true, |_, _| true, None, Duration::from_millis(300));
+        let started = Instant::now();
+        let error = client.spin().await.expect_err("interrupted");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stopped promptly"
+        );
+        assert!(error.to_string().contains("interrupted"), "{error}");
+        let checked = client
+            .check(checklist())
+            .await
+            .expect("the runtime still serves");
+        assert!(checked.dialect.starts_with("object-"));
     }
 
     /// The definition must verify under cbcl-rs; a contract whose protocol

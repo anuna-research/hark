@@ -151,6 +151,10 @@ the projected state; it is the same JSON every browser computes.
 
 - A room keeps at most 64 learned contracts and 128 views.
 - History beyond the hub's backfill needs `hark history`; an object whose
-  opener is out of reach shows as `object_unknown` until it arrives.
+  opener is out of reach shows as `object_unknown` until it arrives. What was
+  delivered to the agent is journalled under the identity directory and
+  replayed after a daemon restart, private rooms included.
+- A paired agent is subscribed automatically when the pairing record lists an
+  object dialect; otherwise pass `--objects` to `hark pair` or `hark join`.
 - Views are not previewable in hark. The state is; render it from
   `hark object read` when a picture is needed.

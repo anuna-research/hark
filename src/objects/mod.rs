@@ -158,6 +158,10 @@ pub(crate) enum Command {
         definition: serde_json::Value,
         reply: oneshot::Sender<Result<CheckOutcome, ObjectsError>>,
     },
+    #[cfg(test)]
+    Spin {
+        reply: oneshot::Sender<Result<(), ObjectsError>>,
+    },
 }
 
 /// A handle on the object runtime. Cheap to clone; every clone talks to the
@@ -245,6 +249,16 @@ impl ObjectsClient {
         let _ = self.tx.send(Command::Close { agent });
     }
 
+    /// Test hook: run a script that never yields, to exercise the deadline.
+    #[cfg(test)]
+    pub(crate) async fn spin(&self) -> Result<(), ObjectsError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Spin { reply })
+            .map_err(|_| ObjectsError::Unavailable)?;
+        rx.await.map_err(|_| ObjectsError::Unavailable)?
+    }
+
     /// Compile and verify a definition without sending anything.
     pub async fn check(&self, definition: serde_json::Value) -> Result<CheckOutcome, ObjectsError> {
         let (reply, rx) = oneshot::channel();
@@ -283,10 +297,17 @@ mod vendor_tests {
                 "{name} differs from the pinned cbcl-bus copy"
             );
         }
-        assert_eq!(
-            manifest["cbcl_rs_sha"].as_str(),
-            Some("58dbcfcfb286a97a9e1ea076c19d401bf15be918"),
-            "the manifest names the cbcl-rs revision Cargo.toml pins for cbcl-wasm"
+        // The manifest's cbcl-rs revision is the one Cargo.toml pins for
+        // cbcl-wasm: the vendored JS and the native verifier move together.
+        let sha = manifest["cbcl_rs_sha"].as_str().expect("cbcl_rs_sha");
+        let cargo = include_str!("../../Cargo.toml");
+        let pin = cargo
+            .lines()
+            .find(|line| line.trim_start().starts_with("cbcl-wasm"))
+            .expect("Cargo.toml pins cbcl-wasm");
+        assert!(
+            pin.contains(&format!("rev = \"{sha}\"")),
+            "Cargo.toml's cbcl-wasm rev must equal VENDOR.json's cbcl_rs_sha ({sha}); run scripts/vendor-objects.sh"
         );
     }
 }

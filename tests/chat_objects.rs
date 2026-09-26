@@ -317,6 +317,7 @@ async fn a_hark_agent_creates_reads_and_acts_on_an_object_through_the_hub() {
         .attach_objects(spawn_objects(
             store.clone(),
             tokio::runtime::Handle::current(),
+            None,
         ))
         .await;
     let handle = join(store.clone(), &hub, true, false).await;

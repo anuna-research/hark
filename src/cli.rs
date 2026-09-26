@@ -219,6 +219,11 @@ pub struct PairArgs {
         help = "Chat hub WebSocket URL; defaults to the configured hub or the public hub"
     )]
     pub hub: Option<String>,
+    #[arg(
+        long = "objects",
+        help = "Subscribe to hypermedia-object messages (SPEC-086). Implied when the pairing record lists an object dialect (object-<digest>)"
+    )]
+    pub objects: bool,
 }
 
 #[derive(Debug, Args)]
@@ -527,8 +532,9 @@ async fn join_command(args: JoinArgs) -> AppResult<()> {
     for dialect in &args.speak {
         // `*` is the receive-all sentinel (deliver every channel message to
         // `recv`), interpreted by the daemon — not a concrete dialect id, so
-        // it is exempt from the id grammar.
-        if dialect != "*" {
+        // it is exempt from the id grammar. An object dialect (SPEC-086) is
+        // the object subscription and is exempt for the same reason.
+        if dialect != "*" && !crate::object_transport::is_object_dialect_name(dialect) {
             validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
         }
         if !seen.insert(dialect) {
@@ -700,7 +706,9 @@ async fn pair_command(args: PairArgs) -> AppResult<()> {
             // A paired agent joins an existing channel; it is never the MLS
             // room creator (SPEC-013 REQ-016 stays an explicit operator act).
             mls_create: None,
-            objects: None,
+            // SPEC-086 CON-003: explicit, or implied by an object dialect in
+            // the record's chosen dialects (the daemon strips and honours those).
+            objects: args.objects.then_some(true),
         })
         .await
         .map_err(map_local_api_request_error)?;
@@ -718,9 +726,17 @@ async fn pair_command(args: PairArgs) -> AppResult<()> {
     // addressed by the wire `@name` cbcl-bus assigned (CBCL_AGENT_HANDLE
     // accepts it). Without this each shell falls back to the daemon's single
     // active-handle slot and both collapse onto the last-paired agent.
+    let objects = args.objects
+        || record
+            .dialects
+            .iter()
+            .any(|dialect| crate::object_transport::is_object_dialect_name(&dialect.name));
     eprintln!(
-        "paired into {} as {} (added by {}) · speaking: {speaking}",
-        record.channel, handle, record.adder
+        "paired into {} as {} (added by {}) · speaking: {speaking}{}",
+        record.channel,
+        handle,
+        record.adder,
+        if objects { " · objects: on" } else { "" }
     );
     println!("export CBCL_AGENT_HANDLE='{}'", shell_single_quote(&handle));
     Ok(())
@@ -1040,8 +1056,9 @@ fn validate_init_advertisement(dialects: &[String]) -> AppResult<()> {
     for dialect in dialects {
         // `*` is the receive-all sentinel (deliver every channel message to
         // `recv`), interpreted by the daemon — not a concrete dialect id, so
-        // it is exempt from the id grammar.
-        if dialect != "*" {
+        // it is exempt from the id grammar. An object dialect (SPEC-086) is
+        // the object subscription and is exempt for the same reason.
+        if dialect != "*" && !crate::object_transport::is_object_dialect_name(dialect) {
             validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
         }
         if !seen.insert(dialect) {
@@ -1633,6 +1650,14 @@ async fn daemon_run() -> AppResult<()> {
         .attach_objects(crate::objects::runtime::spawn(
             agents.clone(),
             tokio::runtime::Handle::current(),
+            // CON-004: the object journal lives beside the identity keys and
+            // the pairing store, the durable owner-only home of this class of
+            // material. No chat config, no journal (the router transport has
+            // no objects).
+            config
+                .validate_chat()
+                .ok()
+                .map(|chat| chat.identity_dir.join("objects")),
         ))
         .await;
     // SPEC-026 REQ-008: bring back every agent the last daemon had, before the

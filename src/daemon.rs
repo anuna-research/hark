@@ -960,6 +960,36 @@ impl AgentStore {
         entry.ensure_healthy()?;
         let bytes = message.len();
 
+        // SPEC-086 Stage B: an agent that acts on objects through the runtime
+        // may never drain `recv`, yet every object message is delivered there
+        // too (REQ-001). Killing the handle for that would make Stage B
+        // unusable on any busy object. When the runtime holds the records,
+        // the queue is a convenience copy: shed the OLDEST object records to
+        // make room, never a non-object message, and never when no runtime
+        // has them.
+        if record.is_some() && objects.is_some() {
+            let mut shed = 0usize;
+            while entry.queue.len() >= max_messages
+                || entry.queued_bytes.saturating_add(bytes) > max_bytes
+            {
+                let Some(index) = entry.queue.iter().position(|queued| queued.record.is_some())
+                else {
+                    break;
+                };
+                if let Some(dropped) = entry.queue.remove(index) {
+                    entry.queued_bytes = entry.queued_bytes.saturating_sub(dropped.bytes);
+                    shed += 1;
+                }
+            }
+            if shed > 0 {
+                tracing::debug!(
+                    agent = handle.as_str(),
+                    shed,
+                    "recv queue full; shed the oldest object records (the object runtime holds them)"
+                );
+            }
+        }
+
         if entry.queue.len() >= max_messages || entry.queued_bytes.saturating_add(bytes) > max_bytes
         {
             entry.mark_unhealthy("queue_overflow", None);
@@ -2253,6 +2283,62 @@ mod tests {
                 .expect("recv should succeed"),
             "two-two"
         );
+    }
+
+    /// SPEC-086 Stage B (CON-004 note): with the object runtime attached, a
+    /// full queue sheds the OLDEST object records instead of killing the
+    /// handle — an agent acting through the runtime need not drain `recv`.
+    /// Non-object messages still overflow as before, and without a runtime
+    /// nothing is shed.
+    #[tokio::test]
+    async fn object_records_are_shed_before_the_queue_overflows() {
+        use crate::object_transport::{AttestedBy, ObjectRecord};
+        let record = || ObjectRecord {
+            room: "@general".into(),
+            signer: "@bo".into(),
+            attested_by: AttestedBy::Hub,
+            own: false,
+            replayed: false,
+        };
+        let store = super::AgentStore::new(super::AgentStoreConfig {
+            agent_id_prefix: "t".into(),
+            max_messages_per_handle: 2,
+            max_bytes_per_handle: 4096,
+        });
+        store
+            .attach_objects(crate::objects::runtime::spawn_with_hooks(|_, _| true, |_, _| true))
+            .await;
+        let handle = super::AgentHandle::generate();
+        store
+            .insert_connected_with_router_channels(
+                handle.clone(),
+                vec!["cite".into()],
+                None,
+                None,
+                Some("@aria".into()),
+                Some("@general".into()),
+            )
+            .await
+            .unwrap();
+        for text in ["one", "two", "three"] {
+            store
+                .enqueue_object(&handle, format!("(lang object-x (check @general :n {text}))"), record())
+                .await
+                .expect("never overflows while records can be shed");
+        }
+        let snapshot = store.status_snapshots().await.into_iter().next().unwrap();
+        assert_eq!(snapshot.state, super::AgentState::Connected);
+        assert_eq!(snapshot.queued_messages, 2);
+        let first = store.recv(&handle, None).await.unwrap();
+        assert!(first.contains(":n two"), "the oldest record was shed: {first}");
+
+        // A non-object message never sheds anything and overflows as before.
+        store.enqueue_inbound(&handle, "(tell @general \"a\")".into()).await.unwrap();
+        let error = store
+            .enqueue_inbound(&handle, "(tell @general \"b\")".into())
+            .await
+            .expect_err("plain messages overflow");
+        assert!(matches!(error, super::AgentError::QueueOverflow));
     }
 
     #[tokio::test]

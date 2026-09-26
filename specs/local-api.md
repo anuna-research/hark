@@ -184,7 +184,9 @@ Fields:
   to `recv` with an attestation record, independent of `dialects` and of the
   room's declared menu. Persisted in the pairing record, so a daemon restart
   resumes it. On the router transport `true` is rejected with `400` and
-  `error.code = "objects_unsupported"`.
+  `error.code = "objects_unsupported"`. An object dialect (`object-<64hex>`)
+  in `dialects` turns the subscription on as well; such names are stripped
+  before advertisement and never appear in the response's `dialects`.
 
 The daemon must reject requests whose `capabilities` list is empty. Capability
 and dialect values must follow the grammars defined in [`config.md`](config.md),
@@ -481,9 +483,12 @@ returns `503` with `error.code = "objects_unavailable"`.
 The daemon runs the browser's own object code (the `@cbcl/object` controller,
 broker, projection and store, vendored byte-for-byte from cbcl-bus) in an
 embedded QuickJS runtime, with every CBCL judgement and the content address
-supplied natively by cbcl-rs at the revision cbcl-bus ships. State is
-rebuilt from the room's backfill and history replies, like a browser tab; it
-is not persisted.
+supplied natively by cbcl-rs at the revision cbcl-bus ships. Delivered object
+messages are journalled per agent and room under `<chat.identity_dir>/objects/`
+(owner-only) and replayed into a fresh controller after a daemon restart
+(SPEC-086 CON-004), so private-room state survives where no hub replay could
+restore it. With the runtime attached, a full `recv` queue sheds its oldest
+object records instead of marking the handle unhealthy.
 
 #### `POST /v1/objects/check`
 

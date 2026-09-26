@@ -126,6 +126,12 @@ Consequence: hark carries a second cbcl-rs pin. Hark's own pin serialises a quot
 Consequence: object state is not persisted; a controller rebuilds it from backfill and history replies, as a browser tab does.
 Interface: `hark object list|read|act|open`; `GET/POST /v1/agents/{handle}/objects[/{thread}[/act]]` (see `specs/local-api.md`, `specs/cli.md`).
 
+## CON-004
+The object journal. Every object message delivered to a subscribed agent is appended, as plaintext plus the attested signer, to `<chat.identity_dir>/objects/<agent>/<room>.jsonl` (directory `0700`, file `0600`), one line per distinct (signer, bytes). A fresh controller — a restarted daemon — replays its journal before serving its first command. The runtime deduplicates by cid, so a journal replay is idempotent.
+Why: in a cleartext room a controller rebuilds from backfill and [[SPEC-086-hark-object-transport#CON-002]]; in an MLS room it cannot, because replayed frames from earlier epochs do not decrypt and this member's own sends never did. Without the journal a restarted agent in a private room would fill `replaces`/`removes` blind to its own earlier writes. The journal is the browser's archive, for an agent.
+Queue rule: with the runtime attached, a full `recv` queue sheds the oldest object records rather than marking the handle unhealthy — the runtime holds them, and an agent acting through `hark object` need not drain `recv`. Non-object messages overflow as before; without a runtime nothing is shed.
+Limits: the runtime runs with a 256 MiB heap, a 4 MiB stack, and a 20 s per-command deadline that a blocking host call (a send awaiting the hub) extends on return.
+
 ## CON-001
 `recv` response for an object message, as RFC 8259 JSON:
 ```json
@@ -158,8 +164,9 @@ Success returns `202 {"ok": true}`. Replies arrive through `recv`.
 
 ## CON-003
 Opt-in, off by default:
-- CLI: `hark join … --objects`.
+- CLI: `hark join … --objects`, `hark pair … --objects`.
 - API: `POST /v1/agents` accepts `"objects": true`.
+- An object dialect name (`object-<64hex>`) in the dialect set is the subscription: a pairing record whose adder chose an object from the room's menu arrives subscribed. Object dialects are stripped before advertisement; they are not capabilities.
 - The flag persists in the pairing record (SPEC-026 CON-002), so a restarted daemon resumes it.
 Rollback: rejoin without the flag. No other agent or room is affected.
 
@@ -176,6 +183,19 @@ Core: Restart the daemon. After more than 50 later frames, the opener is outside
 Negative input: A second history request for the same room while one is in flight returns `history_in_flight`.
 Negative output: Replayed non-object messages still do not reach `recv`.
 Traces: [[SPEC-086-hark-object-transport#REQ-003]], [[SPEC-086-hark-object-transport#REQ-004]].
+
+## TEST-004
+Core: `hark object check` on an authoring definition with a view reports the contract and view digests; `open` sends one opener carrying both; a second controller that receives only that opener reads the object's state.
+Core: with the object runtime attached, `open` → hub echo → `act` → `read` over a real socket yields the projection of exactly the bytes on the wire, and the echoes deduplicate.
+Negative input: an action whose field type contradicts the contract is refused with cbcl-rs's shape blame and never reaches the wire; a contract whose protocol cycles is refused before send.
+Negative output: an action received before its opener stays pending, triggers one history request, and is released when the opener arrives.
+Traces: [[SPEC-086-hark-object-transport#ADR-004]].
+
+## TEST-005
+Core: after a runtime restart with the journal, `read` returns the state the agent had, and the broker's next write on a key replaces the agent's earlier one.
+Negative input: a runaway script is stopped at the deadline and the runtime keeps serving.
+Negative output: a full `recv` queue sheds the oldest object records and the handle stays connected; a plain message still overflows.
+Traces: [[SPEC-086-hark-object-transport#CON-004]].
 
 ## TEST-003
 Core: In an MLS room, an object message delivers a record with `attested_by: "mls"` and the MLS sender.

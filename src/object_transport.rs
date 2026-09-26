@@ -87,18 +87,24 @@ pub fn object_dialect(text: &str) -> Option<&str> {
     // `(lang` must be followed by at least one whitespace character.
     let rest = rest.strip_prefix(|c: char| c.is_whitespace())?;
     let rest = rest.trim_start();
-    let name = rest.strip_prefix("object-")?;
-    let hex: &str = name.get(..64)?;
-    if !hex
-        .bytes()
-        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return None;
-    }
-    match name[64..].chars().next() {
-        Some(c) if c.is_whitespace() => Some(&rest[..7 + 64]),
-        _ => None,
-    }
+    let end = rest.find(char::is_whitespace)?;
+    let name = &rest[..end];
+    is_object_dialect_name(name).then_some(name)
+}
+
+/// Whether `name` is an SDK object dialect name: `object-` plus exactly 64
+/// lowercase hex digits (the browser's `isSDKDialect`). Such a name in an
+/// agent's dialect set means the object subscription (SPEC-086 CON-003): it
+/// is a contract digest, not an advertisable capability, and it exceeds the
+/// dialect-id length grammar on purpose.
+pub fn is_object_dialect_name(name: &str) -> bool {
+    let Some(hex) = name.strip_prefix("object-") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Whether `text` is an object content message (REQ-001).
@@ -351,6 +357,9 @@ mod tests {
         assert!(!is_object_message(&format!("(lang object-{HEX})")));
         assert!(!is_object_message("(tell @general \"hi\" :from @bob)"));
         assert!(!is_object_message("(langobject-abc (x @r))"));
+        assert!(is_object_dialect_name(&format!("object-{HEX}")));
+        assert!(!is_object_dialect_name("object-abc"));
+        assert!(!is_object_dialect_name("poll"));
     }
 
     #[test]

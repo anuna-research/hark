@@ -34,9 +34,19 @@ function agent(handle) {
   return a;
 }
 
+/** Build the agent's controller on first use. Returns "created" when this
+ *  call built it (the host then replays the agent's journal into it) and
+ *  "existing" otherwise. */
 export async function ensure(handle, me, room) {
-  if (!agents.has(handle)) agents.set(handle, createAgent(handle, me, room));
-  return null;
+  if (agents.has(handle)) return 'existing';
+  agents.set(handle, createAgent(handle, me, room));
+  return 'created';
+}
+
+/** Test hook: a script that never yields, so the host's interrupt deadline
+ *  can be exercised. Never called by production code. */
+export async function __spin() {
+  for (;;) {}
 }
 
 export async function close(handle) {
