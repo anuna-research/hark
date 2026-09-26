@@ -89,6 +89,13 @@ pub struct PairedAgent {
     /// silently downgrade a firehose agent to an answer-only one across a
     /// restart, with nothing to show for it.
     pub receive_all: bool,
+    /// SPEC-086 CON-003: the object subscription. Always written; on read an
+    /// ABSENT key means a store written before SPEC-086, whose agents had no
+    /// subscription — `false` is the exact historical value, not a guess, so
+    /// this is the one field the grammar defaults (SPEC-026 CON-002 lists it
+    /// as optional).
+    #[serde(default)]
+    pub objects: bool,
 }
 
 /// The store document. `deny_unknown_fields` on both levels is part of the

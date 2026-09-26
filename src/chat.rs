@@ -30,6 +30,10 @@ use crate::chat_responder::{Action, Responder, WindowOutcome};
 use crate::daemon::{AgentHandle, AgentSendChannel, AgentStore, OutboundReject};
 use crate::identity::ChatIdentity;
 use crate::mls::session::{MlsSession, SessionEvent};
+use crate::object_transport::{
+    Attestation, ReplayAccounting, history_request_limit, is_object_message, object_record,
+    parse_backfilltimes,
+};
 use crate::reconnect::ReconnectSchedule;
 use crate::signed_transport::{SignedConn, parse_conn_bootstrap};
 
@@ -400,6 +404,7 @@ pub async fn create_chat_agent(
     mut mls: Option<MlsSession>,
     mls_create: bool,
     receive_all: bool,
+    objects: bool,
     resume: Option<AgentHandle>,
 ) -> Result<(AgentHandle, Vec<String>), ChatError> {
     AgentStore::validate_advertisement(&dialects)
@@ -505,6 +510,10 @@ pub async fn create_chat_agent(
         }
     };
 
+    // SPEC-086 CON-003: the subscription is a property of the registered
+    // handle, so the object API can refuse an unsubscribed agent.
+    let _ = store.mark_objects(&handle, objects).await;
+
     let responder = Responder::new(
         agent_handle.to_owned(),
         channel.to_owned(),
@@ -534,6 +543,7 @@ pub async fn create_chat_agent(
         conn,
         mls,
         receive_all,
+        objects,
         wire_handle: agent_handle.to_owned(),
         ds_rx,
         join,
@@ -632,8 +642,12 @@ struct ReceiveLoopArgs {
     /// own fanned-back messages are skipped. The responder still runs for any
     /// concrete dialects also advertised.
     receive_all: bool,
-    /// This agent's wire handle (`@name`) — used only by receive-all to skip
-    /// its own messages.
+    /// SPEC-086 CON-003: the object subscription. Every `object-*` content
+    /// message — including the agent's own, and replayed history — is
+    /// delivered to `recv` with an attestation record (REQ-001..REQ-004).
+    objects: bool,
+    /// This agent's wire handle (`@name`) — used by receive-all to skip its
+    /// own messages, and by the object subscription to mark them `own`.
     wire_handle: String,
     /// SPEC-024 (ADR-035): admitted DS records from the per-room pull task.
     /// The receive loop owns the MlsSession, so the CON-006 apply and the
@@ -1131,6 +1145,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         mut conn,
         mut mls,
         receive_all,
+        objects,
         wire_handle,
         ds_rx,
         join,
@@ -1155,6 +1170,9 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         // SPEC-026 REQ-003: the hub replays the room's recent history after
         // EVERY successful hello, including a re-join's.
         let mut replay_guard = ReplayGuard::new();
+        // SPEC-086 CON-001 `replayed`: which frames are hub backfill (announced
+        // by `backfilltimes`, SPEC-070) or a `(history …)` reply.
+        let mut replays = ReplayAccounting::new();
         // Frames from a state-mutating exchange that the socket died under.
         let mut pending_frames = PendingFrames::default();
         loop {
@@ -1177,6 +1195,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         conn = replacement.conn;
                         schedule.reset();
                         replay_guard.arm();
+                        replays.on_join();
                         let _ = store.mark_connected(&handle).await;
                         // Flush anything the dead socket swallowed BEFORE serving
                         // new traffic — it may be a Commit this agent has already
@@ -1186,9 +1205,13 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             let queued = pending_frames.take();
                             let mut failed: Option<String> = None;
                             for (index, text) in queued.iter().enumerate() {
-                                let Ok(payload) = payload_bytes(text) else { continue };
+                                let Ok(payload) = payload_bytes(text) else {
+                                    continue;
+                                };
                                 let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
-                                if let Err(error) = websocket.send(WsMessage::Binary(frame.into())).await {
+                                if let Err(error) =
+                                    websocket.send(WsMessage::Binary(frame.into())).await
+                                {
                                     failed = Some(sanitize(&error.to_string()));
                                     pending_frames.retain_from(&queued[index..]);
                                     break;
@@ -1235,8 +1258,12 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     // SPEC-013 REQ-005/REQ-023: in a pinned-encrypted channel
                     // every outbound payload is wrapped as an MLS deliver
                     // frame; there is no plaintext fallback (fail closed).
+                    // SPEC-086 CON-002: a hub control request (`history`) is
+                    // addressed to the hub, not the group; it is never sealed.
+                    let sealed = mls.as_ref().is_some_and(|session| session.encrypted())
+                        && !outbound.control;
                     let message_text = match mls.as_mut() {
-                        Some(session) if session.encrypted() => {
+                        Some(session) if sealed => {
                             match session.encrypt_outbound(&outbound.message) {
                                 Ok(wrapped) => wrapped,
                                 // A NotReady refusal is transient (no Welcome yet):
@@ -1265,7 +1292,36 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     };
                     let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
                     match websocket.send(WsMessage::Binary(frame.into())).await {
-                        Ok(()) => { let _ = outbound.result_tx.send(Ok(())); }
+                        Ok(()) => {
+                            let _ = outbound.result_tx.send(Ok(()));
+                            if outbound.control {
+                                // The loop reads its own request to know how
+                                // many reply frames to mark `replayed`.
+                                if let Some(limit) = history_request_limit(&outbound.message) {
+                                    replays.note_history_request(limit, std::time::Instant::now());
+                                }
+                            } else if objects && sealed {
+                                // SPEC-086 REQ-001: delivery includes the agent's
+                                // own messages. In a cleartext room the hub fans
+                                // them back and they arrive like any other; under
+                                // MLS the echo is ciphertext this member cannot
+                                // decrypt (MLS refuses its own sends), so the
+                                // plaintext is delivered here, at the moment the
+                                // sealed frame was accepted by the socket.
+                                let attestation = Attestation::Mls { sender: wire_handle.clone() };
+                                if let Some(record) = object_record(
+                                    &outbound.message,
+                                    &attestation,
+                                    &wire_handle,
+                                    &join.channel,
+                                    false,
+                                ) {
+                                    if store.enqueue_object(&handle, outbound.message.clone(), record).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         // SPEC-026 REQ-001/REQ-004: a failed write is the same
                         // event as a failed read — the socket died — so it
                         // schedules a reconnect rather than killing the handle.
@@ -1304,7 +1360,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     };
                     let Some(session) = mls.as_mut() else { continue };
                     let applied_text = match session.handle_frame(&apply.payload) {
-                        SessionEvent::Plaintext { text, .. } => Some(text),
+                        SessionEvent::Plaintext { text, sender } => Some((text, sender)),
                         SessionEvent::NotMls => None,   // marker/control payload — nothing to render
                         SessionEvent::Handled { .. } => None,
                         SessionEvent::Dropped { reason, .. } => {
@@ -1337,9 +1393,21 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         continue;
                     }
                     // Decrypted DS-delivered content reaches recv exactly like live
-                    // content (receive-all path; own messages skipped).
-                    if let Some(text) = applied_text {
-                        if receive_all {
+                    // content: as an object record under the object subscription
+                    // (SPEC-086 REQ-001/REQ-006), else on the receive-all path
+                    // (own messages skipped).
+                    if let Some((text, sender)) = applied_text {
+                        let mut delivered_as_object = false;
+                        if objects {
+                            let attestation = Attestation::Mls { sender };
+                            if let Some(record) = object_record(&text, &attestation, &wire_handle, &join.channel, false) {
+                                delivered_as_object = true;
+                                if store.enqueue_object(&handle, text.clone(), record).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        if receive_all && !delivered_as_object {
                             let own = crate::chat_responder::message_sender(&text).as_deref()
                                 == Some(wire_handle.as_str());
                             if !own && store.enqueue_inbound(&handle, text).await.is_err() {
@@ -1409,13 +1477,32 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             continue;
                         }
                     };
+                    // SPEC-086 CON-001 `replayed`. The hub announces a backfill
+                    // run's length ahead of the run (SPEC-070 `backfilltimes`);
+                    // the announcement itself is not part of the run, and
+                    // otherwise flows on exactly as it did before (REQ-001:
+                    // the subscription changes no other delivery).
+                    let replayed = match parse_backfilltimes(&payload_text) {
+                        Some(count) => {
+                            replays.note_backfilltimes(count);
+                            false
+                        }
+                        None => replays.classify(std::time::Instant::now()),
+                    };
                     // SPEC-026 REQ-003: drop the history the hub replayed after
                     // the re-join. Checked before the session and the responder
                     // see it — a replayed frame is one we have already fully
                     // processed, so re-running either is duplicated work at
                     // best and a duplicate delivery or a re-contended ask at
                     // worst.
-                    if replay_guard.is_replay(&payload_text) {
+                    //
+                    // SPEC-086 REQ-003: NOT for object messages under the
+                    // object subscription. The SDK needs the replayed history
+                    // (an opener older than the agent's store) and
+                    // deduplicates by cid itself (ADR-003); the guard keeps
+                    // suppressing every other replayed frame as before.
+                    let object_frame = objects && is_object_message(&payload_text);
+                    if !object_frame && replay_guard.is_replay(&payload_text) {
                         tracing::debug!(
                             agent = handle.as_str(),
                             "dropping a frame the hub replayed after the re-join"
@@ -1427,6 +1514,10 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     // content and emitting any protocol frames to send. In a
                     // pinned-encrypted channel ONLY decrypted content reaches
                     // the responder (REQ-005/REQ-006/REQ-017/REQ-018).
+                    // SPEC-086 REQ-006: how this frame's authorship was
+                    // established — the hub's signed-member check for a
+                    // cleartext frame, the MLS sender for a decrypted one.
+                    let mut attestation = Attestation::Hub;
                     let responder_text: Option<String> = match mls.as_mut() {
                         None => Some(payload_text),
                         Some(session) => match session.handle_frame(&payload_text) {
@@ -1440,7 +1531,10 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                                     Some(payload_text)
                                 }
                             }
-                            SessionEvent::Plaintext { text, .. } => Some(text),
+                            SessionEvent::Plaintext { text, sender } => {
+                                attestation = Attestation::Mls { sender };
+                                Some(text)
+                            }
                             SessionEvent::Handled { outbound } => {
                                 // SPEC-026 REQ-001: a write failure here is the
                                 // socket dying mid-MLS-exchange. Reconnect; the
@@ -1550,12 +1644,41 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         }
                     }
                     let Some(responder_text) = responder_text else { continue };
+                    // SPEC-086 REQ-001/REQ-002/REQ-006: under the object
+                    // subscription an `object-*` content message is delivered
+                    // with its attestation record — own messages and replays
+                    // included — independent of `--speak`, the capability set,
+                    // and the room's dialect menu. Hark never parses the
+                    // object itself (REQ-007): a message with no establishable
+                    // signer is simply not an object record, and falls through
+                    // to whatever delivery it had before.
+                    let mut delivered_as_object = false;
+                    if objects {
+                        if let Some(record) = object_record(
+                            &responder_text,
+                            &attestation,
+                            &wire_handle,
+                            &join.channel,
+                            replayed,
+                        ) {
+                            delivered_as_object = true;
+                            if store
+                                .enqueue_object(&handle, responder_text.clone(), record)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
                     // Receive-all (`*`): deliver EVERY channel content message to
                     // `recv`, not just answerable asks — the firehose a paired
                     // observer asked for. Skip our own messages the hub fans back
                     // so the agent doesn't receive its own emits. The responder
                     // still runs below for any concrete dialects also advertised.
-                    if receive_all {
+                    // A message already delivered as an object record is not
+                    // delivered a second time without one.
+                    if receive_all && !delivered_as_object {
                         let own = crate::chat_responder::message_sender(&responder_text)
                             .as_deref()
                             == Some(wire_handle.as_str());

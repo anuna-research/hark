@@ -3,14 +3,14 @@ id: SPEC-086
 title: Object transport for SDK agents
 status: draft
 tier: 2 (hark attests message authorship to an agent that acts on it)
-version: 0.1.0
+version: 0.2.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 5.5)
 last-updated: 2026-09-26
 owner-repo: hark
 affects-repos: none (cbcl-bus already serves the frames; SPEC-085 owns the SDK side)
 depends-on: SPEC-085 (agent object SDK — REQ-008 message identity, REQ-009 predecessor), SPEC-013 (MLS private channels — authenticated sender), SPEC-026 (reconnect and backfill replay)
-stage: A of 2 — transport only; a native projection is a later specification
+stage: B of 2 — transport (Stage A) plus native read/act/open by running the SDK headlessly (ADR-004)
 ---
 # SPEC-086 — Object transport for SDK agents
 
@@ -117,6 +117,15 @@ Hark delivers duplicates, including backfill overlap and the hub's echo of the a
 The SDK store deduplicates by cid ([[SPEC-085-agent-object-sdk#REQ-004]]). Hark-side deduplication needs the cid, which ADR-001 keeps out of hark.
 The cost is repeated delivery of up to one backfill window per reconnect.
 
+## ADR-004
+Status: accepted 2026-09-26 (repository owner's instruction; supersedes the second rejected alternative of [[SPEC-086-hark-object-transport#ADR-001]]).
+Hark reads, acts on, and creates objects by running the SDK's own code — `controller.js`, `emit.js`, `projection.js`, `store.js`, `object-sdk.js`, `dialects.js` — headlessly in an embedded QuickJS runtime (`rquickjs`), not by porting the projection to Rust.
+The vendored files are byte-pinned to a cbcl-bus commit (`src/objects/js/VENDOR.json`, checked by a test). Every browser-bound dependency is replaced by a host function: the content address is `sha2`; canonical text and the dialect, shape, protocol and `message_hash` verdicts are `cbcl-wasm` linked natively at the revision cbcl-bus ships (`cbcl-rs.sha`); `send` is the agent's signed hub connection; the missing-opener history request is [[SPEC-086-hark-object-transport#CON-002]]. Views and the sandbox are excluded: they carry author code and belong to a rendering host.
+Why the reversal: ADR-001 weighed a JavaScript runtime against the transport, where a separate agent process already did the work. Weighed against a Rust port of the projection semantics, embedding four hundred lines of pure functions is the smaller risk: parity with browsers holds by construction, and the [[SPEC-085-agent-object-sdk#REQ-007]] corpus becomes a regression net for pin bumps rather than the gate on correctness.
+Consequence: hark carries a second cbcl-rs pin. Hark's own pin serialises a quoted `:caused-by` differently from cbcl-bus's, so a cid computed with hark's parser would not equal the browser's; only the cbcl-bus pin may canonicalise object messages. The two pins bump together with `cbcl-rs.sha`.
+Consequence: object state is not persisted; a controller rebuilds it from backfill and history replies, as a browser tab does.
+Interface: `hark object list|read|act|open`; `GET/POST /v1/agents/{handle}/objects[/{thread}[/act]]` (see `specs/local-api.md`, `specs/cli.md`).
+
 ## CON-001
 `recv` response for an object message, as RFC 8259 JSON:
 ```json
@@ -185,5 +194,6 @@ Hard stops: [[SPEC-086-hark-object-transport#REQ-005]], [[SPEC-086-hark-object-t
 <details>
 <summary>Revision history — 0.1.0</summary>
 
+- 0.2.0 (2026-09-26) — Stage B: native read/act/open by running the SDK headlessly (ADR-004); Stage A implemented.
 - 0.1.0 (2026-09-26) — draft: Stage A transport, from the SPEC-085 v0.2.0 review of what hark lacks.
 </details>

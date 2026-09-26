@@ -178,6 +178,13 @@ Fields:
 * `capabilities` - non-empty per-agent capability strings advertised in the
   router `hello`.
 * `dialects` - optional dialect ids advertised in the router `hello`.
+* `objects` - chat transport only; optional boolean, default `false`. The
+  SPEC-086 object subscription (CON-003): every `object-*` content message in
+  the channel — the agent's own and replayed history included — is delivered
+  to `recv` with an attestation record, independent of `dialects` and of the
+  room's declared menu. Persisted in the pairing record, so a daemon restart
+  resumes it. On the router transport `true` is rejected with `400` and
+  `error.code = "objects_unsupported"`.
 
 The daemon must reject requests whose `capabilities` list is empty. Capability
 and dialect values must follow the grammars defined in [`config.md`](config.md),
@@ -259,6 +266,40 @@ Response:
   "message": "(lang elf (ask @router \"echo\" :thread \"rcp-...\"))"
 }
 ```
+
+An object message delivered under the SPEC-086 object subscription carries an
+additional `record` member (SPEC-086 CON-001; additive, ADR-002 — consumers
+that do not know it ignore it). It is absent for every other message.
+
+```json
+{
+  "agent_handle": "01JX8F4V2QK8GZP9H6W5",
+  "message": "(lang object-<64hex> (check @room :item \"milk\" … :from @alice))",
+  "record": {
+    "room": "@room",
+    "signer": "@alice",
+    "attested_by": "mls",
+    "own": false,
+    "replayed": true
+  }
+}
+```
+
+* `room` - the room handle the frame arrived on.
+* `signer` - the authenticated author (SPEC-086 REQ-006): in an MLS room the
+  MLS sender (a message whose inner `:from` differs is dropped); in a cleartext
+  room the `:from` of a frame the hub delivered. A frame with no establishable
+  signer is never delivered as an object record.
+* `attested_by` - `"mls"` or `"hub"`.
+* `own` - `signer` is this agent's own wire handle.
+* `replayed` - the frame arrived in join/reconnect backfill (announced by the
+  hub's `backfilltimes` frame) or in a history reply.
+
+The record carries no cid: the daemon never canonicalises, verifies, or
+projects object messages (SPEC-086 ADR-001, REQ-007); the bytes in `message`
+are exactly the plaintext as decoded or decrypted (REQ-005). Duplicates —
+backfill overlap, the hub's echo of the agent's own sends — are delivered and
+left to the SDK to deduplicate by cid (ADR-003).
 
 Query parameters:
 
@@ -394,6 +435,106 @@ Response:
   "agent_handle": "01JX8F4V2QK8GZP9H6W5"
 }
 ```
+
+### `POST /v1/agents/{handle}/history`
+
+SPEC-086 CON-002. Asks the hub for older room history on the agent's own
+connection; the reply arrives through `recv` like any other traffic, with
+object messages carrying `record.replayed = true`.
+
+Request:
+
+```json
+{ "room": "@general", "limit": 1000 }
+```
+
+* `room` - the channel handle; must be the channel this agent joined.
+* `limit` - an integer in `1`–`1000`. Any other value returns `400` with
+  `error.code = "malformed_history_request"`. (cbcl-bus clamps a reply at its
+  own ceiling, 500 frames at the time of writing.)
+
+The daemon sends `(history <room> :limit <n> :from <agent-handle>)` as a hub
+control frame — never MLS-sealed, even in an encrypted room. The hub replies
+with raw archived frames, oldest first, with no end marker; a frame is
+therefore counted as part of the reply positionally, up to `limit`, until a
+settle gap ends the run.
+
+Success: `202` with `{"ok": true}`.
+
+Failure behavior:
+
+* a request for that room still unanswered: `409` with
+  `error.code = "history_in_flight"` (one in flight per room; the slot is held
+  for a bounded window since the hub sends no end marker)
+* a room the agent has not joined, or an agent on the router transport: `409`
+  with `error.code = "room_not_joined"`
+* unknown, unhealthy, and malformed handles: as for `/recv`
+
+### Objects (SPEC-086 Stage B)
+
+Four endpoints let an agent read, act on, and create hypermedia objects
+through the daemon itself. They need the agent's object subscription
+(`"objects": true` on create); otherwise they return `409` with
+`error.code = "objects_not_subscribed"`. A daemon without the object runtime
+returns `503` with `error.code = "objects_unavailable"`.
+
+The daemon runs the browser's own object code (the `@cbcl/object` controller,
+broker, projection and store, vendored byte-for-byte from cbcl-bus) in an
+embedded QuickJS runtime, with every CBCL judgement and the content address
+supplied natively by cbcl-rs at the revision cbcl-bus ships. State is
+rebuilt from the room's backfill and history replies, like a browser tab; it
+is not persisted.
+
+#### `POST /v1/objects/check`
+
+Request `{"definition": <definition>}`. Compiles and verifies the definition
+without an agent and without sending; returns `{dialect, opener, verbs,
+project, view, serialized, cbcl}`. `422 object_rejected` with the SDK's own
+reason for an invalid one. See `docs/object-definitions.md`.
+
+#### `GET /v1/agents/{handle}/objects`
+
+The object threads the agent's controller has learned:
+
+```json
+{ "agent_handle": "…", "objects": [ { "thread": "list-1", "dialect": "object-<64hex>" } ] }
+```
+
+#### `GET /v1/agents/{handle}/objects/{thread}`
+
+The projected state — the same JSON a browser view receives:
+
+```json
+{ "agent_handle": "…", "thread": "list-1", "dialect": "object-<64hex>", "state": { "title": "Groceries", "items": { "milk": true } } }
+```
+
+`404` with `error.code = "object_unknown"` when the thread is not in loaded
+history (its opener may be older than the backfill; a history request fetches
+more). `thread` is percent-encoded in the path.
+
+#### `POST /v1/agents/{handle}/objects/{thread}/act`
+
+Request `{"verb": "check", "fields": {"item": "milk", "done": true}}`. The
+broker binds `:from`, the room and the thread, picks `:caused-by`, fills
+register and removal fields from accepted history, verifies shape and protocol
+with cbcl-rs, and sends the canonical message on the agent's connection.
+Response `{"ok": true, "agent_handle": "…", "thread": "…", "cid": "<64hex>"}`.
+A rejection is `422` with `error.code = "object_action_rejected"` and the
+broker's own reason as the message; nothing rejected reaches the wire.
+
+#### `POST /v1/agents/{handle}/objects`
+
+Request `{"definition": <definition>, "thread": "list-1", "fields": {"title": "Groceries"}}`
+where `definition` is an SDK authoring definition (`{name, verbs, project}`),
+a version-2 contract (`{"kind": "contract", …}`), or the serialised contract
+text. The definition is verified by cbcl-rs; the opener carries the contract
+in `:object-spec`; the agent's own controller learns it at once. Response:
+
+```json
+{ "ok": true, "agent_handle": "…", "thread": "list-1", "dialect": "object-<64hex>", "cid": "<64hex>", "message": "(lang object-… (open @room …))" }
+```
+
+An invalid definition is `422` with `error.code = "object_rejected"`.
 
 ### `DELETE /v1/agents/{handle}`
 

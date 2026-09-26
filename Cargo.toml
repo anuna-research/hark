@@ -22,6 +22,13 @@ base64 = "0.22"
 # commit once the role layer lands (closes IMPL-024 ADR-021).
 cbcl-core = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034", features = ["mls-ds-proof"] }
 cbcl-parser = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034" }
+# SPEC-086 Stage B: the object SDK's CBCL judgements (canonical text for the
+# cid, dialect/shape/protocol verdicts, message_hash) come from cbcl-wasm at the
+# EXACT revision cbcl-bus ships to browsers (`cbcl-bus/cbcl-rs.sha`), linked
+# natively. Deliberately a second cbcl-rs pin: hark's own pin above serialises a
+# quoted `:caused-by` differently, and a cid computed there would not match the
+# browser's. Bump this in lockstep with cbcl-bus's `cbcl-rs.sha`.
+cbcl-wasm = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "58dbcfcfb286a97a9e1ea076c19d401bf15be918", default-features = false, features = ["std"] }
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 config = "0.15"
@@ -41,6 +48,7 @@ openmls_rust_crypto = "=0.5.1"
 openmls_traits = "=0.5.0"
 tls_codec = "0.4"
 rand = "0.9"
+rquickjs = { version = "0.14", features = ["loader"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

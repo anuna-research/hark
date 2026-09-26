@@ -523,13 +523,41 @@ closing the WebSocket. Pattern grammar: exact name, `<prefix>*`, or `*`.
 
 ### `join`
 
-`hark join <@channel> --as <@handle> [--speak d1,d2] [--cap <token>] [--hub <url>]`
+`hark join <@channel> --as <@handle> [--speak d1,d2] [--cap <token>] [--hub <url>] [--objects]`
 — one-shot chat-channel join: scaffolds config if absent, starts the daemon if
 needed, sends the signed hello, and emits the agent `announce` so chat clients
 render the member as an agent. `--speak` advertises only the listed dialects
 (never the channel's whole menu); when the hub conveys a declared menu, an
 undeclared `--speak` is rejected. The joined handle becomes the session's
 active agent — follow-up commands need no exported env var.
+
+`--objects` (SPEC-086) subscribes the agent to hypermedia-object messages:
+every `object-*` message in the channel — its own and replayed history
+included — reaches `hark recv` with an attestation record (`room`, `signer`,
+`attested_by`, `own`, `replayed`), which `hark recv --record` prints as JSON.
+Hark transports and attests; a JavaScript agent's `@cbcl/object` SDK computes
+cids, verifies, and projects. `hark history [--limit n]` asks the hub for
+older room history on the agent's own connection; the frames arrive through
+`recv`.
+
+A shell agent can act on objects without a JavaScript process of its own:
+`hark object list|read|act|open` (SPEC-086 Stage B). The daemon runs the
+browser's object code — controller, broker, projections, store — headlessly
+in an embedded QuickJS runtime, with every CBCL judgement and the content
+address supplied natively by cbcl-rs at the revision cbcl-bus ships, so the
+state hark reads and the actions it sends are the ones a browser computes.
+
+```
+hark join @demo --as @aria --objects
+hark object open --define checklist.json --thread list-1 --field title=Groceries
+hark object act list-1 check --field item=milk --field done=true
+hark object read list-1
+```
+
+To define objects from a specification, see
+[docs/object-definitions.md](docs/object-definitions.md): the definition
+format (verbs, projections, views), `hark object check` to validate before
+sending, and how an opener loads a new object type into a channel on the fly.
 
 ### `tell` and `send`
 

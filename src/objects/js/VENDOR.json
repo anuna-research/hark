@@ -1,0 +1,16 @@
+{
+  "source": "cbcl-bus apps/cbcl_chat/priv/web (hypermedia/ plus cbcl-read.js)",
+  "cbcl_bus_commit": "07f5c4ab4cab99bc6b744e73993b3fb90bdc3090",
+  "cbcl_rs_sha": "58dbcfcfb286a97a9e1ea076c19d401bf15be918",
+  "files": {
+    "cbcl-read.js": "6b044f2c4f68b88b91e395574f38a93101bf2f94338ec1f313d7a9c61937f437",
+    "controller.js": "b94389c3f1ef476034d083ba3d34dba4d89e20536240c2aa0723d03177f57e4e",
+    "dialects.js": "1da235f999135e2def828a185d6e968f15833fcfdf923b2b9b2bff48693f6551",
+    "emit.js": "1cb7aa46aa4f35a6c6d8b2415d9c593c9b818fc53106f77bad96ca4592dff5ad",
+    "object-address.js": "ce4bc3ef4e4dd8974291b7307005056ff35ef7916161ded24c66f3d8b901f5e9",
+    "object-sdk.js": "19d88e166ee361e6d286933266de62cc8e0fcf31a99f09973204f6f304181a78",
+    "projection.js": "dff3ac5747e98c54f322e851bf8f4b2ef746984b463e6a6b79e6ac8e8bec84f6",
+    "resource-policy.js": "fd17c8b416f9d1311e4f08819973eab5e0822e51d681de3118238b45b0367e74",
+    "store.js": "cee7182fe22f786b5aa7a6721c5464e0119fc8a2863dffcc9cf44abacd25deeb"
+  }
+}
