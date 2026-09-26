@@ -426,6 +426,16 @@ failing the field grammar yields **no** agents and a diagnostic naming the file.
 There is no partial load: a valid record beside a malformed one yields zero, not
 one.
 
+### Object journal (SPEC-086 CON-004)
+
+Beside the pairing store, `<chat.identity_dir>/objects/<agent>/<room>.jsonl`
+(directory `0700`, file `0600`) holds every object message delivered to an
+agent with the object subscription — plaintext plus attested signer, one line
+per distinct delivery. The object runtime replays it into a fresh controller
+before serving the agent's first command after a restart. It is never read to
+decide anything about admission; it is a cache of what the agent already
+accepted, kept because MLS rooms cannot replay it.
+
 ### Agent state
 
 `daemon status` reports three agent states, not two:

@@ -1,12 +1,12 @@
 ---
 id: SPEC-086
 title: Object transport for SDK agents
-status: draft
+status: implementing
 tier: 2 (hark attests message authorship to an agent that acts on it)
 version: 0.2.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 5.5)
-last-updated: 2026-09-26
+last-updated: 2026-09-27
 owner-repo: hark
 affects-repos: none (cbcl-bus already serves the frames; SPEC-085 owns the SDK side)
 depends-on: SPEC-085 (agent object SDK — REQ-008 message identity, REQ-009 predecessor), SPEC-013 (MLS private channels — authenticated sender), SPEC-026 (reconnect and backfill replay)
@@ -46,14 +46,20 @@ Controls:
 - A history request asks for at most 1000 frames. Hark allows one unanswered request per room. The once-per-controller budget of [[SPEC-085-agent-object-sdk#ADR-002]] binds the agent's SDK, not hark → [[SPEC-086-hark-object-transport#CON-002]].
 - The subscription is opt-in and off by default. It persists in the pairing record, so a daemon restart resumes it → [[SPEC-086-hark-object-transport#CON-003]].
 
+Resolved (2026-09-27, live against a hub built from cbcl-bus HEAD):
+- The hub answers `(history …)` from a hark connection with raw archived frames, oldest first, no end marker, clamped at 500. Hark marks them `replayed` positionally ([[SPEC-086-hark-object-transport#CON-002]]). Verified with a 548-frame reply.
+- The MLS `:from` mismatch rule is one rule: the browser (`mls.js` REQ-018) and hark both drop the message. SPEC-085's note is corrected.
+- The per-handle queue is bounded by the daemon's `max_messages_per_handle` / `max_bytes_per_handle`; under the object runtime a full queue sheds the oldest object records instead of killing the handle ([[SPEC-086-hark-object-transport#CON-004]]).
+- `emit` of an `object-*` dialect passes: the dialect is unknown to hark's registry, so validation falls back to R1–R4 and the bytes go out untouched (unit test in `cbcl_validation`).
+- Stage B is specified and implemented by [[SPEC-086-hark-object-transport#ADR-004]]: the SDK runs headlessly, so the corpus is a regression net rather than the gate. The cbcl-rs exports come from a second pin equal to cbcl-bus `cbcl-rs.sha`.
+- Offline storage: delivered object messages are journalled and replayed ([[SPEC-086-hark-object-transport#CON-004]]). Messages the agent never received remain unavailable beyond the replay window and history limit, as for a browser.
+- TEST-001 passed: a headless browser on the cbcl-bus web app rendered a hark-created object, showed hark's action, and its form produced an action hark read.
+
 Open:
-- The hark maintainer verifies the hub's reply to `(history …)` from a signed-member agent connection, including its order. Hark has never sent one.
-- The hark maintainer verifies that a restarted daemon decrypts replayed MLS frames from earlier epochs. Undecryptable frames leave the opener unreachable.
-- The repository owner decides the MLS `:from` mismatch rule. Hark drops such a message; the browser projects it under the MLS sender. [[SPEC-085-agent-object-sdk#REQ-004]] needs one rule.
-- The hark maintainer states the bound on the per-handle inbound queue. Replayed history makes an unbounded queue observable.
-- The hark maintainer verifies that `emit` of an `object-*` dialect passes in a room that declares a dialect menu.
-- Hark stores nothing while offline. Messages beyond the replay window and the 1000-frame history limit are unavailable to the agent, as to a browser.
-- The hark maintainer specifies Stage B, native projection in Rust. It is gated on the [[SPEC-085-agent-object-sdk#REQ-007]] corpus. It also needs a cbcl-rs pin exporting `verify_message_shape`, `verify_protocol`, and `message_hash`, as cbcl-bus `cbcl-rs.sha` does.
+- A restarted daemon does not decrypt replayed MLS frames from earlier epochs (MLS forward secrecy); the journal covers what the agent received before the restart, not what it missed while down. An MLS-room live run has not been done.
+- Deploy skew: hark's vendored SDK must be the one the hub serves. A room published under SDK version 1 is refused by name; re-vendor (`scripts/vendor-objects.sh`) when the hub is redeployed.
+- Two cbcl-rs pins in one binary until cbcl-rs main carries both the MLS-DS work and the `message_hash` export.
+- The [[SPEC-085-agent-object-sdk#REQ-007]] corpus does not exist yet.
 
 Detail: Implementers follow [[SPEC-086-hark-object-transport#CON-001]] → [[SPEC-086-hark-object-transport#TEST-001]] → [[SPEC-086-hark-object-transport#REQ-002]]. Reviewers follow the ADRs and `Open`.
 Artefact IDs repeat across the two specs; always qualify them, as in `SPEC-086 CON-001`.
