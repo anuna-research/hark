@@ -689,6 +689,8 @@ mod tests {
 
     use super::*;
 
+    const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn who(agent: &AgentHandle) -> AgentIdentity {
         AgentIdentity {
             agent: agent.clone(),
@@ -1156,6 +1158,40 @@ mod tests {
             .await
             .expect("the runtime still serves");
         assert!(checked.dialect.starts_with("object-"));
+    }
+
+    /// Version 1 definitions (the pre-v2 SDK's single artifact) are refused by
+    /// name on `check`/`open`, and an incoming version 1 opener is skipped
+    /// without becoming a pending thread — hark serves version 2 only.
+    #[tokio::test]
+    async fn version_one_definitions_are_refused_by_name() {
+        let client = spawn_with_hooks(|_, _| true, |_, _| true);
+        let v1 = serde_json::json!({
+            "version": 1, "name": "old",
+            "verbs": { "open": { "causedBy": "begin", "fields": { "title": "string" } } },
+            "project": { "title": ["last", "open", "title"] },
+            "view": []
+        });
+        let error = client.check(v1.clone()).await.expect_err("refused");
+        assert!(error.to_string().contains("version 1"), "{error}");
+        let error = client
+            .check(serde_json::Value::String(v1.to_string()))
+            .await
+            .expect_err("refused as text too");
+        assert!(error.to_string().contains("version 1"), "{error}");
+
+        // A version 1 opener from the room: not loaded, not pending, no error.
+        let agent = AgentHandle::generate();
+        let spec = v1.to_string().replace('\\', "\\\\").replace('"', "\\\"");
+        let opener = format!(
+            "(lang object-{HEX} (open @general :title \"Old\" :object-spec \"{spec}\" :caused-by begin :thread \"old-1\" :from @bo))"
+        );
+        client.ingest(who(&agent), "@bo".into(), opener);
+        assert_eq!(
+            client.read(who(&agent), "old-1".to_owned()).await.unwrap(),
+            None
+        );
+        assert!(client.list(who(&agent)).await.unwrap().is_empty());
     }
 
     /// The definition must verify under cbcl-rs; a contract whose protocol

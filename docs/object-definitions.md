@@ -19,6 +19,11 @@ Later actions carry only their fields.
 
 ## The definition
 
+Version 2 only. The pre-v2 SDK's single-artifact form (`"version": 1` with
+the view inside the contract) is refused by name by `check` and `open`, and an
+incoming version 1 opener is skipped rather than loaded. Objects published
+that way must be re-published as version 2; hark does not translate them.
+
 A JSON object with three required members and three optional ones:
 
 ```json

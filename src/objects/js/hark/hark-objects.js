@@ -25,7 +25,8 @@ function createAgent(handle, me, room) {
     report: info => globalThis.__hark.log('debug', JSON.stringify(info)),
   });
   const threadDialect = new Map();
-  return { C, me, room, threadDialect };
+  const unsupported = new Set();
+  return { C, me, room, threadDialect, unsupported };
 }
 
 function agent(handle) {
@@ -56,7 +57,7 @@ export async function close(handle) {
 
 /** Ingest one delivered object message. `signer` is the record's attested signer. */
 export async function ingest(handle, text, signer, room) {
-  const { C, threadDialect } = agent(handle);
+  const { C, threadDialect, unsupported } = agent(handle);
   const list = parseSexpr(text);
   if (!Array.isArray(list) || asText(list[0]) !== 'lang') return null;
   const dialect = asText(list[1]);
@@ -70,6 +71,20 @@ export async function ingest(handle, text, signer, room) {
   for (const [key, value] of Object.entries(kw)) {
     if (['thread', 'from', 'caused-by', 'dialect'].includes(key)) continue;
     fields[key] = normalizeValue(value, asText);
+  }
+  // An opener carrying a version 1 definition: the SDK would reject it with
+  // "unknown record field" and its actions would sit pending. Say why, once
+  // per thread, and let it go — hark serves version 2 only.
+  if (typeof fields['object-spec'] === 'string') {
+    let spec = null;
+    try { spec = JSON.parse(fields['object-spec']); } catch { /* the SDK judges it */ }
+    if (isVersionOne(spec)) {
+      if (!unsupported.has(thread)) {
+        unsupported.add(thread);
+        globalThis.__hark.log('warn', `object ${thread} in ${room} carries a version 1 definition; hark supports version 2 only, so it is not loaded`);
+      }
+      return null;
+    }
   }
   const result = await C.ingest({ dialect, verb, kw: fields, thread, from, room, canonical: text, causedBy: normalizeValue(kw['caused-by'], asText) });
   if (result) threadDialect.set(thread, dialect);
@@ -107,8 +122,23 @@ export async function act(handle, thread, verb, fieldsJson) {
  *  which `defineObject` turns into a contract artifact plus a view artifact
  *  bound to the contract's digest. In every case cbcl-rs verifies the native
  *  dialect the contract compiles to. */
+const UNSUPPORTED_V1 = 'version 1 object definitions are not supported; publish a version 2 contract (see docs/object-definitions.md)';
+
+/** The one shape hark refuses by name: the pre-v2 SDK's single-artifact
+ *  definition (`{version: 1, name, verbs, project, view}`). The SDK rejects it
+ *  too ("unknown record field"); naming the cause is the whole difference. */
+function isVersionOne(definition) {
+  return definition && typeof definition === 'object' && definition.version === 1;
+}
+
 async function compile(definition) {
-  if (typeof definition === 'string') return importObject(definition);
+  if (typeof definition === 'string') {
+    let parsed = null;
+    try { parsed = JSON.parse(definition); } catch { /* the SDK reports the parse error */ }
+    if (isVersionOne(parsed)) throw new Error(UNSUPPORTED_V1);
+    return importObject(definition);
+  }
+  if (isVersionOne(definition)) throw new Error(UNSUPPORTED_V1);
   const isArtifact = definition.kind === 'contract'
     || (definition.version === 2 && typeof definition.contract === 'string' && !definition.verbs);
   return isArtifact ? importObject(JSON.stringify(definition)) : defineObject(definition);
