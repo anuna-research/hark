@@ -2322,7 +2322,7 @@ mod tests {
             .unwrap();
         for text in ["one", "two", "three"] {
             store
-                .enqueue_object(&handle, format!("(lang object-x (check @general :n {text}))"), record())
+                .enqueue_object(&handle, format!("(lang sha256-x (check @general :n {text}))"), record())
                 .await
                 .expect("never overflows while records can be shed");
         }

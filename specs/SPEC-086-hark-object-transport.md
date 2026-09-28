@@ -3,7 +3,7 @@ id: SPEC-086
 title: Object transport for SDK agents
 status: implementing
 tier: 2 (hark attests message authorship to an agent that acts on it)
-version: 0.2.0
+version: 0.3.0
 audience: agent, human
 author: Anuna Research (drafted with Claude Opus 5.5)
 last-updated: 2026-09-27
@@ -34,7 +34,7 @@ Structure:
 The agent passes `message` to the SDK and takes the signer from `record`. The record carries no cid; only the SDK computes cids. The SDK parses verb, keywords, and `:caused-by` from `message`.
 The hub replays about 50 frames on every join and reconnect; hark passes object frames through. For anything older, the agent calls the history endpoint.
 
-Decisions: [[SPEC-086-hark-object-transport#ADR-001]] hark transports and the SDK computes · [[SPEC-086-hark-object-transport#ADR-002]] additive `record` member on `recv` · [[SPEC-086-hark-object-transport#ADR-003]] duplicates reach the agent, which deduplicates by cid.
+Decisions: [[SPEC-086-hark-object-transport#ADR-001]] hark transports and the SDK computes · [[SPEC-086-hark-object-transport#ADR-002]] additive `record` member on `recv` · [[SPEC-086-hark-object-transport#ADR-003]] duplicates reach the agent, which deduplicates by cid · [[SPEC-086-hark-object-transport#ADR-005]] Stage B is a Rust runtime over cbcl-rs's state layer, not the browser's JavaScript.
 
 Load-bearing: [[SPEC-086-hark-object-transport#REQ-006]] signer attestation · [[SPEC-086-hark-object-transport#REQ-005]] byte preservation · [[SPEC-086-hark-object-transport#REQ-003]] history reaches the agent · [[SPEC-086-hark-object-transport#REQ-001]] subscription independent of `--speak`.
 
@@ -50,16 +50,16 @@ Resolved (2026-09-27, live against a hub built from cbcl-bus HEAD):
 - The hub answers `(history …)` from a hark connection with raw archived frames, oldest first, no end marker, clamped at 500. Hark marks them `replayed` positionally ([[SPEC-086-hark-object-transport#CON-002]]). Verified with a 548-frame reply.
 - The MLS `:from` mismatch rule is one rule: the browser (`mls.js` REQ-018) and hark both drop the message. SPEC-085's note is corrected.
 - The per-handle queue is bounded by the daemon's `max_messages_per_handle` / `max_bytes_per_handle`; under the object runtime a full queue sheds the oldest object records instead of killing the handle ([[SPEC-086-hark-object-transport#CON-004]]).
-- `emit` of an `object-*` dialect passes: the dialect is unknown to hark's registry, so validation falls back to R1–R4 and the bytes go out untouched (unit test in `cbcl_validation`).
-- Stage B is specified and implemented by [[SPEC-086-hark-object-transport#ADR-004]]: the SDK runs headlessly, so the corpus is a regression net rather than the gate. The cbcl-rs exports come from a second pin equal to cbcl-bus `cbcl-rs.sha`.
+- `emit` of an object dialect (`sha256-<64hex>`) passes: the dialect is unknown to hark's registry, so validation falls back to R1–R4 and the bytes go out untouched (unit test in `cbcl_validation`).
+- Stage B is specified by [[SPEC-086-hark-object-transport#ADR-005]] (superseding ADR-004): every judgement is cbcl-rs's, linked natively at a second pin equal to cbcl-bus `cbcl-rs.sha`; the runtime replays the SPEC-019 conformance corpus.
 - Offline storage: delivered object messages are journalled and replayed ([[SPEC-086-hark-object-transport#CON-004]]). Messages the agent never received remain unavailable beyond the replay window and history limit, as for a browser.
 - TEST-001 passed: a headless browser on the cbcl-bus web app rendered a hark-created object, showed hark's action, and its form produced an action hark read.
 
 Open:
 - A restarted daemon does not decrypt replayed MLS frames from earlier epochs (MLS forward secrecy); the journal covers what the agent received before the restart, not what it missed while down. An MLS-room live run has not been done.
-- Deploy skew: hark's vendored SDK must be the one the hub serves. A room published under SDK version 1 is refused by name; re-vendor (`scripts/vendor-objects.sh`) when the hub is redeployed.
+- Deploy skew: hark's `cbcl-wasm` pin must be the cbcl-rs the hub serves (`cbcl-rs.sha`); a definition of SDK version 1 or 2 is refused by name. Bump the pin and re-copy `tests/vectors/state` when the hub is redeployed.
 - Two cbcl-rs pins in one binary until cbcl-rs main carries both the MLS-DS work and the `message_hash` export.
-- The [[SPEC-085-agent-object-sdk#REQ-007]] corpus does not exist yet.
+- The [[SPEC-085-agent-object-sdk#REQ-007]] corpus is cbcl-rs `test-vectors/state` (SPEC-019 REQ-1931); hark replays a copy (`tests/vectors/state`).
 
 Detail: Implementers follow [[SPEC-086-hark-object-transport#CON-001]] → [[SPEC-086-hark-object-transport#TEST-001]] → [[SPEC-086-hark-object-transport#REQ-002]]. Reviewers follow the ADRs and `Open`.
 Artefact IDs repeat across the two specs; always qualify them, as in `SPEC-086 CON-001`.
@@ -73,7 +73,7 @@ An agent that drives hark cannot act correctly on an object. Four gaps combine:
 The SDK's broker needs the thread's complete accepted history to choose a predecessor and fill `replaces`/`removes` ([[SPEC-085-agent-object-sdk#REQ-009]]). Without it, the agent emits actions that other clients reject or that silently lose writes.
 
 ## REQ-001
-WHEN an agent joins with the object subscription, hark MUST deliver every `object-*` content message to `recv`.
+WHEN an agent joins with the object subscription, hark MUST deliver every object content message (a `sha256-<64hex>` dialect, SPEC-019 R.6) to `recv`.
 This applies in every room the agent joined.
 Delivery MUST NOT depend on `--speak`, the capability set, or the room's declared dialect menu.
 Delivery MUST include messages the agent itself sent.
@@ -124,26 +124,30 @@ The SDK store deduplicates by cid ([[SPEC-085-agent-object-sdk#REQ-004]]). Hark-
 The cost is repeated delivery of up to one backfill window per reconnect.
 
 ## ADR-004
-Status: accepted 2026-09-26 (repository owner's instruction; supersedes the second rejected alternative of [[SPEC-086-hark-object-transport#ADR-001]]).
-Hark reads, acts on, and creates objects by running the SDK's own code — `controller.js`, `emit.js`, `projection.js`, `store.js`, `object-sdk.js`, `dialects.js` — headlessly in an embedded QuickJS runtime (`rquickjs`), not by porting the projection to Rust.
-The vendored files are byte-pinned to a cbcl-bus commit (`src/objects/js/VENDOR.json`, checked by a test). Every browser-bound dependency is replaced by a host function: the content address is `sha2`; canonical text and the dialect, shape, protocol and `message_hash` verdicts are `cbcl-wasm` linked natively at the revision cbcl-bus ships (`cbcl-rs.sha`); `send` is the agent's signed hub connection; the missing-opener history request is [[SPEC-086-hark-object-transport#CON-002]]. Views and the sandbox are excluded: they carry author code and belong to a rendering host.
-Why the reversal: ADR-001 weighed a JavaScript runtime against the transport, where a separate agent process already did the work. Weighed against a Rust port of the projection semantics, embedding four hundred lines of pure functions is the smaller risk: parity with browsers holds by construction, and the [[SPEC-085-agent-object-sdk#REQ-007]] corpus becomes a regression net for pin bumps rather than the gate on correctness.
-Consequence: hark carries a second cbcl-rs pin. Hark's own pin serialises a quoted `:caused-by` differently from cbcl-bus's, so a cid computed with hark's parser would not equal the browser's; only the cbcl-bus pin may canonicalise object messages. The two pins bump together with `cbcl-rs.sha`.
-Consequence: object state is not persisted; a controller rebuilds it from backfill and history replies, as a browser tab does.
-Interface: `hark object list|read|act|open`; `GET/POST /v1/agents/{handle}/objects[/{thread}[/act]]` (see `specs/local-api.md`, `specs/cli.md`).
+Status: superseded 2026-09-28 by [[SPEC-086-hark-object-transport#ADR-005]].
+Hark read, acted on, and created objects by running the SDK's own code — `controller.js`, `emit.js`, `projection.js`, `store.js`, `object-sdk.js`, `dialects.js` — headlessly in an embedded QuickJS runtime (`rquickjs`), byte-pinned to a cbcl-bus commit, with every browser-bound dependency replaced by a host function. The argument was parity by construction: while the projection semantics lived in JavaScript, a Rust port could diverge invisibly.
+
+## ADR-005
+Status: accepted 2026-09-28 (repository owner's instruction).
+Hark reads, acts on, and creates objects with a Rust runtime over cbcl-rs's state layer. SPEC-019 put admission (R.4/R5/R6), the fold (R7) and the intent binder (R.5) into cbcl-rs's core, and SPEC-087 made the JSON contract compile a cbcl-rs export; every one of them is `cbcl-wasm` linked natively at the revision cbcl-bus ships to browsers (`cbcl-rs.sha`). What remains for a host is bookkeeping — learned dialects, each thread's records, decided admissions, the acts waiting for a dialect the room has not taught — and `src/objects/runtime.rs` is that bookkeeping, the same the `cbcl` package's `runtime`, `broker` and `store` are for a browser.
+Why the reversal: ADR-004's premise was that the projection semantics lived only in the browser's JavaScript. They now live in cbcl-rs, and SPEC-087 ADR-001 states the parity argument the same way for every host: by specification and by the corpus, not by vendoring a file. The runtime replays the SPEC-019 conformance corpus (`tests/vectors/state`, copied from cbcl-rs at the pin) — verdicts, state and intents; forward, reversed and duplicated — as its regression net. Dropping `rquickjs` removes the C toolchain the object runtime needed, the vendored files and their byte-pin manifest, the per-command deadline and heap limits, and the second parser (the JavaScript reader) from the binary.
+Consequence: the second cbcl-rs pin stays, for the reason ADR-004 gave (hark's own pin canonicalises a quoted `:caused-by` differently); the two pins bump together with `cbcl-rs.sha`.
+Consequence: dialects are named by self-address (`sha256-<64hex>`, SPEC-019 R.6) and reach a controller through the room, not the opener (SPEC-087 ADR-003): `open` declares the dialect (`adddialect :def`) before the opener goes out; a controller meeting an act of an unknown dialect holds it, asks the hub by the digest the room's `roomcfg` menu gives (`fetchdialect`), verifies the `(meta (define …))` reply hashes to its name, installs it through R1–R7, and only then judges the act. Views are outside the definition (a host package, SPEC-087 REQ-003); `check` and `open` refuse a definition carrying one, and SDK versions 1 and 2 by name.
+Consequence: the journal ([[SPEC-086-hark-object-transport#CON-004]]) records taught dialects beside delivered acts, so a restarted daemon judges its replayed history without the room.
+Interface: unchanged — `hark object check|list|read|act|open`; `GET/POST /v1/agents/{handle}/objects[/{thread}[/act]]`, `POST /v1/objects/check` (see `specs/local-api.md`, `specs/cli.md`). `check` reports `{dialect, label, opener, verbs, state, roles, contract, cbcl}`; `open` no longer reports a view.
 
 ## CON-004
-The object journal. Every object message delivered to a subscribed agent is appended, as plaintext plus the attested signer, to `<chat.identity_dir>/objects/<agent>/<room>.jsonl` (directory `0700`, file `0600`), one line per distinct (signer, bytes). A fresh controller — a restarted daemon — replays its journal before serving its first command. The runtime deduplicates by cid, so a journal replay is idempotent.
-Why: in a cleartext room a controller rebuilds from backfill and [[SPEC-086-hark-object-transport#CON-002]]; in an MLS room it cannot, because replayed frames from earlier epochs do not decrypt and this member's own sends never did. Without the journal a restarted agent in a private room would fill `replaces`/`removes` blind to its own earlier writes. The journal is the browser's archive, for an agent.
+The object journal. Every object message delivered to a subscribed agent, and every dialect the room taught it or it declared itself (as the `(meta (define …))` teach frame), is appended, as plaintext plus the attested signer (empty for a teach frame), to `<chat.identity_dir>/objects/<agent>/<room>.jsonl` (directory `0700`, file `0600`), one line per distinct (signer, bytes). A fresh controller — a restarted daemon — replays its journal before serving its first command. The runtime deduplicates by wire address, so a journal replay is idempotent.
+Why: in a cleartext room a controller rebuilds from backfill and [[SPEC-086-hark-object-transport#CON-002]]; in an MLS room it cannot, because replayed frames from earlier epochs do not decrypt and this member's own sends never did. Without the journal a restarted agent in a private room would fill `:replaces` blind to its own earlier writes. The journal is the browser's archive, for an agent.
 Queue rule: with the runtime attached, a full `recv` queue sheds the oldest object records rather than marking the handle unhealthy — the runtime holds them, and an agent acting through `hark object` need not drain `recv`. Non-object messages overflow as before; without a runtime nothing is shed.
-Limits: the runtime runs with a 256 MiB heap, a 4 MiB stack, and a 20 s per-command deadline that a blocking host call (a send awaiting the hub) extends on return.
+Limits: a controller learns at most 64 dialects; the unknown-dialect queue holds 128 acts and 512 KiB (SPEC-087 Controls).
 
 ## CON-001
 `recv` response for an object message, as RFC 8259 JSON:
 ```json
 {
   "agent_handle": "01JX8F4V2QK8GZP9H6W5",
-  "message": "(lang object-<64hex> (check @room :item \"milk\" … :from @alice))",
+  "message": "(lang sha256-<64hex> (check @room :item \"milk\" … :from @alice))",
   "record": {
     "room": "@room",
     "signer": "@alice",
@@ -172,7 +176,7 @@ Success returns `202 {"ok": true}`. Replies arrive through `recv`.
 Opt-in, off by default:
 - CLI: `hark join … --objects`, `hark pair … --objects`.
 - API: `POST /v1/agents` accepts `"objects": true`.
-- An object dialect name (`object-<64hex>`) in the dialect set is the subscription: a pairing record whose adder chose an object from the room's menu arrives subscribed. Object dialects are stripped before advertisement; they are not capabilities.
+- An object dialect name (`sha256-<64hex>`) in the dialect set is the subscription: a pairing record whose adder chose an object from the room's menu arrives subscribed. Object dialects are stripped before advertisement; they are not capabilities.
 - The flag persists in the pairing record (SPEC-026 CON-002), so a restarted daemon resumes it.
 Rollback: rejoin without the flag. No other agent or room is affected.
 
@@ -191,15 +195,15 @@ Negative output: Replayed non-object messages still do not reach `recv`.
 Traces: [[SPEC-086-hark-object-transport#REQ-003]], [[SPEC-086-hark-object-transport#REQ-004]].
 
 ## TEST-004
-Core: `hark object check` on an authoring definition with a view reports the contract and view digests; `open` sends one opener carrying both; a second controller that receives only that opener reads the object's state.
-Core: with the object runtime attached, `open` → hub echo → `act` → `read` over a real socket yields the projection of exactly the bytes on the wire, and the echoes deduplicate.
-Negative input: an action whose field type contradicts the contract is refused with cbcl-rs's shape blame and never reaches the wire; a contract whose protocol cycles is refused before send.
+Core: `hark object check` on an authoring definition reports the dialect's self-address, verbs, state rules, the contract and the CBCL text; `open` declares the dialect to the room and sends an opener carrying no definition; a second controller that meets an act of that dialect holds it, fetches the definition by the room's digest once, and reads the object's state when the teach frame arrives.
+Core: with the object runtime attached, `open` → hub echo → `act` → `read` over a real socket yields the fold of exactly the bytes on the wire, and the echoes deduplicate.
+Core: every vector of the SPEC-019 conformance corpus reproduces through the runtime — verdicts, state and intents; forward, reversed and duplicated.
+Negative input: an action whose field type contradicts the contract is refused with cbcl-rs's blame and never reaches the wire; a contract whose protocol cycles is refused before send; a definition carrying a view, or of SDK version 1 or 2, is refused by name; a teach frame whose body does not hash to its name is not learned.
 Negative output: an action received before its opener stays pending, triggers one history request, and is released when the opener arrives.
-Traces: [[SPEC-086-hark-object-transport#ADR-004]].
+Traces: [[SPEC-086-hark-object-transport#ADR-005]].
 
 ## TEST-005
-Core: after a runtime restart with the journal, `read` returns the state the agent had, and the broker's next write on a key replaces the agent's earlier one.
-Negative input: a runaway script is stopped at the deadline and the runtime keeps serving.
+Core: after a runtime restart with the journal, `read` returns the state the agent had, taught dialects included, and the binder's next write on a key replaces the agent's earlier one.
 Negative output: a full `recv` queue sheds the oldest object records and the handle stays connected; a plain message still overflows.
 Traces: [[SPEC-086-hark-object-transport#CON-004]].
 
@@ -220,6 +224,7 @@ Hard stops: [[SPEC-086-hark-object-transport#REQ-005]], [[SPEC-086-hark-object-t
 <details>
 <summary>Revision history — 0.1.0</summary>
 
+- 0.3.0 (2026-09-28) — Stage B is a Rust runtime over cbcl-rs's state layer (ADR-005, superseding ADR-004): rquickjs and the vendored SDK removed; dialects by self-address, declared to the room and fetched by digest; the SPEC-019 corpus replayed.
 - 0.2.0 (2026-09-26) — Stage B: native read/act/open by running the SDK headlessly (ADR-004); Stage A implemented.
 - 0.1.0 (2026-09-26) — draft: Stage A transport, from the SPEC-085 v0.2.0 review of what hark lacks.
 </details>

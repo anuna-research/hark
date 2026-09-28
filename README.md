@@ -117,25 +117,27 @@ the per-handle dialect registry snapshot and `ThreadedMessageStore`:
 ### Hypermedia objects (SPEC-086)
 
 Objects are the chat client's shared, content-addressed state machines: a
-checklist, a vote, a drawing board. Each is a thread of signed CBCL messages
-under a contract-digest dialect (`object-<64hex>`), projected to state by the
-`@cbcl/object` SDK. Hark takes part in two ways.
+checklist, a vote, a drawing board. Each is a thread of signed CBCL acts under
+a dialect named by its self-address (`sha256-<64hex>`, SPEC-019 R.6) whose
+`(state …)` clause is the fold; cbcl-rs admits every act, folds the state, and
+binds every intent. Hark takes part in two ways.
 
 ```text
 +------------------------------+        +---------------------------------+
-|  hark daemon                 |  recv  |  JS agent (@cbcl/object SDK)    |
-|  object subscription ------->| bytes+ |  canonicalise, cid, verify,     |
-|  signer attestation          | record |  project — Stage A              |
+|  hark daemon                 |  recv  |  JS agent (cbcl/object package) |
+|  object subscription ------->| bytes+ |  admit, fold, intend — through  |
+|  signer attestation          | record |  cbcl-rs wasm — Stage A         |
 |                              |        +---------------------------------+
 |  object runtime  (Stage B)   |
 |  +------------------------+  |        +---------------------------------+
-|  | QuickJS: the SDK's own |  | object |  shell agent                    |
-|  | controller, broker,    |<-+ read/ -+  hark object check|open|act|read |
-|  | projections, store     |  | act    +---------------------------------+
+|  | Rust: learned dialects,|  | object |  shell agent                    |
+|  | thread records, the    |<-+ read/ -+  hark object check|open|act|read |
+|  | unknown-dialect queue  |  | act    +---------------------------------+
 |  +-----------+------------+  |
-|              | host calls    |
-|  cbcl-wasm @ cbcl-bus pin,   |
-|  sha2, signed hub send       |
+|              | native calls  |
+|  cbcl-wasm @ cbcl-bus pin:   |
+|  compile, admit, fold,       |
+|  intend, read; signed send   |
 +------------------------------+
 ```
 
@@ -144,26 +146,26 @@ under a contract-digest dialect (`object-<64hex>`), projected to state by the
   with an attestation record: the room, the signer (the MLS sender in an
   encrypted room, the hub-delivered `:from` in a cleartext one), how it was
   attested, and whether it was replayed. Bytes are delivered untouched, so
-  the SDK's cid equals the browser's. `hark history` fetches older frames.
-- **Stage B, native.** The daemon runs the browser's object code itself,
-  headlessly, in an embedded QuickJS runtime: the SDK files are vendored
-  byte-for-byte from cbcl-bus (`src/objects/js/VENDOR.json` pins the commit)
-  and every browser-bound dependency is a host function — the content
-  address is `sha2`, every CBCL judgement (dialect, shape, protocol,
-  `message_hash`) is `cbcl-wasm` linked natively at the revision cbcl-bus
-  ships, `send` is the agent's signed hub connection. A shell agent then
-  reads, acts on, and creates objects with `hark object …`, and the state it
-  reads is the state every browser computes, by construction rather than by
-  a port. Delivered object messages are journalled under
-  `<identity_dir>/objects/` and replayed after a daemon restart, so private
-  rooms keep their state.
+  the agent's wire address equals the browser's. `hark history` fetches
+  older frames.
+- **Stage B, native.** The daemon keeps one controller per agent, in Rust,
+  and every judgement is cbcl-rs's, linked natively at the revision cbcl-bus
+  ships to browsers: the SPEC-087 contract compile, SPEC-019 admission, the
+  fold and the intent binder, the reads, canonical text and the wire
+  address. The runtime adds only bookkeeping — which dialects the room has
+  taught, which records each thread holds, which acts wait for a definition
+  — and replays the cbcl-rs conformance corpus (`tests/vectors/state`) as
+  its regression net. A shell agent then reads, acts on, and creates objects
+  with `hark object …`, and the state it reads is the state every browser
+  computes. Delivered object messages and taught dialects are journalled
+  under `<identity_dir>/objects/` and replayed after a daemon restart, so
+  private rooms keep their state.
 
 This is why hark carries a **second cbcl-rs pin**: its own pin serialises a
-quoted `:caused-by` differently from cbcl-bus's, and a cid computed there
-would not match a browser's. `Cargo.toml`'s `cbcl-wasm` rev must equal the
-vendored manifest's `cbcl_rs_sha` (a test enforces it); bump both with
-`scripts/vendor-objects.sh <cbcl-bus checkout>` whenever the hub is
-redeployed. Hark serves SDK **version 2** definitions only.
+quoted `:caused-by` differently from cbcl-bus's, and an address computed
+there would not match a browser's. `Cargo.toml`'s `cbcl-wasm` rev must equal
+cbcl-bus's `cbcl-rs.sha`; bump it, and re-copy `tests/vectors/state`, whenever
+the hub is redeployed. Hark serves SPEC-087 **version 3** contracts only.
 
 `hark init` issues a best-effort `(meta (query …))` for each advertised
 `--dialect` so the registry is populated before the first message flows;
@@ -210,11 +212,9 @@ man hark
 so `cargo build`, `cargo test`, `cargo run -- daemon status`, etc., work
 directly if you prefer.
 
-The build needs a C compiler: `ring` already required one, and the object
-runtime compiles QuickJS the same way (the release workflow's per-target
-`CC_*` variables cover it). The object SDK is not fetched at build time; it
-is vendored under `src/objects/js/vendor/` and re-vendored with
-`scripts/vendor-objects.sh ../cbcl-bus`, which also rewrites the pin manifest.
+The build needs a C compiler for `ring` (the release workflow's per-target
+`CC_*` variables cover it). The object runtime is Rust over the `cbcl-wasm`
+crate; nothing is vendored or fetched at build time beyond Cargo's git pins.
 
 ## Configuration
 
@@ -396,9 +396,11 @@ hark object act   list-1 check --field item=milk --field done=true
 hark object read  list-1
 ```
 
-The opener carries the definition, view included, so every browser and agent
-in the room learns the new object type on arrival. Writing definitions from a
-specification is documented in [docs/object-definitions.md](docs/object-definitions.md).
+`open` declares the dialect to the room by self-address, then sends the
+opener; a browser or agent that meets an act of a dialect it has not learned
+fetches the definition by digest and verifies it before judging the act.
+Writing definitions from a specification is documented in
+[docs/object-definitions.md](docs/object-definitions.md).
 
 Close the current agent handle and stop the daemon:
 
@@ -628,10 +630,10 @@ undeclared `--speak` is rejected. The joined handle becomes the session's
 active agent — follow-up commands need no exported env var.
 
 `--objects` (SPEC-086) subscribes the agent to hypermedia-object messages:
-every `object-*` message in the channel — its own and replayed history
+every object message (a `sha256-<64hex>` dialect) in the channel — its own and replayed history
 included — reaches `hark recv` with an attestation record, and feeds the
 daemon's object runtime so `hark object …` can read, act, and create. An
-object dialect (`object-<64hex>`) given to `--speak` means the same thing and
+object dialect (`sha256-<64hex>`) given to `--speak` means the same thing and
 is never advertised. The subscription persists with the pairing across a
 daemon restart; rejoin without it to roll back. See
 [Hypermedia objects](#hypermedia-objects-spec-086) and the `object` command.
@@ -860,7 +862,7 @@ exactly one non-empty string `:thread`.
   [Recovery](#recovery).
 * [SPEC-086 — object transport and native objects](specs/SPEC-086-hark-object-transport.md)
   — Stage A (attested object delivery, history) and Stage B (`hark object`,
-  the SDK run headlessly under QuickJS with cbcl-rs native; ADR-004). Both
+  a Rust runtime over cbcl-rs's state layer, linked natively; ADR-005). Both
   implemented; TEST-001 passed live on 2026-09-27 with a real browser and a
   hark agent acting on one object. Definition format for agents:
   [docs/object-definitions.md](docs/object-definitions.md).

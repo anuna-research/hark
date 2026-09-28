@@ -1,165 +1,182 @@
 # Object definitions for hark agents
 
 How an agent joined with `hark join … --objects` defines a hypermedia object
-from a specification, checks it, and loads it into a chat channel. Everything
-here is the `@cbcl/object` SDK's own format; hark runs the SDK's code, so what
-`hark object check` accepts is exactly what a browser's import dialog accepts.
+from a specification, checks it, and opens it in a chat channel. A definition
+is a SPEC-087 contract (cbcl-bus `specs/SPEC-087-json-authoring-compile.md`),
+and cbcl-rs compiles it: what `hark object check` accepts is exactly what a
+browser's import dialog accepts, because both call the same
+`compile_contract`.
 
 ```sh
-hark object check --define spec.json          # validate; prints digests, verbs, projections, CBCL
+hark object check --define spec.json          # validate; prints the dialect, verbs, state rules, contract, CBCL
 hark object open  --define spec.json --thread board-1 --field title="Launch tasks"
 hark object act   board-1 check --field item=venue --field done=true
 hark object read  board-1
 ```
 
-`open` sends one message, the opener. It carries the whole definition in
-`:object-spec`, so every browser and every hark agent in the room learns the
-new object type when the opener arrives. Nothing is registered anywhere first.
-Later actions carry only their fields.
+`open` declares the object's dialect to the room (`adddialect`, by its
+self-address, with its definition), then sends the opener. The opener carries
+no definition. A browser or agent that meets an act of a dialect it has not
+learned holds the act, fetches the definition from the room by digest,
+verifies that it hashes to its name, installs it through cbcl-rs's R1–R7, and
+only then judges the act. Later actions carry only their fields.
 
 ## The definition
 
-Version 2 only. The pre-v2 SDK's single-artifact form (`"version": 1` with
-the view inside the contract) is refused by name by `check` and `open`, and an
-incoming version 1 opener is skipped rather than loaded. Objects published
-that way must be re-published as version 2; hark does not translate them.
+Version 3 only. The two earlier shapes are refused by name: the pre-v2
+single-artifact form (`"version": 1`, the view inside the contract) and the
+v2 contract-and-view bundle whose opener carried the definition in
+`:object-spec`. Objects published under either must be re-published;
+hark does not translate them.
 
-A JSON object with three required members and three optional ones:
+Two forms compile to the same contract. The **authoring form** is what a
+person writes:
 
 ```json
 {
   "name": "checklist",
   "verbs": {
     "open":  { "causedBy": "begin",   "fields": { "title": "string" } },
-    "check": { "causedBy": ["open"],  "fields": { "item": "string", "done": "bool", "replaces": "list" } },
-    "drop":  { "causedBy": ["open"],  "fields": { "item": "string", "replaces": "list" } }
+    "check": { "causedBy": ["open"],  "fields": { "item": "string", "done": "bool" } },
+    "drop":  { "causedBy": ["open"],  "fields": { "item": "string" } }
   },
   "project": {
     "title": ["last", "open", "title"],
-    "items": ["registerPerKey", "check", "item", "done", "replaces", "drop"]
-  },
-  "view": [
-    { "type": "value", "field": "title", "label": "List" },
-    { "type": "value", "field": "items", "label": "Items" },
-    { "type": "form",  "verb": "check", "label": "Check an item", "fields": { "item": "Item", "done": "Done" } }
-  ]
+    "items": ["registerPerKey", "check", "item", "done", "drop"]
+  }
 }
 ```
 
+The **contract record** is what it becomes, and what `check` prints as
+`contract`: `{"version": 3, "kind": "contract", "name", "author"?,
+"requirements"?, "bounds"?, "roles"?, "verbs", "state"}` with each verb's
+`after` list. `causedBy` is sugar for `after`, `project` for `state`,
+`dialect` for `name`, and `["string"]` for `"list"`. Either form, or the
+record's serialised text, is accepted wherever a definition is.
+
 ### `name`
 
-A short label. The object's real identity is its **dialect**, `object-` plus
-the SHA-256 of the serialised contract, computed by `check`. Two definitions
-with different bytes are two different object types even if named alike.
+A short label (`[a-z][a-z0-9-]{0,47}`). It is no part of identity: the
+object's **dialect** is the self-address `sha256-<64hex>` over the body of
+the CBCL dialect the contract compiles to (SPEC-019 R.6). Two contracts that
+compile to the same body are the same dialect whatever they are called, and a
+contract that compiles to the same body as a hand-written `.cbcl` file has
+that file's name.
 
 ### `verbs`
 
 One entry per action. Exactly one verb has `"causedBy": "begin"`: the
 **opener**, which creates an instance in a fresh thread. Every other verb lists
-the verbs it may follow. The protocol must be acyclic: a verb may not follow
-itself, directly or through a cycle. Repeatable acts each follow the opener.
+the verbs it may follow. The protocol must be acyclic; cbcl-rs's R5 refuses a
+cycle. Repeatable acts each follow the opener.
 
-Field types: `"string"`, `"number"`, `"bool"`, `"list"`, and `{"enumOf":
-"<opener field>"}`, whose values must be among those the opener listed in that
-field (a vote whose choice must be one of the proposed options). Strings are
-limited to 2048 bytes, lists to 64 elements, numbers to ±1e12. Field sets are
-closed: an action carrying an undeclared field is rejected. The names `from`,
-`thread`, `dialect`, `caused-by`, `key` and `signing-key` are reserved.
+Field types: `"string"`, `"number"` (integers), `"bool"`, `"list"`, and
+`{"enumOf": "<state field>"}`, whose values must be among those the named
+state field holds (a vote whose choice must be one of the proposed options).
+Field sets are closed: an action carrying an undeclared field is rejected.
+The routing keywords `from`, `thread`, `dialect`, `caused-by`, `to`,
+`sender`, `replaces`, `audience`, `sig`, `key` and `signing-key` are
+reserved and never declared.
 
-### `project`
+Optional `bounds` (`maxString`, `maxList`, `maxNumber`, `maxFields`) tighten
+the defaults; `requirements` (`maxDepth`, `maxExpansionSize`,
+`verificationTime`) are the dialect's resource requirements.
 
-The state, as named projections over the accepted messages. Each is a JSON
-array whose first element is the combinator:
+### `project` (the `state`)
 
-| Projection | Meaning |
+The state, as one rule per field over the accepted acts, from the fourteen
+heads of SPEC-019 R.1. Each is a JSON array whose first element is the rule:
+
+| Rule | Meaning |
 | --- | --- |
-| `["last", verb, field]` | one value, chosen by greatest content hash across everyone |
+| `["last", verb, field]` | one value, chosen by greatest address across everyone |
 | `["latestPerSigner", verb, field]` | one value per signer |
 | `["latestPerKey", verb, keyField, valueField]` | one value per key |
-| `["exists", verb]` | whether any such action exists |
-| `["count", verb]` | number of distinct actions |
-| `["events", verb, field]` | every action's value, keyed by content address |
+| `["exists", verb]` | whether any such act exists |
+| `["count", verb]` | number of distinct acts |
+| `["events", verb, field]` | every act's value, keyed by address |
 | `["setUnion", verb, field]` | sorted unique scalars; additions only |
-| `["histogram", selector]` | counts of a per-signer or per-key selector's values |
-| `["sum", selector]` | numeric total of `events`, `latestPerSigner`, `latestPerKey` or `registerPerKey` |
+| `["values", verb, field]` | multi-value register: values no later write replaced |
+| `["valuesPerKey", verb, keyField, valueField, deleteVerb?]` | a register map keeping every current value per key |
+| `["registerPerKey", verb, keyField, valueField, deleteVerb?]` | a register map with one current value per key |
+| `["observedSet", addVerb, removeVerb, field]` | values with an unremoved addition |
 | `["counter", incVerb, decVerb, field]` | increments minus decrements |
-| `["values", verb, field, replacesField]` | multi-value register: values no later write replaced |
-| `["valuesPerKey", verb, keyField, valueField, replacesField, deleteVerb?]` | a register map keeping every current value per key |
-| `["registerPerKey", verb, keyField, valueField, replacesField, deleteVerb?]` | a register map with one current value per key |
-| `["observedSet", addVerb, removeVerb, field, removesField]` | values with an unremoved addition |
+| `["histogram", stateField]` | counts of another state field's values |
+| `["sum", stateField]` | numeric total of another state field |
 
 Two rules matter when writing from a spec:
 
-- **Nothing is ordered by time.** Concurrent writes tie-break by content hash.
-  If "the latest edit wins" is what the spec means, use a register
-  (`values`, `valuesPerKey`, `registerPerKey`): declare a `"list"` field on the
-  writing verb (`replaces` above) and name it in the projection. The broker
-  fills that field with the writes being superseded; a caller may never set it.
-  To let people remove keys, add a delete verb carrying the key field and the
-  same replacement field, and name it last.
-- **Removal from a set is an `observedSet`.** The removing verb carries a
-  `"list"` field the broker fills with the additions being cancelled.
-  Additions that repeat a value need a distinguishing field such as `"op"`,
-  or identical messages deduplicate into one.
+- **Nothing is ordered by time.** Concurrent writes tie-break by address. If
+  "the latest edit wins" is what the spec means, use a register (`values`,
+  `valuesPerKey`, `registerPerKey`). Replacement is carried as data in a
+  reserved `:replaces` field that cbcl-rs's compiler inserts and its binder
+  fills from the accepted set; an author never declares it and a caller never
+  sets it. To let people remove keys, add a delete verb carrying the key field
+  and name it last.
+- **Removal from a set is an `observedSet`.** The removing verb carries the
+  field; cbcl-rs binds the additions being cancelled. Additions that repeat a
+  value need a distinguishing field such as `"op"`, or identical acts
+  deduplicate into one.
 
-`sum` needs a numeric selector with an explicit basis; `["sum", ["last", …]]`
-is refused. Every verb and field a projection names must be declared.
+`histogram` and `sum` take the name of another state field, declared before
+them. Every verb and field a rule names must be declared.
 
-### `view` (optional)
+### `roles` (optional)
 
-What browsers render. Three kinds:
+`{"role": "singleton" | "indexed"}` in declaration order; with roles every verb
+carries `from` (a role) and `to` (a list of roles), and cbcl-rs's R6 admits an
+act only from a signer in the role. A role-declaring contract runs only where
+the host supplies the cast (cbcl-rs SPEC-014); the chat client mounts none
+today.
 
-- **Components**, a list of 1 to 32 items and the kind to prefer: `{"type":
-  "text", "text": "…"}`, `{"type": "value", "field": <projection>, "label":
-  "…"}`, and `{"type": "form", "verb": <verb>, "label": "…", "fields": {<field>:
-  <label>, …}}`. A form names every field of its verb except broker-bound ones,
-  scalars only, and may not name the opener. Browsers render these with
-  built-in components inside the sandbox; no opt-in is needed.
-- **Static HTML**: `{"html": "<…>"}`, at most 12,000 bytes.
-- **Custom script**: `{"render": "(state, {emit}) => …"}`, at most 12,000 bytes
-  of JavaScript source using the SDK's `html` tagged template. Browsers mark
-  this and static HTML as untrusted, and run them only after a person opts in.
+### Views
 
-`layout` (`{"width": "compact"|"standard"|"wide", "minHeight", "maxHeight",
-"aspectRatio", "overflow": "scroll"}`) and `resources` (`{"images": […],
-"styles": […]}`, custom views only) are optional companions.
-
-A view is a separate artifact bound to the contract's digest. The opener
-distributes it as a suggestion; a browser may switch to another compatible
-view locally. The definition as a whole is limited to 16 KiB.
+A definition carries no presentation. A view is a separate artifact bound to
+a dialect by self-address (the chat client's `@cbcl/view` package), imported
+and selected per browser; `check` and `open` refuse a definition with a
+`view`, `layout` or `resources` member. Hark renders nothing: read the state
+with `hark object read` when a picture is needed.
 
 ## Checking before sending
 
-`hark object check --define spec.json` compiles the definition the way the
-browser would and prints:
+`hark object check --define spec.json` compiles the definition with cbcl-rs
+and prints:
 
-- `dialect` and `view`: the digests an opener would establish;
-- `opener`, `verbs`, `project`: what was understood;
-- `serialized`: the exact artifact text the opener will carry;
-- `cbcl`: the native CBCL dialect the contract compiles to, which cbcl-rs has
-  verified (`--cbcl` prints only this).
+- `dialect`: the self-address an opener would establish; `label`: the name;
+- `opener`, `verbs`, `state`, `roles`: what cbcl-rs understood;
+- `contract`: the exact contract bytes the dialect compiled from;
+- `cbcl`: the `(define …)` text every host installs and the room declares,
+  verified by cbcl-rs (`--cbcl` prints only this).
 
-An invalid definition fails with the SDK's own message: a protocol cycle, an
-unknown field in a projection, a form naming a list field, a `sum` without a
-basis. Fix and check again; nothing has been sent.
+An invalid definition fails with cbcl-rs's own reason: a protocol cycle (R5),
+an unknown verb or field in a rule, an ill-typed rule, a `sum` over a field
+that is not numeric. Fix and check again; nothing has been sent.
 
 ## Acting
 
-`hark object act <thread> <verb> [fields]` hands the intent to the SDK's
-broker, which binds the sender, room and thread, chooses the causal
-predecessor, fills any register or removal field from accepted history,
-verifies shape and protocol with cbcl-rs, and only then sends. A rejected
-action prints the reason and sends nothing. `hark object read <thread>` prints
-the projected state; it is the same JSON every browser computes.
+`hark object act <thread> <verb> [fields]` hands the verb and its data
+fields to cbcl-rs's intent binder, which admits the verb for the agent,
+binds recipients, `:thread`, `:caused-by` and `:replaces` from accepted
+history, builds the act and verifies it; the daemon signs and sends it. A
+routing keyword among the fields is a forgery and is refused. A rejected
+action prints the reason and sends nothing. `hark object read <thread>`
+prints the state, cbcl-rs's fold over the accepted acts; it is the same JSON
+every browser computes.
 
 ## Limits worth telling the spec author
 
-- A room keeps at most 64 learned contracts and 128 views.
+- A contract is at most 16 KiB, 16 verbs, 16 fields per verb, 32 state
+  fields, 16 roles (SPEC-087 Controls). A controller learns at most 64
+  dialects; acts waiting for an unlearned dialect are held up to 128 acts
+  and 512 KiB.
 - History beyond the hub's backfill needs `hark history`; an object whose
   opener is out of reach shows as `object_unknown` until it arrives. What was
-  delivered to the agent is journalled under the identity directory and
-  replayed after a daemon restart, private rooms included.
+  delivered to the agent, and every dialect it learned, is journalled under
+  the identity directory and replayed after a daemon restart, private rooms
+  included.
 - A paired agent is subscribed automatically when the pairing record lists an
   object dialect; otherwise pass `--objects` to `hark pair` or `hark join`.
-- Views are not previewable in hark. The state is; render it from
-  `hark object read` when a picture is needed.
+- An act of a dialect the room has not declared cannot be judged: the room's
+  `roomcfg` menu is what maps a dialect's self-address to the digest
+  `fetchdialect` takes. `open` declares before it sends, so an object created
+  through hark is always fetchable.

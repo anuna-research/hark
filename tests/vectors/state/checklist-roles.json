@@ -1,0 +1,158 @@
+{
+  "contract": "(define checklist (cbcl) @anuna\n  (:resource-requirements\n    ((max-depth 16)\n     (max-expansion-size 4096)\n     (verification-time 1000)))\n\n  (:roles (owner (* member)))\n\n  (extend open (to title) :from owner :to (owner member)\n    (tell to :title title))\n\n  (extend check (to item done) :from member :to (owner member)\n    (tell to :item item :done done))\n\n  (extend drop (to item) :from owner :to (owner member)\n    (tell to :item item))\n\n  (shape open\n    (require :title string))\n  (shape check\n    (require :item string)\n    (require :done bool))\n  (shape drop\n    (require :item string))\n\n  (protocol\n    (then begin open)\n    (then open check)\n    (then open drop))\n\n  (state\n    (title (last open :title))\n    (items (register-per-key check :item :done drop))))",
+  "covers": [
+    "last",
+    "register-per-key",
+    "delete-verb",
+    "concurrent-writes",
+    "add-wins-delete",
+    "R6-role-gate",
+    "R7-closed",
+    "pending",
+    "intend"
+  ],
+  "expect": {
+    "addresses": [
+      "sha256-482c9b2855fdb98df32c3472fd8648da48fc5cf5594f77627283af7e9c927b3c",
+      "sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69",
+      "sha256-fdbf1ba82f98e0b0d01cf4be9a9258a523ae1caa32ac9fd97bf95433b879d2fa",
+      "sha256-985a28eb304beb56c6369242ab6038461018619bd91b1ab2666fe8585011f8f7",
+      "sha256-fa121c1ef3c94195b43109a5fa8962a8c56f9bf5b2f37a858becaec27722d8a8",
+      "sha256-a25d2646e2ec7b180bf211b8c29f45bb1a0685c1cf5a1d4cb3aaa11e7b57f2d8",
+      "sha256-2178423cad7b965df3c828fcfc709f2d8edb7f8a39585534aa43ce869b44177b",
+      "sha256-bab19532b69d3c5f02752135a8d5fec4bc6c2039b79764806255ecd83df5b52e",
+      "sha256-fa37f2d5d4bd8bc05c7027145a754c21256091356b5e2b0942fea6e2e6149416",
+      "sha256-1d2e504c52c65796077c1b8aaf5ec1d884fbdece69b89d5a484002a48c30ce42"
+    ],
+    "intents": [
+      {
+        "canonical": "(lang checklist (check (@aria @bo @cy) () :done #t :item \"venue\" :replaces (sha256-2178423cad7b965df3c828fcfc709f2d8edb7f8a39585534aa43ce869b44177b sha256-fa121c1ef3c94195b43109a5fa8962a8c56f9bf5b2f37a858becaec27722d8a8) :from @bo :thread \"list-1\" :caused-by sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69))"
+      },
+      {
+        "reject": "role"
+      },
+      {
+        "canonical": "(lang checklist (drop (@aria @bo @cy) () :item \"venue\" :replaces (sha256-fa121c1ef3c94195b43109a5fa8962a8c56f9bf5b2f37a858becaec27722d8a8) :from @aria :thread \"list-1\" :caused-by sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69))"
+      },
+      {
+        "reject": "nothing-to-delete"
+      },
+      {
+        "reject": "forge"
+      },
+      {
+        "reject": "opener"
+      }
+    ],
+    "state": {
+      "items": {
+        "cake": false,
+        "venue": false
+      },
+      "title": "Launch tasks"
+    },
+    "verdicts": {
+      "sha256-1d2e504c52c65796077c1b8aaf5ec1d884fbdece69b89d5a484002a48c30ce42": "pending",
+      "sha256-2178423cad7b965df3c828fcfc709f2d8edb7f8a39585534aa43ce869b44177b": "accepted",
+      "sha256-482c9b2855fdb98df32c3472fd8648da48fc5cf5594f77627283af7e9c927b3c": "accepted",
+      "sha256-985a28eb304beb56c6369242ab6038461018619bd91b1ab2666fe8585011f8f7": "accepted",
+      "sha256-a25d2646e2ec7b180bf211b8c29f45bb1a0685c1cf5a1d4cb3aaa11e7b57f2d8": "accepted",
+      "sha256-bab19532b69d3c5f02752135a8d5fec4bc6c2039b79764806255ecd83df5b52e": "rejected",
+      "sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69": "accepted",
+      "sha256-fa121c1ef3c94195b43109a5fa8962a8c56f9bf5b2f37a858becaec27722d8a8": "accepted",
+      "sha256-fa37f2d5d4bd8bc05c7027145a754c21256091356b5e2b0942fea6e2e6149416": "rejected",
+      "sha256-fdbf1ba82f98e0b0d01cf4be9a9258a523ae1caa32ac9fd97bf95433b879d2fa": "accepted"
+    }
+  },
+  "id": "checklist-roles",
+  "intents": [
+    {
+      "fields": {
+        "done": true,
+        "item": "venue"
+      },
+      "signer": "@bo",
+      "verb": "check"
+    },
+    {
+      "fields": {
+        "item": "venue"
+      },
+      "signer": "@bo",
+      "verb": "drop"
+    },
+    {
+      "fields": {
+        "item": "venue"
+      },
+      "signer": "@aria",
+      "verb": "drop"
+    },
+    {
+      "fields": {
+        "item": "bread"
+      },
+      "signer": "@aria",
+      "verb": "drop"
+    },
+    {
+      "fields": {
+        "done": true,
+        "item": "venue",
+        "replaces": []
+      },
+      "signer": "@bo",
+      "verb": "check"
+    },
+    {
+      "fields": {
+        "title": "again"
+      },
+      "signer": "@bo",
+      "verb": "open"
+    }
+  ],
+  "messages": [
+    {
+      "canonical": "(with-roles ((owner @aria) (member @bo @cy)) (signed @aria (hello :thread \"list-1\" :caused-by begin)))",
+      "signer": "@aria"
+    },
+    {
+      "canonical": "(signed @aria (lang checklist (open (@aria @bo @cy) :title \"Launch tasks\" :caused-by sha256-482c9b2855fdb98df32c3472fd8648da48fc5cf5594f77627283af7e9c927b3c :thread \"list-1\" :from @aria)))",
+      "signer": "@aria"
+    },
+    {
+      "canonical": "(signed @bo (lang checklist (check (@aria @bo @cy) :item \"venue\" :done #f :replaces () :caused-by sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69 :thread \"list-1\" :from @bo)))",
+      "signer": "@bo"
+    },
+    {
+      "canonical": "(signed @bo (lang checklist (check (@aria @bo @cy) :item \"venue\" :done #t :replaces (sha256-fdbf1ba82f98e0b0d01cf4be9a9258a523ae1caa32ac9fd97bf95433b879d2fa) :caused-by sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69 :thread \"list-1\" :from @bo)))",
+      "signer": "@bo"
+    },
+    {
+      "canonical": "(signed @cy (lang checklist (check (@aria @bo @cy) :item \"venue\" :done #f :replaces (sha256-fdbf1ba82f98e0b0d01cf4be9a9258a523ae1caa32ac9fd97bf95433b879d2fa) :caused-by sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69 :thread \"list-1\" :from @cy)))",
+      "signer": "@cy"
+    },
+    {
+      "canonical": "(signed @bo (lang checklist (check (@aria @bo @cy) :item \"cake\" :done #f :replaces () :caused-by sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69 :thread \"list-1\" :from @bo)))",
+      "signer": "@bo"
+    },
+    {
+      "canonical": "(signed @aria (lang checklist (drop (@aria @bo @cy) :item \"venue\" :replaces (sha256-985a28eb304beb56c6369242ab6038461018619bd91b1ab2666fe8585011f8f7) :caused-by sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69 :thread \"list-1\" :from @aria)))",
+      "signer": "@aria"
+    },
+    {
+      "canonical": "(signed @bo (lang checklist (drop (@aria @bo @cy) :item \"cake\" :replaces () :caused-by sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69 :thread \"list-1\" :from @bo)))",
+      "signer": "@bo"
+    },
+    {
+      "canonical": "(signed @bo (lang checklist (check (@aria @bo @cy) :item \"cake\" :done #t :note \"x\" :replaces () :caused-by sha256-d74d0f31a23eb08b76f311dba75890264431cc818073a82050a5dea28b1fab69 :thread \"list-1\" :from @bo)))",
+      "signer": "@bo"
+    },
+    {
+      "canonical": "(signed @bo (lang checklist (check (@aria @bo @cy) :item \"cake\" :done #t :replaces () :caused-by sha256-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff :thread \"list-1\" :from @bo)))",
+      "signer": "@bo"
+    }
+  ],
+  "thread": "list-1"
+}

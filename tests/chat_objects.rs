@@ -29,7 +29,7 @@ const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 /// care (SPEC-086 REQ-007).
 fn object(from: &str, item: &str) -> String {
     format!(
-        "(lang object-{HEX} (check @general :item \"{item}\" :caused-by sha256-{HEX} \
+        "(lang sha256-{HEX} (check @general :item \"{item}\" :caused-by sha256-{HEX} \
          :thread \"list-1\" :from {from}))"
     )
 }
@@ -116,7 +116,7 @@ fn record(signer: &str, own: bool, replayed: bool) -> ObjectRecord {
 /// `:from` yields no record; the agent's own message comes back marked `own`.
 #[tokio::test]
 async fn object_messages_reach_recv_with_a_record_and_nothing_else_does() {
-    let anonymous = format!("(lang object-{HEX} (check @general :item \"eggs\" :thread \"t\"))");
+    let anonymous = format!("(lang sha256-{HEX} (check @general :item \"eggs\" :thread \"t\"))");
     let hub = FakeHub::start(vec![Act::AcceptAndServe {
         enc: false,
         send: vec![

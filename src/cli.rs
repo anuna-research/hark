@@ -200,7 +200,7 @@ pub struct JoinArgs {
     pub hub: Option<String>,
     #[arg(
         long = "objects",
-        help = "Subscribe to hypermedia-object messages (SPEC-086): every `object-*` message in the channel, including this agent's own and replayed history, reaches `recv` with an attestation record"
+        help = "Subscribe to hypermedia-object messages (SPEC-086): every object message (a `sha256-<64hex>` dialect) in the channel, including this agent's own and replayed history, reaches `recv` with an attestation record"
     )]
     pub objects: bool,
 }
@@ -221,7 +221,7 @@ pub struct PairArgs {
     pub hub: Option<String>,
     #[arg(
         long = "objects",
-        help = "Subscribe to hypermedia-object messages (SPEC-086). Implied when the pairing record lists an object dialect (object-<digest>)"
+        help = "Subscribe to hypermedia-object messages (SPEC-086). Implied when the pairing record lists an object dialect (sha256-<64hex>)"
     )]
     pub objects: bool,
 }
@@ -274,7 +274,7 @@ pub struct RecvArgs {
 #[derive(Debug, Subcommand)]
 pub enum ObjectCommand {
     #[command(
-        about = "Validate a definition without sending: prints its dialect digest, verbs, projections, view digest, and the CBCL dialect cbcl-rs verified"
+        about = "Validate a definition without sending: prints its dialect (self-address), verbs, state rules, the contract, and the CBCL dialect cbcl-rs verified"
     )]
     Check(ObjectCheckArgs),
     #[command(about = "List the object threads this agent has learned from the room")]
@@ -282,11 +282,11 @@ pub enum ObjectCommand {
     #[command(about = "Print an object's projected state as JSON")]
     Read(ObjectReadArgs),
     #[command(
-        about = "Act on an object: the broker binds provenance, picks the predecessor, verifies with cbcl-rs, and sends"
+        about = "Act on an object: cbcl-rs binds provenance, picks the predecessor and verifies the act; the daemon signs and sends"
     )]
     Act(ObjectActArgs),
     #[command(
-        about = "Create an object from a contract definition: verifies it, sends the opener with the contract embedded"
+        about = "Create an object from a contract definition: verifies it, declares the dialect to the room, sends the opener"
     )]
     Open(ObjectOpenArgs),
 }
@@ -299,7 +299,10 @@ pub struct ObjectCheckArgs {
         help = "The definition to validate: a path to a JSON file or inline JSON, in any form `open --define` accepts (see docs/object-definitions.md)"
     )]
     pub define: String,
-    #[arg(long = "cbcl", help = "Print only the native CBCL dialect the contract compiles to")]
+    #[arg(
+        long = "cbcl",
+        help = "Print only the native CBCL dialect the contract compiles to"
+    )]
     pub cbcl: bool,
 }
 
@@ -330,14 +333,18 @@ pub struct ObjectOpenArgs {
     #[arg(
         long = "define",
         value_name = "FILE|JSON",
-        help = "The definition: a path to a JSON file, or inline JSON — an SDK authoring definition ({name, verbs, project, view?}), a version-2 contract, or a contract-and-view bundle. Version 1 is refused"
+        help = "The definition: a path to a JSON file, or inline JSON — an authoring definition ({name, verbs, project}), a version-3 contract ({kind: \"contract\", …}), or the serialised contract text. Versions 1 and 2 are refused by name"
     )]
     pub define: String,
     #[arg(long = "thread", help = "The new object's thread id")]
     pub thread: String,
     #[arg(help = "Opener fields as a JSON object")]
     pub fields: Option<String>,
-    #[arg(long = "field", value_name = "KEY=VALUE", help = "One opener field; repeatable")]
+    #[arg(
+        long = "field",
+        value_name = "KEY=VALUE",
+        help = "One opener field; repeatable"
+    )]
     pub field: Vec<String>,
 }
 
@@ -924,15 +931,8 @@ async fn object_command(command: ObjectCommand) -> AppResult<()> {
                 .await
                 .map_err(map_local_api_request_error)?;
             eprintln!(
-                "opened {} as {}{} · cid {}",
-                response.thread,
-                response.dialect,
-                response
-                    .view
-                    .as_deref()
-                    .map(|view| format!(" with view {view}"))
-                    .unwrap_or_default(),
-                response.cid
+                "opened {} as {} · cid {}",
+                response.thread, response.dialect, response.cid
             );
             println!("{}", response.dialect);
         }
@@ -947,7 +947,9 @@ fn read_object_definition(source: &str) -> AppResult<serde_json::Value> {
         trimmed.to_owned()
     } else {
         fs::read_to_string(trimmed).map_err(|error| {
-            AppError::Usage(format!("could not read the definition file {trimmed}: {error}"))
+            AppError::Usage(format!(
+                "could not read the definition file {trimmed}: {error}"
+            ))
         })?
     };
     let value: serde_json::Value = serde_json::from_str(&text)
@@ -968,12 +970,12 @@ fn object_fields_from_cli(json: Option<&str>, pairs: &[String]) -> AppResult<ser
         Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
             Ok(serde_json::Value::Object(map)) => map,
             Ok(_) => {
-                return Err(AppError::Usage(
-                    "fields must be a JSON object".to_owned(),
-                ));
+                return Err(AppError::Usage("fields must be a JSON object".to_owned()));
             }
             Err(error) => {
-                return Err(AppError::Usage(format!("fields are not valid JSON: {error}")));
+                return Err(AppError::Usage(format!(
+                    "fields are not valid JSON: {error}"
+                )));
             }
         },
         None => serde_json::Map::new(),
@@ -1643,9 +1645,9 @@ async fn daemon_run() -> AppResult<()> {
     })?;
 
     let agents = AgentStore::new(AgentStoreConfig::from_config(&config));
-    // SPEC-086 Stage B: the object runtime — the browser's object code under
-    // QuickJS with cbcl-rs linked natively — on its own thread, fed by every
-    // object delivery and driven by `hark object …`.
+    // SPEC-086 Stage B: the object runtime — one controller per agent over
+    // cbcl-rs linked natively — on its own thread, fed by every object
+    // delivery and driven by `hark object …`.
     agents
         .attach_objects(crate::objects::runtime::spawn(
             agents.clone(),
@@ -2086,28 +2088,51 @@ mod tests {
     fn object_fields_merge_json_and_pairs() {
         let fields = super::object_fields_from_cli(
             Some(r#"{"item":"milk"}"#),
-            &["done=true".to_owned(), "count=3".to_owned(), "note=plain text".to_owned(), "tags=[\"a\"]".to_owned()],
+            &[
+                "done=true".to_owned(),
+                "count=3".to_owned(),
+                "note=plain text".to_owned(),
+                "tags=[\"a\"]".to_owned(),
+            ],
         )
         .unwrap();
         assert_eq!(
             fields,
             serde_json::json!({"item": "milk", "done": true, "count": 3, "note": "plain text", "tags": ["a"]})
         );
-        assert!(super::object_fields_from_cli(Some("[1]"), &[]).is_err(), "not an object");
+        assert!(
+            super::object_fields_from_cli(Some("[1]"), &[]).is_err(),
+            "not an object"
+        );
         assert!(super::object_fields_from_cli(None, &["novalue".to_owned()]).is_err());
-        assert_eq!(super::object_fields_from_cli(None, &[]).unwrap(), serde_json::json!({}));
+        assert_eq!(
+            super::object_fields_from_cli(None, &[]).unwrap(),
+            serde_json::json!({})
+        );
 
         let cli = Cli::try_parse_from([
-            "hark", "object", "act", "list-1", "check", "--field", "item=milk", "--field", "done=true",
+            "hark",
+            "object",
+            "act",
+            "list-1",
+            "check",
+            "--field",
+            "item=milk",
+            "--field",
+            "done=true",
         ])
         .unwrap();
         let Command::Object(super::ObjectCommand::Act(args)) = cli.command else {
             panic!("parsed as object act");
         };
-        assert_eq!((args.thread.as_str(), args.verb.as_str()), ("list-1", "check"));
+        assert_eq!(
+            (args.thread.as_str(), args.verb.as_str()),
+            ("list-1", "check")
+        );
         assert_eq!(args.field, ["item=milk", "done=true"]);
 
-        let inline = super::read_object_definition(r#" {"name":"x","verbs":{},"project":{}} "#).unwrap();
+        let inline =
+            super::read_object_definition(r#" {"name":"x","verbs":{},"project":{}} "#).unwrap();
         assert_eq!(inline["name"], "x");
         assert!(super::read_object_definition("/nonexistent/definition.json").is_err());
     }

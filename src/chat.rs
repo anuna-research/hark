@@ -513,6 +513,24 @@ pub async fn create_chat_agent(
     // SPEC-086 CON-003: the subscription is a property of the registered
     // handle, so the object API can refuse an unsubscribed agent.
     let _ = store.mark_objects(&handle, objects).await;
+    // SPEC-087 REQ-005: the room's declared menu maps an object dialect's
+    // self-address to the digest `fetchdialect` takes; the object runtime
+    // keeps it per agent (refreshed by every live `roomcfg`).
+    if objects {
+        if let (Some(menu), Ok(runtime)) = (roomcfg.declared.as_ref(), store.objects_client().await)
+        {
+            runtime.menu(
+                crate::objects::AgentIdentity {
+                    agent: handle.clone(),
+                    me: agent_handle.to_owned(),
+                    room: channel.to_owned(),
+                },
+                menu.iter()
+                    .map(|d| (d.name.clone(), d.digest.clone()))
+                    .collect(),
+            );
+        }
+    }
 
     let responder = Responder::new(
         agent_handle.to_owned(),
@@ -642,7 +660,7 @@ struct ReceiveLoopArgs {
     /// own fanned-back messages are skipped. The responder still runs for any
     /// concrete dialects also advertised.
     receive_all: bool,
-    /// SPEC-086 CON-003: the object subscription. Every `object-*` content
+    /// SPEC-086 CON-003: the object subscription. Every object content
     /// message — including the agent's own, and replayed history — is
     /// delivered to `recv` with an attestation record (REQ-001..REQ-004).
     objects: bool,
@@ -679,6 +697,8 @@ async fn next_optional_apply<T>(receiver: &mut Option<mpsc::Receiver<T>>) -> Opt
 struct Reconnected {
     websocket: ChatSocket,
     conn: SignedConn,
+    /// The room's declared menu as the re-join's `roomcfg` conveyed it.
+    declared: Option<Vec<DeclaredDialect>>,
 }
 
 /// How a reconnect attempt schedule ended ([[SPEC-026 REQ-001]], [[SPEC-026 REQ-005]]).
@@ -933,6 +953,7 @@ async fn reconnect(
                     tracing::debug!(agent = handle.as_str(), warning, "re-join warning");
                 }
                 return Recovery::Reconnected(Box::new(Reconnected {
+                    declared: joined.roomcfg.declared.clone(),
                     websocket: joined.websocket,
                     conn: joined.conn,
                 }));
@@ -1191,6 +1212,20 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                 .await
                 {
                     Recovery::Reconnected(replacement) => {
+                        if objects {
+                            if let (Some(menu), Ok(runtime)) =
+                                (replacement.declared.clone(), store.objects_client().await)
+                            {
+                                runtime.menu(
+                                    crate::objects::AgentIdentity {
+                                        agent: handle.clone(),
+                                        me: wire_handle.clone(),
+                                        room: join.channel.clone(),
+                                    },
+                                    menu.into_iter().map(|d| (d.name, d.digest)).collect(),
+                                );
+                            }
+                        }
                         websocket = replacement.websocket;
                         conn = replacement.conn;
                         schedule.reset();
@@ -1502,6 +1537,39 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     // deduplicates by cid itself (ADR-003); the guard keeps
                     // suppressing every other replayed frame as before.
                     let object_frame = objects && is_object_message(&payload_text);
+                    // SPEC-087 REQ-005 / SPEC-019 R.6: under the object
+                    // subscription the room's teach frames (`(meta (define
+                    // sha256-… …))`, the reply to `fetchdialect`) and its
+                    // declared menu (`roomcfg`, refreshed on every
+                    // `adddialect`) reach the object runtime, which verifies
+                    // each definition by self-address before judging an act
+                    // of it. Teed, not consumed: no other delivery changes.
+                    if objects {
+                        if crate::objects::runtime::taught_dialect(&payload_text).is_some() {
+                            if let Ok(runtime) = store.objects_client().await {
+                                runtime.ingest(
+                                    crate::objects::AgentIdentity {
+                                        agent: handle.clone(),
+                                        me: wire_handle.clone(),
+                                        room: join.channel.clone(),
+                                    },
+                                    String::new(),
+                                    payload_text.clone(),
+                                );
+                            }
+                        } else if let Some(cfg) = parse_roomcfg(&payload_text) {
+                            if let (Some(menu), Ok(runtime)) = (cfg.declared, store.objects_client().await) {
+                                runtime.menu(
+                                    crate::objects::AgentIdentity {
+                                        agent: handle.clone(),
+                                        me: wire_handle.clone(),
+                                        room: join.channel.clone(),
+                                    },
+                                    menu.into_iter().map(|d| (d.name, d.digest)).collect(),
+                                );
+                            }
+                        }
+                    }
                     if !object_frame && replay_guard.is_replay(&payload_text) {
                         tracing::debug!(
                             agent = handle.as_str(),
@@ -1645,7 +1713,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     }
                     let Some(responder_text) = responder_text else { continue };
                     // SPEC-086 REQ-001/REQ-002/REQ-006: under the object
-                    // subscription an `object-*` content message is delivered
+                    // subscription an object content message (a `sha256-<64hex>` dialect) is delivered
                     // with its attestation record — own messages and replays
                     // included — independent of `--speak`, the capability set,
                     // and the room's dialect menu. Hark never parses the
@@ -1839,11 +1907,13 @@ mod tests {
         let cfg = super::parse_roomcfg("(roomcfg @demo :enc true :protocol mls-ds/v1)")
             .expect("protocol roomcfg should parse");
         assert!(cfg.mls_ds, ":protocol mls-ds/v1 marks the room v1");
-        let cfg = super::parse_roomcfg(
-            r#"(roomcfg @demo :enc true :dialects (("mls-ds/v1" "922ba8")))"#,
-        )
-        .expect("v1-menu roomcfg should parse");
-        assert!(cfg.mls_ds, "declaring the mls-ds/v1 dialect marks the room v1");
+        let cfg =
+            super::parse_roomcfg(r#"(roomcfg @demo :enc true :dialects (("mls-ds/v1" "922ba8")))"#)
+                .expect("v1-menu roomcfg should parse");
+        assert!(
+            cfg.mls_ds,
+            "declaring the mls-ds/v1 dialect marks the room v1"
+        );
 
         // Not a roomcfg → None.
         assert!(super::parse_roomcfg("(presence @demo :members ())").is_none());

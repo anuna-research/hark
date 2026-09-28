@@ -179,12 +179,12 @@ Fields:
   router `hello`.
 * `dialects` - optional dialect ids advertised in the router `hello`.
 * `objects` - chat transport only; optional boolean, default `false`. The
-  SPEC-086 object subscription (CON-003): every `object-*` content message in
+  SPEC-086 object subscription (CON-003): every object content message (a `sha256-<64hex>` dialect) in
   the channel — the agent's own and replayed history included — is delivered
   to `recv` with an attestation record, independent of `dialects` and of the
   room's declared menu. Persisted in the pairing record, so a daemon restart
   resumes it. On the router transport `true` is rejected with `400` and
-  `error.code = "objects_unsupported"`. An object dialect (`object-<64hex>`)
+  `error.code = "objects_unsupported"`. An object dialect (`sha256-<64hex>`)
   in `dialects` turns the subscription on as well; such names are stripped
   before advertisement and never appear in the response's `dialects`.
 
@@ -276,7 +276,7 @@ that do not know it ignore it). It is absent for every other message.
 ```json
 {
   "agent_handle": "01JX8F4V2QK8GZP9H6W5",
-  "message": "(lang object-<64hex> (check @room :item \"milk\" … :from @alice))",
+  "message": "(lang sha256-<64hex> (check @room :item \"milk\" … :from @alice))",
   "record": {
     "room": "@room",
     "signer": "@alice",
@@ -480,37 +480,41 @@ through the daemon itself. They need the agent's object subscription
 `error.code = "objects_not_subscribed"`. A daemon without the object runtime
 returns `503` with `error.code = "objects_unavailable"`.
 
-The daemon runs the browser's own object code (the `@cbcl/object` controller,
-broker, projection and store, vendored byte-for-byte from cbcl-bus) in an
-embedded QuickJS runtime, with every CBCL judgement and the content address
-supplied natively by cbcl-rs at the revision cbcl-bus ships. Delivered object
-messages are journalled per agent and room under `<chat.identity_dir>/objects/`
-(owner-only) and replayed into a fresh controller after a daemon restart
-(SPEC-086 CON-004), so private-room state survives where no hub replay could
-restore it. With the runtime attached, a full `recv` queue sheds its oldest
-object records instead of marking the handle unhealthy.
+The daemon keeps one controller per agent in Rust; every judgement is
+cbcl-rs's, linked natively at the revision cbcl-bus ships to browsers: the
+SPEC-087 contract compile, SPEC-019 admission, the fold, the intent binder,
+and the reads. Delivered object messages and taught dialects are journalled
+per agent and room under `<chat.identity_dir>/objects/` (owner-only) and
+replayed into a fresh controller after a daemon restart (SPEC-086 CON-004),
+so private-room state survives where no hub replay could restore it. With the
+runtime attached, a full `recv` queue sheds its oldest object records instead
+of marking the handle unhealthy.
 
 #### `POST /v1/objects/check`
 
 Request `{"definition": <definition>}`. Compiles and verifies the definition
-without an agent and without sending; returns `{dialect, opener, verbs,
-project, view, serialized, cbcl}`. `422 object_rejected` with the SDK's own
-reason for an invalid one. See `docs/object-definitions.md`.
+without an agent and without sending; returns `{dialect, label, opener,
+verbs, state, roles, contract, cbcl}`: the dialect's self-address, the
+contract's label, the opener verb, cbcl-rs's description of the verbs and
+state rules, the exact contract bytes, and the `(define …)` text. `422
+object_rejected` with cbcl-rs's own reason for an invalid one. See
+`docs/object-definitions.md`.
 
 #### `GET /v1/agents/{handle}/objects`
 
 The object threads the agent's controller has learned:
 
 ```json
-{ "agent_handle": "…", "objects": [ { "thread": "list-1", "dialect": "object-<64hex>" } ] }
+{ "agent_handle": "…", "objects": [ { "thread": "list-1", "dialect": "sha256-<64hex>" } ] }
 ```
 
 #### `GET /v1/agents/{handle}/objects/{thread}`
 
-The projected state — the same JSON a browser view receives:
+The state — cbcl-rs's fold over the accepted acts, the same JSON every
+browser computes:
 
 ```json
-{ "agent_handle": "…", "thread": "list-1", "dialect": "object-<64hex>", "state": { "title": "Groceries", "items": { "milk": true } } }
+{ "agent_handle": "…", "thread": "list-1", "dialect": "sha256-<64hex>", "state": { "title": "Groceries", "items": { "milk": true } } }
 ```
 
 `404` with `error.code = "object_unknown"` when the thread is not in loaded
@@ -519,24 +523,29 @@ more). `thread` is percent-encoded in the path.
 
 #### `POST /v1/agents/{handle}/objects/{thread}/act`
 
-Request `{"verb": "check", "fields": {"item": "milk", "done": true}}`. The
-broker binds `:from`, the room and the thread, picks `:caused-by`, fills
-register and removal fields from accepted history, verifies shape and protocol
-with cbcl-rs, and sends the canonical message on the agent's connection.
-Response `{"ok": true, "agent_handle": "…", "thread": "…", "cid": "<64hex>"}`.
-A rejection is `422` with `error.code = "object_action_rejected"` and the
-broker's own reason as the message; nothing rejected reaches the wire.
+Request `{"verb": "check", "fields": {"item": "milk", "done": true}}`. A
+caller supplies the verb and its data fields only; cbcl-rs's intent binder
+(SPEC-019 R.5) admits the verb for the signer, binds recipients, `:thread`,
+`:caused-by` and `:replaces` from the accepted set, builds and verifies the
+act; the daemon signs and sends it on the agent's connection. A routing
+keyword in `fields` is a forgery and is refused. Response
+`{"ok": true, "agent_handle": "…", "thread": "…", "cid": "<64hex>"}` where
+`cid` is the act's wire address. A rejection is `422` with
+`error.code = "object_action_rejected"` and cbcl-rs's own reason as the
+message; nothing rejected reaches the wire.
 
 #### `POST /v1/agents/{handle}/objects`
 
 Request `{"definition": <definition>, "thread": "list-1", "fields": {"title": "Groceries"}}`
-where `definition` is an SDK authoring definition (`{name, verbs, project}`),
-a version-2 contract (`{"kind": "contract", …}`), or the serialised contract
-text. The definition is verified by cbcl-rs; the opener carries the contract
-in `:object-spec`; the agent's own controller learns it at once. Response:
+where `definition` is an authoring definition (`{name, verbs, project}`), a
+SPEC-087 version-3 contract (`{"kind": "contract", …}`), or the serialised
+contract text. cbcl-rs compiles and verifies it; the daemon declares the
+dialect to the room by self-address (`adddialect :def`, SPEC-087 REQ-005),
+sends the opener, and the agent's own controller learns both at once.
+Response:
 
 ```json
-{ "ok": true, "agent_handle": "…", "thread": "list-1", "dialect": "object-<64hex>", "cid": "<64hex>", "message": "(lang object-… (open @room …))" }
+{ "ok": true, "agent_handle": "…", "thread": "list-1", "dialect": "sha256-<64hex>", "cid": "<64hex>", "message": "(lang sha256-… (open @room …))" }
 ```
 
 An invalid definition is `422` with `error.code = "object_rejected"`.

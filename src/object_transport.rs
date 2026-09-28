@@ -1,12 +1,13 @@
 //! SPEC-086 — object transport for SDK agents.
 //!
-//! Hark carries hypermedia-object messages (`(lang object-<64hex> …)`) and
-//! attests their authorship; it never interprets them (SPEC-086 ADR-001,
-//! REQ-007). This module holds the pure parts of that contract:
+//! Hark carries hypermedia-object messages (`(lang sha256-<64hex> …)`) and
+//! attests their authorship (SPEC-086 ADR-001). This module holds the pure
+//! parts of that contract:
 //!
 //! - the object-dialect recogniser, identical to the browser's
-//!   `isSDKDialect` (`/^object-[0-9a-f]{64}$/`), so hark and the SDK agree on
-//!   which frames are object messages;
+//!   `isSDKDialect` (`/^sha256-[0-9a-f]{64}$/`, a dialect's self-address per
+//!   SPEC-019 R.6), so hark and the browser agree on which frames are object
+//!   messages;
 //! - the [`ObjectRecord`] the `recv` response carries beside the message bytes
 //!   (SPEC-086 CON-001), and the rule that derives it from how the receive
 //!   loop authenticated the frame (REQ-006);
@@ -75,13 +76,14 @@ const HISTORY_FIRST_REPLY: Duration = Duration::from_secs(5);
 const HISTORY_SETTLE: Duration = Duration::from_millis(1500);
 
 /// The object dialect named by `text`'s outer `(lang …)` wrapper, when it is an
-/// SDK object dialect: `object-` followed by exactly 64 lowercase hex digits.
+/// object dialect: `sha256-` followed by exactly 64 lowercase hex digits, the
+/// dialect's self-address (SPEC-019 R.6, SPEC-087 REQ-002).
 ///
 /// Textual on purpose: it must agree with the browser's regex recogniser and
 /// must not depend on the message parsing under any stricter grammar — an
 /// object message hark cannot fully parse is still an object message hark must
 /// not drop (REQ-007). Leading whitespace is tolerated; the name must be
-/// followed by whitespace, so `object-<hex>x` is not a match.
+/// followed by whitespace, so `sha256-<hex>x` is not a match.
 pub fn object_dialect(text: &str) -> Option<&str> {
     let rest = text.trim_start().strip_prefix("(lang")?;
     // `(lang` must be followed by at least one whitespace character.
@@ -92,13 +94,14 @@ pub fn object_dialect(text: &str) -> Option<&str> {
     is_object_dialect_name(name).then_some(name)
 }
 
-/// Whether `name` is an SDK object dialect name: `object-` plus exactly 64
-/// lowercase hex digits (the browser's `isSDKDialect`). Such a name in an
-/// agent's dialect set means the object subscription (SPEC-086 CON-003): it
-/// is a contract digest, not an advertisable capability, and it exceeds the
-/// dialect-id length grammar on purpose.
+/// Whether `name` is an object dialect name: `sha256-` plus exactly 64
+/// lowercase hex digits, a dialect's self-address (the browser's
+/// `isSDKDialect`). Such a name in an agent's dialect set means the object
+/// subscription (SPEC-086 CON-003): it is a content address, not an
+/// advertisable capability, and it exceeds the dialect-id length grammar on
+/// purpose.
 pub fn is_object_dialect_name(name: &str) -> bool {
-    let Some(hex) = name.strip_prefix("object-") else {
+    let Some(hex) = name.strip_prefix("sha256-") else {
         return false;
     };
     hex.len() == 64
@@ -326,7 +329,7 @@ mod tests {
 
     fn object(from: &str) -> String {
         format!(
-            "(lang object-{HEX} (check @room :item \"milk\" :caused-by sha256-{HEX} \
+            "(lang sha256-{HEX} (check @room :item \"milk\" :caused-by sha256-{HEX} \
              :thread \"list-1\" :from {from}))"
         )
     }
@@ -335,10 +338,10 @@ mod tests {
     fn recogniser_matches_the_browsers_sdk_dialect_regex() {
         assert_eq!(
             object_dialect(&object("@alice")),
-            Some(format!("object-{HEX}").as_str())
+            Some(format!("sha256-{HEX}").as_str())
         );
         assert!(is_object_message(&format!(
-            "  (lang   object-{HEX}\n (open @r))"
+            "  (lang   sha256-{HEX}\n (open @r))"
         )));
         // Not object messages: a built-in dialect, wrong hex length, uppercase
         // hex, a trailing character, a bare message, or an unwrapped verb.
@@ -346,39 +349,39 @@ mod tests {
             "(lang poll (vote @trip :date \"sat\" :from @hugo))"
         ));
         assert!(!is_object_message(&format!(
-            "(lang object-{} (x @r))",
+            "(lang sha256-{} (x @r))",
             &HEX[..63]
         )));
         assert!(!is_object_message(&format!(
-            "(lang object-{} (x @r))",
+            "(lang sha256-{} (x @r))",
             HEX.to_uppercase()
         )));
-        assert!(!is_object_message(&format!("(lang object-{HEX}x (x @r))")));
-        assert!(!is_object_message(&format!("(lang object-{HEX})")));
+        assert!(!is_object_message(&format!("(lang sha256-{HEX}x (x @r))")));
+        assert!(!is_object_message(&format!("(lang sha256-{HEX})")));
         assert!(!is_object_message("(tell @general \"hi\" :from @bob)"));
-        assert!(!is_object_message("(langobject-abc (x @r))"));
-        assert!(is_object_dialect_name(&format!("object-{HEX}")));
-        assert!(!is_object_dialect_name("object-abc"));
+        assert!(!is_object_message("(langsha256-abc (x @r))"));
+        assert!(is_object_dialect_name(&format!("sha256-{HEX}")));
+        assert!(!is_object_dialect_name("sha256-abc"));
         assert!(!is_object_dialect_name("poll"));
     }
 
     #[test]
     fn inner_from_reads_the_wrapped_messages_sender() {
         assert_eq!(inner_from(&object("@alice")).as_deref(), Some("@alice"));
-        // A string-valued :from and an object-spec with escaped quotes parse too.
+        // A string-valued :from and a string field with escaped quotes parse too.
         let opener = format!(
-            "(lang object-{HEX} (open @room :title \"Launch\" :object-spec \"{{\\\"version\\\":2}}\" \
+            "(lang sha256-{HEX} (open @room :title \"Launch\" :note \"{{\\\"version\\\":3}}\" \
              :caused-by begin :thread \"t\" :from \"@bo\"))"
         );
         assert_eq!(inner_from(&opener).as_deref(), Some("@bo"));
         // No :from → no signer.
         assert_eq!(
-            inner_from(&format!("(lang object-{HEX} (check @room :thread \"t\"))")),
+            inner_from(&format!("(lang sha256-{HEX} (check @room :thread \"t\"))")),
             None
         );
         // Unparseable text falls back to the textual scan.
         assert_eq!(
-            inner_from("(lang object-x (check @room :from @cy").as_deref(),
+            inner_from("(lang sha256-x (check @room :from @cy").as_deref(),
             Some("@cy")
         );
     }
@@ -407,7 +410,7 @@ mod tests {
             .expect("own message");
         assert!(own.own && own.replayed);
         // TEST-003 negative input: no :from in a cleartext room → no record.
-        let anonymous = format!("(lang object-{HEX} (check @room :thread \"t\"))");
+        let anonymous = format!("(lang sha256-{HEX} (check @room :thread \"t\"))");
         assert_eq!(
             object_record(&anonymous, &Attestation::Hub, "@aria", "@room", false),
             None
@@ -435,7 +438,7 @@ mod tests {
         assert_eq!(record.attested_by, AttestedBy::Mls);
         assert_eq!(record.signer, "@alice");
         // The MLS sender is authoritative even when the inner :from is absent.
-        let anonymous = format!("(lang object-{HEX} (check @room :thread \"t\"))");
+        let anonymous = format!("(lang sha256-{HEX} (check @room :thread \"t\"))");
         let record =
             object_record(&anonymous, &attestation, "@alice", "@room", false).expect("record");
         assert!(record.own);

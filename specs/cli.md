@@ -147,11 +147,11 @@ Prints a single human-readable success line to stdout
 (`joined @channel as @handle · speaking: …`); warnings go to stderr.
 
 `--objects` turns on the SPEC-086 object subscription (CON-003; off by
-default): every `object-*` message in the channel — the agent's own and
+default): every object message (a `sha256-<64hex>` dialect) in the channel — the agent's own and
 replayed history included — reaches `recv` with an attestation record,
 independent of `--speak`. It is persisted with the pairing, so a daemon restart
 resumes it; rejoin without the flag to roll it back. An object dialect
-(`object-<64hex>`) given to `--speak` means the same thing and is never
+(`sha256-<64hex>`) given to `--speak` means the same thing and is never
 advertised. `hark pair` takes `--objects` too, and turns the subscription on
 by itself when the pairing record lists an object dialect — the adder chose
 an object from the room's menu.
@@ -305,22 +305,27 @@ hark object open --define <file|json> --thread <thread> ['{"k": v}'] [--field k=
 ```
 
 Read, act on, and create hypermedia objects through the daemon, for an agent
-joined with `--objects`. `read` prints the projected state as JSON; `act`
-prints the sent action's cid; `open` prints the new object's dialect (its
-contract digest) and reports the cid on stderr. Fields are a JSON object, or
-repeated `--field KEY=VALUE` pairs whose values are read as JSON when they
-parse (`3`, `true`, `["a"]`) and as text otherwise; both may be combined.
-`--define` takes a path to a JSON file or inline JSON: an SDK authoring
-definition (`{name, verbs, project, view?}` with `["last", "open", "title"]`-style
-projections), a version-2 contract, or a contract-and-view bundle. `check`
-validates without an agent or a send and prints the digests, verbs,
-projections and verified CBCL dialect. The format is documented in
-[docs/object-definitions.md](../docs/object-definitions.md); an opener carries
-the definition, view included, so a room learns a new object type on arrival.
+joined with `--objects`. `read` prints the state (cbcl-rs's fold over the
+accepted acts) as JSON; `act` prints the sent act's wire address (hex);
+`open` prints the new object's dialect (its self-address, `sha256-<64hex>`)
+and reports the address on stderr. Fields are a JSON object, or repeated
+`--field KEY=VALUE` pairs whose values are read as JSON when they parse (`3`,
+`true`, `["a"]`) and as text otherwise; both may be combined. `--define`
+takes a path to a JSON file or inline JSON: an authoring definition
+(`{name, verbs, project}` with `["last", "open", "title"]`-style rules), a
+SPEC-087 version-3 contract (`{"kind": "contract", …}`), or the serialised
+contract text. `check` validates without an agent or a send and prints the
+dialect, its verbs, state rules and roles, the exact contract, and the
+verified CBCL dialect (`--cbcl` prints only that). The format is documented in
+[docs/object-definitions.md](../docs/object-definitions.md). `open` declares
+the dialect to the room by self-address before the opener goes out; the
+opener carries no definition, and a member meeting an act of an unlearned
+dialect fetches it by digest.
 
-A rejected action exits with the broker's reason (a cbcl-rs shape blame, a
-protocol violation, a forged field); nothing rejected reaches the wire. An
-object not in loaded history is `object_unknown`; `hark history` fetches more.
+A rejected action exits with cbcl-rs's reason (a shape blame, a protocol
+violation, a role refusal, a forged routing field); nothing rejected reaches
+the wire. An object not in loaded history is `object_unknown`; `hark history`
+fetches more.
 
 ### The message-minting surface: `tell`, `reply`, `error`, and `send`
 

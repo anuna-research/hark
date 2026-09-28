@@ -1031,18 +1031,18 @@ mod tests {
         let registry = DialectRegistry::new();
         let mut store = ThreadedMessageStore::new();
         let action = format!(
-            "(lang object-{hex} (check @room :item \"milk\" :caused-by sha256-{hex} \
+            "(lang sha256-{hex} (check @room :item \"milk\" :caused-by sha256-{hex} \
              :thread \"list-1\" :from @aria))"
         );
         validate_for_emit(&action, &registry, &mut store)
             .expect("an object action with an unknown dialect passes emit validation");
         let opener = format!(
-            "(lang object-{hex} (open @room :title \"Launch\" \
-             :object-spec \"{{\\\"version\\\":2,\\\"contract\\\":\\\"x\\\"}}\" \
+            "(lang sha256-{hex} (open @room :title \"Launch\" \
+             :note \"{{\\\"version\\\":3,\\\"contract\\\":\\\"x\\\"}}\" \
              :caused-by begin :thread \"list-1\" :from @aria))"
         );
         validate_for_emit(&opener, &registry, &mut store)
-            .expect("an object opener with an escaped object-spec passes emit validation");
+            .expect("an object opener with an escaped string field passes emit validation");
     }
 
     #[test]

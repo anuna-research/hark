@@ -1,33 +1,27 @@
 //! SPEC-086 Stage B — native object read/write for hark agents.
 //!
 //! Stage A ([`crate::object_transport`]) made hark a signing transport for
-//! `@cbcl/object` SDK agents: it carries object messages and attests their
-//! authorship, and a JavaScript process does the rest. Stage B lets a *shell*
-//! agent act on objects through hark itself — `hark object read`, `act`,
-//! `open` — without a JavaScript process of its own.
+//! object agents: it carries object messages and attests their authorship.
+//! Stage B lets a *shell* agent act on objects through hark itself — `hark
+//! object read`, `act`, `open` — without a JavaScript process of its own.
 //!
-//! It does so by running the browser's object code, not by porting it. The
-//! SDK's controller, broker, projection combinators and store (`js/vendor/`,
-//! byte-pinned to a cbcl-bus commit in `js/VENDOR.json`) run headlessly in an
-//! embedded QuickJS runtime ([`runtime`]). Everything the browser injects into
-//! that code is a host function backed by hark's Rust side:
+//! Every judgement is cbcl-rs's, linked natively (`cbcl-wasm` at the
+//! revision cbcl-bus ships to browsers, so a wire address hark computes is
+//! the address every browser computes): the SPEC-087 contract compile, the
+//! SPEC-019 admission, fold and intent binder, and the reads. What is left
+//! for a host is bookkeeping — learned dialects, each thread's records, the
+//! acts waiting for a dialect the room has not taught yet — and [`runtime`]
+//! is that bookkeeping, the same the `cbcl` package does for a browser.
+//! Parity holds by cbcl-rs and by the conformance corpus the runtime replays
+//! (`tests/vectors/state`), not by running the browser's code.
 //!
-//! - canonical text and every CBCL verdict (dialect, shape, protocol,
-//!   `message_hash`) come from `cbcl-wasm` linked natively **at the revision
-//!   cbcl-bus ships to browsers**, so a cid hark computes is the cid every
-//!   browser computes;
-//! - the content address is `sha2`;
-//! - `send` is the agent's own signed hub connection ([`crate::daemon::AgentStore::send_outbound`]);
-//! - the history-on-missing-opener request is SPEC-086 CON-002.
+//! The runtime is a single actor thread; every caller talks to it through
+//! [`ObjectsClient`]. Ingestion is fire-and-forget from the receive loop
+//! (never blocking the transport); reads and writes are request/reply.
 //!
-//! The runtime is a single actor thread owning the QuickJS context; every
-//! caller talks to it through [`ObjectsClient`]. Ingestion is fire-and-forget
-//! from the receive loop (never blocking the transport); reads and writes are
-//! request/reply.
-//!
-//! State is not persisted. Like a browser tab, a controller rebuilds its store
-//! from the hub's backfill on join and from history replies (SPEC-086 REQ-003,
-//! REQ-004); only agents with the object subscription feed it.
+//! State is rebuilt from the hub's backfill on join, from history replies
+//! (SPEC-086 REQ-003, REQ-004), and from the per-agent journal (CON-004);
+//! only agents with the object subscription feed it.
 
 pub mod runtime;
 
@@ -67,33 +61,33 @@ pub struct ActOutcome {
 /// it would establish, without sending anything.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CheckOutcome {
-    /// The contract digest: `object-<64hex>`.
+    /// The dialect's self-address, `sha256-<64hex>` over its body (SPEC-019 R.6).
     pub dialect: String,
+    /// The contract's label; no part of identity.
+    pub label: String,
     /// The verb whose predecessor is `begin`.
     pub opener: Option<String>,
+    /// Each verb's parameters, fields and predecessors, as cbcl-rs describes them.
     pub verbs: serde_json::Value,
-    pub project: serde_json::Value,
-    /// The view digest (`view-<64hex>`) when the definition carries one.
+    /// The state rules, `{field: [op, …]}`.
+    pub state: serde_json::Value,
+    /// The roles, when the contract declares any.
     #[serde(default)]
-    pub view: Option<String>,
-    /// The exact artifact text an opener carries in `:object-spec`.
-    pub serialized: String,
-    /// The native CBCL dialect the contract compiles to, verified by cbcl-rs.
+    pub roles: serde_json::Value,
+    /// The exact contract bytes the dialect compiled from.
+    pub contract: String,
+    /// The `(define …)` text every host installs and the room declares.
     pub cbcl: String,
 }
 
 /// The outcome of creating an object: the opener that went out, and the
-/// dialect (contract digest) it established.
+/// dialect (self-address) it established.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenOutcome {
     pub ok: bool,
     pub thread: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialect: Option<String>,
-    /// The view digest distributed with the opener, when the definition
-    /// carried a view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,8 +101,8 @@ pub enum ObjectsError {
     /// The daemon runs without an object runtime, or it has stopped.
     #[error("the object runtime is not available")]
     Unavailable,
-    /// The vendored SDK threw: an invalid definition, a malformed message,
-    /// or a JavaScript failure. The message is the SDK's own.
+    /// cbcl-rs refused: an invalid definition, a malformed message, a
+    /// rejected act. The message is cbcl-rs's own reason.
     #[error("{0}")]
     Failed(String),
 }
@@ -158,9 +152,11 @@ pub(crate) enum Command {
         definition: serde_json::Value,
         reply: oneshot::Sender<Result<CheckOutcome, ObjectsError>>,
     },
-    #[cfg(test)]
-    Spin {
-        reply: oneshot::Sender<Result<(), ObjectsError>>,
+    /// The room's declared dialect menu, `(self-address, digest)` pairs
+    /// (SPEC-015 CON-001): what `fetchdialect` takes for an unknown dialect.
+    Menu {
+        who: AgentIdentity,
+        entries: Vec<(String, String)>,
     },
 }
 
@@ -182,6 +178,13 @@ impl ObjectsClient {
     /// send acknowledgement.
     pub fn ingest(&self, who: AgentIdentity, signer: String, text: String) {
         let _ = self.tx.send(Command::Ingest { who, signer, text });
+    }
+
+    /// The room's declared dialect menu as the hub conveyed it (`roomcfg`).
+    /// Never blocks. The controller asks for every dialect its queue is
+    /// waiting on by the digest the menu gives.
+    pub fn menu(&self, who: AgentIdentity, entries: Vec<(String, String)>) {
+        let _ = self.tx.send(Command::Menu { who, entries });
     }
 
     pub async fn read(
@@ -249,16 +252,6 @@ impl ObjectsClient {
         let _ = self.tx.send(Command::Close { agent });
     }
 
-    /// Test hook: run a script that never yields, to exercise the deadline.
-    #[cfg(test)]
-    pub(crate) async fn spin(&self) -> Result<(), ObjectsError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Spin { reply })
-            .map_err(|_| ObjectsError::Unavailable)?;
-        rx.await.map_err(|_| ObjectsError::Unavailable)?
-    }
-
     /// Compile and verify a definition without sending anything.
     pub async fn check(&self, definition: serde_json::Value) -> Result<CheckOutcome, ObjectsError> {
         let (reply, rx) = oneshot::channel();
@@ -266,48 +259,5 @@ impl ObjectsClient {
             .send(Command::Check { definition, reply })
             .map_err(|_| ObjectsError::Unavailable)?;
         rx.await.map_err(|_| ObjectsError::Unavailable)?
-    }
-}
-
-#[cfg(test)]
-mod vendor_tests {
-    use sha2::{Digest, Sha256};
-
-    /// The vendored SDK is byte-pinned: `VENDOR.json` records the cbcl-bus
-    /// commit and the SHA-256 of every vendored file, and this test holds the
-    /// embedded bytes to it. An edit to a vendored file without a manifest
-    /// update is a fork of the browser's code, which is exactly what running
-    /// the browser's code exists to prevent.
-    #[test]
-    fn vendored_sdk_matches_its_manifest() {
-        let manifest: serde_json::Value =
-            serde_json::from_str(include_str!("js/VENDOR.json")).expect("manifest parses");
-        let files = manifest["files"].as_object().expect("files map");
-        let embedded = super::runtime::vendored_files();
-        assert_eq!(
-            files.len(),
-            embedded.len(),
-            "every vendored file is listed exactly once"
-        );
-        for (name, source) in embedded {
-            let expected = files[name].as_str().expect("hex digest");
-            let actual = format!("{:x}", Sha256::digest(source.as_bytes()));
-            assert_eq!(
-                actual, expected,
-                "{name} differs from the pinned cbcl-bus copy"
-            );
-        }
-        // The manifest's cbcl-rs revision is the one Cargo.toml pins for
-        // cbcl-wasm: the vendored JS and the native verifier move together.
-        let sha = manifest["cbcl_rs_sha"].as_str().expect("cbcl_rs_sha");
-        let cargo = include_str!("../../Cargo.toml");
-        let pin = cargo
-            .lines()
-            .find(|line| line.trim_start().starts_with("cbcl-wasm"))
-            .expect("Cargo.toml pins cbcl-wasm");
-        assert!(
-            pin.contains(&format!("rev = \"{sha}\"")),
-            "Cargo.toml's cbcl-wasm rev must equal VENDOR.json's cbcl_rs_sha ({sha}); run scripts/vendor-objects.sh"
-        );
     }
 }

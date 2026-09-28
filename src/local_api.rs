@@ -128,7 +128,7 @@ pub struct ObjectActResponse {
 }
 
 /// SPEC-086 Stage B: `POST /v1/agents/{handle}/objects`. `definition` is an
-/// SDK authoring definition (`{name, verbs, project}`), a version-2 contract
+/// authoring definition (`{name, verbs, project}`), a version-3 contract
 /// (`{kind: "contract", …}`), or the serialised contract text.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObjectOpenRequest {
@@ -144,8 +144,6 @@ pub struct ObjectOpenResponse {
     pub agent_handle: String,
     pub thread: String,
     pub dialect: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view: Option<String>,
     pub cid: String,
     pub message: String,
 }
@@ -286,7 +284,7 @@ pub struct CreateAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mls_create: Option<bool>,
     /// Chat transport only: the SPEC-086 object subscription (CON-003). Off
-    /// by default. When on, every `object-*` content message in the channel —
+    /// by default. When on, every object content message (a `sha256-<64hex>` dialect) in the channel —
     /// the agent's own and replayed history included — is delivered to `recv`
     /// with an attestation record. Persisted in the pairing record, so a
     /// daemon restart resumes it. Ignored by the router.
@@ -914,10 +912,7 @@ fn router(state: AppState) -> Router {
         )
         .route("/v1/objects/check", post(object_check))
         .route("/v1/agents/{handle}/objects/{thread}", get(object_read))
-        .route(
-            "/v1/agents/{handle}/objects/{thread}/act",
-            post(object_act),
-        )
+        .route("/v1/agents/{handle}/objects/{thread}/act", post(object_act))
         .route("/v1/agents/{handle}/meta/subscribe", post(meta_subscribe))
         .route(
             "/v1/agents/{handle}/meta/unsubscribe",
@@ -978,11 +973,13 @@ async fn create_agent(
     }
 }
 
-/// Strip every object dialect (`object-<64hex>`) from an advertised dialect
+/// Strip every object dialect (`sha256-<64hex>`) from an advertised dialect
 /// set, returning whether any was present (SPEC-086 CON-003).
 fn take_objects(dialects: &mut Vec<String>) -> bool {
     use crate::object_transport::is_object_dialect_name;
-    let present = dialects.iter().any(|dialect| is_object_dialect_name(dialect));
+    let present = dialects
+        .iter()
+        .any(|dialect| is_object_dialect_name(dialect));
     dialects.retain(|dialect| !is_object_dialect_name(dialect));
     present
 }
@@ -1478,8 +1475,8 @@ fn objects_error_to_api(error: ObjectsError) -> ApiError {
             "the object runtime is not available",
             None,
         ),
-        // The vendored SDK's own verdict: an invalid definition, a malformed
-        // message, a rejected intent. Its message is the one a browser shows.
+        // cbcl-rs's own verdict: an invalid definition, a malformed message,
+        // a rejected intent. Its message is the one a browser shows.
         ObjectsError::Failed(reason) => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "object_rejected",
@@ -1566,8 +1563,8 @@ async fn objects_list(
     }))
 }
 
-/// SPEC-086 Stage B: an object's projected state — the same JSON a browser's
-/// view receives, computed by the same code.
+/// SPEC-086 Stage B: an object's state — cbcl-rs's fold over the accepted
+/// acts, the same JSON every browser computes.
 async fn object_read(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1591,7 +1588,10 @@ async fn object_read(
                 StatusCode::NOT_FOUND,
                 "object_unknown",
                 format!("object thread {thread} is not in loaded history"),
-                Some("it may be older than the hub's backfill; `hark history` fetches more".to_owned()),
+                Some(
+                    "it may be older than the hub's backfill; `hark history` fetches more"
+                        .to_owned(),
+                ),
             )
         })?;
     Ok(Json(ObjectReadResponse {
@@ -1602,10 +1602,10 @@ async fn object_read(
     }))
 }
 
-/// SPEC-086 Stage B: act on an object. The vendored broker binds `:from`,
-/// the room and the thread, picks `:caused-by`, fills register and removal
-/// fields, verifies shape and protocol with cbcl-rs, and sends the canonical
-/// message on the agent's connection. A rejection is the broker's own reason.
+/// SPEC-086 Stage B: act on an object. cbcl-rs's intent binder (SPEC-019
+/// R.5) binds recipients, `:thread`, `:caused-by` and `:replaces` from the
+/// accepted set and verifies the act; the daemon signs and sends it on the
+/// agent's connection. A rejection is cbcl-rs's own reason.
 async fn object_act(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1645,9 +1645,10 @@ async fn object_act(
     }
 }
 
-/// SPEC-086 Stage B: create an object. The definition is verified by cbcl-rs,
-/// the opener carries the contract in `:object-spec`, and the agent's own
-/// controller learns it at once so the next act need not wait for the echo.
+/// SPEC-086 Stage B: create an object. cbcl-rs compiles and verifies the
+/// definition; the dialect is declared to the room by self-address
+/// (SPEC-087 REQ-005), the opener goes out, and the agent's own controller
+/// learns both at once so the next act need not wait for the echo.
 async fn object_open(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1676,14 +1677,12 @@ async fn object_open(
         .open(who, request.definition, thread.clone(), fields)
         .await
         .map_err(objects_error_to_api)?;
-    let view = outcome.view.clone();
     match (outcome.ok, outcome.dialect, outcome.cid, outcome.message) {
         (true, Some(dialect), Some(cid), Some(message)) => Ok(Json(ObjectOpenResponse {
             ok: true,
             agent_handle: handle.as_str().to_owned(),
             thread,
             dialect,
-            view,
             cid,
             message,
         })),
@@ -2911,10 +2910,14 @@ mod tests {
     #[test]
     fn take_objects_strips_object_dialects_and_reports_presence() {
         let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut dialects = vec!["cite".to_owned(), format!("object-{hex}"), "vote".to_owned()];
+        let mut dialects = vec![
+            "cite".to_owned(),
+            format!("sha256-{hex}"),
+            "vote".to_owned(),
+        ];
         assert!(super::take_objects(&mut dialects));
         assert_eq!(dialects, ["cite", "vote"]);
-        let mut none = vec!["cite".to_owned(), "object-short".to_owned()];
+        let mut none = vec!["cite".to_owned(), "sha256-short".to_owned()];
         assert!(!super::take_objects(&mut none));
         assert_eq!(none.len(), 2);
     }
@@ -3382,7 +3385,7 @@ mod tests {
         store
             .enqueue_object(
                 &handle,
-                "(lang object-x (check @room))".to_owned(),
+                "(lang sha256-x (check @room))".to_owned(),
                 record.clone(),
             )
             .await
@@ -3399,7 +3402,7 @@ mod tests {
             .json::<serde_json::Value>()
             .await
             .expect("response should decode");
-        assert_eq!(body["message"], "(lang object-x (check @room))");
+        assert_eq!(body["message"], "(lang sha256-x (check @room))");
         assert_eq!(
             body["record"],
             serde_json::json!({
@@ -3625,8 +3628,23 @@ mod tests {
         .await;
         assert_eq!(opened.status(), StatusCode::OK);
         let opened: super::ObjectOpenResponse = opened.json().await.unwrap();
-        assert!(opened.dialect.starts_with("object-"));
-        assert_eq!(sent.lock().unwrap().as_slice(), std::slice::from_ref(&opened.message));
+        assert!(opened.dialect.starts_with("sha256-"), "{}", opened.dialect);
+        {
+            // SPEC-087 REQ-005: the dialect is declared to the room before
+            // the opener goes out; the opener carries no definition.
+            let frames = sent.lock().unwrap();
+            assert_eq!(frames.len(), 2, "{frames:?}");
+            assert!(
+                frames[0].starts_with(&format!(
+                    "(adddialect @general :name {} :def \"(define ",
+                    opened.dialect
+                )),
+                "{}",
+                frames[0]
+            );
+            assert_eq!(frames[1], opened.message);
+            assert!(!opened.message.contains(":object-spec"));
+        }
 
         let listed = authed_get(&server, &base).await;
         assert_eq!(listed.status(), StatusCode::OK);
@@ -3637,7 +3655,10 @@ mod tests {
         let read = authed_get(&server, &format!("{base}/list%201")).await;
         assert_eq!(read.status(), StatusCode::OK);
         let read: super::ObjectReadResponse = read.json().await.unwrap();
-        assert_eq!(read.state, serde_json::json!({ "title": "Groceries", "items": {} }));
+        assert_eq!(
+            read.state,
+            serde_json::json!({ "title": "Groceries", "items": {} })
+        );
 
         let acted = authed_post_json(
             &server,
@@ -3650,8 +3671,8 @@ mod tests {
         assert_eq!(acted.cid.len(), 64);
         {
             let frames = sent.lock().unwrap();
-            assert_eq!(frames.len(), 2);
-            assert!(frames[1].contains(":caused-by sha256-"), "{}", frames[1]);
+            assert_eq!(frames.len(), 3);
+            assert!(frames[2].contains(":caused-by sha256-"), "{}", frames[2]);
         }
 
         let read: super::ObjectReadResponse = authed_get(&server, &format!("{base}/list%201"))
@@ -3659,7 +3680,10 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(read.state, serde_json::json!({ "title": "Groceries", "items": { "milk": true } }));
+        assert_eq!(
+            read.state,
+            serde_json::json!({ "title": "Groceries", "items": { "milk": true } })
+        );
 
         let rejected = authed_post_json(
             &server,
@@ -3669,7 +3693,11 @@ mod tests {
         .await;
         assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error_code(rejected).await, "object_action_rejected");
-        assert_eq!(sent.lock().unwrap().len(), 2, "nothing rejected reaches the wire");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            3,
+            "nothing rejected reaches the wire"
+        );
 
         let unknown = authed_get(&server, &format!("{base}/nope")).await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
@@ -3696,11 +3724,15 @@ mod tests {
             "name": "tally",
             "verbs": { "open": { "causedBy": "begin", "fields": { "title": "string" } },
                        "add": { "causedBy": ["open"], "fields": { "amount": "number", "op": "string" } } },
-            "project": { "title": ["last", "open", "title"], "total": ["sum", ["events", "add", "amount"]] }
+            "project": { "title": ["last", "open", "title"], "amounts": ["events", "add", "amount"], "total": ["sum", "amounts"] }
         });
 
-        let no_runtime =
-            authed_post_json(&server, "/v1/objects/check", serde_json::json!({ "definition": definition })).await;
+        let no_runtime = authed_post_json(
+            &server,
+            "/v1/objects/check",
+            serde_json::json!({ "definition": definition }),
+        )
+        .await;
         assert_eq!(no_runtime.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         store
@@ -3710,12 +3742,20 @@ mod tests {
                 None,
             ))
             .await;
-        let checked =
-            authed_post_json(&server, "/v1/objects/check", serde_json::json!({ "definition": definition })).await;
+        let checked = authed_post_json(
+            &server,
+            "/v1/objects/check",
+            serde_json::json!({ "definition": definition }),
+        )
+        .await;
         assert_eq!(checked.status(), StatusCode::OK);
         let checked: super::ObjectCheckResponse = checked.json().await.unwrap();
-        assert!(checked.dialect.starts_with("object-"));
-        assert_eq!(checked.view, None);
+        assert!(
+            checked.dialect.starts_with("sha256-"),
+            "{}",
+            checked.dialect
+        );
+        assert_eq!(checked.label, "tally");
         assert!(checked.cbcl.contains("(protocol"), "{}", checked.cbcl);
 
         let invalid = authed_post_json(
@@ -3727,7 +3767,12 @@ mod tests {
         assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error_code(invalid).await, "object_rejected");
 
-        let malformed = authed_post_json(&server, "/v1/objects/check", serde_json::json!({ "definition": 3 })).await;
+        let malformed = authed_post_json(
+            &server,
+            "/v1/objects/check",
+            serde_json::json!({ "definition": 3 }),
+        )
+        .await;
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
 
         server.stop().await;
