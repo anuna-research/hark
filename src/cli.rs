@@ -19,8 +19,9 @@ use crate::daemon::{
 };
 use crate::errors::{AppError, AppResult};
 use crate::local_api::{
-    AgentStatus, ClientPingError, CreateAgentRequest, LocalApiClient, LocalApiRequestError,
-    MetaPublishRequest, MetaQueryRequest, MetaSubscribeRequest, SendMessageKind, SendRequest,
+    AgentStatus, ClientPingError, CreateAgentRequest, HistoryRequest, LocalApiClient,
+    LocalApiRequestError, MetaPublishRequest, MetaQueryRequest, MetaSubscribeRequest,
+    ObjectActRequest, ObjectCheckRequest, ObjectOpenRequest, SendMessageKind, SendRequest,
     serve_local_api_with_agents,
 };
 
@@ -51,6 +52,15 @@ pub enum Command {
     Init(InitArgs),
     #[command(about = "Receive one CBCL message for the current agent handle")]
     Recv(RecvArgs),
+    #[command(
+        about = "Ask the hub for older room history (SPEC-086); the frames arrive through `hark recv`"
+    )]
+    History(HistoryArgs),
+    #[command(
+        about = "Read, act on, and create hypermedia objects in the joined channel (SPEC-086 Stage B; needs `join --objects`)"
+    )]
+    #[command(subcommand)]
+    Object(ObjectCommand),
     #[command(about = "Validate and send a CBCL reply message")]
     Reply(MessageInputArgs),
     #[command(about = "Validate and send a CBCL error message")]
@@ -188,6 +198,11 @@ pub struct JoinArgs {
         help = "Chat hub WebSocket URL (…/chat/v1); defaults to the configured hub or the public hub"
     )]
     pub hub: Option<String>,
+    #[arg(
+        long = "objects",
+        help = "Subscribe to hypermedia-object messages (SPEC-086): every object message (a `sha256-<64hex>` dialect) in the channel, including this agent's own and replayed history, reaches `recv` with an attestation record"
+    )]
+    pub objects: bool,
 }
 
 #[derive(Debug, Args)]
@@ -204,6 +219,11 @@ pub struct PairArgs {
         help = "Chat hub WebSocket URL; defaults to the configured hub or the public hub"
     )]
     pub hub: Option<String>,
+    #[arg(
+        long = "objects",
+        help = "Subscribe to hypermedia-object messages (SPEC-086). Implied when the pairing record lists an object dialect (sha256-<64hex>)"
+    )]
+    pub objects: bool,
 }
 
 #[derive(Debug, Args)]
@@ -244,6 +264,103 @@ pub struct InitArgs {
 pub struct RecvArgs {
     #[arg(long = "timeout", help = "Maximum wait, using ms, s, m, or h")]
     pub timeout: Option<String>,
+    #[arg(
+        long = "record",
+        help = "Print the JSON recv response (message plus the SPEC-086 attestation record) instead of the bare message bytes"
+    )]
+    pub record: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ObjectCommand {
+    #[command(
+        about = "Validate a definition without sending: prints its dialect (self-address), verbs, state rules, the contract, and the CBCL dialect cbcl-rs verified"
+    )]
+    Check(ObjectCheckArgs),
+    #[command(about = "List the object threads this agent has learned from the room")]
+    List,
+    #[command(about = "Print an object's projected state as JSON")]
+    Read(ObjectReadArgs),
+    #[command(
+        about = "Act on an object: cbcl-rs binds provenance, picks the predecessor and verifies the act; the daemon signs and sends"
+    )]
+    Act(ObjectActArgs),
+    #[command(
+        about = "Create an object from a contract definition: verifies it, declares the dialect to the room, sends the opener"
+    )]
+    Open(ObjectOpenArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ObjectCheckArgs {
+    #[arg(
+        long = "define",
+        value_name = "FILE|JSON",
+        help = "The definition to validate: a path to a JSON file or inline JSON, in any form `open --define` accepts (see docs/object-definitions.md)"
+    )]
+    pub define: String,
+    #[arg(
+        long = "cbcl",
+        help = "Print only the native CBCL dialect the contract compiles to"
+    )]
+    pub cbcl: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ObjectReadArgs {
+    #[arg(help = "The object's thread id")]
+    pub thread: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ObjectActArgs {
+    #[arg(help = "The object's thread id")]
+    pub thread: String,
+    #[arg(help = "The verb to perform, from the object's contract")]
+    pub verb: String,
+    #[arg(help = "Fields as a JSON object, e.g. '{\"item\":\"milk\",\"done\":true}'")]
+    pub fields: Option<String>,
+    #[arg(
+        long = "field",
+        value_name = "KEY=VALUE",
+        help = "One field; the value is read as JSON when it parses (numbers, booleans, lists), else as text. Repeatable"
+    )]
+    pub field: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ObjectOpenArgs {
+    #[arg(
+        long = "define",
+        value_name = "FILE|JSON",
+        help = "The definition: a path to a JSON file, or inline JSON — an authoring definition ({name, verbs, project}), a version-3 contract ({kind: \"contract\", …}), or the serialised contract text. Versions 1 and 2 are refused by name"
+    )]
+    pub define: String,
+    #[arg(long = "thread", help = "The new object's thread id")]
+    pub thread: String,
+    #[arg(help = "Opener fields as a JSON object")]
+    pub fields: Option<String>,
+    #[arg(
+        long = "field",
+        value_name = "KEY=VALUE",
+        help = "One opener field; repeatable"
+    )]
+    pub field: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct HistoryArgs {
+    #[arg(
+        long = "limit",
+        default_value_t = 1000,
+        help = "How many recent frames to ask for (1–1000; the hub clamps at its own ceiling)"
+    )]
+    pub limit: usize,
+    #[arg(
+        long = "room",
+        help = "Room to fetch (@name); defaults to the channel the current agent joined"
+    )]
+    pub room: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -292,6 +409,8 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Pair(args) => pair_command(args).await,
         Command::Init(args) => init_command(args).await,
         Command::Recv(args) => recv_command(args).await,
+        Command::History(args) => history_command(args).await,
+        Command::Object(command) => object_command(command).await,
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args).await,
         Command::Error(args) => send_message_command(SendMessageKind::Error, args).await,
         Command::Tell(args) => tell_command(args).await,
@@ -420,8 +539,9 @@ async fn join_command(args: JoinArgs) -> AppResult<()> {
     for dialect in &args.speak {
         // `*` is the receive-all sentinel (deliver every channel message to
         // `recv`), interpreted by the daemon — not a concrete dialect id, so
-        // it is exempt from the id grammar.
-        if dialect != "*" {
+        // it is exempt from the id grammar. An object dialect (SPEC-086) is
+        // the object subscription and is exempt for the same reason.
+        if dialect != "*" && !crate::object_transport::is_object_dialect_name(dialect) {
             validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
         }
         if !seen.insert(dialect) {
@@ -487,6 +607,7 @@ async fn join_command(args: JoinArgs) -> AppResult<()> {
             // `join` never bootstraps an MLS group; `init --mls-create` is the
             // room-creator path (SPEC-013 REQ-016 operator intent).
             mls_create: None,
+            objects: args.objects.then_some(true),
         })
         .await
         .map_err(map_local_api_request_error)?;
@@ -592,6 +713,9 @@ async fn pair_command(args: PairArgs) -> AppResult<()> {
             // A paired agent joins an existing channel; it is never the MLS
             // room creator (SPEC-013 REQ-016 stays an explicit operator act).
             mls_create: None,
+            // SPEC-086 CON-003: explicit, or implied by an object dialect in
+            // the record's chosen dialects (the daemon strips and honours those).
+            objects: args.objects.then_some(true),
         })
         .await
         .map_err(map_local_api_request_error)?;
@@ -609,9 +733,17 @@ async fn pair_command(args: PairArgs) -> AppResult<()> {
     // addressed by the wire `@name` cbcl-bus assigned (CBCL_AGENT_HANDLE
     // accepts it). Without this each shell falls back to the daemon's single
     // active-handle slot and both collapse onto the last-paired agent.
+    let objects = args.objects
+        || record
+            .dialects
+            .iter()
+            .any(|dialect| crate::object_transport::is_object_dialect_name(&dialect.name));
     eprintln!(
-        "paired into {} as {} (added by {}) · speaking: {speaking}",
-        record.channel, handle, record.adder
+        "paired into {} as {} (added by {}) · speaking: {speaking}{}",
+        record.channel,
+        handle,
+        record.adder,
+        if objects { " · objects: on" } else { "" }
     );
     println!("export CBCL_AGENT_HANDLE='{}'", shell_single_quote(&handle));
     Ok(())
@@ -669,6 +801,7 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
             cap: args.cap,
             added_by: None,
             mls_create: if args.mls_create { Some(true) } else { None },
+            objects: None,
         })
         .await
         .map_err(map_local_api_request_error)?;
@@ -705,7 +838,203 @@ async fn recv_command(args: RecvArgs) -> AppResult<()> {
         .recv(&handle, timeout_ms)
         .await
         .map_err(map_local_api_request_error)?;
-    println!("{}", response.message);
+    if args.record {
+        // SPEC-086 ADR-002: the JSON response, record included (absent for a
+        // message the object subscription did not deliver).
+        println!(
+            "{}",
+            serde_json::to_string(&response)
+                .map_err(|error| AppError::Internal(error.to_string()))?
+        );
+    } else {
+        println!("{}", response.message);
+    }
+    Ok(())
+}
+
+/// SPEC-086 Stage B: `hark object list|read|act|open`. Every subcommand talks
+/// to the daemon's object runtime for the current agent, which must have
+/// joined with `--objects`.
+async fn object_command(command: ObjectCommand) -> AppResult<()> {
+    let client = discover_live_client().await?;
+    if let ObjectCommand::Check(args) = command {
+        // Needs the runtime, not an agent: a definition can be checked before
+        // any channel is joined.
+        let definition = read_object_definition(&args.define)?;
+        let response = client
+            .object_check(&ObjectCheckRequest { definition })
+            .await
+            .map_err(map_local_api_request_error)?;
+        if args.cbcl {
+            println!("{}", response.cbcl);
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response)
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+            );
+        }
+        return Ok(());
+    }
+    let handle = resolve_session_handle(&client).await?;
+    match command {
+        ObjectCommand::Check(_) => unreachable!("handled above"),
+        ObjectCommand::List => {
+            let response = client
+                .objects_list(&handle)
+                .await
+                .map_err(map_local_api_request_error)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response.objects)
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+            );
+        }
+        ObjectCommand::Read(args) => {
+            let response = client
+                .object_read(&handle, &args.thread)
+                .await
+                .map_err(map_local_api_request_error)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response.state)
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+            );
+        }
+        ObjectCommand::Act(args) => {
+            let fields = object_fields_from_cli(args.fields.as_deref(), &args.field)?;
+            let response = client
+                .object_act(
+                    &handle,
+                    &args.thread,
+                    &ObjectActRequest {
+                        verb: args.verb,
+                        fields,
+                    },
+                )
+                .await
+                .map_err(map_local_api_request_error)?;
+            println!("{}", response.cid);
+        }
+        ObjectCommand::Open(args) => {
+            let definition = read_object_definition(&args.define)?;
+            let fields = object_fields_from_cli(args.fields.as_deref(), &args.field)?;
+            let response = client
+                .object_open(
+                    &handle,
+                    &ObjectOpenRequest {
+                        definition,
+                        thread: args.thread,
+                        fields,
+                    },
+                )
+                .await
+                .map_err(map_local_api_request_error)?;
+            eprintln!(
+                "opened {} as {} · cid {}",
+                response.thread, response.dialect, response.cid
+            );
+            println!("{}", response.dialect);
+        }
+    }
+    Ok(())
+}
+
+/// A definition given inline as JSON or as a path to a JSON file.
+fn read_object_definition(source: &str) -> AppResult<serde_json::Value> {
+    let trimmed = source.trim();
+    let text = if trimmed.starts_with('{') {
+        trimmed.to_owned()
+    } else {
+        fs::read_to_string(trimmed).map_err(|error| {
+            AppError::Usage(format!(
+                "could not read the definition file {trimmed}: {error}"
+            ))
+        })?
+    };
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| AppError::Usage(format!("the definition is not valid JSON: {error}")))?;
+    if !value.is_object() {
+        return Err(AppError::Usage(
+            "the definition must be a JSON object".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+/// Merge a positional JSON object with repeated `--field key=value` pairs.
+/// A pair's value is read as JSON when it parses — `3`, `true`, `["a","b"]`,
+/// `"quoted"` — and as plain text otherwise, so `--field item=milk` works.
+fn object_fields_from_cli(json: Option<&str>, pairs: &[String]) -> AppResult<serde_json::Value> {
+    let mut fields = match json.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(serde_json::Value::Object(map)) => map,
+            Ok(_) => {
+                return Err(AppError::Usage("fields must be a JSON object".to_owned()));
+            }
+            Err(error) => {
+                return Err(AppError::Usage(format!(
+                    "fields are not valid JSON: {error}"
+                )));
+            }
+        },
+        None => serde_json::Map::new(),
+    };
+    for pair in pairs {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(AppError::Usage(format!(
+                "--field expects KEY=VALUE, got {pair:?}"
+            )));
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(AppError::Usage(format!(
+                "--field expects KEY=VALUE, got {pair:?}"
+            )));
+        }
+        let value = serde_json::from_str::<serde_json::Value>(value.trim())
+            .unwrap_or_else(|_| serde_json::Value::String(value.to_owned()));
+        fields.insert(key.to_owned(), value);
+    }
+    Ok(serde_json::Value::Object(fields))
+}
+
+/// SPEC-086 CON-002: `hark history [--limit N] [--room @name]`. The request
+/// goes out on the current agent's own hub connection; the replayed frames
+/// arrive through `hark recv` (with `replayed: true` in their records).
+async fn history_command(args: HistoryArgs) -> AppResult<()> {
+    if !(1..=crate::object_transport::HISTORY_LIMIT_MAX).contains(&args.limit) {
+        return Err(AppError::Usage(format!(
+            "--limit must be between 1 and {}",
+            crate::object_transport::HISTORY_LIMIT_MAX
+        )));
+    }
+    let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client).await?;
+    let room = match args.room {
+        Some(room) => {
+            crate::config::validate_chat_handle("room", &room)
+                .map_err(|error| AppError::Usage(error.to_string()))?;
+            room
+        }
+        None => {
+            let (channel, _wire_handle) = agent_chat_channel(&client, &handle).await?;
+            channel.ok_or_else(|| {
+                AppError::Usage(
+                    "history needs a chat-hub agent with a channel; pass --room or join one"
+                        .to_owned(),
+                )
+            })?
+        }
+    };
+    client
+        .history(&handle, &HistoryRequest::new(room.clone(), args.limit))
+        .await
+        .map_err(map_local_api_request_error)?;
+    eprintln!(
+        "history requested for {room} (limit {}); frames arrive via `hark recv`",
+        args.limit
+    );
     Ok(())
 }
 
@@ -729,8 +1058,9 @@ fn validate_init_advertisement(dialects: &[String]) -> AppResult<()> {
     for dialect in dialects {
         // `*` is the receive-all sentinel (deliver every channel message to
         // `recv`), interpreted by the daemon — not a concrete dialect id, so
-        // it is exempt from the id grammar.
-        if dialect != "*" {
+        // it is exempt from the id grammar. An object dialect (SPEC-086) is
+        // the object subscription and is exempt for the same reason.
+        if dialect != "*" && !crate::object_transport::is_object_dialect_name(dialect) {
             validate_dialect_id(dialect).map_err(|error| AppError::Usage(error.to_string()))?;
         }
         if !seen.insert(dialect) {
@@ -1315,6 +1645,23 @@ async fn daemon_run() -> AppResult<()> {
     })?;
 
     let agents = AgentStore::new(AgentStoreConfig::from_config(&config));
+    // SPEC-086 Stage B: the object runtime — one controller per agent over
+    // cbcl-rs linked natively — on its own thread, fed by every object
+    // delivery and driven by `hark object …`.
+    agents
+        .attach_objects(crate::objects::runtime::spawn(
+            agents.clone(),
+            tokio::runtime::Handle::current(),
+            // CON-004: the object journal lives beside the identity keys and
+            // the pairing store, the durable owner-only home of this class of
+            // material. No chat config, no journal (the router transport has
+            // no objects).
+            config
+                .validate_chat()
+                .ok()
+                .map(|chat| chat.identity_dir.join("objects")),
+        ))
+        .await;
     // SPEC-026 REQ-008: bring back every agent the last daemon had, before the
     // server is awaited and without blocking readiness on it. A restart used to
     // drop every agent and require re-pairing by hand.
@@ -1733,6 +2080,61 @@ mod tests {
 
         assert_eq!(args.dialects, ["elf", "arena-v1"]);
         assert!(args.json);
+    }
+
+    /// SPEC-086 Stage B: `hark object act` takes fields as a JSON object, as
+    /// `--field KEY=VALUE` pairs (JSON-valued when they parse), or both.
+    #[test]
+    fn object_fields_merge_json_and_pairs() {
+        let fields = super::object_fields_from_cli(
+            Some(r#"{"item":"milk"}"#),
+            &[
+                "done=true".to_owned(),
+                "count=3".to_owned(),
+                "note=plain text".to_owned(),
+                "tags=[\"a\"]".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            fields,
+            serde_json::json!({"item": "milk", "done": true, "count": 3, "note": "plain text", "tags": ["a"]})
+        );
+        assert!(
+            super::object_fields_from_cli(Some("[1]"), &[]).is_err(),
+            "not an object"
+        );
+        assert!(super::object_fields_from_cli(None, &["novalue".to_owned()]).is_err());
+        assert_eq!(
+            super::object_fields_from_cli(None, &[]).unwrap(),
+            serde_json::json!({})
+        );
+
+        let cli = Cli::try_parse_from([
+            "hark",
+            "object",
+            "act",
+            "list-1",
+            "check",
+            "--field",
+            "item=milk",
+            "--field",
+            "done=true",
+        ])
+        .unwrap();
+        let Command::Object(super::ObjectCommand::Act(args)) = cli.command else {
+            panic!("parsed as object act");
+        };
+        assert_eq!(
+            (args.thread.as_str(), args.verb.as_str()),
+            ("list-1", "check")
+        );
+        assert_eq!(args.field, ["item=milk", "done=true"]);
+
+        let inline =
+            super::read_object_definition(r#" {"name":"x","verbs":{},"project":{}} "#).unwrap();
+        assert_eq!(inline["name"], "x");
+        assert!(super::read_object_definition("/nonexistent/definition.json").is_err());
     }
 
     #[test]

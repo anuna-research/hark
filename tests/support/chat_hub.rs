@@ -45,6 +45,16 @@ pub enum Act {
     /// `AcceptAndSend`, then drop the socket. The redeploy that happens after
     /// the client has already seen some history.
     AcceptThenDropAfterSending { enc: bool, send: Vec<String> },
+    /// SPEC-086: acknowledge, push `send` as the join backfill, then keep
+    /// serving like a real hub does for an object agent: every content frame
+    /// the client sends (`(lang …)` / `(tell …)`) is fanned back to it, and a
+    /// `(history …)` request is answered with `history` — raw archived frames,
+    /// oldest first, no wrapper and no end marker (cbcl-chat-room:history).
+    AcceptAndServe {
+        enc: bool,
+        send: Vec<String>,
+        history: Vec<String>,
+    },
     /// Reject the join outright: `(error <channel> "<slug>")`, socket left open,
     /// exactly as cbcl-bus does.
     Reject { slug: String },
@@ -263,7 +273,7 @@ async fn serve(
             .expect("transcript lock")
             .get_mut(index)
             .expect("transcript slot exists")
-            .push(text);
+            .push(text.clone());
 
         if is_hello && !acked {
             acked = true;
@@ -272,6 +282,7 @@ async fn serve(
                 Act::Accept { enc }
                 | Act::AcceptThenDrop { enc, .. }
                 | Act::AcceptAndSend { enc, .. }
+                | Act::AcceptAndServe { enc, .. }
                 | Act::AcceptThenDropAfterSending { enc, .. } => {
                     format!("(roomcfg {channel} :enc {enc})")
                 }
@@ -287,8 +298,9 @@ async fn serve(
             // Backfill-on-join: a real hub replays the room's recent history
             // straight after the ack, on EVERY successful hello — including a
             // reconnect's.
-            if let Act::AcceptAndSend { send, .. } | Act::AcceptThenDropAfterSending { send, .. } =
-                &act
+            if let Act::AcceptAndSend { send, .. }
+            | Act::AcceptAndServe { send, .. }
+            | Act::AcceptThenDropAfterSending { send, .. } = &act
             {
                 for frame in send {
                     if ws
@@ -323,6 +335,24 @@ async fn serve(
             if let Act::AcceptThenDrop { after_frames, .. } = act {
                 if frames_after_ack >= after_frames {
                     return;
+                }
+            }
+            if let Act::AcceptAndServe { history, .. } = &act {
+                let replies: Vec<String> = if text.starts_with("(history ") {
+                    history.clone()
+                } else if text.starts_with("(lang ") || text.starts_with("(tell ") {
+                    vec![text.clone()]
+                } else {
+                    Vec::new()
+                };
+                for frame in replies {
+                    if ws
+                        .send(Message::Binary(hub_frame(&frame).into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }

@@ -22,6 +22,8 @@ use tokio::{net::TcpListener, sync::oneshot};
 use crate::cbcl_validation::{
     CbclValidationError, MessageKind, validate_for_emit, validate_for_send_with_context,
 };
+use crate::object_transport::ObjectRecord;
+use crate::objects::{ObjectSummary, ObjectsError};
 use crate::{
     chat::{ChatError, create_chat_agent},
     config::{AppConfig, ConfigError, Transport, validate_chat_handle},
@@ -60,7 +62,100 @@ pub struct StopResponse {
 pub struct RecvResponse {
     pub agent_handle: String,
     pub message: String,
+    /// SPEC-086 REQ-002/CON-001: the attestation record of an object message
+    /// delivered under the object subscription. Additive (ADR-002): absent for
+    /// every other message, and existing consumers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<ObjectRecord>,
 }
+
+/// SPEC-086 CON-002: `POST /v1/agents/{handle}/history`.
+///
+/// `limit` is recognised here rather than typed as an integer so that any
+/// non-conforming value — a string, a float, a negative, out of range —
+/// answers with the contract's `malformed_history_request` instead of a
+/// generic body-rejection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryRequest {
+    pub room: String,
+    pub limit: serde_json::Value,
+}
+
+impl HistoryRequest {
+    pub fn new(room: impl Into<String>, limit: usize) -> Self {
+        Self {
+            room: room.into(),
+            limit: serde_json::Value::from(limit),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct HistoryResponse {
+    pub ok: bool,
+}
+
+/// SPEC-086 Stage B: `GET /v1/agents/{handle}/objects`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectsListResponse {
+    pub agent_handle: String,
+    pub objects: Vec<ObjectSummary>,
+}
+
+/// SPEC-086 Stage B: `GET /v1/agents/{handle}/objects/{thread}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObjectReadResponse {
+    pub agent_handle: String,
+    pub thread: String,
+    pub dialect: String,
+    pub state: serde_json::Value,
+}
+
+/// SPEC-086 Stage B: `POST /v1/agents/{handle}/objects/{thread}/act`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObjectActRequest {
+    pub verb: String,
+    #[serde(default)]
+    pub fields: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectActResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+    pub thread: String,
+    pub cid: String,
+}
+
+/// SPEC-086 Stage B: `POST /v1/agents/{handle}/objects`. `definition` is an
+/// authoring definition (`{name, verbs, project}`), a version-3 contract
+/// (`{kind: "contract", …}`), or the serialised contract text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObjectOpenRequest {
+    pub definition: serde_json::Value,
+    pub thread: String,
+    #[serde(default)]
+    pub fields: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectOpenResponse {
+    pub ok: bool,
+    pub agent_handle: String,
+    pub thread: String,
+    pub dialect: String,
+    pub cid: String,
+    pub message: String,
+}
+
+/// SPEC-086 Stage B: `POST /v1/objects/check` — compile and verify a
+/// definition without an agent and without sending.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObjectCheckRequest {
+    pub definition: serde_json::Value,
+}
+
+pub type ObjectCheckResponse = crate::objects::CheckOutcome;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CloseResponse {
@@ -188,6 +283,13 @@ pub struct CreateAgentRequest {
     /// a pinned-encrypted channel. Ignored by the router.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mls_create: Option<bool>,
+    /// Chat transport only: the SPEC-086 object subscription (CON-003). Off
+    /// by default. When on, every object content message (a `sha256-<64hex>` dialect) in the channel —
+    /// the agent's own and replayed history included — is delivered to `recv`
+    /// with an attestation record. Persisted in the pairing record, so a
+    /// daemon restart resumes it. Ignored by the router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objects: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -475,6 +577,114 @@ impl LocalApiClient {
         decode_api_response(response).await
     }
 
+    /// SPEC-086 CON-002: request older room history for `handle`'s room.
+    pub async fn history(
+        &self,
+        handle: &AgentHandle,
+        request: &HistoryRequest,
+    ) -> Result<HistoryResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/v1/agents/{}/history", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+
+        decode_api_response(response).await
+    }
+
+    /// SPEC-086 Stage B: the object threads the agent's controller knows.
+    pub async fn objects_list(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<ObjectsListResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/v1/agents/{}/objects", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    /// SPEC-086 Stage B: an object's projected state.
+    pub async fn object_read(
+        &self,
+        handle: &AgentHandle,
+        thread: &str,
+    ) -> Result<ObjectReadResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .get(self.url(&format!(
+                "/v1/agents/{}/objects/{}",
+                handle.as_str(),
+                urlencoded(thread)
+            )))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    /// SPEC-086 Stage B: act on an object.
+    pub async fn object_act(
+        &self,
+        handle: &AgentHandle,
+        thread: &str,
+        request: &ObjectActRequest,
+    ) -> Result<ObjectActResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!(
+                "/v1/agents/{}/objects/{}/act",
+                handle.as_str(),
+                urlencoded(thread)
+            )))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    /// SPEC-086 Stage B: validate a definition without sending.
+    pub async fn object_check(
+        &self,
+        request: &ObjectCheckRequest,
+    ) -> Result<ObjectCheckResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url("/v1/objects/check"))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
+    /// SPEC-086 Stage B: create an object.
+    pub async fn object_open(
+        &self,
+        handle: &AgentHandle,
+        request: &ObjectOpenRequest,
+    ) -> Result<ObjectOpenResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/v1/agents/{}/objects", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
     pub async fn meta_subscribe(
         &self,
         handle: &AgentHandle,
@@ -695,6 +905,14 @@ fn router(state: AppState) -> Router {
         .route("/v1/agents", get(agents).post(create_agent))
         .route("/v1/agents/{handle}/recv", get(recv))
         .route("/v1/agents/{handle}/send", post(send))
+        .route("/v1/agents/{handle}/history", post(history))
+        .route(
+            "/v1/agents/{handle}/objects",
+            get(objects_list).post(object_open),
+        )
+        .route("/v1/objects/check", post(object_check))
+        .route("/v1/agents/{handle}/objects/{thread}", get(object_read))
+        .route("/v1/agents/{handle}/objects/{thread}/act", post(object_act))
         .route("/v1/agents/{handle}/meta/subscribe", post(meta_subscribe))
         .route(
             "/v1/agents/{handle}/meta/unsubscribe",
@@ -722,6 +940,13 @@ async fn create_agent(
     // channel to observe.
     let mut request = request;
     let receive_all = take_receive_all(&mut request.dialects);
+    // SPEC-086 CON-003: an object dialect in the dialect set IS the object
+    // subscription. A pairing record lists what the adder chose from the
+    // room's menu, and a room's menu lists its objects by contract digest, so
+    // a paired agent whose adder picked an object arrives subscribed. The
+    // digests are stripped before advertisement validation: they are not
+    // capabilities, and they exceed the dialect-id grammar.
+    let objects = request.objects.unwrap_or(false) | take_objects(&mut request.dialects);
     AgentStore::validate_advertisement(&request.dialects).map_err(agent_error_to_api)?;
     // The configured hub URL's path decides the transport (config::transport).
     match state.config.transport().map_err(config_error_to_api)? {
@@ -734,10 +959,29 @@ async fn create_agent(
                     None,
                 ));
             }
+            if objects {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "objects_unsupported",
+                    "the object subscription is only supported on a chat channel, not the router transport",
+                    None,
+                ));
+            }
             create_router_transport_agent(state, request).await
         }
-        Transport::Chat => create_chat_transport_agent(state, request, receive_all).await,
+        Transport::Chat => create_chat_transport_agent(state, request, receive_all, objects).await,
     }
+}
+
+/// Strip every object dialect (`sha256-<64hex>`) from an advertised dialect
+/// set, returning whether any was present (SPEC-086 CON-003).
+fn take_objects(dialects: &mut Vec<String>) -> bool {
+    use crate::object_transport::is_object_dialect_name;
+    let present = dialects
+        .iter()
+        .any(|dialect| is_object_dialect_name(dialect));
+    dialects.retain(|dialect| !is_object_dialect_name(dialect));
+    present
 }
 
 /// Strip the receive-all sentinel `*` from an advertised dialect set, returning
@@ -815,6 +1059,7 @@ async fn create_chat_transport_agent(
     state: AppState,
     request: CreateAgentRequest,
     receive_all: bool,
+    objects: bool,
 ) -> Result<Json<CreateAgentResponse>, ApiError> {
     let chat = state.config.validate_chat().map_err(config_error_to_api)?;
     let wire_handle = request
@@ -908,6 +1153,7 @@ async fn create_chat_transport_agent(
         mls,
         request.mls_create.unwrap_or(false),
         receive_all,
+        objects,
         None, // a fresh join mints a new handle; only a resume supplies one
     )
     .await
@@ -917,6 +1163,12 @@ async fn create_chat_transport_agent(
         warnings.push(format!(
             "receiving all messages in {channel} (dialect `*`); every channel message is \
              delivered to `recv`, not only answerable asks"
+        ));
+    }
+    if objects {
+        warnings.push(format!(
+            "object subscription active in {channel} (SPEC-086); every object message, \
+             including this agent's own and replayed history, is delivered to `recv` with a record"
         ));
     }
 
@@ -932,6 +1184,7 @@ async fn create_chat_transport_agent(
         cap: cap.clone(),
         added_by: request.added_by.clone(),
         receive_all,
+        objects,
     };
     if let Err(error) = crate::pairing::store::PairingStore::new(&chat.identity_dir).upsert(record)
     {
@@ -948,6 +1201,20 @@ async fn create_chat_transport_agent(
         state: "connected".to_owned(),
         warnings,
     }))
+}
+
+/// Percent-encode a path segment (an object thread is free text).
+fn urlencoded(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Map a wire handle to a key filename: strip the leading `@` and keep only
@@ -1131,15 +1398,303 @@ async fn recv(
         Some(value) => Some(std::time::Duration::from_millis(value)),
         None => None,
     };
-    let message = state
+    let inbound = state
         .agents
-        .recv(&handle, timeout)
+        .recv_inbound(&handle, timeout)
         .await
         .map_err(agent_error_to_api)?;
     Ok(Json(RecvResponse {
         agent_handle: handle.as_str().to_owned(),
-        message,
+        message: inbound.message,
+        record: inbound.record,
     }))
+}
+
+/// How long a `(history …)` request holds its room's one in-flight slot
+/// (SPEC-086 CON-002). The hub answers with raw frames and no end marker, so
+/// "unanswered" is bounded by time; a later request re-fetches at worst
+/// (ADR-003: the SDK deduplicates by cid).
+const HISTORY_IN_FLIGHT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// SPEC-086 CON-002: ask the hub for older room history on the agent's own
+/// connection. Replies arrive through `recv` like any other object message
+/// (REQ-004).
+async fn history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Json(request): Json<HistoryRequest>,
+) -> Result<(StatusCode, Json<HistoryResponse>), ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let limit = match request.limit.as_u64() {
+        Some(limit) if (1..=crate::object_transport::HISTORY_LIMIT_MAX as u64).contains(&limit) => {
+            limit as usize
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "malformed_history_request",
+                format!(
+                    "limit must be an integer in 1..={}",
+                    crate::object_transport::HISTORY_LIMIT_MAX
+                ),
+                None,
+            ));
+        }
+    };
+    let room = request.room.trim();
+    if validate_chat_handle("room", room).is_err() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_history_request",
+            "room must be a channel handle (@name)",
+            None,
+        ));
+    }
+    let wire_handle = state
+        .agents
+        .begin_history(&handle, room, HISTORY_IN_FLIGHT_WINDOW)
+        .await
+        .map_err(agent_error_to_api)?;
+    let frame = crate::object_transport::history_request_frame(room, limit, &wire_handle);
+    if let Err(error) = state.agents.send_control_outbound(&handle, frame).await {
+        // The request never reached the wire: nothing is in flight.
+        state.agents.end_history(&handle).await;
+        return Err(agent_error_to_api(error));
+    }
+    Ok((StatusCode::ACCEPTED, Json(HistoryResponse { ok: true })))
+}
+
+fn objects_error_to_api(error: ObjectsError) -> ApiError {
+    match error {
+        ObjectsError::Unavailable => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "objects_unavailable",
+            "the object runtime is not available",
+            None,
+        ),
+        // cbcl-rs's own verdict: an invalid definition, a malformed message,
+        // a rejected intent. Its message is the one a browser shows.
+        ObjectsError::Failed(reason) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "object_rejected",
+            reason,
+            None,
+        ),
+    }
+}
+
+/// A JSON object of fields for an intent or an opener; absent means empty.
+fn object_fields(fields: serde_json::Value) -> Result<serde_json::Value, ApiError> {
+    match fields {
+        serde_json::Value::Null => Ok(serde_json::json!({})),
+        value @ serde_json::Value::Object(_) => Ok(value),
+        _ => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+            "fields must be a JSON object",
+            None,
+        )),
+    }
+}
+
+fn non_empty(value: &str, what: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+            format!("{what} must not be empty"),
+            None,
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+/// SPEC-086 Stage B: validate a definition the way the browser's import
+/// dialog would, and report what an opener built from it would establish.
+async fn object_check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ObjectCheckRequest>,
+) -> Result<Json<ObjectCheckResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    if !(request.definition.is_object() || request.definition.is_string()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+            "definition must be a JSON object or the serialised artifact text",
+            None,
+        ));
+    }
+    let objects = state
+        .agents
+        .objects_client()
+        .await
+        .map_err(agent_error_to_api)?;
+    let outcome = objects
+        .check(request.definition)
+        .await
+        .map_err(objects_error_to_api)?;
+    Ok(Json(outcome))
+}
+
+/// SPEC-086 Stage B: the object threads this agent's controller has learned.
+async fn objects_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Result<Json<ObjectsListResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let (objects, who) = state
+        .agents
+        .objects_for(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let listed = objects.list(who).await.map_err(objects_error_to_api)?;
+    Ok(Json(ObjectsListResponse {
+        agent_handle: handle.as_str().to_owned(),
+        objects: listed,
+    }))
+}
+
+/// SPEC-086 Stage B: an object's state — cbcl-rs's fold over the accepted
+/// acts, the same JSON every browser computes.
+async fn object_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((handle, thread)): Path<(String, String)>,
+) -> Result<Json<ObjectReadResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let thread = non_empty(&thread, "thread")?;
+    let (objects, who) = state
+        .agents
+        .objects_for(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let state = objects
+        .read(who, thread.clone())
+        .await
+        .map_err(objects_error_to_api)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "object_unknown",
+                format!("object thread {thread} is not in loaded history"),
+                Some(
+                    "it may be older than the hub's backfill; `hark history` fetches more"
+                        .to_owned(),
+                ),
+            )
+        })?;
+    Ok(Json(ObjectReadResponse {
+        agent_handle: handle.as_str().to_owned(),
+        thread: state.thread,
+        dialect: state.dialect,
+        state: state.state,
+    }))
+}
+
+/// SPEC-086 Stage B: act on an object. cbcl-rs's intent binder (SPEC-019
+/// R.5) binds recipients, `:thread`, `:caused-by` and `:replaces` from the
+/// accepted set and verifies the act; the daemon signs and sends it on the
+/// agent's connection. A rejection is cbcl-rs's own reason.
+async fn object_act(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((handle, thread)): Path<(String, String)>,
+    Json(request): Json<ObjectActRequest>,
+) -> Result<Json<ObjectActResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let thread = non_empty(&thread, "thread")?;
+    let verb = non_empty(&request.verb, "verb")?;
+    let fields = object_fields(request.fields)?;
+    let (objects, who) = state
+        .agents
+        .objects_for(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let outcome = objects
+        .act(who, thread.clone(), verb, fields)
+        .await
+        .map_err(objects_error_to_api)?;
+    match (outcome.ok, outcome.cid) {
+        (true, Some(cid)) => Ok(Json(ObjectActResponse {
+            ok: true,
+            agent_handle: handle.as_str().to_owned(),
+            thread,
+            cid,
+        })),
+        _ => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "object_action_rejected",
+            outcome
+                .reason
+                .unwrap_or_else(|| "the broker rejected the action".to_owned()),
+            None,
+        )),
+    }
+}
+
+/// SPEC-086 Stage B: create an object. cbcl-rs compiles and verifies the
+/// definition; the dialect is declared to the room by self-address
+/// (SPEC-087 REQ-005), the opener goes out, and the agent's own controller
+/// learns both at once so the next act need not wait for the echo.
+async fn object_open(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+    Json(request): Json<ObjectOpenRequest>,
+) -> Result<Json<ObjectOpenResponse>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    let handle = parse_handle(handle)?;
+    let thread = non_empty(&request.thread, "thread")?;
+    let fields = object_fields(request.fields)?;
+    if !(request.definition.is_object() || request.definition.is_string()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+            "definition must be a JSON object or the serialised contract text",
+            None,
+        ));
+    }
+    let (objects, who) = state
+        .agents
+        .objects_for(&handle)
+        .await
+        .map_err(agent_error_to_api)?;
+    let outcome = objects
+        .open(who, request.definition, thread.clone(), fields)
+        .await
+        .map_err(objects_error_to_api)?;
+    match (outcome.ok, outcome.dialect, outcome.cid, outcome.message) {
+        (true, Some(dialect), Some(cid), Some(message)) => Ok(Json(ObjectOpenResponse {
+            ok: true,
+            agent_handle: handle.as_str().to_owned(),
+            thread,
+            dialect,
+            cid,
+            message,
+        })),
+        _ => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "object_rejected",
+            outcome
+                .reason
+                .unwrap_or_else(|| "the opener could not be sent".to_owned()),
+            None,
+        )),
+    }
 }
 
 async fn send(
@@ -1910,6 +2465,7 @@ async fn resume_chat_agent(
         // fork the channel into two ciphertext worlds.
         false,
         record.receive_all,
+        record.objects,
         Some(handle),
     )
     .await
@@ -2071,6 +2627,30 @@ fn agent_error_to_api(error: AgentError) -> ApiError {
             StatusCode::REQUEST_TIMEOUT,
             "meta_reply_timeout",
             "router did not reply to the meta send in time",
+            None,
+        ),
+        AgentError::RoomNotJoined => ApiError::new(
+            StatusCode::CONFLICT,
+            "room_not_joined",
+            "this agent has not joined the requested room",
+            Some("a history request names the channel the agent joined".to_owned()),
+        ),
+        AgentError::HistoryInFlight => ApiError::new(
+            StatusCode::CONFLICT,
+            "history_in_flight",
+            "a history request for this room is still unanswered",
+            Some("wait for the reply to arrive through `recv` before asking again".to_owned()),
+        ),
+        AgentError::ObjectsNotSubscribed => ApiError::new(
+            StatusCode::CONFLICT,
+            "objects_not_subscribed",
+            "this agent has no object subscription",
+            Some("rejoin with `hark join … --objects` (or `\"objects\": true`)".to_owned()),
+        ),
+        AgentError::ObjectsUnavailable => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "objects_unavailable",
+            "the object runtime is not available",
             None,
         ),
     }
@@ -2324,6 +2904,23 @@ mod tests {
         AgentsResponse, ClientPingError, ErrorResponse, LocalApiClient, PingResponse,
         chat_key_filename, serve_local_api_with_agents, take_receive_all,
     };
+
+    /// SPEC-086 CON-003: object dialects in the set mean the subscription and
+    /// are never advertised.
+    #[test]
+    fn take_objects_strips_object_dialects_and_reports_presence() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut dialects = vec![
+            "cite".to_owned(),
+            format!("sha256-{hex}"),
+            "vote".to_owned(),
+        ];
+        assert!(super::take_objects(&mut dialects));
+        assert_eq!(dialects, ["cite", "vote"]);
+        let mut none = vec!["cite".to_owned(), "sha256-short".to_owned()];
+        assert!(!super::take_objects(&mut none));
+        assert_eq!(none.len(), 2);
+    }
 
     #[test]
     fn take_receive_all_strips_wildcard_and_reports_presence() {
@@ -2766,5 +3363,418 @@ mod tests {
         assert!(super::validate_subscribe_pattern("*").is_ok());
         assert!(super::validate_subscribe_pattern("arena-*").is_ok());
         assert!(super::validate_subscribe_pattern("arena-v1").is_ok());
+    }
+
+    /// SPEC-086 CON-001/REQ-002: `recv` carries the object record beside the
+    /// message, and only then — a plain message has no `record` member.
+    #[tokio::test]
+    async fn recv_carries_the_object_record_only_for_object_deliveries() {
+        let store = agent_store();
+        let handle = handle();
+        store
+            .insert_connected(handle.clone(), vec!["elf".to_owned()])
+            .await
+            .expect("agent should insert");
+        let record = crate::object_transport::ObjectRecord {
+            room: "@room".to_owned(),
+            signer: "@alice".to_owned(),
+            attested_by: crate::object_transport::AttestedBy::Mls,
+            own: false,
+            replayed: true,
+        };
+        store
+            .enqueue_object(
+                &handle,
+                "(lang sha256-x (check @room))".to_owned(),
+                record.clone(),
+            )
+            .await
+            .expect("object should enqueue");
+        store
+            .enqueue_inbound(&handle, "(tell @room \"hi\" :from @bo)".to_owned())
+            .await
+            .expect("message should enqueue");
+        let server = TestServer::start_with_store(None, store).await;
+        let path = format!("/v1/agents/{}/recv", handle.as_str());
+
+        let body = authed_get(&server, &path)
+            .await
+            .json::<serde_json::Value>()
+            .await
+            .expect("response should decode");
+        assert_eq!(body["message"], "(lang sha256-x (check @room))");
+        assert_eq!(
+            body["record"],
+            serde_json::json!({
+                "room": "@room", "signer": "@alice", "attested_by": "mls",
+                "own": false, "replayed": true
+            })
+        );
+        let typed: super::RecvResponse =
+            serde_json::from_value(body).expect("the typed response decodes too");
+        assert_eq!(typed.record, Some(record));
+
+        let plain = authed_get(&server, &path)
+            .await
+            .json::<serde_json::Value>()
+            .await
+            .expect("response should decode");
+        assert_eq!(plain["message"], "(tell @room \"hi\" :from @bo)");
+        assert!(
+            plain.get("record").is_none(),
+            "a non-object delivery has no record member (ADR-002): {plain}"
+        );
+
+        server.stop().await;
+    }
+
+    async fn authed_post_json(
+        server: &TestServer,
+        path: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(server.url(path))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", server.record.token),
+            )
+            .json(&body)
+            .send()
+            .await
+            .expect("request should complete")
+    }
+
+    /// SPEC-086 CON-002: the history endpoint's whole contract — limit
+    /// recognition, the joined-room rule, the wire frame (sent as a control
+    /// frame, never sealed), and the one-in-flight rule.
+    #[tokio::test]
+    async fn history_endpoint_honours_con_002() {
+        let store = agent_store();
+        let handle = handle();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::daemon::OutboundFrame>(4);
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<(String, bool)>(4);
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let _ = seen_tx.send((frame.message.clone(), frame.control)).await;
+                let _ = frame.result_tx.send(Ok(()));
+            }
+        });
+        store
+            .insert_connected_with_router_channels(
+                handle.clone(),
+                vec!["cite".to_owned()],
+                None,
+                Some(crate::daemon::AgentSendChannel::new(tx)),
+                Some("@aria".to_owned()),
+                Some("@general".to_owned()),
+            )
+            .await
+            .expect("agent should insert");
+        let server = TestServer::start_with_store(None, store).await;
+        let path = format!("/v1/agents/{}/history", handle.as_str());
+
+        for bad in [
+            serde_json::json!({"room": "@general", "limit": 0}),
+            serde_json::json!({"room": "@general", "limit": 1001}),
+            serde_json::json!({"room": "@general", "limit": "5"}),
+            serde_json::json!({"room": "@general", "limit": 2.5}),
+            serde_json::json!({"room": "@general", "limit": -1}),
+            serde_json::json!({"room": "general", "limit": 5}),
+        ] {
+            let response = authed_post_json(&server, &path, bad.clone()).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(
+                error_code(response).await,
+                "malformed_history_request",
+                "{bad}"
+            );
+        }
+
+        let unjoined = authed_post_json(
+            &server,
+            &path,
+            serde_json::json!({"room": "@other", "limit": 5}),
+        )
+        .await;
+        assert_eq!(unjoined.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(unjoined).await, "room_not_joined");
+
+        let accepted = authed_post_json(
+            &server,
+            &path,
+            serde_json::json!({"room": "@general", "limit": 7}),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let body = accepted
+            .json::<super::HistoryResponse>()
+            .await
+            .expect("response should decode");
+        assert!(body.ok);
+        let (frame, control) = seen_rx
+            .recv()
+            .await
+            .expect("the request reached the transport");
+        assert_eq!(frame, "(history @general :limit 7 :from @aria)");
+        assert!(
+            control,
+            "a history request is a hub control frame, never MLS-sealed"
+        );
+
+        let again = authed_post_json(
+            &server,
+            &path,
+            serde_json::json!({"room": "@general", "limit": 7}),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(again).await, "history_in_flight");
+
+        server.stop().await;
+    }
+
+    /// SPEC-086 Stage B: the object endpoints refuse an agent without the
+    /// subscription (its controller would have no history), and refuse a
+    /// missing runtime distinctly.
+    #[tokio::test]
+    async fn object_endpoints_require_the_subscription_and_a_runtime() {
+        let store = agent_store();
+        let handle = handle();
+        store
+            .insert_connected_with_router_channels(
+                handle.clone(),
+                vec!["cite".to_owned()],
+                None,
+                None,
+                Some("@aria".to_owned()),
+                Some("@general".to_owned()),
+            )
+            .await
+            .expect("agent should insert");
+        let server = TestServer::start_with_store(None, store.clone()).await;
+        let path = format!("/v1/agents/{}/objects", handle.as_str());
+
+        let no_runtime = authed_get(&server, &path).await;
+        assert_eq!(no_runtime.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code(no_runtime).await, "objects_unavailable");
+
+        store
+            .attach_objects(crate::objects::runtime::spawn(
+                store.clone(),
+                tokio::runtime::Handle::current(),
+                None,
+            ))
+            .await;
+        let unsubscribed = authed_get(&server, &path).await;
+        assert_eq!(unsubscribed.status(), StatusCode::CONFLICT);
+        assert_eq!(error_code(unsubscribed).await, "objects_not_subscribed");
+
+        server.stop().await;
+    }
+
+    /// SPEC-086 Stage B end to end over HTTP: open sends the opener on the
+    /// agent's connection and learns it; read projects; act sends a
+    /// broker-built action; a bad field is the broker's rejection; an
+    /// unknown thread is 404.
+    #[tokio::test]
+    async fn object_open_read_and_act_over_the_local_api() {
+        let store = agent_store();
+        let handle = handle();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::daemon::OutboundFrame>(8);
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = std::sync::Arc::clone(&sent);
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                recorder.lock().unwrap().push(frame.message.clone());
+                let _ = frame.result_tx.send(Ok(()));
+            }
+        });
+        store
+            .insert_connected_with_router_channels(
+                handle.clone(),
+                vec!["cite".to_owned()],
+                None,
+                Some(crate::daemon::AgentSendChannel::new(tx)),
+                Some("@aria".to_owned()),
+                Some("@general".to_owned()),
+            )
+            .await
+            .expect("agent should insert");
+        store.mark_objects(&handle, true).await.unwrap();
+        store
+            .attach_objects(crate::objects::runtime::spawn(
+                store.clone(),
+                tokio::runtime::Handle::current(),
+                None,
+            ))
+            .await;
+        let server = TestServer::start_with_store(None, store.clone()).await;
+        let base = format!("/v1/agents/{}/objects", handle.as_str());
+
+        let definition = serde_json::json!({
+            "name": "checklist",
+            "verbs": {
+                "open": { "causedBy": "begin", "fields": { "title": "string" } },
+                "check": { "causedBy": ["open"], "fields": { "item": "string", "done": "bool" } }
+            },
+            "project": { "title": ["last", "open", "title"], "items": ["latestPerKey", "check", "item", "done"] }
+        });
+        let opened = authed_post_json(
+            &server,
+            &base,
+            serde_json::json!({ "definition": definition, "thread": "list 1", "fields": { "title": "Groceries" } }),
+        )
+        .await;
+        assert_eq!(opened.status(), StatusCode::OK);
+        let opened: super::ObjectOpenResponse = opened.json().await.unwrap();
+        assert!(opened.dialect.starts_with("sha256-"), "{}", opened.dialect);
+        {
+            // SPEC-087 REQ-005: the dialect is declared to the room before
+            // the opener goes out; the opener carries no definition.
+            let frames = sent.lock().unwrap();
+            assert_eq!(frames.len(), 2, "{frames:?}");
+            assert!(
+                frames[0].starts_with(&format!(
+                    "(adddialect @general :name {} :def \"(define ",
+                    opened.dialect
+                )),
+                "{}",
+                frames[0]
+            );
+            assert_eq!(frames[1], opened.message);
+            assert!(!opened.message.contains(":object-spec"));
+        }
+
+        let listed = authed_get(&server, &base).await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: super::ObjectsListResponse = listed.json().await.unwrap();
+        assert_eq!(listed.objects.len(), 1);
+        assert_eq!(listed.objects[0].thread, "list 1");
+
+        let read = authed_get(&server, &format!("{base}/list%201")).await;
+        assert_eq!(read.status(), StatusCode::OK);
+        let read: super::ObjectReadResponse = read.json().await.unwrap();
+        assert_eq!(
+            read.state,
+            serde_json::json!({ "title": "Groceries", "items": {} })
+        );
+
+        let acted = authed_post_json(
+            &server,
+            &format!("{base}/list%201/act"),
+            serde_json::json!({ "verb": "check", "fields": { "item": "milk", "done": true } }),
+        )
+        .await;
+        assert_eq!(acted.status(), StatusCode::OK);
+        let acted: super::ObjectActResponse = acted.json().await.unwrap();
+        assert_eq!(acted.cid.len(), 64);
+        {
+            let frames = sent.lock().unwrap();
+            assert_eq!(frames.len(), 3);
+            assert!(frames[2].contains(":caused-by sha256-"), "{}", frames[2]);
+        }
+
+        let read: super::ObjectReadResponse = authed_get(&server, &format!("{base}/list%201"))
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            read.state,
+            serde_json::json!({ "title": "Groceries", "items": { "milk": true } })
+        );
+
+        let rejected = authed_post_json(
+            &server,
+            &format!("{base}/list%201/act"),
+            serde_json::json!({ "verb": "check", "fields": { "item": "milk", "done": "yes" } }),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_code(rejected).await, "object_action_rejected");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            3,
+            "nothing rejected reaches the wire"
+        );
+
+        let unknown = authed_get(&server, &format!("{base}/nope")).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error_code(unknown).await, "object_unknown");
+
+        let bad_fields = authed_post_json(
+            &server,
+            &format!("{base}/list%201/act"),
+            serde_json::json!({ "verb": "check", "fields": [1] }),
+        )
+        .await;
+        assert_eq!(bad_fields.status(), StatusCode::BAD_REQUEST);
+
+        server.stop().await;
+    }
+
+    /// SPEC-086 Stage B: `POST /v1/objects/check` validates without an agent
+    /// and without sending; an invalid definition is the SDK's own rejection.
+    #[tokio::test]
+    async fn object_check_validates_a_definition_without_an_agent() {
+        let store = agent_store();
+        let server = TestServer::start_with_store(None, store.clone()).await;
+        let definition = serde_json::json!({
+            "name": "tally",
+            "verbs": { "open": { "causedBy": "begin", "fields": { "title": "string" } },
+                       "add": { "causedBy": ["open"], "fields": { "amount": "number", "op": "string" } } },
+            "project": { "title": ["last", "open", "title"], "amounts": ["events", "add", "amount"], "total": ["sum", "amounts"] }
+        });
+
+        let no_runtime = authed_post_json(
+            &server,
+            "/v1/objects/check",
+            serde_json::json!({ "definition": definition }),
+        )
+        .await;
+        assert_eq!(no_runtime.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        store
+            .attach_objects(crate::objects::runtime::spawn(
+                store.clone(),
+                tokio::runtime::Handle::current(),
+                None,
+            ))
+            .await;
+        let checked = authed_post_json(
+            &server,
+            "/v1/objects/check",
+            serde_json::json!({ "definition": definition }),
+        )
+        .await;
+        assert_eq!(checked.status(), StatusCode::OK);
+        let checked: super::ObjectCheckResponse = checked.json().await.unwrap();
+        assert!(
+            checked.dialect.starts_with("sha256-"),
+            "{}",
+            checked.dialect
+        );
+        assert_eq!(checked.label, "tally");
+        assert!(checked.cbcl.contains("(protocol"), "{}", checked.cbcl);
+
+        let invalid = authed_post_json(
+            &server,
+            "/v1/objects/check",
+            serde_json::json!({ "definition": { "name": "x", "verbs": { "open": { "causedBy": "begin", "fields": {} } }, "project": { "n": ["sum", ["last", "open", "title"]] } } }),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_code(invalid).await, "object_rejected");
+
+        let malformed = authed_post_json(
+            &server,
+            "/v1/objects/check",
+            serde_json::json!({ "definition": 3 }),
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        server.stop().await;
     }
 }

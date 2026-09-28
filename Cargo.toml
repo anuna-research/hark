@@ -22,6 +22,14 @@ base64 = "0.22"
 # commit once the role layer lands (closes IMPL-024 ADR-021).
 cbcl-core = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034", features = ["mls-ds-proof"] }
 cbcl-parser = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034" }
+# SPEC-086 Stage B: every object judgement (the SPEC-087 contract compile, the
+# SPEC-019 admission, fold and intent binder, the reads, canonical text and the
+# wire address) is cbcl-wasm linked natively at the EXACT revision cbcl-bus
+# ships to browsers (`cbcl-bus/cbcl-rs.sha`). Deliberately a second cbcl-rs pin:
+# hark's own pin above serialises a quoted `:caused-by` differently, and an
+# address computed there would not match the browser's. Bump this in lockstep
+# with cbcl-bus's `cbcl-rs.sha` and re-copy tests/vectors/state.
+cbcl-wasm = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "d2cbd968e36dbc0d5876a878e65a89942386890c", default-features = false, features = ["std"] }
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 config = "0.15"

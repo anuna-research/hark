@@ -57,6 +57,7 @@ async fn exactly_one_of_two_agents_is_elected() {
         None,
         false,
         false,
+        false, // objects (SPEC-086): not subscribed
         None,
     )
     .await
@@ -75,6 +76,7 @@ async fn exactly_one_of_two_agents_is_elected() {
         None,
         false,
         false,
+        false, // objects (SPEC-086): not subscribed
         None,
     )
     .await

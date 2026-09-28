@@ -591,7 +591,7 @@ version      = %s"\"version\":" %s"1"            ; unknown version => reject the
 agents       = %s"\"agents\":" "[" [ record *( "," record ) ] "]"
 
 record       = "{" agent-handle "," wire-handle "," channel "," dialects
-                   "," receive-all [ "," cap ] [ "," added-by ] "}"
+                   "," receive-all [ "," cap ] [ "," added-by ] [ "," objects ] "}"
 
 agent-handle = %s"\"agent_handle\":" json-string  ; MUST satisfy the AgentHandle recogniser
 wire-handle  = %s"\"wire_handle\":"  json-string  ; MUST satisfy validate_chat_handle
@@ -601,6 +601,9 @@ dialects     = %s"\"dialects\":" "[" [ json-string *( "," json-string ) ] "]"
 receive-all  = %s"\"receive_all\":" ( %s"true" / %s"false" )
 cap          = %s"\"cap\":"      json-string
 added-by     = %s"\"added_by\":" json-string      ; MUST satisfy validate_chat_handle
+objects      = %s"\"objects\":"  ( %s"true" / %s"false" )
+                                                  ; SPEC-086 CON-003; always written,
+                                                  ; absent (pre-SPEC-086 store) reads false
 ```
 
 The field recognisers (`AgentHandle`, `validate_chat_handle`, `validate_dialect_id`) are the

@@ -1,0 +1,95 @@
+{
+  "contract": "(define lunch-vote (cbcl) @anuna\n  (:resource-requirements\n    ((max-depth 12)\n     (max-expansion-size 2048)\n     (verification-time 200)))\n\n  (:state-bounds\n    (max-string 280)\n    (max-list 24))\n\n  (extend propose (to question options)\n    (tell to :question question :options options))\n\n  (extend vote (to choice)\n    (tell to :choice choice))\n\n  (shape propose\n    (require :question string)\n    (require :options list))\n\n  (shape vote\n    (require :choice string))\n\n  (protocol\n    (then begin propose)\n    (then propose vote))\n\n  (state\n    (question (last propose :question))\n    (options  (last propose :options))\n    (domain vote :choice options)\n    (ballots  (latest-per-signer vote :choice))\n    (tally    (histogram ballots))))",
+  "covers": [
+    "last",
+    "latest-per-signer",
+    "histogram",
+    "domain",
+    "state-bounds",
+    "intend-domain"
+  ],
+  "expect": {
+    "addresses": [
+      "sha256-5baf2223ddfaeb4fada57b5edd42129d80c7c26b111b6263c2f60f212b118dd5",
+      "sha256-e1ef883a35be4b84ea97b72d9c6ea1ee2cbc8497c3b6d4c04f55fb8aab20a85a",
+      "sha256-58b7769176d353bdca832fc30ba59f75be5701f3c9d34013ab14996dd031da3e",
+      "sha256-09ce3613953aa586fee5b8200c33af999bf3399192dd0241ef2bcf2d24391974",
+      "sha256-ecd12957e1744bdb80b77bc40e366c95ec0c4597d3d054b9e4d8ad481f3b0074",
+      "sha256-0cec4be111c4f1eab4770ff67149dcc4a653f1d1c0a9f4436d404b5ced219d18"
+    ],
+    "intents": [
+      {
+        "canonical": "(lang lunch-vote (vote @lunch () :choice \"Sushi\" :from @dan :thread \"v1\" :caused-by sha256-5baf2223ddfaeb4fada57b5edd42129d80c7c26b111b6263c2f60f212b118dd5))"
+      },
+      {
+        "reject": "domain"
+      }
+    ],
+    "state": {
+      "ballots": {
+        "@bo": "Pizza",
+        "@dan": "Pizza"
+      },
+      "options": [
+        "Pizza",
+        "Sushi"
+      ],
+      "question": "Lunch?",
+      "tally": {
+        "Pizza": 2
+      }
+    },
+    "verdicts": {
+      "sha256-09ce3613953aa586fee5b8200c33af999bf3399192dd0241ef2bcf2d24391974": "accepted",
+      "sha256-0cec4be111c4f1eab4770ff67149dcc4a653f1d1c0a9f4436d404b5ced219d18": "rejected",
+      "sha256-58b7769176d353bdca832fc30ba59f75be5701f3c9d34013ab14996dd031da3e": "accepted",
+      "sha256-5baf2223ddfaeb4fada57b5edd42129d80c7c26b111b6263c2f60f212b118dd5": "accepted",
+      "sha256-e1ef883a35be4b84ea97b72d9c6ea1ee2cbc8497c3b6d4c04f55fb8aab20a85a": "accepted",
+      "sha256-ecd12957e1744bdb80b77bc40e366c95ec0c4597d3d054b9e4d8ad481f3b0074": "accepted"
+    }
+  },
+  "id": "lunch-vote-domain",
+  "intents": [
+    {
+      "fields": {
+        "choice": "Sushi"
+      },
+      "signer": "@dan",
+      "verb": "vote"
+    },
+    {
+      "fields": {
+        "choice": "Tacos"
+      },
+      "signer": "@dan",
+      "verb": "vote"
+    }
+  ],
+  "messages": [
+    {
+      "canonical": "(lang lunch-vote (propose @lunch :question \"Lunch?\" :options (\"Pizza\" \"Sushi\") :caused-by begin :thread \"v1\" :from @aria))",
+      "signer": "@aria"
+    },
+    {
+      "canonical": "(lang lunch-vote (vote @lunch :choice \"Pizza\" :caused-by sha256-5baf2223ddfaeb4fada57b5edd42129d80c7c26b111b6263c2f60f212b118dd5 :thread \"v1\" :from @bo))",
+      "signer": "@bo"
+    },
+    {
+      "canonical": "(lang lunch-vote (vote @lunch :choice \"Sushi\" :caused-by sha256-5baf2223ddfaeb4fada57b5edd42129d80c7c26b111b6263c2f60f212b118dd5 :thread \"v1\" :from @bo))",
+      "signer": "@bo"
+    },
+    {
+      "canonical": "(lang lunch-vote (vote @lunch :choice \"Tacos\" :caused-by sha256-5baf2223ddfaeb4fada57b5edd42129d80c7c26b111b6263c2f60f212b118dd5 :thread \"v1\" :from @cy))",
+      "signer": "@cy"
+    },
+    {
+      "canonical": "(lang lunch-vote (vote @lunch :choice \"Pizza\" :caused-by sha256-5baf2223ddfaeb4fada57b5edd42129d80c7c26b111b6263c2f60f212b118dd5 :thread \"v1\" :from @dan))",
+      "signer": "@dan"
+    },
+    {
+      "canonical": "(lang lunch-vote (propose @lunch :question \"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\" :options (\"a\") :caused-by begin :thread \"v1\" :from @eve))",
+      "signer": "@eve"
+    }
+  ],
+  "thread": "v1"
+}

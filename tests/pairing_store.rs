@@ -19,6 +19,7 @@ fn record(handle: &str) -> PairedAgent {
         cap: Some("cap-abc123".to_owned()),
         added_by: Some("@hugo".to_owned()),
         receive_all: true,
+        objects: true,
     }
 }
 
@@ -67,6 +68,7 @@ fn the_store_round_trips_every_valid_record_shape() {
             cap: None,      // a public channel
             added_by: None, // joined directly, not paired in
             receive_all: false,
+            objects: false,
         },
         PairedAgent {
             agent_handle: "3N87ZYG9PVRBPEXMHHCYV24VKT".to_owned(),
@@ -76,6 +78,7 @@ fn the_store_round_trips_every_valid_record_shape() {
             cap: Some("cap-xyz".to_owned()),
             added_by: None,
             receive_all: true,
+            objects: false,
         },
     ];
 
@@ -208,6 +211,39 @@ fn an_empty_agent_list_is_recognised() {
     assert!(
         store.load_checked().is_ok(),
         "an empty list parses cleanly; only malformed input reports an error"
+    );
+}
+
+/// SPEC-086 CON-003 — the object subscription persists in the pairing record,
+/// and a store written before SPEC-086 (no `objects` key) still loads, with
+/// the subscription off: `false` is the exact historical value.
+#[test]
+fn the_object_subscription_persists_and_a_pre_spec_086_store_reads_it_as_off() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = PairingStore::new(dir.path());
+    std::fs::write(
+        store.path(),
+        r#"{"version":1,"agents":[{"agent_handle":"1K65XWE7NSPZMCVJFFAWS02SHR","wire_handle":"@aria","channel":"@research","dialects":[],"receive_all":false}]}"#,
+    )
+    .expect("the fixture writes");
+    let loaded = store.load();
+    assert_eq!(loaded.len(), 1, "a pre-SPEC-086 record is still recognised");
+    assert!(!loaded[0].objects, "absent means the subscription was off");
+
+    let mut subscribed = record("2M76YXF8PTQANDWKGGBXT13TJS");
+    subscribed.objects = true;
+    store.upsert(subscribed.clone()).expect("the upsert succeeds");
+    let body = std::fs::read_to_string(store.path()).expect("the store reads");
+    assert!(body.contains("\"objects\": true"), "the flag is written: {body}");
+    assert!(
+        body.contains("\"objects\": false"),
+        "the rewritten pre-SPEC-086 record is made explicit: {body}"
+    );
+    let again = store.load();
+    assert_eq!(again.len(), 2);
+    assert!(
+        again.contains(&subscribed),
+        "the subscribed record round-trips"
     );
 }
 

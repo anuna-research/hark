@@ -23,6 +23,8 @@ use cbcl_core::{
     store::{ContentHash, MessageStore, ThreadId, ThreadedMessageStore},
 };
 
+use crate::object_transport::ObjectRecord;
+use crate::objects::{AgentIdentity, ObjectsClient};
 use crate::{
     config::validate_dialect_id, constants::LOCAL_API_VERSION, dialect_cache::DialectCache,
     local_api::PingResponse,
@@ -81,6 +83,8 @@ pub struct AgentStatusSnapshot {
     /// diverged from the room's — inbound Commits no longer process — and the
     /// agent is re-establishing it.
     ///
+    /// SPEC-086 CON-003: the object subscription is on for this agent.
+    pub objects: bool,
     /// Kept apart from `unhealthy_reason` for exactly the reason
     /// `reconnect_detail` is: that field means *dead*, and this state is not.
     /// The agent is connected, its socket is fine, and its own recovery is
@@ -112,6 +116,11 @@ pub struct AgentSendChannel {
 pub struct OutboundFrame {
     pub message: String,
     pub result_tx: oneshot::Sender<Result<(), OutboundReject>>,
+    /// SPEC-086 CON-002: a hub control request (`(history …)`) rather than
+    /// channel content. In a pinned-encrypted channel content is sealed under
+    /// MLS; a control frame is addressed to the hub and goes in the clear,
+    /// exactly as the browser sends it.
+    pub control: bool,
 }
 
 /// Why a transport loop refused to send an outbound frame. The `retryable`
@@ -228,6 +237,21 @@ pub enum AgentError {
     MetaSendBusy,
     #[error("meta send timed out waiting for router reply")]
     MetaReplyTimeout,
+    /// SPEC-086 CON-002: the history request names a room this agent has
+    /// not joined (or the agent is on the router transport, which has no
+    /// rooms).
+    #[error("room not joined")]
+    RoomNotJoined,
+    /// SPEC-086 CON-002: a history request for this room is still unanswered.
+    #[error("a history request for this room is already in flight")]
+    HistoryInFlight,
+    /// SPEC-086 Stage B: an object command on an agent without the object
+    /// subscription. Its controller would have no history to act on.
+    #[error("agent has no object subscription")]
+    ObjectsNotSubscribed,
+    /// SPEC-086 Stage B: the daemon runs without an object runtime.
+    #[error("the object runtime is not available")]
+    ObjectsUnavailable,
 }
 
 #[derive(Debug)]
@@ -238,6 +262,9 @@ struct AgentRegistry {
     /// recently created agent. CLI commands fall back to it when
     /// `CBCL_AGENT_HANDLE` is unset, dropping the `eval` ritual.
     active: Option<AgentHandle>,
+    /// SPEC-086 Stage B: the object runtime, when the daemon runs one. Every
+    /// object delivery to a subscribed agent is also fed to it.
+    objects: Option<ObjectsClient>,
 }
 
 #[derive(Debug)]
@@ -256,6 +283,12 @@ struct AgentEntry {
     /// SPEC-013 REQ-006: a non-terminal MLS divergence, or `None` when the group
     /// is tracking the room.
     mls_fork_detail: Option<String>,
+    /// SPEC-086 CON-002: while set and in the future, a `(history …)` request
+    /// for this agent's room is unanswered and a second one is refused.
+    history_in_flight_until: Option<std::time::Instant>,
+    /// SPEC-086 CON-003: the object subscription is on. Only then do object
+    /// deliveries carry records and reach the object runtime.
+    objects: bool,
     queue: VecDeque<QueuedMessage>,
     queued_bytes: usize,
     recv_waiter: Option<RecvWaiterId>,
@@ -367,7 +400,7 @@ struct RecvWaiterGuard {
 
 #[derive(Debug)]
 enum RecvClaim {
-    Ready(String),
+    Ready(Inbound),
     Waiting {
         notify: Arc<Notify>,
         waiter: RecvWaiterGuard,
@@ -378,6 +411,18 @@ enum RecvClaim {
 struct QueuedMessage {
     text: String,
     bytes: usize,
+    /// SPEC-086 REQ-002: present when the message was delivered as an object
+    /// record — the attestation travels with the bytes it attests.
+    record: Option<ObjectRecord>,
+}
+
+/// One message popped from a handle's inbound queue: the bytes, plus the
+/// object attestation record when the object subscription delivered it
+/// (SPEC-086 CON-001).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Inbound {
+    pub message: String,
+    pub record: Option<ObjectRecord>,
 }
 
 pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
@@ -524,12 +569,70 @@ impl AgentStore {
                 config,
                 agents: HashMap::new(),
                 active: None,
+                objects: None,
             })),
         }
     }
 
     pub fn validate_advertisement(dialects: &[String]) -> Result<(), AgentError> {
         validate_agent_advertisement(dialects)
+    }
+
+    /// SPEC-086 Stage B: give the store its object runtime. Called once at
+    /// daemon start; a store without one transports objects but cannot read
+    /// or act on them.
+    pub async fn attach_objects(&self, client: ObjectsClient) {
+        self.inner.lock().await.objects = Some(client);
+    }
+
+    /// SPEC-086 CON-003: record whether the agent's object subscription is on.
+    pub async fn mark_objects(&self, handle: &AgentHandle, objects: bool) -> Result<(), AgentError> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        entry.objects = objects;
+        Ok(())
+    }
+
+    /// SPEC-086 Stage B: the object runtime, for work that needs no agent
+    /// (checking a definition).
+    pub async fn objects_client(&self) -> Result<ObjectsClient, AgentError> {
+        self.inner
+            .lock()
+            .await
+            .objects
+            .clone()
+            .ok_or(AgentError::ObjectsUnavailable)
+    }
+
+    /// SPEC-086 Stage B: the runtime client and the identity a controller for
+    /// `handle` is built with. Refused for an unsubscribed agent (its
+    /// controller would see no history) and when no runtime is attached.
+    pub async fn objects_for(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<(ObjectsClient, AgentIdentity), AgentError> {
+        let inner = self.inner.lock().await;
+        let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
+        entry.ensure_healthy()?;
+        let client = inner
+            .objects
+            .clone()
+            .ok_or(AgentError::ObjectsUnavailable)?;
+        if !entry.objects {
+            return Err(AgentError::ObjectsNotSubscribed);
+        }
+        let room = entry.channel.clone().ok_or(AgentError::ObjectsNotSubscribed)?;
+        Ok((
+            client,
+            AgentIdentity {
+                agent: handle.clone(),
+                me: entry.router_agent_id.clone(),
+                room,
+            },
+        ))
     }
 
     pub async fn insert_connected(
@@ -576,6 +679,8 @@ impl AgentStore {
             reconnect_attempts: 0,
             reconnect_detail: None,
             mls_fork_detail: None,
+            history_in_flight_until: None,
+            objects: false,
             queue: VecDeque::new(),
             queued_bytes: 0,
             recv_waiter: None,
@@ -610,6 +715,26 @@ impl AgentStore {
         handle: &AgentHandle,
         message: String,
     ) -> Result<(), AgentError> {
+        self.send_frame(handle, message, false).await
+    }
+
+    /// Send a hub control request that must never be sealed under MLS
+    /// (SPEC-086 CON-002's `(history …)`). Otherwise identical to
+    /// [`Self::send_outbound`].
+    pub async fn send_control_outbound(
+        &self,
+        handle: &AgentHandle,
+        message: String,
+    ) -> Result<(), AgentError> {
+        self.send_frame(handle, message, true).await
+    }
+
+    async fn send_frame(
+        &self,
+        handle: &AgentHandle,
+        message: String,
+        control: bool,
+    ) -> Result<(), AgentError> {
         let send_channel = {
             let inner = self.inner.lock().await;
             let entry = inner.agents.get(handle).ok_or(AgentError::UnknownHandle)?;
@@ -638,7 +763,11 @@ impl AgentStore {
         let (result_tx, result_rx) = oneshot::channel();
         if send_channel
             .tx
-            .send(OutboundFrame { message, result_tx })
+            .send(OutboundFrame {
+                message,
+                result_tx,
+                control,
+            })
             .await
             .is_err()
         {
@@ -799,15 +928,67 @@ impl AgentStore {
         handle: &AgentHandle,
         message: String,
     ) -> Result<(), AgentError> {
+        self.enqueue(handle, message, None).await
+    }
+
+    /// SPEC-086 REQ-001/REQ-002: deliver an object message with its
+    /// attestation record. Same queue, same bounds, same overflow rule as
+    /// [`Self::enqueue_inbound`] — the record is additive.
+    pub async fn enqueue_object(
+        &self,
+        handle: &AgentHandle,
+        message: String,
+        record: ObjectRecord,
+    ) -> Result<(), AgentError> {
+        self.enqueue(handle, message, Some(record)).await
+    }
+
+    async fn enqueue(
+        &self,
+        handle: &AgentHandle,
+        message: String,
+        record: Option<ObjectRecord>,
+    ) -> Result<(), AgentError> {
         let mut inner = self.inner.lock().await;
         let max_messages = inner.config.max_messages_per_handle;
         let max_bytes = inner.config.max_bytes_per_handle;
+        let objects = inner.objects.clone();
         let entry = inner
             .agents
             .get_mut(handle)
             .ok_or(AgentError::UnknownHandle)?;
         entry.ensure_healthy()?;
         let bytes = message.len();
+
+        // SPEC-086 Stage B: an agent that acts on objects through the runtime
+        // may never drain `recv`, yet every object message is delivered there
+        // too (REQ-001). Killing the handle for that would make Stage B
+        // unusable on any busy object. When the runtime holds the records,
+        // the queue is a convenience copy: shed the OLDEST object records to
+        // make room, never a non-object message, and never when no runtime
+        // has them.
+        if record.is_some() && objects.is_some() {
+            let mut shed = 0usize;
+            while entry.queue.len() >= max_messages
+                || entry.queued_bytes.saturating_add(bytes) > max_bytes
+            {
+                let Some(index) = entry.queue.iter().position(|queued| queued.record.is_some())
+                else {
+                    break;
+                };
+                if let Some(dropped) = entry.queue.remove(index) {
+                    entry.queued_bytes = entry.queued_bytes.saturating_sub(dropped.bytes);
+                    shed += 1;
+                }
+            }
+            if shed > 0 {
+                tracing::debug!(
+                    agent = handle.as_str(),
+                    shed,
+                    "recv queue full; shed the oldest object records (the object runtime holds them)"
+                );
+            }
+        }
 
         if entry.queue.len() >= max_messages || entry.queued_bytes.saturating_add(bytes) > max_bytes
         {
@@ -817,20 +998,49 @@ impl AgentStore {
             return Err(AgentError::QueueOverflow);
         }
 
+        // SPEC-086 Stage B: the object runtime sees every delivered object
+        // record, on the same terms as `recv` — the bytes and the attested
+        // signer — and never blocks the transport.
+        if let (Some(record), Some(objects)) = (record.as_ref(), objects.as_ref()) {
+            objects.ingest(
+                AgentIdentity {
+                    agent: handle.clone(),
+                    me: entry.router_agent_id.clone(),
+                    room: record.room.clone(),
+                },
+                record.signer.clone(),
+                message.clone(),
+            );
+        }
         entry.queue.push_back(QueuedMessage {
             text: message,
             bytes,
+            record,
         });
         entry.queued_bytes += bytes;
         entry.notify.notify_one();
         Ok(())
     }
 
+    /// Pop the next inbound message, waiting up to `timeout`. Returns only the
+    /// message bytes; [`Self::recv_inbound`] also returns the object record.
     pub async fn recv(
         &self,
         handle: &AgentHandle,
         timeout: Option<Duration>,
     ) -> Result<String, AgentError> {
+        self.recv_inbound(handle, timeout)
+            .await
+            .map(|inbound| inbound.message)
+    }
+
+    /// Pop the next inbound message with its object attestation record, when
+    /// the object subscription delivered it (SPEC-086 REQ-002).
+    pub async fn recv_inbound(
+        &self,
+        handle: &AgentHandle,
+        timeout: Option<Duration>,
+    ) -> Result<Inbound, AgentError> {
         let (notify, mut waiter) = match self.claim_recv_waiter(handle).await? {
             RecvClaim::Ready(message) => return Ok(message),
             RecvClaim::Waiting { notify, waiter } => (notify, waiter),
@@ -871,6 +1081,44 @@ impl AgentStore {
         }
     }
 
+    /// SPEC-086 CON-002: admit a `(history …)` request for `room`. Returns the
+    /// agent's wire handle (the request's `:from`) and reserves the room's one
+    /// in-flight slot for `window`; the caller releases it with
+    /// [`Self::end_history`] if the request never reaches the wire.
+    pub async fn begin_history(
+        &self,
+        handle: &AgentHandle,
+        room: &str,
+        window: Duration,
+    ) -> Result<String, AgentError> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        entry.ensure_healthy()?;
+        if entry.channel.as_deref() != Some(room) {
+            return Err(AgentError::RoomNotJoined);
+        }
+        let now = std::time::Instant::now();
+        if entry
+            .history_in_flight_until
+            .is_some_and(|until| now < until)
+        {
+            return Err(AgentError::HistoryInFlight);
+        }
+        entry.history_in_flight_until = Some(now + window);
+        Ok(entry.router_agent_id.clone())
+    }
+
+    /// Release the in-flight slot taken by [`Self::begin_history`].
+    pub async fn end_history(&self, handle: &AgentHandle) {
+        let mut inner = self.inner.lock().await;
+        if let Some(entry) = inner.agents.get_mut(handle) {
+            entry.history_in_flight_until = None;
+        }
+    }
+
     pub async fn close(&self, handle: &AgentHandle) -> Result<(), AgentError> {
         let notify = {
             let mut inner = self.inner.lock().await;
@@ -880,6 +1128,9 @@ impl AgentStore {
                 .ok_or(AgentError::UnknownHandle)?;
             if inner.active.as_ref() == Some(handle) {
                 inner.active = None;
+            }
+            if let Some(objects) = inner.objects.as_ref() {
+                objects.close(handle.clone());
             }
             let mut entry = entry;
             entry.close_connection();
@@ -985,6 +1236,8 @@ impl AgentStore {
             reconnect_attempts: 0,
             reconnect_detail: detail,
             mls_fork_detail: None,
+            history_in_flight_until: None,
+            objects: false,
             queue: VecDeque::new(),
             queued_bytes: 0,
             recv_waiter: None,
@@ -1245,10 +1498,13 @@ impl AgentEntry {
         }
     }
 
-    fn pop_message(&mut self) -> Option<String> {
+    fn pop_message(&mut self) -> Option<Inbound> {
         let message = self.queue.pop_front()?;
         self.queued_bytes = self.queued_bytes.saturating_sub(message.bytes);
-        Some(message.text)
+        Some(Inbound {
+            message: message.text,
+            record: message.record,
+        })
     }
 
     fn mark_unhealthy(&mut self, reason: impl Into<String>, detail: Option<String>) {
@@ -1288,6 +1544,7 @@ impl AgentEntry {
             channel: self.channel.clone(),
             reconnect_attempts: self.reconnect_attempts,
             reconnect_detail: self.reconnect_detail.clone(),
+            objects: self.objects,
             mls_fork_detail: self.mls_fork_detail.clone(),
         }
     }
@@ -2026,6 +2283,62 @@ mod tests {
                 .expect("recv should succeed"),
             "two-two"
         );
+    }
+
+    /// SPEC-086 Stage B (CON-004 note): with the object runtime attached, a
+    /// full queue sheds the OLDEST object records instead of killing the
+    /// handle — an agent acting through the runtime need not drain `recv`.
+    /// Non-object messages still overflow as before, and without a runtime
+    /// nothing is shed.
+    #[tokio::test]
+    async fn object_records_are_shed_before_the_queue_overflows() {
+        use crate::object_transport::{AttestedBy, ObjectRecord};
+        let record = || ObjectRecord {
+            room: "@general".into(),
+            signer: "@bo".into(),
+            attested_by: AttestedBy::Hub,
+            own: false,
+            replayed: false,
+        };
+        let store = super::AgentStore::new(super::AgentStoreConfig {
+            agent_id_prefix: "t".into(),
+            max_messages_per_handle: 2,
+            max_bytes_per_handle: 4096,
+        });
+        store
+            .attach_objects(crate::objects::runtime::spawn_with_hooks(|_, _| true, |_, _| true))
+            .await;
+        let handle = super::AgentHandle::generate();
+        store
+            .insert_connected_with_router_channels(
+                handle.clone(),
+                vec!["cite".into()],
+                None,
+                None,
+                Some("@aria".into()),
+                Some("@general".into()),
+            )
+            .await
+            .unwrap();
+        for text in ["one", "two", "three"] {
+            store
+                .enqueue_object(&handle, format!("(lang sha256-x (check @general :n {text}))"), record())
+                .await
+                .expect("never overflows while records can be shed");
+        }
+        let snapshot = store.status_snapshots().await.into_iter().next().unwrap();
+        assert_eq!(snapshot.state, super::AgentState::Connected);
+        assert_eq!(snapshot.queued_messages, 2);
+        let first = store.recv(&handle, None).await.unwrap();
+        assert!(first.contains(":n two"), "the oldest record was shed: {first}");
+
+        // A non-object message never sheds anything and overflows as before.
+        store.enqueue_inbound(&handle, "(tell @general \"a\")".into()).await.unwrap();
+        let error = store
+            .enqueue_inbound(&handle, "(tell @general \"b\")".into())
+            .await
+            .expect_err("plain messages overflow");
+        assert!(matches!(error, super::AgentError::QueueOverflow));
     }
 
     #[tokio::test]

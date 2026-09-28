@@ -54,6 +54,7 @@ async fn signed_hello_is_accepted_by_live_hub() {
         None,
         false,
         false,
+        false, // objects (SPEC-086): not subscribed
         None,
     )
     .await
@@ -90,6 +91,7 @@ async fn join_to_unknown_channel_is_rejected() {
         None,
         false,
         false,
+        false, // objects (SPEC-086): not subscribed
         None,
     )
     .await;

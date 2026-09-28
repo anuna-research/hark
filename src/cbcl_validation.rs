@@ -1020,6 +1020,31 @@ mod tests {
         );
     }
 
+    /// SPEC-086 REQ-005/REQ-007 (outbound): an SDK object action names a
+    /// contract-digest dialect hark has never been taught and a `:caused-by`
+    /// predecessor hark's store has never seen. `emit` must pass it through
+    /// untouched — the SDK verified it against ITS accepted history; hark
+    /// only transports.
+    #[test]
+    fn emit_accepts_an_object_message_with_an_uninstalled_dialect_and_unknown_predecessor() {
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let registry = DialectRegistry::new();
+        let mut store = ThreadedMessageStore::new();
+        let action = format!(
+            "(lang sha256-{hex} (check @room :item \"milk\" :caused-by sha256-{hex} \
+             :thread \"list-1\" :from @aria))"
+        );
+        validate_for_emit(&action, &registry, &mut store)
+            .expect("an object action with an unknown dialect passes emit validation");
+        let opener = format!(
+            "(lang sha256-{hex} (open @room :title \"Launch\" \
+             :note \"{{\\\"version\\\":3,\\\"contract\\\":\\\"x\\\"}}\" \
+             :caused-by begin :thread \"list-1\" :from @aria))"
+        );
+        validate_for_emit(&opener, &registry, &mut store)
+            .expect("an object opener with an escaped string field passes emit validation");
+    }
+
     #[test]
     fn validate_for_send_passes_through_when_lang_dialect_unknown() {
         // The agent advertises `elf` but the daemon hasn't received

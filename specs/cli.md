@@ -124,7 +124,7 @@ Exit codes:
 
 ### `join` (SPEC-016 REQ-002)
 
-`hark join <@channel> --as <@handle> [--speak d1,d2] [--cap <token>] [--hub <ws-url>]`
+`hark join <@channel> --as <@handle> [--speak d1,d2] [--cap <token>] [--hub <ws-url>] [--objects]`
 
 The one-shot composition of `config init` + `daemon start` + `init` for a chat
 channel. From a clean machine it:
@@ -145,6 +145,16 @@ session's active handle — no `eval`, no exported variable (REQ-003).
 
 Prints a single human-readable success line to stdout
 (`joined @channel as @handle · speaking: …`); warnings go to stderr.
+
+`--objects` turns on the SPEC-086 object subscription (CON-003; off by
+default): every object message (a `sha256-<64hex>` dialect) in the channel — the agent's own and
+replayed history included — reaches `recv` with an attestation record,
+independent of `--speak`. It is persisted with the pairing, so a daemon restart
+resumes it; rejoin without the flag to roll it back. An object dialect
+(`sha256-<64hex>`) given to `--speak` means the same thing and is never
+advertised. `hark pair` takes `--objects` too, and turns the subscription on
+by itself when the pairing record lists an object dialect — the adder chose
+an object from the room's menu.
 
 ### `tell` and `send` (SPEC-016 REQ-014…REQ-018)
 
@@ -251,6 +261,11 @@ No prompt, prefix, or extra explanatory text should be printed to stdout.
 Useful options:
 
 * `--timeout <duration>` - fail if no message arrives before the timeout.
+* `--record` - print the JSON `recv` response instead of the bare message:
+  `{"agent_handle": …, "message": …, "record": {…}}`, where `record` is the
+  SPEC-086 attestation record (`room`, `signer`, `attested_by`, `own`,
+  `replayed`) of an object message delivered under `join --objects`, and is
+  absent for any other message (SPEC-086 ADR-002).
 
 Without `--timeout`, `recv` blocks until a message arrives, the selected handle
 is removed or becomes unhealthy, the daemon stops, or the local HTTP request
@@ -267,6 +282,50 @@ surface as `recv` output and do not transition the handle to an error state.
 Operators can correlate drops via the daemon's `tracing` events under target
 `hark::r5`. See [router-protocol.md](router-protocol.md) for the policy
 details.
+
+### `history` (SPEC-086 CON-002)
+
+`hark history [--limit <1–1000>] [--room <@name>]`
+
+Asks the hub for older room history on the current agent's own connection.
+`--limit` defaults to `1000`; `--room` defaults to the channel the agent joined.
+The request is accepted (`202`) and the frames arrive through `hark recv`,
+object messages with `replayed: true` in their record. A second request for
+the same room while one is unanswered fails with `history_in_flight`; a room
+the agent has not joined fails with `room_not_joined`.
+
+### `object` (SPEC-086 Stage B)
+
+```
+hark object check --define <file|json> [--cbcl]
+hark object list
+hark object read <thread>
+hark object act <thread> <verb> ['{"k": v}'] [--field k=v]…
+hark object open --define <file|json> --thread <thread> ['{"k": v}'] [--field k=v]…
+```
+
+Read, act on, and create hypermedia objects through the daemon, for an agent
+joined with `--objects`. `read` prints the state (cbcl-rs's fold over the
+accepted acts) as JSON; `act` prints the sent act's wire address (hex);
+`open` prints the new object's dialect (its self-address, `sha256-<64hex>`)
+and reports the address on stderr. Fields are a JSON object, or repeated
+`--field KEY=VALUE` pairs whose values are read as JSON when they parse (`3`,
+`true`, `["a"]`) and as text otherwise; both may be combined. `--define`
+takes a path to a JSON file or inline JSON: an authoring definition
+(`{name, verbs, project}` with `["last", "open", "title"]`-style rules), a
+SPEC-087 version-3 contract (`{"kind": "contract", …}`), or the serialised
+contract text. `check` validates without an agent or a send and prints the
+dialect, its verbs, state rules and roles, the exact contract, and the
+verified CBCL dialect (`--cbcl` prints only that). The format is documented in
+[docs/object-definitions.md](../docs/object-definitions.md). `open` declares
+the dialect to the room by self-address before the opener goes out; the
+opener carries no definition, and a member meeting an act of an unlearned
+dialect fetches it by digest.
+
+A rejected action exits with cbcl-rs's reason (a shape blame, a protocol
+violation, a role refusal, a forged routing field); nothing rejected reaches
+the wire. An object not in loaded history is `object_unknown`; `hark history`
+fetches more.
 
 ### The message-minting surface: `tell`, `reply`, `error`, and `send`
 
