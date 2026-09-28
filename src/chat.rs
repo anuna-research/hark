@@ -1326,6 +1326,9 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         }
                     };
                     let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
+                    if outbound.control {
+                        tracing::debug!(agent = handle.as_str(), frame = %message_text.chars().take(160).collect::<String>(), "outbound control frame");
+                    }
                     match websocket.send(WsMessage::Binary(frame.into())).await {
                         Ok(()) => {
                             let _ = outbound.result_tx.send(Ok(()));
@@ -1517,6 +1520,9 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     // the announcement itself is not part of the run, and
                     // otherwise flows on exactly as it did before (REQ-001:
                     // the subscription changes no other delivery).
+                    if payload_text.starts_with("(meta") || payload_text.starts_with("(error") || payload_text.starts_with("(roomcfg") {
+                        tracing::trace!(agent = handle.as_str(), frame = %payload_text.chars().take(120).collect::<String>(), "inbound control frame");
+                    }
                     let replayed = match parse_backfilltimes(&payload_text) {
                         Some(count) => {
                             replays.note_backfilltimes(count);
@@ -1546,6 +1552,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     // of it. Teed, not consumed: no other delivery changes.
                     if objects {
                         if crate::objects::runtime::taught_dialect(&payload_text).is_some() {
+                            tracing::debug!(agent = handle.as_str(), "teach frame for the object runtime");
                             if let Ok(runtime) = store.objects_client().await {
                                 runtime.ingest(
                                     crate::objects::AgentIdentity {

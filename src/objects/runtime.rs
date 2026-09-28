@@ -629,7 +629,7 @@ fn declaration_frame(room: &str, name: &str, define: &str, from: &str) -> String
 
 /// The acquisition of a declared dialect by digest (SPEC-015 REQ-005).
 fn fetch_frame(room: &str, digest: &str, from: &str) -> String {
-    format!("(fetchdialect {room} :digest {digest} :from {from})")
+    format!("(fetchdialect {room} :digest {} :from {from})", quote(digest))
 }
 
 /// The teach frame an own declaration is journalled as, so a restarted daemon
@@ -755,6 +755,7 @@ impl Controller {
     /// The room's declared menu changed: ask again for every dialect the
     /// queue is waiting on.
     fn menu(&mut self, entries: Vec<(String, String)>, host: &Host<'_>) {
+        tracing::debug!(target: "hark::objects", entries = entries.len(), pending = self.pending.len(), "room menu received");
         self.menu = entries.into_iter().collect();
         let waiting: HashSet<String> = self.pending.iter().map(|p| p.dialect.clone()).collect();
         for name in waiting {
@@ -772,7 +773,9 @@ impl Controller {
             return;
         };
         let frame = fetch_frame(&self.room, &digest, &self.me);
-        if (host.on_control)(host.agent, &frame) {
+        let sent = (host.on_control)(host.agent, &frame);
+        tracing::debug!(target: "hark::objects", dialect = name, sent, "dialect requested by digest");
+        if sent {
             self.requested.insert(name.to_owned());
         }
     }
@@ -1347,9 +1350,10 @@ impl Runtime {
 
 /// One delivered line: a teach frame or an act.
 fn deliver(controller: &mut Controller, text: &str, signer: &str, host: &Host<'_>) {
-    if taught_dialect(text).is_some() {
-        if let Err(reason) = controller.teach(text, host) {
-            tracing::debug!(target: "hark::objects", %reason, "dialect not learned");
+    if let Some(name) = taught_dialect(text) {
+        match controller.teach(text, host) {
+            Ok(learned) => tracing::debug!(target: "hark::objects", dialect = name, learned, "teach frame"),
+            Err(reason) => tracing::debug!(target: "hark::objects", dialect = name, %reason, "dialect not learned"),
         }
     } else {
         controller.receive(text, signer, host);
@@ -1699,7 +1703,7 @@ mod tests {
         assert_eq!(
             fetched,
             vec![format!(
-                "(fetchdialect @general :digest {} :from @aria)",
+                "(fetchdialect @general :digest \"{}\" :from @aria)",
                 "ab".repeat(32)
             )]
         );
