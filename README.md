@@ -120,35 +120,39 @@ Objects are the chat client's shared, content-addressed state machines: a
 checklist, a vote, a drawing board. Each is a thread of signed CBCL acts under
 a dialect named by its self-address (`sha256-<64hex>`, SPEC-019 R.6) whose
 `(state …)` clause is the fold; cbcl-rs admits every act, folds the state, and
-binds every intent. Hark takes part in two ways.
+binds every intent. The dialect defines the object type; each thread is an
+independent instance with its own history and state.
+
+Hark's object runtime is **native Rust**. It links the `cbcl-wasm` crate as
+native code with its `std` feature; the crate name does not mean hark runs
+WebAssembly. No JavaScript or WebAssembly runtime is needed for `hark object`.
+The same Rust implementation is compiled to WebAssembly for browsers.
 
 ```text
-+------------------------------+        +---------------------------------+
-|  hark daemon                 |  recv  |  JS agent (cbcl/object package) |
-|  object subscription ------->| bytes+ |  admit, fold, intend — through  |
-|  signer attestation          | record |  cbcl-rs wasm — Stage A         |
-|                              |        +---------------------------------+
-|  object runtime  (Stage B)   |
-|  +------------------------+  |        +---------------------------------+
-|  | Rust: learned dialects,|  | object |  shell agent                    |
-|  | thread records, the    |<-+ read/ -+  hark object check|open|act|read |
-|  | unknown-dialect queue  |  | act    +---------------------------------+
-|  +-----------+------------+  |
-|              | native calls  |
-|  cbcl-wasm @ cbcl-bus pin:   |
-|  compile, admit, fold,       |
-|  intend, read; signed send   |
-+------------------------------+
+Agent: hark object check | list | read | act | open
+                         |
+                         v
+Hark daemon: native Rust object runtime
+  Learned dialects, thread records, pending acts, journal
+                         |
+                         v  native function calls
+  cbcl-rs (crate: cbcl-wasm, built for the host CPU)
+  Compile contracts, admit acts, fold state, bind intents, read
+                         |
+                         v
+  Hark transport: sign and send to the chat hub
+
+Object messages also reach hark recv with signer attestations.
 ```
 
-- **Stage A, transport.** With `join --objects`, every object message in the
+- **Transport.** With `join --objects`, every object message in the
   room — the agent's own and replayed history included — reaches `recv`
   with an attestation record: the room, the signer (the MLS sender in an
   encrypted room, the hub-delivered `:from` in a cleartext one), how it was
   attested, and whether it was replayed. Bytes are delivered untouched, so
   the agent's wire address equals the browser's. `hark history` fetches
   older frames.
-- **Stage B, native.** The daemon keeps one controller per agent, in Rust,
+- **Object operations.** The daemon keeps one controller per agent, in Rust,
   and every judgement is cbcl-rs's, linked natively at the revision cbcl-bus
   ships to browsers: the SPEC-087 contract compile, SPEC-019 admission, the
   fold and the intent binder, the reads, canonical text and the wire
@@ -213,8 +217,9 @@ so `cargo build`, `cargo test`, `cargo run -- daemon status`, etc., work
 directly if you prefer.
 
 The build needs a C compiler for `ring` (the release workflow's per-target
-`CC_*` variables cover it). The object runtime is Rust over the `cbcl-wasm`
-crate; nothing is vendored or fetched at build time beyond Cargo's git pins.
+`CC_*` variables cover it). The object runtime links `cbcl-wasm` as native
+Rust code; it needs no WebAssembly target or JavaScript runtime. Cargo
+fetches the pinned dependencies.
 
 ## Configuration
 
@@ -548,17 +553,27 @@ object runtime learns them too. One request per room may be in flight.
 ### `object`
 
 `hark object check|list|read|act|open` — read, act on, and create hypermedia
-objects through the daemon's object runtime (SPEC-086 Stage B; the agent
-must have the object subscription). `check` validates a definition without
-sending and prints its digests, verbs, projections, and the CBCL dialect
-cbcl-rs verified; `list` names the threads the agent has learned; `read`
-prints an object's projected state as JSON; `act <thread> <verb>` hands an
-intent to the SDK's broker, which binds provenance, picks the predecessor,
-fills register and removal fields, verifies with cbcl-rs, and sends; `open
---define <file|json> --thread <t>` verifies a definition and sends its opener
-with the contract (and view) embedded. Fields are a JSON object or repeated
-`--field k=v`. A rejected action prints the broker's reason and sends
-nothing. See [docs/object-definitions.md](docs/object-definitions.md).
+objects through the daemon's native Rust runtime (SPEC-086). `check`
+validates a definition without an agent or a send and prints its dialect
+self-address, label, opener, verbs, state rules, roles, contract, and verified
+CBCL. The other commands require an agent with the object subscription:
+`list` names the threads it has learned; `read` prints an object's projected
+state as JSON; `act <thread> <verb>` uses cbcl-rs to bind routing, causal
+predecessors, and replacements from accepted history, validate, then send.
+`open --define <file|json> --thread <t>` verifies a definition, declares its
+dialect to the room, and sends the opener. Recipients fetch an unknown
+dialect from the room by digest. Views are separate from the contract.
+
+Fields are a JSON object or repeated `--field k=v`. Each flag value is parsed
+as JSON when possible, otherwise as text: `done=true` is a boolean,
+`count=3` an integer, and `item=milk` a string. To preserve a numeric string,
+use `--field 'item="123"'`. Types are checked against the contract; numbers
+are integers only, and null or object-valued fields are unsupported. A
+rejected action reports the reason and sends nothing.
+
+An agent can also construct a complete object action and use `hark send`;
+`object act` handles construction and validation from intent and history.
+See [docs/object-definitions.md](docs/object-definitions.md).
 
 ### `tell`, `reply`, `error`, and `send`
 
@@ -657,7 +672,7 @@ See [SPEC-016](docs/decisions/SPEC-016-cli-verb-set-cbcl-merge.md).
 
 ### `pair`
 
-`hark pair <id>-word-word` — redeem a pairing code minted by the
+`hark pair <id>-word-word [--objects]` — redeem a pairing code minted by the
 web app's "add agent" flow. Runs a SPAKE2 handshake (RFC 9382) with the hub:
 the words never cross the wire, and the pairing record is released bound to
 the PAKE-derived session key. On success the agent joins under the adder-set
@@ -666,7 +681,9 @@ channel the encryption pin derives from the record's invite-cap presence; a
 record claiming `enc=true` without a cap fails closed rather than sending
 plaintext. `--objects` turns on the object subscription, and it turns on by
 itself when the record lists an object dialect — the adder chose an object
-from the room's menu for this agent.
+from the room's menu for this agent. The flag enables object support when
+the invite lists no object dialect; it is redundant when one is already
+listed. Either way, the subscription covers all objects in the channel.
 
 ### `close`
 
@@ -861,8 +878,6 @@ exactly one non-empty string `:thread`.
   redeploy or a daemon restart no longer needs a human. See
   [Recovery](#recovery).
 * [SPEC-086 — object transport and native objects](specs/SPEC-086-hark-object-transport.md)
-  — Stage A (attested object delivery, history) and Stage B (`hark object`,
-  a Rust runtime over cbcl-rs's state layer, linked natively; ADR-005). Both
-  implemented; TEST-001 passed live on 2026-09-27 with a real browser and a
-  hark agent acting on one object. Definition format for agents:
+  — attested object delivery, history, and `hark object`, a native Rust
+  runtime over cbcl-rs's state layer (ADR-005). Definition format for agents:
   [docs/object-definitions.md](docs/object-definitions.md).
