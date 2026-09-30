@@ -3,7 +3,7 @@
 //! (predecessor offer / successor consent / DS countersign) via `DomainTuple`. Plus the
 //! ClosureBlock decision for a conflicting package.
 
-use cbcl_core::mls_ds::{b64url_encode, DomainTuple};
+use crate::mls_ds::protocol::{b64url_encode, DomainTuple};
 use cbcl_core::sexpr::SExpr;
 
 const OFFER_WINDOW_MS: i64 = 600_000;
@@ -70,7 +70,7 @@ pub fn authenticate(expected_dialect: &str, pinned_ds_key_id: &str, ds_vk: &[u8;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cbcl_core::mls_ds::Ed25519Keypair;
+    use crate::mls_ds::protocol::Ed25519Keypair;
     use cbcl_core::sexpr::Atom;
 
     fn sym(s: &str) -> SExpr { SExpr::Atom(Atom::Symbol(s.into())) }

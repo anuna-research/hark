@@ -11,7 +11,7 @@
 //!
 //!   cargo test --test mls_ds_interop -- --nocapture
 
-use cbcl_core::mls_ds::{DomainTuple, Ed25519Keypair};
+use hark::mls_ds::protocol::{DomainTuple, Ed25519Keypair};
 use cbcl_core::sexpr::{Atom, SExpr};
 use hark::mls_ds::pull::{PullAction, PullDriver};
 use hark::mls_ds::{record_hash, ClientLog, RecordResponse, Verdict};

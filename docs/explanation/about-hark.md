@@ -116,10 +116,10 @@ The runtime replays `tests/vectors/state` as its regression corpus.
 Agents and browsers compute state through the same implementation.
 Object messages and taught dialects are journalled under `<identity_dir>/objects/` and replayed after daemon restarts, preserving private-room state.
 
-Hark carries a second cbcl-rs pin because its messaging pin serialises quoted `:caused-by` differently from the bus pin.
-Using the messaging pin for objects produces addresses that disagree with browsers.
-The bus revision also lacks the `mls-ds-proof` feature and role APIs used by hark's MLS Delivery Service client.
-Unifying the pins requires a shared cbcl-rs revision containing those APIs and the browser's object runtime.
+Hark pins its parser, core and object runtime to the same cbcl-rs revision as cbcl-bus.
+Generic CBCL parsing, canonical encoding and role verification come from cbcl-rs.
+MLS-DS message domains, signature profiles and client checks belong to hark's `mls_ds` module.
+The client does not depend on cbcl-rs's experimental `mls-ds-proof` module.
 [Maintain object compatibility](../how-to/how-to-develop-hark.md#maintain-object-compatibility) covers dependency updates.
 Hark accepts version 3 contracts; [Object definitions for hark agents](../object-definitions.md) describes the authoring format.
 That page traces the state and contract formats to their upstream specifications.

@@ -1,29 +1,25 @@
 //! SPEC-024 `mls-ds/v1` Delivery-Service client — IMPL-025. Real hark production module.
 //!
-//! CONSUMES the pinned role-layer cbcl-rs (ADR-031, no re-porting): `canonical_encode`, the
-//! closed-world recogniser (the `cbcl-parser` pipeline + the installed full `mls-ds/v1`
-//! dialect — CON-011), the SPEC-014 role layer, and the corrected `DomainTuple` crypto +
-//! strict Ed25519 (CON-002/003, `mls-ds-proof`). PORTS the CON-005 decision/ordering logic
-//! (ADR-032), computing every preimage via `DomainTuple`.
-//!
-//! This is the production home of the cores validated pre-pin in
-//! `experiments/spec-024-mls-ds-canonical-spike/` (57 tests). Wiring into the live receive
-//! path (`chat.rs` pull loop, ADR-035) is layered on top of this module.
+//! Uses cbcl-rs for parsing, canonical encoding and generic role verification.
+//! MLS-DS domain tuples, strict signatures and client transition rules live in
+//! hark. The live receive path composes these cores with transport and storage.
 
 pub mod attestation;
 pub mod boundary;
 pub mod closure;
 pub mod genesis;
+pub mod protocol;
 pub mod pull;
 pub mod store;
 pub mod task;
 pub mod wire;
 
 use cbcl_core::dialect::DialectRegistry;
-use cbcl_core::mls_ds::{DomainTuple, ReadContext};
+use crate::mls_ds::protocol::{DomainTuple, ReadContext};
 use cbcl_core::sexpr::SExpr;
 use cbcl_core::store::ThreadedMessageStore;
-use cbcl_parser::{parse, parse_dialect, run_pipeline_full, PipelineContext, PipelineResult};
+use cbcl_parser::{parse, parse_dialect, PipelineContext, PipelineResult};
+use crate::cbcl_validation::run_implicit_dialect_pipeline;
 use sha2::{Digest, Sha256};
 
 /// The normative `mls-ds/v1` dialect source (byte-authority; hash `sha256:922ba8…`).
@@ -48,7 +44,7 @@ pub fn install_dialect() -> DialectRegistry {
 pub fn recognize(registry: &DialectRegistry, payload: &str) -> Result<(), String> {
     let store = ThreadedMessageStore::new();
     let ctx = PipelineContext::new(registry, &store);
-    match run_pipeline_full(payload, &ctx) {
+    match run_implicit_dialect_pipeline(payload, &ctx, "mls-ds/v1") {
         PipelineResult::Success(_) => Ok(()),
         other => Err(alloc_fmt(&other)),
     }
@@ -195,7 +191,7 @@ pub fn verify_response_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cbcl_core::mls_ds::Ed25519Keypair;
+    use crate::mls_ds::protocol::Ed25519Keypair;
     use cbcl_core::sexpr::Atom;
 
     fn sym(s: &str) -> SExpr {

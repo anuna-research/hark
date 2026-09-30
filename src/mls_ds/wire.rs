@@ -29,7 +29,8 @@
 use cbcl_core::dialect::DialectRegistry;
 use cbcl_core::sexpr::{Atom, SExpr};
 use cbcl_core::store::{ContentHash, MessageStore, ThreadId, ThreadedMessageStore};
-use cbcl_parser::{run_pipeline_full, PipelineContext, PipelineResult};
+use cbcl_parser::{PipelineContext, PipelineResult};
+use crate::cbcl_validation::run_implicit_dialect_pipeline;
 use sha2::{Digest, Sha256};
 
 use super::{install_dialect, RecordResponse};
@@ -105,7 +106,7 @@ impl DsWire {
     fn recognize_and_store(&mut self, payload: &str, frame: &SExpr) -> Result<(), String> {
         let result = {
             let ctx = PipelineContext::new(&self.registry, &self.store);
-            run_pipeline_full(payload, &ctx)
+            run_implicit_dialect_pipeline(payload, &ctx, "mls-ds/v1")
         };
         match result {
             PipelineResult::Success(message) => {
@@ -296,7 +297,7 @@ pub fn response_frame(verb: &str, body: SExpr, req_hash: &str) -> SExpr {
 mod tests {
     use super::*;
     use crate::mls_ds::record_hash;
-    use cbcl_core::mls_ds::{DomainTuple, Ed25519Keypair};
+    use crate::mls_ds::protocol::{DomainTuple, Ed25519Keypair};
 
     const H0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -324,7 +325,8 @@ mod tests {
         let ds = Ed25519Keypair::from_seed(&[42u8; 32]);
         let mut w = DsWire::new("room-alpha");
         let req = w.next_record_request(0).expect("request recognised");
-        assert!(req.contains("next-record"));
+        assert_eq!(req, "(next-record (read \"room-alpha\" 0) :caused-by \"begin\")",
+            "implicit verification scope does not change signed wire bytes");
         let resp = record_frame("room-alpha", &req_hash_of(&w), 1, H0, &ds);
         match w.inbound(&resp).expect("recognised + bound") {
             DsInbound::Record(r) => {

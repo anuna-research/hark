@@ -2,7 +2,7 @@ use cbcl_core::{
     dialect::DialectRegistry,
     message::{CorePerformative, Message, Performative},
     sexpr::{Atom, SExpr},
-    store::ThreadedMessageStore,
+    store::{MessageStore, ThreadedMessageStore},
 };
 use cbcl_parser::{
     ParseError, PipelineContext, PipelineResult, ValidationError, run_pipeline, run_pipeline_full,
@@ -301,7 +301,39 @@ fn run_validation_pipeline(
         return run_pipeline(input);
     }
     let pipeline_ctx = PipelineContext::new(registry, store);
-    run_pipeline_full(input, &pipeline_ctx)
+    run_implicit_dialect_pipeline(input, &pipeline_ctx, "hub")
+}
+
+/// The hub and DS transports route bare control verbs within an already-known
+/// dialect. Supply that scope only for verification; wire bytes and content
+/// hashes remain unchanged. Unknown verbs still fail the generic pipeline.
+pub(crate) fn run_implicit_dialect_pipeline<S: MessageStore>(
+    input: &str,
+    ctx: &PipelineContext<'_, S>,
+    dialect_name: &str,
+) -> PipelineResult {
+    let Ok(ast) = cbcl_parser::parse(input) else {
+        return run_pipeline_full(input, ctx);
+    };
+    let Ok(Message::Simple { performative: Performative::Custom(name), .. }) =
+        cbcl_parser::parse_message_lax(&ast)
+    else {
+        return run_pipeline_full(input, ctx);
+    };
+    if !ctx.registry.find_by_name(dialect_name)
+        .is_some_and(|dialect| dialect.defines_performative(&name))
+    {
+        return run_pipeline_full(input, ctx);
+    }
+    let scoped = SExpr::List(vec![
+        SExpr::Atom(Atom::Symbol("lang".into())),
+        SExpr::Atom(Atom::Symbol(dialect_name.into())),
+        ast,
+    ]);
+    match run_pipeline_full(&scoped.to_string(), ctx) {
+        PipelineResult::Success(Message::Dialect { inner, .. }) => PipelineResult::Success(*inner),
+        other => other,
+    }
 }
 
 /// Best-effort: parse the outer wrapper to decide whether `run_pipeline_full`
@@ -569,6 +601,29 @@ fn list_items(expr: &SExpr) -> Option<&Vec<SExpr>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn implicit_control_scope_preserves_the_original_message() {
+        let registry = crate::hub_dialect::learn_hub_dialect(&format!(
+            "(meta {})", include_str!("dialects/hub.cbcl")
+        )).unwrap();
+        let store = ThreadedMessageStore::new();
+        let ctx = PipelineContext::new(&registry, &store);
+        let frame = "(announce @general :from @aria :agent @aria :dialects ())";
+        assert!(!matches!(run_pipeline_full(frame, &ctx), PipelineResult::Success(_)));
+        let PipelineResult::Success(message) = run_implicit_dialect_pipeline(frame, &ctx, "hub") else {
+            panic!("known hub control should verify")
+        };
+        assert_eq!(message, cbcl_parser::parse_message_lax(&cbcl_parser::parse(frame).unwrap()).unwrap());
+        assert!(!matches!(
+            run_implicit_dialect_pipeline(frame, &ctx, "mls-ds/v1"),
+            PipelineResult::Success(_)
+        ), "a different transport does not borrow the hub's control grammar");
+        assert!(!matches!(
+            run_implicit_dialect_pipeline("(unrecognized @general)", &ctx, "hub"),
+            PipelineResult::Success(_)
+        ));
+    }
+
     fn validate(input: &str, kind: MessageKind) -> Result<ValidatedMessage, CbclValidationError> {
         validate_for_send(input, kind)
     }
@@ -827,6 +882,8 @@ mod tests {
         let mut registry = DialectRegistry::new();
         registry
             .install(Dialect {
+                state: None,
+                state_bounds: None,
                 roles: Vec::new(),
                 causal_locality: Default::default(),
                 name: String::from("shape-dialect"),
@@ -891,6 +948,8 @@ mod tests {
         let mut registry = DialectRegistry::new();
         registry
             .install(Dialect {
+                state: None,
+                state_bounds: None,
                 roles: Vec::new(),
                 causal_locality: Default::default(),
                 name: String::from("causal-dialect"),

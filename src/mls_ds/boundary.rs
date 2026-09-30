@@ -1,7 +1,7 @@
 //! CON-006 — MLS semantic boundary (H7). v1 owner-removal rejection (REQ-098) and
 //! ADD-AUTH ↔ membership-delta consistency; crypto via `DomainTuple::AddAuth`.
 
-use cbcl_core::mls_ds::DomainTuple;
+use crate::mls_ds::protocol::DomainTuple;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -70,7 +70,7 @@ pub fn validate_v1_commit(owner: &str, creator_vk: &[u8; 32], c: &Commit) -> Ver
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cbcl_core::mls_ds::Ed25519Keypair;
+    use crate::mls_ds::protocol::Ed25519Keypair;
 
     fn d(nib: &str) -> String { format!("sha256:{}", nib.repeat(64)) }
     fn auth_for(targets: &[&str], creator: &Ed25519Keypair) -> AddAuth {

@@ -268,7 +268,9 @@ pub(crate) fn message_sender(text: &str) -> Option<String> {
 /// it is not well-formed. The same parser the hub uses, so field semantics match.
 fn parse_message(text: &str) -> Option<Message> {
     let sexpr = cbcl_parser::parse(text).ok()?;
-    cbcl_parser::parse_message(&sexpr).ok()
+    // Transport controls such as `claim` are bare custom performatives. This
+    // read extracts fields; admission and dialect verification happen separately.
+    cbcl_parser::parse_message_lax(&sexpr).ok()
 }
 
 /// The string value of a `:key` keyword param on a Simple message — used for

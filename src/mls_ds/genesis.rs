@@ -2,7 +2,7 @@
 //! `mls-ds-genesis-validator.mjs` VERDICT logic; crypto CONSUMED via
 //! `DomainTuple::{Claim,ClaimDs,Genesis}` (ADR-031/032).
 
-use cbcl_core::mls_ds::{b64url_encode, tuple_content_hash, DomainTuple};
+use crate::mls_ds::protocol::{b64url_encode, tuple_content_hash, DomainTuple};
 use cbcl_core::sexpr::SExpr;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,7 +87,7 @@ pub fn validate_genesis(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cbcl_core::mls_ds::Ed25519Keypair;
+    use crate::mls_ds::protocol::Ed25519Keypair;
     use cbcl_core::sexpr::{Atom, SExpr};
 
     fn sym(s: &str) -> SExpr { SExpr::Atom(Atom::Symbol(s.into())) }

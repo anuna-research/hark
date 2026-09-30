@@ -61,7 +61,7 @@ Submit focused changes through https://git.anuna.io/anuna-research/hark.
 
 ## Maintain object compatibility
 
-When the hub is redeployed, match `Cargo.toml`'s `cbcl-wasm` revision to cbcl-bus's `cbcl-rs.sha`.
+When the hub is redeployed, match `Cargo.toml`'s `cbcl-core`, `cbcl-parser` and `cbcl-wasm` revisions to cbcl-bus's `cbcl-rs.sha`.
 Copy the upstream `tests/vectors/state` corpus at that revision.
 Run the object conformance tests through `make test`.
-[ADR-005](../../specs/SPEC-086-hark-object-transport.md#adr-005) explains the separate pin.
+Keep one shared revision so agent and browser clients use the same canonical bytes and object addresses.
