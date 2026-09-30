@@ -17,14 +17,14 @@
 //!    {ADMIT,HOLD,REJECT} space. The one JS-reducer-stricter divergence is asserted
 //!    PRESENT + DOCUMENTED, never silently passed.
 //!
-//! Crypto + canonical are CONSUMED from `cbcl-core` (the pinned role layer, `mls-ds-proof`).
+//! Canonical encoding comes from cbcl-core; MLS-DS domains and signature checks live in hark.
 //! The semantic manifest is a CONTRACT, not transplanted bytes: each runtime builds the
 //! scenario with its own keys/encoder and must reach the same outcome.
 //!
 //!   cargo test --test parity_harness -- --nocapture
 
 use cbcl_core::canonical::canonical_encode;
-use cbcl_core::mls_ds::{b64url_encode, DomainTuple, Ed25519Keypair, ReadContext};
+use hark::mls_ds::protocol::{b64url_encode, DomainTuple, Ed25519Keypair, ReadContext};
 use cbcl_core::sexpr::{Atom, SExpr};
 
 use hark::mls_ds::boundary::{self, AddAuth, Commit};

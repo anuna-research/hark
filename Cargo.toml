@@ -14,24 +14,11 @@ path = "src/main.rs"
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
-# IMPL-025: pinned to the role-layer cbcl-rs at fd8f034 (epp `febc669` + the mls-ds
-# commits), the ADR-021 pin recommendation. `mls-ds-proof` compiles the DomainTuple
-# crypto + strict Ed25519 the client consumes.
-# PROVISIONAL PIN: fd8f034 is the tip of the fix/mls-ds-quoted-hash-depth branch on
-# the cbcl-rs remote, NOT yet merged to cbcl-rs main. Move `rev` to the merged/tagged
-# commit once the role layer lands (closes IMPL-024 ADR-021).
-# The bus revision d2cbd968 below lacks mls-ds-proof and the role APIs used by
-# src/mls_ds. Unifying these pins requires a revision containing both surfaces;
-# changing the messaging pin directly to the bus revision does not compile.
-cbcl-core = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034", features = ["mls-ds-proof"] }
-cbcl-parser = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034" }
-# SPEC-086 Stage B: every object judgement (the SPEC-087 contract compile, the
-# SPEC-019 admission, fold and intent binder, the reads, canonical text and the
-# wire address) is cbcl-wasm linked natively at the EXACT revision cbcl-bus
-# ships to browsers (`cbcl-bus/cbcl-rs.sha`). Deliberately a second cbcl-rs pin:
-# hark's own pin above serialises a quoted `:caused-by` differently, and an
-# address computed there would not match the browser's. Bump this in lockstep
-# with cbcl-bus's `cbcl-rs.sha` and re-copy tests/vectors/state.
+# One cbcl-rs revision shared with cbcl-bus/cbcl-rs.sha. Core and parser provide
+# generic CBCL semantics; hark owns MLS-DS protocol domains and signature checks.
+# Keep all three dependencies in lockstep with the browser's object runtime.
+cbcl-core = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "d2cbd968e36dbc0d5876a878e65a89942386890c" }
+cbcl-parser = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "d2cbd968e36dbc0d5876a878e65a89942386890c" }
 cbcl-wasm = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "d2cbd968e36dbc0d5876a878e65a89942386890c", default-features = false, features = ["std"] }
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }

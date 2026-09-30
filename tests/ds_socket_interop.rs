@@ -9,7 +9,7 @@
 //!
 //!   cargo test --test ds_socket_interop -- --nocapture
 
-use cbcl_core::mls_ds::{DomainTuple, Ed25519Keypair};
+use hark::mls_ds::protocol::{DomainTuple, Ed25519Keypair};
 use cbcl_core::sexpr::{Atom, SExpr};
 use futures_util::{SinkExt, StreamExt};
 use hark::mls_ds::pull::{PullAction, PullDriver};

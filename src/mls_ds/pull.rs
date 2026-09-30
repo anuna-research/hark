@@ -70,7 +70,7 @@ impl PullDriver {
 mod tests {
     use super::*;
     use crate::mls_ds::record_hash;
-    use cbcl_core::mls_ds::{DomainTuple, Ed25519Keypair};
+    use crate::mls_ds::protocol::{DomainTuple, Ed25519Keypair};
     use cbcl_core::sexpr::{Atom, SExpr};
 
     const H0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";

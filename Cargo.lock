@@ -282,30 +282,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "cbcl-core"
-version = "0.1.0"
-source = "git+https://codeberg.org/anuna/cbcl-rs?rev=fd8f034#fd8f034043702b5ac276369a077be159f08934e0"
-dependencies = [
- "ed25519-dalek",
- "hashbrown 0.15.5",
- "sha2",
-]
-
-[[package]]
 name = "cbcl-parser"
 version = "0.1.0"
 source = "git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=d2cbd968e36dbc0d5876a878e65a89942386890c#d2cbd968e36dbc0d5876a878e65a89942386890c"
 dependencies = [
- "cbcl-core 0.1.0 (git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=d2cbd968e36dbc0d5876a878e65a89942386890c)",
+ "cbcl-core",
  "serde_json",
-]
-
-[[package]]
-name = "cbcl-parser"
-version = "0.1.0"
-source = "git+https://codeberg.org/anuna/cbcl-rs?rev=fd8f034#fd8f034043702b5ac276369a077be159f08934e0"
-dependencies = [
- "cbcl-core 0.1.0 (git+https://codeberg.org/anuna/cbcl-rs?rev=fd8f034)",
 ]
 
 [[package]]
@@ -313,8 +295,8 @@ name = "cbcl-wasm"
 version = "0.1.0"
 source = "git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=d2cbd968e36dbc0d5876a878e65a89942386890c#d2cbd968e36dbc0d5876a878e65a89942386890c"
 dependencies = [
- "cbcl-core 0.1.0 (git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=d2cbd968e36dbc0d5876a878e65a89942386890c)",
- "cbcl-parser 0.1.0 (git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=d2cbd968e36dbc0d5876a878e65a89942386890c)",
+ "cbcl-core",
+ "cbcl-parser",
  "dlmalloc",
  "sha2",
 ]
@@ -997,8 +979,8 @@ dependencies = [
  "assert_cmd",
  "axum",
  "base64",
- "cbcl-core 0.1.0 (git+https://codeberg.org/anuna/cbcl-rs?rev=fd8f034)",
- "cbcl-parser 0.1.0 (git+https://codeberg.org/anuna/cbcl-rs?rev=fd8f034)",
+ "cbcl-core",
+ "cbcl-parser",
  "cbcl-wasm",
  "chacha20poly1305",
  "clap",
