@@ -20,6 +20,9 @@ base64 = "0.22"
 # PROVISIONAL PIN: fd8f034 is the tip of the fix/mls-ds-quoted-hash-depth branch on
 # the cbcl-rs remote, NOT yet merged to cbcl-rs main. Move `rev` to the merged/tagged
 # commit once the role layer lands (closes IMPL-024 ADR-021).
+# The bus revision d2cbd968 below lacks mls-ds-proof and the role APIs used by
+# src/mls_ds. Unifying these pins requires a revision containing both surfaces;
+# changing the messaging pin directly to the bus revision does not compile.
 cbcl-core = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034", features = ["mls-ds-proof"] }
 cbcl-parser = { git = "https://codeberg.org/anuna/cbcl-rs", rev = "fd8f034" }
 # SPEC-086 Stage B: every object judgement (the SPEC-087 contract compile, the
