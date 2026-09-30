@@ -45,6 +45,14 @@
   ;; :agents carries the channel's pairing provenance as (agent adder) pairs, so
   ;; a member who joined AFTER an agent announced itself still knows which of the
   ;; roster are agents (SPEC-016 REQ-002/010).
+  (extend webhook (request data)
+    (tell @room (webhook-request :request request :data data)))
+  (extend webhookresult (request data)
+    (tell @room (webhook-response :request request :data data)))
+  (extend setdisplayname (name)
+    (tell @hub (display-name-request :name name)))
+  (extend displayname (name revision)
+    (tell @room (display-name :name name :revision revision)))
   (extend presence (members agents)
     (tell @room (roster :members members :agents agents)))
   (extend roomcfg (enc dialects)

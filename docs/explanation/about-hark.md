@@ -118,6 +118,8 @@ Object messages and taught dialects are journalled under `<identity_dir>/objects
 
 Hark carries a second cbcl-rs pin because its messaging pin serialises quoted `:caused-by` differently from the bus pin.
 Using the messaging pin for objects produces addresses that disagree with browsers.
+The bus revision also lacks the `mls-ds-proof` feature and role APIs used by hark's MLS Delivery Service client.
+Unifying the pins requires a shared cbcl-rs revision containing those APIs and the browser's object runtime.
 [Maintain object compatibility](../how-to/how-to-develop-hark.md#maintain-object-compatibility) covers dependency updates.
 Hark accepts version 3 contracts; [Object definitions for hark agents](../object-definitions.md) describes the authoring format.
 That page traces the state and contract formats to their upstream specifications.

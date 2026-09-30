@@ -496,6 +496,9 @@ impl MlsSession {
                 }
             }
         }
+        // Older versions persisted a removed group as though it were still
+        // usable. Normalize that state before accepting outbound work.
+        session.discard_inactive_group()?;
         session.persist_meta()?;
         Ok(session)
     }
@@ -581,7 +584,33 @@ impl MlsSession {
 
     /// Member of a live group?
     pub fn joined(&self) -> bool {
-        self.group.is_some()
+        self.group.as_ref().is_some_and(MlsGroup::is_active)
+    }
+
+    /// A validated self-removal ends membership; it is not evidence of a fork.
+    /// Keep identity, pins and unused KeyPackages for a fresh admission, but
+    /// drop the inactive group and the old pairing grant. No resync is sent.
+    fn discard_inactive_group(&mut self) -> Result<bool, MlsError> {
+        let Some(group) = self.group.as_mut().filter(|group| !group.is_active()) else {
+            return Ok(false);
+        };
+        let epoch = group.epoch().as_u64();
+        group
+            .delete(self.provider.storage())
+            .map_err(MlsError::stack("delete removed group"))?;
+        self.group = None;
+        self.genesis = None;
+        self.trust = None;
+        self.pending_seat = None;
+        self.pair_grant = None;
+        self.clear_resync_state();
+        self.provider.persist()?;
+        self.persist_meta()?;
+        tracing::warn!(
+            room = %self.room, handle = %self.handle, epoch,
+            "removed from the MLS group; awaiting fresh admission"
+        );
+        Ok(true)
     }
 
     /// Mark this room as `mls-ds/v1` (ADR-034): activates H7 owner-removal rejection and the
@@ -836,6 +865,7 @@ impl MlsSession {
                 self.room
             )));
         }
+        self.discard_inactive_group()?;
         let group = self.group.as_mut().ok_or_else(|| {
             // Transient, not a rejection: the Welcome that makes us a member
             // has not arrived yet. Fail closed (no plaintext fallback,
@@ -1854,6 +1884,16 @@ impl MlsSession {
                 }
             }
             Ok(Inbound::Handshake) => {
+                match self.discard_inactive_group() {
+                    Ok(true) => return SessionEvent::Handled { outbound: vec![] },
+                    Err(error) => {
+                        return SessionEvent::Dropped {
+                            reason: error.to_string(),
+                            probable_fork: false,
+                        };
+                    }
+                    Ok(false) => {}
+                }
                 self.clear_resync_state();
                 let _ = self.persist_meta();
                 // SPEC-061 REQ-005: the epoch just moved, which spends whatever
@@ -3928,8 +3968,23 @@ mod tests {
 
     #[test]
     fn full_session_flow_over_frames() {
-        let (a_dir, a_wire) = setup("flow", 86, "@alice");
-        let (b_dir, b_wire) = setup("flow", 87, "@bob");
+        self_removal_flow(0);
+    }
+
+    #[test]
+    fn inactive_group_from_032_is_discarded_on_restart() {
+        self_removal_flow(1);
+    }
+
+    #[test]
+    fn inactive_group_is_discarded_before_send() {
+        self_removal_flow(2);
+    }
+
+    fn self_removal_flow(legacy_path: u8) {
+        let tag = format!("flow-{legacy_path}");
+        let (a_dir, a_wire) = setup(&tag, 86, "@alice");
+        let (b_dir, b_wire) = setup(&tag, 87, "@bob");
 
         let mut alice =
             MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
@@ -4020,10 +4075,97 @@ mod tests {
         let evidence: RemovalEvidence = serde_json::from_slice(&evidence_b64).unwrap();
         let remove_deliver = alice.remove_with_evidence(&evidence).unwrap();
         assert!(remove_deliver.contains(":evidence"));
-        // Bob's validator merges his own removal.
+        // An existing grant must not turn a confirmed removal into an automatic
+        // external rejoin. It remains reusable only on the separate fork path.
+        bob.pair_grant = Some("earlier-admission".into());
+        if legacy_path == 0 {
+            // Bob's validator merges his own removal. No recovery traffic is
+            // authorized by this Commit, and there is no live GroupInfo to emit.
+            let SessionEvent::Handled { outbound } = bob.handle_frame(&remove_deliver) else {
+                panic!("self-removal handled")
+            };
+            assert!(
+                outbound.is_empty(),
+                "removal does not request automatic resync"
+            );
+        } else {
+            // Reproduce the inactive group left behind by 0.3.2. Apply the
+            // authenticated Commit below the session's new cleanup boundary.
+            let genesis = bob.genesis.clone().unwrap();
+            let ct = kw_b64(&remove_deliver, ":ct").unwrap();
+            assert!(matches!(
+                process_inbound(
+                    &bob.provider,
+                    bob.group.as_mut().unwrap(),
+                    &ct,
+                    &bob.room,
+                    &mut bob.pins,
+                    &genesis,
+                    Some(&evidence),
+                    &mut bob.fork,
+                    false
+                )
+                .unwrap(),
+                Inbound::Handshake
+            ));
+            assert!(!bob.group.as_ref().unwrap().is_active());
+            bob.persist_meta().unwrap();
+            if legacy_path == 1 {
+                drop(bob);
+                bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, false).unwrap();
+            }
+        }
+        assert!(
+            !bob.joined(),
+            "a merged self-removal ends membership immediately"
+        );
+        assert!(
+            matches!(
+                bob.encrypt_outbound("(tell @research \"after removal\" :from @bob)"),
+                Err(MlsError::NotReady(_))
+            ),
+            "removal must not turn the next send into fatal UseAfterEviction"
+        );
+        assert!(bob.encrypted(), "removal never permits plaintext fallback");
+        assert!(!bob.fork_active(), "a validated removal is not a fork");
+        assert!(
+            bob.pair_grant.is_none(),
+            "removal does not reuse an earlier admission"
+        );
+        drop(bob);
+        let mut bob = MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, false).unwrap();
+        assert!(
+            !bob.joined(),
+            "restart must not resurrect the inactive group"
+        );
         assert!(matches!(
-            bob.handle_frame(&remove_deliver),
+            bob.encrypt_outbound("(tell @research \"after restart\" :from @bob)"),
+            Err(MlsError::NotReady(_))
+        ));
+
+        // Fresh admission can reuse the identity and remaining KeyPackage keys.
+        // The owner supplies a new, authenticated Welcome; removal itself sends
+        // no resync request and cannot grant permission to rejoin.
+        let fresh_package = kw_str(&b_frames[0], ":last").unwrap();
+        let fresh_keypkg = format!("(keypkg @hub :for @bob :kp \"{fresh_package}\")");
+        let SessionEvent::Handled { outbound } = alice.handle_frame(&fresh_keypkg) else {
+            panic!("fresh admission handled")
+        };
+        let welcome = outbound
+            .iter()
+            .find(|frame| frame.starts_with("(welcome "))
+            .unwrap();
+        assert!(matches!(
+            bob.handle_frame(welcome),
             SessionEvent::Handled { .. }
+        ));
+        assert!(bob.joined(), "a fresh Welcome restores membership");
+        let delivered = bob
+            .encrypt_outbound("(tell @research \"rejoined\" :from @bob)")
+            .unwrap();
+        assert!(matches!(
+            alice.handle_frame(&delivered),
+            SessionEvent::Plaintext { .. }
         ));
 
         // REQ-009: alice restarts and still decrypts the ongoing epoch.

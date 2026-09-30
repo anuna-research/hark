@@ -299,6 +299,20 @@ pub fn process_inbound(
                     }
                 })
                 .collect();
+            // Retain public attribution before the merge removes our leaf.
+            // These fields come from validated evidence and the MLS sender,
+            // rather than the outer transport's untrusted :from label.
+            let removal = if staged.self_removed() {
+                evidence.cloned()
+            } else {
+                None
+            };
+            let committer = sender_index.and_then(|index| {
+                group
+                    .members()
+                    .find(|member| member.index == index)
+                    .and_then(|member| credential_handle(&member.credential).ok())
+            });
             group
                 .merge_staged_commit(provider, *staged)
                 .map_err(MlsError::stack("merge staged commit"))?;
@@ -306,6 +320,14 @@ pub fn process_inbound(
                 pins.observe_verified(&handle, &key)?;
             }
             provider.persist()?;
+            if let Some(evidence) = removal {
+                tracing::warn!(
+                    room, target = %evidence.target_handle,
+                    authorized_by = %evidence.signer_handle,
+                    committer = ?committer, epoch = evidence.epoch,
+                    "validated self-removal Commit merged"
+                );
+            }
             Ok(Inbound::Handshake)
         }
         ProcessedMessageContent::ProposalMessage(proposal) => {
