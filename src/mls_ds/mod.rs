@@ -24,17 +24,42 @@ use sha2::{Digest, Sha256};
 
 /// The normative `mls-ds/v1` dialect source (byte-authority; hash `sha256:922ba8…`).
 const MLS_DS_V1: &str = include_str!("../../priv/dialects/mls-ds-v1.cbcl");
+pub const MLS_DS_V1_RAW_SHA256: &str =
+    "f668451b75215e2bf5b100219cb73aeaf674f975a5238f1da7751778c0b18bf2";
+pub const MLS_DS_V1_CANONICAL_HASH: &str =
+    "sha256:922ba8bf9eb62a07b81989a9bfe6754a626b2edaf4d3f52e3fc4b41321261858";
 
 /// Install the closed-world `mls-ds/v1` dialect into a fresh registry (CON-011). The registry
 /// IS the recogniser's language: `run_pipeline_full` validates every inbound payload against it.
 pub fn install_dialect() -> DialectRegistry {
     let d = parse_dialect(&parse(MLS_DS_V1).expect("mls-ds-v1.cbcl parses"))
         .expect("parse_dialect(mls-ds/v1)");
+    assert_eq!(
+        cbcl_core::canonical::dialect_hash(&d),
+        MLS_DS_V1_CANONICAL_HASH,
+        "Hark's mls-ds/v1 bytes drifted from the cbcl-bus protocol authority",
+    );
     let mut registry = DialectRegistry::new();
     registry
         .install(d)
         .expect("mls-ds/v1 installs (R1–R6) — the closed-world language is recognised");
     registry
+}
+
+#[cfg(test)]
+mod dialect_correspondence_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_dialect_matches_cbcl_bus_byte_and_semantic_pins() {
+        let raw = Sha256::digest(MLS_DS_V1.as_bytes());
+        assert_eq!(format!("{raw:x}"), MLS_DS_V1_RAW_SHA256);
+        let registry = install_dialect();
+        assert_eq!(
+            registry.find_by_name("mls-ds/v1").and_then(|d| d.hash.as_deref()),
+            Some(MLS_DS_V1_CANONICAL_HASH),
+        );
+    }
 }
 
 /// CON-011 ingress recognition: parse + validate an inbound DS payload against the installed

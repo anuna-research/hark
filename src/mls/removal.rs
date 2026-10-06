@@ -209,6 +209,46 @@ pub fn remove_member(
     creator_handle: &str,
     promise: super::claim::CommitPromise<'_>,
 ) -> Result<Vec<u8>, MlsError> {
+    remove_member_inner(provider, identity, group, room, evidence, pins, creator_handle, promise, true)
+}
+
+/// Build a Remove without merging it. The canonical `mls-ds/v1` record is
+/// the acceptance event that permits the session to merge the pending commit.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_remove_member(
+    provider: &super::provider::DurableProvider,
+    identity: &super::MlsIdentity,
+    group: &mut openmls::prelude::MlsGroup,
+    room: &str,
+    evidence: &RemovalEvidence,
+    pins: &super::pins::PinStore,
+    creator_handle: &str,
+) -> Result<Vec<u8>, MlsError> {
+    remove_member_inner(
+        provider,
+        identity,
+        group,
+        room,
+        evidence,
+        pins,
+        creator_handle,
+        super::claim::CommitPromise::Inactive,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remove_member_inner(
+    provider: &super::provider::DurableProvider,
+    identity: &super::MlsIdentity,
+    group: &mut openmls::prelude::MlsGroup,
+    room: &str,
+    evidence: &RemovalEvidence,
+    pins: &super::pins::PinStore,
+    creator_handle: &str,
+    promise: super::claim::CommitPromise<'_>,
+    merge_now: bool,
+) -> Result<Vec<u8>, MlsError> {
     use super::group::{credential_handle, is_owner};
 
     if !is_owner(group, identity)? {
@@ -260,14 +300,18 @@ pub fn remove_member(
 
     // SPEC-027 REQ-001: the same promise gate as the Add path. A Remove moves
     // the epoch exactly as an Add does, so it conflicts exactly as an Add does.
-    super::group::check_promise(&promise, room, group.epoch().as_u64())?;
+    if merge_now {
+        super::group::check_promise(&promise, room, group.epoch().as_u64())?;
+    }
 
     let (commit, _welcome, _gi) = group
         .remove_members(provider, &identity.signer, &[target.index])
         .map_err(MlsError::stack("remove members"))?;
-    group
-        .merge_pending_commit(provider)
-        .map_err(MlsError::stack("merge remove commit"))?;
+    if merge_now {
+        group
+            .merge_pending_commit(provider)
+            .map_err(MlsError::stack("merge remove commit"))?;
+    }
     provider.persist()?;
     use tls_codec::Serialize as _;
     commit

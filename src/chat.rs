@@ -544,8 +544,25 @@ pub async fn create_chat_agent(
     // v1 rooms: start the DS pull loop; its admitted records flow into the
     // receive loop through ds_rx for the MLS apply + CON-013 atomic commit.
     let (ds_tx, ds_rx) = mpsc::channel(8);
+    let (submit_tx, ds_submit_rx) = mpsc::channel(4);
+    let (ds_submit_event_tx, submit_event_rx) = mpsc::channel(4);
+    let mut ds_submit_tx = None;
+    let mut ds_submit_event_rx = None;
     if let Some(cfg) = ds_pull {
+        crate::mls_ds::task::spawn_ds_submit_loop(
+            cfg.ds_url.clone(),
+            cfg.room.clone(),
+            ds_submit_rx,
+            ds_submit_event_tx,
+        );
+        ds_submit_tx = Some(submit_tx);
+        ds_submit_event_rx = Some(submit_event_rx);
         crate::mls_ds::task::spawn_ds_pull_loop(cfg, ds_tx);
+    }
+    if let (Some(session), Some(tx)) = (mls.as_ref(), ds_submit_tx.as_ref()) {
+        if let Some(submit) = session.pending_ds_submit() {
+            let _ = tx.try_send(submit);
+        }
     }
 
     spawn_receive_loop(ReceiveLoopArgs {
@@ -564,6 +581,8 @@ pub async fn create_chat_agent(
         objects,
         wire_handle: agent_handle.to_owned(),
         ds_rx,
+        ds_submit_tx,
+        ds_submit_event_rx,
         join,
     });
 
@@ -672,6 +691,8 @@ struct ReceiveLoopArgs {
     /// CON-013 atomic commit happen here. Idle (sender dropped immediately)
     /// on non-v1 rooms.
     ds_rx: mpsc::Receiver<crate::mls_ds::task::DsApply>,
+    ds_submit_tx: Option<mpsc::Sender<crate::mls_ds::task::DsSubmit>>,
+    ds_submit_event_rx: Option<mpsc::Receiver<crate::mls_ds::task::DsSubmitEvent>>,
     /// SPEC-026 REQ-003: the parameters of the original join, kept so the loop
     /// can replay it after the socket ends. Without this the loop could
     /// reconnect a *socket* but not rejoin a *channel*.
@@ -1169,12 +1190,15 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
         objects,
         wire_handle,
         ds_rx,
+        ds_submit_tx,
+        ds_submit_event_rx,
         join,
     } = args;
     tokio::spawn(async move {
         // SPEC-028 REQ-001/REQ-002: an ordinary room has no DS pull sender.
         // A closed receiver must leave the select after one closure event.
         let mut ds_rx = Some(ds_rx);
+        let mut ds_submit_event_rx = ds_submit_event_rx;
         // Pending Δ-window and liveness-fallback timers, fired into the select.
         let mut timers: FuturesUnordered<BoxFuture<'static, ClaimTimer>> = FuturesUnordered::new();
         // SPEC-026 REQ-001. Every transport-level end of the socket — read side
@@ -1397,10 +1421,22 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         continue;
                     };
                     let Some(session) = mls.as_mut() else { continue };
+                    if let Err(error) = session.prepare_ds_apply(&apply.payload) {
+                        tracing::warn!(%error, "could not abandon stale local DS mutation");
+                        continue;
+                    }
+                    let mut protocol_outbound = Vec::new();
                     let applied_text = match session.handle_frame(&apply.payload) {
                         SessionEvent::Plaintext { text, sender } => Some((text, sender)),
                         SessionEvent::NotMls => None,   // marker/control payload — nothing to render
-                        SessionEvent::Handled { .. } => None,
+                        SessionEvent::Handled { outbound } => {
+                            protocol_outbound = outbound;
+                            None
+                        }
+                        SessionEvent::DsSubmit(_) => {
+                            tracing::warn!("DS record attempted to start another local mutation");
+                            continue;
+                        }
                         SessionEvent::Dropped { reason, .. } => {
                             tracing::warn!(reason, "ds-admitted record failed MLS apply; cursor NOT committed");
                             continue;
@@ -1430,6 +1466,24 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                         tracing::warn!(%error, "CON-013 persist failed; durable cursor holds");
                         continue;
                     }
+                    match session.discharge_ds_followup() {
+                        Ok(outbound) => protocol_outbound.extend(outbound),
+                        Err(error) => {
+                            tracing::warn!(%error, "could not discharge durable DS operation");
+                            continue;
+                        }
+                    }
+                    // Welcome is released only after the admitted Commit and
+                    // its cursor/group state are durably committed together.
+                    for text in &protocol_outbound {
+                        let Ok(payload) = payload_bytes(text) else { continue };
+                        let frame = conn.sign_chat_frame(identity.as_ref(), &payload);
+                        if websocket.send(WsMessage::Binary(frame.into())).await.is_err() {
+                            pending_frames.retain_from(&protocol_outbound);
+                            pending_reconnect = Some("socket failed while releasing DS follow-up".into());
+                            break;
+                        }
+                    }
                     // Decrypted DS-delivered content reaches recv exactly like live
                     // content: as an object record under the object subscription
                     // (SPEC-086 REQ-001/REQ-006), else on the receive-all path
@@ -1451,6 +1505,26 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             if !own && store.enqueue_inbound(&handle, text).await.is_err() {
                                 break;
                             }
+                        }
+                    }
+                }
+                maybe_submit_event = next_optional_apply(&mut ds_submit_event_rx) => {
+                    let Some(event) = maybe_submit_event else { continue };
+                    if let Some(session) = mls.as_mut() {
+                        if let Err(error) = session.on_ds_submit_event(&event) {
+                            tracing::warn!(%error, "failed to resolve DS submission state");
+                        }
+                    }
+                    match event {
+                        crate::mls_ds::task::DsSubmitEvent::Admitted => {}
+                        crate::mls_ds::task::DsSubmitEvent::Stale { head } => {
+                            tracing::info!(head, "DS rejected staged Commit at stale base; pending commit cleared");
+                        }
+                        crate::mls_ds::task::DsSubmitEvent::Rejected(reason) => {
+                            tracing::warn!(reason, "DS submission rejected; pending Commit cleared");
+                        }
+                        crate::mls_ds::task::DsSubmitEvent::Transport(reason) => {
+                            tracing::debug!(reason, "DS submission transport retry");
                         }
                     }
                 }
@@ -1609,6 +1683,16 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             SessionEvent::Plaintext { text, sender } => {
                                 attestation = Attestation::Mls { sender };
                                 Some(text)
+                            }
+                            SessionEvent::DsSubmit(submit) => {
+                                let Some(tx) = ds_submit_tx.as_ref() else {
+                                    tracing::warn!("MLS mutation refused: room has no mls-ds/v1 submit path");
+                                    continue;
+                                };
+                                if tx.send(submit).await.is_err() {
+                                    tracing::warn!("MLS mutation submit task stopped");
+                                }
+                                None
                             }
                             SessionEvent::Handled { outbound } => {
                                 // SPEC-026 REQ-001: a write failure here is the

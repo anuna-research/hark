@@ -50,6 +50,11 @@ pub enum DsInbound {
     Rejected(String),
     /// The room reached closure (H10) — stop pulling.
     RoomClosed,
+    /// A mutation was appended to the canonical log. The client still waits
+    /// for the signed record on the pull path before applying local effects.
+    RecordAdmitted { seq: i64, record_hash: String },
+    /// The submitted base cursor was no longer the DS head.
+    StaleHead { head: i64 },
 }
 
 /// The per-connection production wire: closed-world recogniser + frame codec.
@@ -143,6 +148,25 @@ impl DsWire {
         self.request("genesis-get", body)
     }
 
+    /// Submit an MLS Commit against the exact DS head observed by the client.
+    pub fn commit_submit_request(
+        &mut self,
+        base: i64,
+        payload: &str,
+        adds_member: bool,
+    ) -> Result<String, String> {
+        let body = SExpr::List(vec![
+            sym("submit"),
+            st(&self.room),
+            num(base),
+            st(payload),
+        ]);
+        self.request(
+            if adds_member { "commit-add-submit" } else { "commit-submit" },
+            body,
+        )
+    }
+
     /// Recognise + decode one inbound DS payload. Fail-closed at every step: an unrecognised
     /// frame, a malformed body, a wrong room, or a `:caused-by` naming anything but THE
     /// outstanding request (CON-012 transplant) is an `Err` — the caller drops the frame and
@@ -188,7 +212,20 @@ impl DsWire {
                     ds_vk: pk32(&str_at(items, 3, "ds-vk")?)?,
                 })
             }
-            "ds-rejected" | "genesis-none" | "log-behind" | "log-truncated" | "stale-head" => {
+            "record-admitted" => {
+                let items = body_items(body, "admitted")?;
+                self.bind_room(&str_at(items, 1, "room")?)?;
+                Ok(DsInbound::RecordAdmitted {
+                    seq: num_at(items, 2, "seq")?,
+                    record_hash: str_at(items, 3, "record-hash")?,
+                })
+            }
+            "stale-head" => {
+                let items = body_items(body, "stale")?;
+                self.bind_room(&str_at(items, 1, "room")?)?;
+                Ok(DsInbound::StaleHead { head: num_at(items, 2, "head")? })
+            }
+            "ds-rejected" | "genesis-none" | "log-behind" | "log-truncated" => {
                 Ok(DsInbound::Rejected(render(body)))
             }
             "room-closed" => Ok(DsInbound::RoomClosed),
@@ -338,6 +375,30 @@ mod tests {
         }
         // the slot is freed: a new pull can go out
         assert!(w.next_record_request(1).is_ok());
+    }
+
+    #[test]
+    fn commit_add_submission_is_dialect_checked_and_acknowledged() {
+        let mut wire = DsWire::new("room-alpha");
+        let request = wire
+            .commit_submit_request(7, "(deliver @room :ct \"x\")", true)
+            .unwrap();
+        assert!(request.starts_with("(commit-add-submit (submit \"room-alpha\" 7 "));
+        let hash = req_hash_of(&wire);
+        let response = render(&response_frame(
+            "record-admitted",
+            SExpr::List(vec![
+                sym("admitted"),
+                st("room-alpha"),
+                num(8),
+                st("sha256:record"),
+            ]),
+            &hash,
+        ));
+        assert!(matches!(
+            wire.inbound(&response).unwrap(),
+            DsInbound::RecordAdmitted { seq: 8, .. }
+        ));
     }
 
     #[test]
