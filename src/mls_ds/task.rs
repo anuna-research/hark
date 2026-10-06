@@ -69,6 +69,86 @@ pub struct DsApply {
     pub log: ClientLog,
 }
 
+/// A staged local MLS mutation awaiting admission to the canonical DS log.
+#[derive(Debug, Clone)]
+pub struct DsSubmit {
+    pub payload: String,
+    pub base: i64,
+    pub adds_member: bool,
+}
+
+/// Submit-path feedback. Admission is deliberately not an apply signal: the
+/// signed pull record remains the sole input that advances MLS state.
+#[derive(Debug)]
+pub enum DsSubmitEvent {
+    Admitted,
+    Stale { head: i64 },
+    Rejected(String),
+    Transport(String),
+}
+
+/// Run the mutation side of `mls-ds/v1`. Each request uses a fresh dialect
+/// recogniser/connection so its causal slot cannot be confused with polling.
+pub fn spawn_ds_submit_loop(
+    ds_url: String,
+    room: String,
+    mut submit_rx: mpsc::Receiver<DsSubmit>,
+    event_tx: mpsc::Sender<DsSubmitEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(submit) = submit_rx.recv().await {
+            let mut backoff = Duration::from_secs(1);
+            let event = loop {
+                match submit_once(&ds_url, &room, &submit).await {
+                    DsSubmitEvent::Transport(reason) => {
+                        tracing::debug!(room, reason, ?backoff, "DS submit transport failed; retrying durable operation");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    }
+                    event => break event,
+                }
+            };
+            if event_tx.send(event).await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
+async fn submit_once(ds_url: &str, room: &str, submit: &DsSubmit) -> DsSubmitEvent {
+    let (mut ws, _) = match connect_async(ds_url).await {
+        Ok(pair) => pair,
+        Err(error) => return DsSubmitEvent::Transport(format!("connect: {error}")),
+    };
+    let mut wire = DsWire::new(room);
+    let request = match wire.commit_submit_request(
+        submit.base,
+        &submit.payload,
+        submit.adds_member,
+    ) {
+        Ok(request) => request,
+        Err(error) => return DsSubmitEvent::Rejected(error),
+    };
+    if let Err(error) = ws.send(WsMessage::text(request)).await {
+        return DsSubmitEvent::Transport(format!("send: {error}"));
+    }
+    let Some(Ok(message)) = ws.next().await else {
+        return DsSubmitEvent::Transport("stream ended before admission response".into());
+    };
+    let text = match message {
+        WsMessage::Text(text) => text.to_string(),
+        WsMessage::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        _ => return DsSubmitEvent::Transport("non-data admission response".into()),
+    };
+    match wire.inbound(&text) {
+        Ok(DsInbound::RecordAdmitted { .. }) => DsSubmitEvent::Admitted,
+        Ok(DsInbound::StaleHead { head }) => DsSubmitEvent::Stale { head },
+        Ok(DsInbound::Rejected(reason)) => DsSubmitEvent::Rejected(reason),
+        Ok(other) => DsSubmitEvent::Rejected(format!("unexpected admission response: {other:?}")),
+        Err(error) => DsSubmitEvent::Rejected(error),
+    }
+}
+
 fn read_pin(dir: &Path, name: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(name)).ok().map(|s| s.trim().to_string())
 }
@@ -238,6 +318,10 @@ async fn run_connection(cfg: &DsPullConfig, apply_tx: &mpsc::Sender<DsApply>) ->
             Ok(DsInbound::RoomClosed) => {
                 tracing::info!(room = %cfg.room, "room closed at the DS (H10) — pull loop ends");
                 return LoopEnd::Terminal("room closed");
+            }
+            Ok(DsInbound::RecordAdmitted { .. } | DsInbound::StaleHead { .. }) => {
+                tracing::warn!(room = %cfg.room, "mutation response received on pull connection");
+                return LoopEnd::Terminal("crossed DS response streams");
             }
         }
     }

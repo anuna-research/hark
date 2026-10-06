@@ -27,7 +27,7 @@ use openmls::prelude::MlsGroup;
 use rand::Rng as _;
 
 use super::group::{
-    GenesisAssertion, GenesisTrust, add_member, create_group, group_genesis_creator, is_owner,
+    GenesisAssertion, GenesisTrust, add_member, stage_add_member, create_group, group_genesis_creator, is_owner,
     join_by_grant, join_from_welcome, member_bindings, verify_add_target,
 };
 use super::keypackages::{
@@ -109,6 +109,9 @@ pub enum SessionEvent {
     /// An MLS handshake/control frame was consumed; optionally frames to
     /// send back (keyget after presence, commit+welcome after keypkg, …).
     Handled { outbound: Vec<String> },
+    /// A local Commit is durable but unmerged and must be submitted through
+    /// the room's `mls-ds/v1` endpoint.
+    DsSubmit(crate::mls_ds::task::DsSubmit),
     /// The frame was dropped (undecryptable / failed validation); the
     /// reason is surfaced for logs and the fork flag for REQ-006/REQ-021.
     Dropped { reason: String, probable_fork: bool },
@@ -144,6 +147,11 @@ pub struct MlsSession {
     /// SPEC-024 per-room protocol-version flag (ADR-034): true on a mls-ds/v1 room, activating
     /// H7 owner-removal rejection and the pull loop. Loaded from `SessionMeta.protocol_version`.
     is_v1: bool,
+    /// Last durably applied `mls-ds/v1` cursor; submission bases are DS
+    /// positions, not MLS epochs.
+    v1_log: Option<crate::mls_ds::ClientLog>,
+    /// Durable, unmerged local mutation awaiting its signed DS log record.
+    pending_ds: Option<PendingDsCommit>,
     /// The wire identity (signs idkey/bye assertions — same key as the MLS
     /// leaf, different DS labels).
     wire_seed: [u8; 32],
@@ -291,6 +299,18 @@ struct PendingSeat {
     ct_b64: String,
     /// The GroupInfo epoch this Commit was built against.
     epoch: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingDsCommit {
+    base: i64,
+    payload: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    welcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consumed_ref: Option<String>,
+    #[serde(skip)]
+    accepted_in_memory: bool,
 }
 
 /// The on-disk stem for one agent's MLS state **in one room**.
@@ -447,6 +467,8 @@ impl MlsSession {
             downgrade_refused: false,
             meta_path,
             is_v1: false,
+            v1_log: None,
+            pending_ds: None,
             wire_seed: wire.signing_seed(),
             pair_grant: None,
             present: std::collections::HashSet::new(),
@@ -467,6 +489,15 @@ impl MlsSession {
             session.is_v1 = meta.protocol_version >= 1;
             session.genesis = meta.genesis;
             session.pair_grant = meta.pair_grant;
+            if session.is_v1 {
+                let store = crate::mls_ds::store::DurableStore::open(
+                    session.meta_path.with_extension("v1store"),
+                );
+                if let Some((_generation, snapshot, log)) = store.load_client_state() {
+                    session.provider.restore_snapshot_bytes(&snapshot)?;
+                    session.v1_log = Some(log);
+                }
+            }
             // REQ-026(a)(ii)/(e): restore the replay floor and the rate-limit
             // budget. Without this a restart is a free reset of both, and a
             // captured resync replays.
@@ -495,6 +526,10 @@ impl MlsSession {
                     }
                 }
             }
+        }
+        session.pending_ds = session.load_pending_ds()?;
+        if let (Some(pending), Some(group)) = (session.pending_ds.as_mut(), session.group.as_ref()) {
+            pending.accepted_in_memory = group.epoch().as_u64() == pending.base as u64 + 1;
         }
         // Older versions persisted a removed group as though it were still
         // usable. Normalize that state before accepting outbound work.
@@ -572,6 +607,48 @@ impl MlsSession {
         Ok(())
     }
 
+    fn pending_ds_path(&self) -> PathBuf {
+        self.meta_path.with_extension("dspending")
+    }
+
+    fn load_pending_ds(&self) -> Result<Option<PendingDsCommit>, MlsError> {
+        match fs::read(self.pending_ds_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| MlsError::Storage(std::io::Error::other(error))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(MlsError::Storage(error)),
+        }
+    }
+
+    fn persist_pending_ds(&self, pending: &PendingDsCommit) -> Result<(), MlsError> {
+        let path = self.pending_ds_path();
+        let tmp = path.with_extension("dspending.tmp");
+        let bytes = serde_json::to_vec_pretty(pending).map_err(std::io::Error::other)?;
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    fn clear_pending_ds(&mut self) -> Result<(), MlsError> {
+        if let Some(group) = self.group.as_mut() {
+            if group.pending_commit().is_some() {
+                group
+                    .clear_pending_commit(self.provider.storage())
+                    .map_err(MlsError::stack("clear rejected DS commit"))?;
+            }
+        }
+        self.provider.persist()?;
+        self.pending_ds = None;
+        match fs::remove_file(self.pending_ds_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(MlsError::Storage(error)),
+        }
+    }
+
     /// Is the channel pinned encrypted (REQ-023)?
     pub fn encrypted(&self) -> bool {
         self.enc_pinned
@@ -617,12 +694,73 @@ impl MlsSession {
     /// pull loop, and persists the flag. Called by the v1-room creation path (claim → genesis).
     pub fn mark_v1(&mut self) -> Result<(), MlsError> {
         self.is_v1 = true;
+        self.v1_log.get_or_insert_with(|| crate::mls_ds::ClientLog {
+            cursor: 0,
+            cursor_hash: crate::mls_ds::task::GENESIS_CURSOR_HASH.into(),
+        });
         self.persist_meta()
     }
 
     /// Whether this room speaks `mls-ds/v1` (ADR-034).
     pub fn is_v1(&self) -> bool {
         self.is_v1
+    }
+
+    /// Resolve submit feedback without treating acknowledgement as an MLS
+    /// apply. Only the signed pull record may merge the pending commit.
+    pub fn on_ds_submit_event(
+        &mut self,
+        event: &crate::mls_ds::task::DsSubmitEvent,
+    ) -> Result<(), MlsError> {
+        match event {
+            crate::mls_ds::task::DsSubmitEvent::Admitted => Ok(()),
+            crate::mls_ds::task::DsSubmitEvent::Stale { .. }
+            | crate::mls_ds::task::DsSubmitEvent::Transport(_) => Ok(()),
+            crate::mls_ds::task::DsSubmitEvent::Rejected(_) => self.clear_pending_ds(),
+        }
+    }
+
+    /// A different exact-next DS record won the race. Abandon our staged
+    /// pending commit before applying the canonical winner.
+    pub fn prepare_ds_apply(&mut self, payload: &str) -> Result<(), MlsError> {
+        if self
+            .pending_ds
+            .as_ref()
+            .is_some_and(|pending| pending.payload != payload && !pending.accepted_in_memory)
+        {
+            self.clear_pending_ds()?;
+        }
+        Ok(())
+    }
+
+    /// Re-drive a durable staged operation after process restart.
+    pub fn pending_ds_submit(&self) -> Option<crate::mls_ds::task::DsSubmit> {
+        let pending = self.pending_ds.as_ref()?;
+        (!pending.accepted_in_memory).then(|| crate::mls_ds::task::DsSubmit {
+            payload: pending.payload.clone(),
+            base: pending.base,
+            adds_member: pending.welcome.is_some(),
+        })
+    }
+
+    /// Release deferred effects after the merged group and DS cursor have
+    /// committed atomically. This is the only path that yields a Welcome.
+    pub fn discharge_ds_followup(&mut self) -> Result<Vec<String>, MlsError> {
+        let Some(pending) = self.pending_ds.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if !pending.accepted_in_memory {
+            return Ok(Vec::new());
+        }
+        let mut outbound = pending.welcome.iter().cloned().collect::<Vec<_>>();
+        self.pending_ds = None;
+        match fs::remove_file(self.pending_ds_path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(MlsError::Storage(error)),
+        }
+        outbound.extend(self.group_info_frame());
+        Ok(outbound)
     }
 
     /// The pull task's pin directory (genesis anchor + TOFU DS key), colocated
@@ -636,7 +774,7 @@ impl MlsSession {
     /// mix (REQ-083). v1 rooms use this INSTEAD of the separate `persist_meta` + provider renames;
     /// legacy rooms keep their format — no on-disk migration, since v1 rooms are new.
     pub fn persist_v1_state(
-        &self,
+        &mut self,
         generation: u64,
         log: &crate::mls_ds::ClientLog,
     ) -> Result<(), MlsError> {
@@ -645,7 +783,9 @@ impl MlsSession {
             crate::mls_ds::store::DurableStore::open(self.meta_path.with_extension("v1store"));
         store
             .commit_client_state(generation, &snapshot, log)
-            .map_err(MlsError::Storage)
+            .map_err(MlsError::Storage)?;
+        self.v1_log = Some(log.clone());
+        Ok(())
     }
 
     /// Reload the v1 client state committed by [`Self::persist_v1_state`] — whole-old or whole-new,
@@ -1681,13 +1821,13 @@ impl MlsSession {
     /// The limit, stated rather than glossed: the echo proves the HUB took and
     /// fanned the Commit, not that every member applied it. That is strictly more
     /// than the previous evidence, which was none.
-    fn note_own_seat_echo(&mut self, ct_b64: &str) -> bool {
+    fn note_own_seat_echo(&mut self, ct_b64: &str) -> Result<bool, MlsError> {
         let matches = self
             .pending_seat
             .as_ref()
             .is_some_and(|p| p.ct_b64 == ct_b64);
         if !matches {
-            return false;
+            return Ok(false);
         }
         let pending = self.pending_seat.take().expect("just matched");
         self.group = Some(pending.group);
@@ -1706,17 +1846,41 @@ impl MlsSession {
         // Meta-last is what makes a crash between the two writes survivable. The
         // meta is the pointer; a pointer written before its target is a dangling
         // one, and that is exactly the failure above.
-        if let Err(e) = self.provider.persist() {
-            tracing::warn!(room = %self.room, error = %e, "seat accepted but group state did not persist");
-        }
-        if let Err(e) = self.persist_meta() {
-            tracing::warn!(room = %self.room, error = %e, "seat accepted but meta did not persist");
-        }
+        self.provider.persist()?;
+        self.persist_meta()?;
         tracing::info!(
             room = %self.room, epoch = pending.epoch,
             "our external Commit was accepted — seated (SPEC-061 REQ-008)"
         );
-        true
+        Ok(true)
+    }
+
+    fn accept_pending_ds(&mut self, payload: &str) -> Result<Option<Vec<String>>, MlsError> {
+        let Some(pending) = self.pending_ds.as_ref() else {
+            return Ok(None);
+        };
+        if pending.payload != payload {
+            return Ok(None);
+        }
+        if pending.accepted_in_memory {
+            return Ok(Some(Vec::new()));
+        }
+        let consumed_ref = pending.consumed_ref.clone();
+        let group = self
+            .group
+            .as_mut()
+            .ok_or_else(|| MlsError::Rejected("DS admitted a local Commit without a group".into()))?;
+        group
+            .merge_pending_commit(&self.provider)
+            .map_err(MlsError::stack("merge DS-admitted local commit"))?;
+        if let Some(reference) = consumed_ref.as_deref() {
+            self.ledger.mark_consumed(reference)?;
+        }
+        self.pending_ds
+            .as_mut()
+            .expect("matched pending DS operation")
+            .accepted_in_memory = true;
+        Ok(Some(Vec::new()))
     }
 
     /// REQ-001/REQ-012: a Welcome addressed to us.
@@ -1781,7 +1945,19 @@ impl MlsSession {
                 // ordinary dropped frame started from a raised baseline.
                 self.clear_resync_state();
                 match self.persist_meta() {
-                    Ok(()) => SessionEvent::Handled { outbound: vec![] },
+                    Ok(()) => match self.join_frames() {
+                        // Refill the one-time directory immediately after a
+                        // successful Welcome consumed an init key. Only the
+                        // key publication is needed; identity/grant frames are
+                        // connection bootstrap traffic.
+                        Ok(frames) => SessionEvent::Handled {
+                            outbound: frames.into_iter().take(1).collect(),
+                        },
+                        Err(e) => SessionEvent::Dropped {
+                            reason: e.to_string(),
+                            probable_fork: false,
+                        },
+                    },
                     Err(e) => SessionEvent::Dropped {
                         reason: e.to_string(),
                         probable_fork: false,
@@ -1812,14 +1988,33 @@ impl MlsSession {
         // yet — the old order reported this as "deliver before MLS join" and
         // discarded the only acknowledgement the self-seating path ever gets.
         if kw_symbol(text, ":from").as_deref() == Some(self.handle.as_str()) {
+            match self.accept_pending_ds(text) {
+                Ok(Some(outbound)) => return SessionEvent::Handled { outbound },
+                Err(error) => {
+                    return SessionEvent::Dropped {
+                        reason: error.to_string(),
+                        probable_fork: false,
+                    };
+                }
+                Ok(None) => {}
+            }
             if let Some(ct) = kw_str(text, ":ct") {
-                if self.note_own_seat_echo(&ct) {
+                match self.note_own_seat_echo(&ct) {
+                    Ok(true) => {
                     // Now that we hold the group, publish a GroupInfo for the
                     // epoch we just moved the room to: ours spent the one the
                     // hub was holding.
                     return SessionEvent::Handled {
                         outbound: self.group_info_frame().into_iter().collect(),
                     };
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return SessionEvent::Dropped {
+                            reason: error.to_string(),
+                            probable_fork: false,
+                        };
+                    }
                 }
             }
             // Any other echo of our own is not ours to process — MLS refuses to
@@ -1937,14 +2132,14 @@ impl MlsSession {
     /// REQ-003/REQ-008: the hub answered our `keyget` — add the member if we
     /// are the elected owner.
     fn on_keypkg(&mut self, text: &str) -> SessionEvent {
-        let result = (|| -> Result<Vec<String>, MlsError> {
+        let result = (|| -> Result<SessionEvent, MlsError> {
             let target = kw_symbol(text, ":for")
                 .ok_or_else(|| MlsError::Rejected("keypkg missing :for".into()))?;
             let kp = kw_b64(text, ":kp")
                 .ok_or_else(|| MlsError::Rejected("keypkg missing :kp".into()))?;
             if kp.is_empty() {
                 // Directory miss — nothing to add.
-                return Ok(vec![]);
+                return Ok(SessionEvent::Handled { outbound: vec![] });
             }
             let group = self
                 .group
@@ -1969,7 +2164,59 @@ impl MlsSession {
             if self.resync_heal.contains(&target) {
                 let outcome = self.heal_member(&target, &kp);
                 self.resync_heal.remove(&target);
-                return outcome;
+                return outcome.map(|outbound| SessionEvent::Handled { outbound });
+            }
+
+            if self.is_v1 {
+                if self.pending_ds.is_some() {
+                    return Err(MlsError::Rejected(
+                        "an mls-ds/v1 Commit is already awaiting admission".into(),
+                    ));
+                }
+                let base = self
+                    .v1_log
+                    .as_ref()
+                    .ok_or_else(|| MlsError::Rejected("mls-ds/v1 cursor is unavailable".into()))?
+                    .cursor;
+                let outcome = stage_add_member(
+                    &self.provider,
+                    &self.identity,
+                    group,
+                    &kp,
+                    &target,
+                    &self.pins,
+                    &mut self.ledger,
+                    &self.room,
+                )?;
+                let payload = format!(
+                    "(deliver {} :enc mls :ct \"{}\" :from {})",
+                    self.room,
+                    B64.encode(&outcome.commit_bytes),
+                    self.handle
+                );
+                let pending = PendingDsCommit {
+                    base,
+                    payload: payload.clone(),
+                    welcome: Some(format!(
+                        "(welcome {} :for {} :ct \"{}\" :from {})",
+                        self.room,
+                        target,
+                        B64.encode(&outcome.welcome_bytes),
+                        self.handle
+                    )),
+                    consumed_ref: outcome.consumed_ref,
+                    accepted_in_memory: false,
+                };
+                // The pending OpenMLS commit and its exact wire obligation are
+                // durable before the DS can admit either.
+                self.provider.persist()?;
+                self.persist_pending_ds(&pending)?;
+                self.pending_ds = Some(pending);
+                return Ok(SessionEvent::DsSubmit(crate::mls_ds::task::DsSubmit {
+                    payload,
+                    base,
+                    adds_member: true,
+                }));
             }
 
             let outcome = add_member(
@@ -1990,7 +2237,7 @@ impl MlsSession {
                 crate::mls::claim::CommitPromise::Inactive,
             )?;
             self.persist_meta()?;
-            Ok(vec![
+            Ok(SessionEvent::Handled { outbound: vec![
                 format!(
                     "(deliver {} :enc mls :ct \"{}\" :from {})",
                     self.room,
@@ -2004,10 +2251,10 @@ impl MlsSession {
                     B64.encode(&outcome.welcome_bytes),
                     self.handle
                 ),
-            ])
+            ] })
         })();
         match result {
-            Ok(outbound) => SessionEvent::Handled { outbound },
+            Ok(event) => event,
             Err(e) => SessionEvent::Dropped {
                 reason: e.to_string(),
                 probable_fork: false,
@@ -3969,6 +4216,62 @@ mod tests {
     #[test]
     fn full_session_flow_over_frames() {
         self_removal_flow(0);
+    }
+
+    #[test]
+    fn v1_add_waits_for_the_admitted_ds_record_before_merge_and_welcome() {
+        let (a_dir, a_wire) = setup("v1-stage", 186, "@alice");
+        let (b_dir, b_wire) = setup("v1-stage", 187, "@bob");
+        let mut alice =
+            MlsSession::open(&a_dir, "alice", "@research", "@alice", &a_wire, true).unwrap();
+        let mut bob =
+            MlsSession::open(&b_dir, "bob", "@research", "@bob", &b_wire, true).unwrap();
+        let a_frames = alice.join_frames().unwrap();
+        let b_frames = bob.join_frames().unwrap();
+        alice.handle_frame(&b_frames[1]);
+        bob.handle_frame(&a_frames[1]);
+        alice.create_group_as_creator().unwrap();
+        alice.mark_v1().unwrap();
+        alice.v1_log = Some(crate::mls_ds::ClientLog {
+            cursor: 7,
+            cursor_hash: "sha256:cursor-seven".into(),
+        });
+        let base_epoch = alice.group.as_ref().unwrap().epoch().as_u64();
+        let package = match kw_value(&b_frames[0], ":onetime").unwrap() {
+            SExpr::List(items) => match &items[0] {
+                SExpr::Atom(Atom::Str(value)) => value.clone(),
+                _ => panic!("package"),
+            },
+            _ => panic!("package list"),
+        };
+        let SessionEvent::DsSubmit(submit) = alice.handle_frame(&format!(
+            "(keypkg @hub :for @bob :kp \"{package}\")"
+        )) else {
+            panic!("v1 Add must go through the DS")
+        };
+        assert_eq!(submit.base, 7, "submission is based on the DS cursor");
+        assert!(submit.adds_member);
+        assert_eq!(alice.group.as_ref().unwrap().epoch().as_u64(), base_epoch);
+        assert!(alice.pending_ds_path().exists(), "obligation is durable before submit");
+
+        let SessionEvent::Handled { outbound } = alice.handle_frame(&submit.payload) else {
+            panic!("admitted own record merges the pending Commit")
+        };
+        assert!(outbound.is_empty(), "Welcome remains deferred until durable cursor commit");
+        assert_eq!(alice.group.as_ref().unwrap().epoch().as_u64(), base_epoch + 1);
+        assert!(alice.pending_ds_path().exists());
+        alice
+            .persist_v1_state(
+                8,
+                &crate::mls_ds::ClientLog {
+                    cursor: 8,
+                    cursor_hash: "sha256:record".into(),
+                },
+            )
+            .unwrap();
+        let outbound = alice.discharge_ds_followup().unwrap();
+        assert!(!alice.pending_ds_path().exists());
+        assert_eq!(outbound.iter().filter(|f| f.starts_with("(welcome ")).count(), 1);
     }
 
     #[test]

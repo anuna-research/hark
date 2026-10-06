@@ -217,38 +217,23 @@ pub fn process_inbound(
     // signature over the FramedContent rather than merely travelling beside it.
     // Read before `into_content` consumes the message.
     let aad = processed.aad().to_vec();
+    // OpenMLS resolves this credential against the message's own epoch before
+    // returning `ProcessedMessage`. Keep that historical identity; looking the
+    // numeric leaf index up in the current tree aliases a delayed message to a
+    // replacement member after leaf reuse.
+    let authenticated_sender = credential_handle(processed.credential())?;
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app) => {
-            let sender_index = sender_index.ok_or_else(|| {
+            let _sender_index = sender_index.ok_or_else(|| {
                 MlsError::Rejected("application message from a non-member sender (REQ-017e)".into())
             })?;
-            let members = member_bindings(group)?;
-            let (sender_handle, sender_key) = group
-                .members()
-                .find(|m| m.index == sender_index)
-                .map(|m| (credential_handle(&m.credential), m.signature_key))
-                .map(|(h, k)| h.map(|h| (h, k)))
-                .transpose()?
-                .ok_or_else(|| {
-                    MlsError::Rejected("application message from unknown leaf".into())
-                })?;
-            // The sender leaf must match its handle's pin — the leaf was
-            // validated on entry, but the pin may have moved (flagged).
-            match pins.pinned(&sender_handle) {
-                Some(pin) if pin.key == sender_key.as_slice() => {}
-                Some(_) => {
-                    return Err(MlsError::Rejected(format!(
-                        "sender {sender_handle} leaf key no longer matches its pin"
-                    )));
-                }
-                None => {
-                    return Err(MlsError::Rejected(format!(
-                        "sender {sender_handle} has no pin (validated members are always pinned)"
-                    )));
-                }
+            let sender_handle = authenticated_sender;
+            if pins.pinned(&sender_handle).is_none() {
+                return Err(MlsError::Rejected(format!(
+                    "sender {sender_handle} has no pin (validated members are always pinned)"
+                )));
             }
-            debug_assert!(!members.is_empty());
             fork.record_success();
             Ok(Inbound::App {
                 plaintext: app.into_bytes(),

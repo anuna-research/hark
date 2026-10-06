@@ -659,6 +659,8 @@ pub fn verify_add_target(
 pub struct AddOutcome {
     pub commit_bytes: Vec<u8>,
     pub welcome_bytes: Vec<u8>,
+    /// One-time KeyPackage ref to consume after canonical admission.
+    pub consumed_ref: Option<String>,
 }
 
 /// REQ-003: add `target_handle` using their fetched KeyPackage, with full
@@ -675,6 +677,50 @@ pub fn add_member(
     ledger: &mut ConsumedLedger,
     room: &str,
     promise: super::claim::CommitPromise<'_>,
+) -> Result<AddOutcome, MlsError> {
+    add_member_inner(provider, identity, group, kp_bytes, target_handle, pins, ledger, room, promise, true)
+}
+
+/// Build an Add while retaining OpenMLS's pending commit. `mls-ds/v1`
+/// callers persist this state and submit the exact bytes to the DS; only the
+/// admitted record may merge it.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_add_member(
+    provider: &DurableProvider,
+    identity: &MlsIdentity,
+    group: &mut MlsGroup,
+    kp_bytes: &[u8],
+    target_handle: &str,
+    pins: &PinStore,
+    ledger: &mut ConsumedLedger,
+    room: &str,
+) -> Result<AddOutcome, MlsError> {
+    add_member_inner(
+        provider,
+        identity,
+        group,
+        kp_bytes,
+        target_handle,
+        pins,
+        ledger,
+        room,
+        super::claim::CommitPromise::Inactive,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_member_inner(
+    provider: &DurableProvider,
+    identity: &MlsIdentity,
+    group: &mut MlsGroup,
+    kp_bytes: &[u8],
+    target_handle: &str,
+    pins: &PinStore,
+    ledger: &mut ConsumedLedger,
+    room: &str,
+    promise: super::claim::CommitPromise<'_>,
+    merge_now: bool,
 ) -> Result<AddOutcome, MlsError> {
     if !is_owner(group, identity)? {
         return Err(MlsError::Rejected(
@@ -721,14 +767,18 @@ pub fn add_member(
     // An `ArmedClaim` IS that promise, which is why it is a type and not a
     // boolean: this function cannot be reached without one, or without the
     // caller saying explicitly that the room has not activated the protocol.
-    check_promise(&promise, room, group.epoch().as_u64())?;
+    if merge_now {
+        check_promise(&promise, room, group.epoch().as_u64())?;
+    }
 
     let (commit, welcome, _group_info) = group
         .add_members(provider, &identity.signer, &[kp])
         .map_err(MlsError::stack("add members"))?;
-    group
-        .merge_pending_commit(provider)
-        .map_err(MlsError::stack("merge own add commit"))?;
+    if merge_now {
+        group
+            .merge_pending_commit(provider)
+            .map_err(MlsError::stack("merge own add commit"))?;
+    }
     // REQ-013: record what this Add SPENT.
     //
     // Without it the ledger only ever held refs consumed on the JOIN path — our
@@ -753,8 +803,8 @@ pub fn add_member(
     // This is only decidable here because the flag now travels on the package
     // (see `build_key_package`); before that it was local state the adder could
     // not see.
-    if !is_last_resort {
-        let _ = ledger.mark_consumed(&ref_b64);
+    if merge_now && !is_last_resort {
+        ledger.mark_consumed(&ref_b64)?;
     }
     provider.persist()?;
     Ok(AddOutcome {
@@ -764,6 +814,7 @@ pub fn add_member(
         welcome_bytes: welcome
             .tls_serialize_detached()
             .map_err(MlsError::stack("serialize welcome"))?,
+        consumed_ref: (!is_last_resort).then_some(ref_b64),
     })
 }
 
@@ -1039,8 +1090,7 @@ pub fn join_from_welcome(
     // the durable single-use ledger), pin first-contact members TOFU, then
     // persist (the consumed init key leaves disk here).
     for ref_b64 in &welcome_refs {
-        // mark_consumed errors only on duplicates, which we pre-checked.
-        let _ = ledger.mark_consumed(ref_b64);
+        ledger.mark_consumed(ref_b64)?;
     }
     for (handle, key) in tofu_pins {
         pins.observe_verified(&handle, &key)?;
