@@ -111,7 +111,18 @@ pub const DS_MLS_INVITE: &str = "cbcl-mls-invite/v1";
 /// admitted group inside the signed bytes and the JSON record (`group_id_b64`),
 /// and every verifier requires it to equal the group being judged. v1 grants are
 /// refused, not translated: there is no legacy path.
-pub const DS_MLS_PAIRGRANT: &str = "cbcl-mls-pairgrant/v2";
+///
+/// **v3 — bound to the group's authenticated state.** A public GroupId is not an
+/// anchor: anyone can create a group under the genuine identifier (OpenMLS
+/// `new_with_group_id`), with its own valid genesis, and Add another public
+/// KeyPackage of the signer. Every v2 check then passes in that rival. v3 adds the
+/// canonical TLS-serialized MLS GroupContext of the signer's admitted group at
+/// the signer's epoch (`group_context_b64`), signed immediately after the group
+/// id. That context carries the epoch, tree hash, confirmed transcript hash and
+/// extensions, so a different tree under a copied identifier cannot reproduce
+/// it. A grant therefore authorises ONE epoch: any Commit to the group makes it
+/// stale, and a member must reissue it. v1 and v2 are refused with no fallback.
+pub const DS_MLS_PAIRGRANT: &str = "cbcl-mls-pairgrant/v3";
 
 /// Leaf capabilities advertising the genesis extension type. REQ-016 obliges
 /// every hark and web-client KeyPackage/leaf to carry this; openmls then

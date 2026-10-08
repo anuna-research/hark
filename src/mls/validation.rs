@@ -19,8 +19,9 @@ use openmls::prelude::{
 use tls_codec::{DeserializeBytes as _, Serialize as _};
 
 use super::group::{
-    ExternalAdmission, GenesisAssertion, credential_handle, elect_committer,
-    group_genesis_creator, live_leaf_bindings, member_bindings, verify_admission_authority,
+    ExternalAdmission, GenesisAssertion, canonical_group_context, credential_handle,
+    elect_committer, group_genesis_creator, live_leaf_bindings, member_bindings,
+    verify_admission_authority,
 };
 use super::pins::PinStore;
 use super::provider::DurableProvider;
@@ -455,14 +456,17 @@ fn validate_external_commit(
     })?;
     // Which credential is this, and does it authorise this leaf into THIS group?
     // The same predicate the joiner applied before installing (and cbcl-bus
-    // applies on both sides): a pairing grant must name this group's id and a
-    // live signer leaf of the tree we hold; an unsupported pairing kind is refused
-    // and never re-read as an invite (SPEC-061 OQ-001).
+    // applies on both sides): a pairing grant must name this group's id, our
+    // GroupContext as it stands BEFORE this Commit merges (so a grant minted at
+    // an earlier epoch is stale), and a live signer leaf of the tree we hold; an
+    // unsupported pairing kind is refused and never re-read as an invite
+    // (SPEC-061 OQ-001).
     verify_admission_authority(
         &presented.grant_json,
         &presented.token_b64,
         room,
         group.group_id().as_slice(),
+        &canonical_group_context(group)?,
         &handle,
         leaf_key,
         &live_leaf_bindings(group, None),

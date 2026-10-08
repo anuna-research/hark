@@ -321,12 +321,12 @@ pub fn invite_signing_bytes(
     out
 }
 
-/// The `cbcl-mls-pairgrant/v2` signed context (SPEC-061 CON-006, as corrected by
-/// the group-bound pairing decision): `lp(label) ‖ lp(room) ‖ lp(group_id) ‖
-/// lp(signer_handle) ‖ lp(signer_key) ‖ lp(subject_handle) ‖ lp(subject_key) ‖
-/// u64-be(not_after_ms)`. MUST be byte-identical to cbcl-bus's
+/// The `cbcl-mls-pairgrant/v3` signed context (SPEC-061 CON-006, as corrected by
+/// the group-bound pairing decisions): `lp(label) ‖ lp(room) ‖ lp(group_id) ‖
+/// lp(group_context) ‖ lp(signer_handle) ‖ lp(signer_key) ‖ lp(subject_handle) ‖
+/// lp(subject_key) ‖ u64-be(not_after_ms)`. MUST be byte-identical to cbcl-bus's
 /// `pairgrant_signing_bytes` (crates/cbcl-mls-wasm); the shared known-answer
-/// vector is `tests/vectors/pairgrant-v2-context-vector.json`.
+/// vector is `tests/vectors/pairgrant-v3-context-vector.json`.
 ///
 /// The parity requirement bites harder here than it does for
 /// [`invite_signing_bytes`]. An invite may be minted and redeemed on the same
@@ -346,10 +346,16 @@ pub fn invite_signing_bytes(
 /// signer's own admitted group. History: v1 (`cbcl-mls-pairgrant/v1`) had the same
 /// layout without `lp(group_id)`; it bound a grant to a room NAME, and a rival
 /// group under that name carrying a copy of the signer's public leaf satisfied
-/// every v1 check. v2 is the correction; v1 is no longer produced or accepted.
+/// every v1 check. v2 added `lp(group_id)`, but a public identifier can be
+/// copied into a rival group. v3 adds `lp(group_context)`: the RAW canonical TLS
+/// serialization of the MLS GroupContext at the signer's admitted epoch, which
+/// authenticates that group's tree and transcript. Neither v1 nor v2 is produced
+/// or accepted.
+#[allow(clippy::too_many_arguments)]
 pub fn pairgrant_signing_bytes(
     room: &str,
     group_id: &[u8],
+    group_context: &[u8],
     signer_handle: &str,
     signer_key: &[u8; 32],
     subject_handle: &str,
@@ -360,6 +366,7 @@ pub fn pairgrant_signing_bytes(
     lp(&mut out, DS_MLS_PAIRGRANT.as_bytes());
     lp(&mut out, room.as_bytes());
     lp(&mut out, group_id);
+    lp(&mut out, group_context);
     lp(&mut out, signer_handle.as_bytes());
     lp(&mut out, signer_key);
     lp(&mut out, subject_handle.as_bytes());
@@ -539,12 +546,12 @@ mod tests {
         assert_ne!(got, idkey_signing_bytes("@research", &key, "@research", 0));
     }
 
-    /// SPEC-061 CON-006 / OQ-001 (v2, group-bound): the PAIRING grant's signed
+    /// SPEC-061 CON-006 / OQ-001 (v3, group-state-bound): the PAIRING grant's signed
     /// context is byte-identical to cbcl-bus's `pairgrant_signing_bytes`, and the
     /// same literal is constructed by hand there. The machine-readable twin of
     /// this vector, shared with the browser contract, is
-    /// `tests/vectors/pairgrant-v2-context-vector.json` (checked in
-    /// `tests/pairgrant_v2_vector.rs`).
+    /// `tests/vectors/pairgrant-v3-context-vector.json` (checked in
+    /// `tests/pairgrant_v3_vector.rs`).
     ///
     /// This vector carries more weight than the invite one above. An invite can be
     /// minted and redeemed on a single stack, so a same-stack test would catch a
@@ -556,9 +563,11 @@ mod tests {
         let signer = [0xABu8; 32];
         let subject = [0xCDu8; 32];
         let group_id: Vec<u8> = (0u8..32).collect();
+        let context = b"canonical TLS GroupContext bytes".to_vec(); // opaque here: 32 bytes
         let got = pairgrant_signing_bytes(
             "@research",
             &group_id,
+            &context,
             "@user-qp2zs",
             &signer,
             "@agent6",
@@ -567,16 +576,18 @@ mod tests {
         );
 
         // Independent manual construction:
-        // lp(label) ‖ lp(room) ‖ lp(group_id) ‖ lp(signer_handle) ‖ lp(signer_key)
-        //           ‖ lp(subject_handle) ‖ lp(subject_key) ‖ u64-be(exp)
+        // lp(label) ‖ lp(room) ‖ lp(group_id) ‖ lp(group_context) ‖ lp(signer_handle)
+        //           ‖ lp(signer_key) ‖ lp(subject_handle) ‖ lp(subject_key) ‖ u64-be(exp)
         let mut want = Vec::new();
-        let label = b"cbcl-mls-pairgrant/v2"; // 21 bytes
+        let label = b"cbcl-mls-pairgrant/v3"; // 21 bytes
         want.extend_from_slice(&(label.len() as u32).to_be_bytes());
         want.extend_from_slice(label);
         want.extend_from_slice(&9u32.to_be_bytes());
         want.extend_from_slice(b"@research");
         want.extend_from_slice(&32u32.to_be_bytes());
         want.extend_from_slice(&group_id);
+        want.extend_from_slice(&32u32.to_be_bytes());
+        want.extend_from_slice(&context);
         want.extend_from_slice(&11u32.to_be_bytes());
         want.extend_from_slice(b"@user-qp2zs");
         want.extend_from_slice(&32u32.to_be_bytes());
@@ -597,6 +608,24 @@ mod tests {
             pairgrant_signing_bytes(
                 "@research",
                 &other_group,
+                &context,
+                "@user-qp2zs",
+                &signer,
+                "@agent6",
+                &subject,
+                1_785_000_000_000,
+            )
+        );
+        // So is the group state: the same id at another epoch or tree signs
+        // different bytes, which is what makes a grant single-epoch.
+        let mut other_context = context.clone();
+        other_context[0] ^= 1;
+        assert_ne!(
+            got,
+            pairgrant_signing_bytes(
+                "@research",
+                &group_id,
+                &other_context,
                 "@user-qp2zs",
                 &signer,
                 "@agent6",

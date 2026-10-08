@@ -1,5 +1,10 @@
 # Group-bound pairing grants (`cbcl-mls-pairgrant/v2`): hark contract
 
+> **Superseded (rejected candidate).** Independent review (cbcl-bus `549c0d80`) reproduced a
+> bypass: a rival group created under the genuine group's copied public GroupId passes every v2
+> check. The repair is `cbcl-mls-pairgrant/v3`, which binds the grant to the canonical MLS
+> GroupContext. See `SPEC-061-pairing-context-v3.md`. This file is kept as history.
+
 Status: **candidate implementation in hark; not independently reviewed.** The domain choice was
 approved by the user (self-appointed human protocol/media domain reviewer), who chose "Bind pairing
 grants to the MLS group (Recommended)". The decision is recorded in cbcl-bus at

@@ -962,14 +962,17 @@ impl MlsSession {
             .map(|bs| bs.into_iter().map(|(h, _)| h).collect())
     }
 
-    /// SPEC-061 REQ-008 (group-bound pairing v2): sign a pairing admission grant
-    /// authorising `(subject_handle, subject_key)` to seat itself in THIS room's
-    /// group, returned as the grant JSON the `(pairgrant …)` frame carries.
+    /// SPEC-061 REQ-008 (pairing v3): sign a pairing admission grant authorising
+    /// `(subject_handle, subject_key)` to seat itself in THIS room's group at its
+    /// current epoch, returned as the grant JSON the `(pairgrant …)` frame
+    /// carries.
     ///
-    /// The group identifier inside the signature is read from the group this
-    /// session has INSTALLED — a merged, admitted membership — and from nothing
-    /// else: not a pending self-seat, not a hub-supplied id. With no admitted
-    /// group there is nothing to vouch for, so this refuses (retryably).
+    /// The group identifier and the canonical GroupContext inside the signature
+    /// are read from the group this session has INSTALLED — a merged, admitted
+    /// membership — and from nothing else: not a pending self-seat, not a
+    /// hub-supplied id. With no admitted group there is nothing to vouch for, so
+    /// this refuses (retryably). The grant is stale once any Commit advances the
+    /// group, and must then be signed again.
     ///
     /// `subject_key` MUST be the key verified from the subject's own signed
     /// `idkey` assertion (SPEC-013 REQ-019); a hub-asserted key would authorise
@@ -998,7 +1001,7 @@ impl MlsSession {
             subject_handle,
             subject_key,
             not_after_ms,
-        );
+        )?;
         serde_json::to_string(&grant)
             .map_err(|e| MlsError::Rejected(format!("serialize pairing grant: {e}")))
     }
@@ -1148,9 +1151,12 @@ impl MlsSession {
     /// Nothing is verified here, and there is nothing here that could be: a grant
     /// is checked against the ratchet tree it authorises entry to, and we do not
     /// have that tree yet. It is verified when a GroupInfo arrives — by
-    /// `join_by_grant`, against that GroupInfo's group id and tree, before anything
-    /// is installed or sent (group-bound pairing v2) — and again by every member
-    /// before merge. What we DO check is that it names us — not for security, but because acting
+    /// `join_by_grant`, against that GroupInfo's group id, signature-verified
+    /// pre-join GroupContext and tree, before anything is installed or sent
+    /// (pairing v3) — and again by every member before merge. A grant is
+    /// single-epoch: once the room has committed since it was signed, every
+    /// GroupInfo refuses it as stale until a member signs a new one. What we DO
+    /// check is that it names us — not for security, but because acting
     /// on a grant for another agent means burning a GroupInfo claim to build a
     /// commit that is certain to be rejected.
     fn on_pairgrant(&mut self, text: &str) -> SessionEvent {
@@ -3025,11 +3031,12 @@ mod tests {
         );
     }
 
-    /// Group-bound pairing v2, on the agent's real frame path: a hub that serves a
-    /// RIVAL same-room GroupInfo — its own creator, a copy of the signer's public
-    /// leaf — gets no Commit, no ciphertext and no installed or pending group out
-    /// of the agent, and the agent keeps its UNCHANGED grant and seats itself on
-    /// the genuine GroupInfo when that arrives.
+    /// Pairing v3, on the agent's real frame path: a hub that serves a RIVAL
+    /// same-room GroupInfo — under the genuine group's COPIED public GroupId, with
+    /// its own creator and valid genesis for that id, and a copy of the signer's
+    /// public leaf — gets no Commit, no ciphertext and no installed or pending
+    /// group out of the agent. The agent keeps its UNCHANGED grant and seats
+    /// itself on the genuine GroupInfo when that arrives.
     #[test]
     fn a_rival_group_info_yields_no_commit_and_leaves_the_grant_redeemable() {
         use openmls::group::GroupId;
@@ -3066,7 +3073,22 @@ mod tests {
             .unwrap();
         let mut m_ledger =
             super::super::keypackages::ConsumedLedger::open(&m_dir.join("m.kpledger")).unwrap();
-        let (mut rival, _) = create_group(&m_provider, &m_identity, "@room").unwrap();
+        let genuine_id: [u8; 32] = creator
+            .group
+            .as_ref()
+            .unwrap()
+            .group_id()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let (mut rival, _) = super::super::group::create_group_with_id(
+            &m_provider,
+            &m_identity,
+            "@room",
+            genuine_id,
+        )
+        .unwrap();
+        assert_eq!(rival.group_id().as_slice(), genuine_id.as_slice(), "the copied public id");
         let kp = build_one_time(&creator.provider, &creator.identity, 1)
             .unwrap()
             .remove(0);
@@ -3094,7 +3116,7 @@ mod tests {
 
         match agent.handle_frame(&rival_frame) {
             SessionEvent::Dropped { reason, .. } => {
-                assert!(reason.contains("different MLS group"), "{reason}")
+                assert!(reason.contains("stale or different MLS group state"), "{reason}")
             }
             other => panic!("a rival GroupInfo must be refused, got {other:?}"),
         }

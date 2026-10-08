@@ -1,5 +1,10 @@
 # Candidate report: hark group-bound pairing (`cbcl-mls-pairgrant/v2`)
 
+> **Superseded (rejected candidate).** This v2 evidence is kept as history. The v2 predicate was
+> bypassed by a rival under the copied public GroupId (cbcl-bus `549c0d80`). The repair and its
+> evidence are in `docs/evidence/pairing-context-v3/`. The runner here targets v2 code that no
+> longer exists, and is not expected to run.
+
 - **Branch:** `circus/svelte-group-bound-pairing-hark/1`, based on `50acfba` (v0.4.1).
 - **Author:** Claude Opus 5.5 (Anthropic), as an implementation candidate.
 - **Status:** CANDIDATE. Not pushed, not merged, and **not independently reviewed**.
