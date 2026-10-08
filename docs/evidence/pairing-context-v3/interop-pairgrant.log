@@ -1,0 +1,29 @@
+
+-- 1/3 honest: a member who is not the creator authorises the agent
+emitted: agent @agent6 in @interop-pair, key published for the member to bind
+minted a pairing grant for @agent6 in @interop-pair
+  signed by : @member
+  bound to  : the agent's published key
+PASS: hark seated itself by external Commit on a member-signed grant
+      members: ["@creator", "@member", "@agent6"]
+PASS: the web member admitted the agent it authorised
+  members: ["@creator","@member","@agent6"] (was 2)
+  ok   the agent seated itself on a member-signed grant
+
+-- 2/3 forged: the signer holds no leaf in the group
+emitted: agent @agent6 in @interop-pair, key published for the member to bind
+minted a pairing grant for @agent6 in @interop-pair
+  signed by : @outsider  (FORGERY: not a member of the group)
+  bound to  : the agent's published key
+FAIL: agent could not seat itself: Dropped { reason: "external join refused: rejected: pairing grant refused: @outsider is not a live leaf of this group, so it cannot authorise an admission to it (SPEC-061 REQ-008 / NFR-001)", probable_fork: false }
+  ok   a grant from a non-member is refused (refused by the agent before it built a Commit)
+
+-- 3/3 wrong key: the right agent handle, a key it does not hold
+emitted: agent @agent6 in @interop-pair, key published for the member to bind
+minted a pairing grant for @agent6 in @interop-pair
+  signed by : @member
+  bound to  : @outsider's key (WRONG KEY)
+FAIL: agent could not seat itself: Dropped { reason: "external join refused: rejected: pairing grant authorises a different key for @agent6 than the one its leaf presents (SPEC-061 REQ-008 — the grant is bound to a key, not a name)", probable_fork: false }
+  ok   a grant bound to another key is refused (refused by the agent before it built a Commit)
+
+== PASS: both stacks agree, on the admission AND on both refusals ==

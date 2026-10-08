@@ -1,0 +1,33 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use hark::mls::group::{GenesisAssertion, verify_admission_authority};
+use hark::mls::pins::pairgrant_signing_bytes;
+fn unhex(s: &str) -> Vec<u8> { (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect() }
+fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+#[test]
+fn chat_node_vector() {
+    let path = "/Users/anuna-02/Code/cbcl-bus-svelte-pairing-context-chat-1/crates/cbcl-mls-wasm/vectors/pairgrant-v3.json";
+    let raw = std::fs::read(path).unwrap();
+    println!("chat vector sha256-input-bytes={}", raw.len());
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    for c in v["vectors"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let s = |k: &str| c[k].as_str().unwrap().to_string();
+        let na: u64 = c["not_after_ms"].as_u64().unwrap_or_else(|| s("not_after_ms").parse().unwrap());
+        let sk: [u8; 32] = unhex(&s("signer_key_hex")).try_into().unwrap();
+        let subk: [u8; 32] = unhex(&s("subject_key_hex")).try_into().unwrap();
+        let gid = unhex(&s("group_id_hex"));
+        let ctx = unhex(&s("group_context_hex"));
+        let sb = pairgrant_signing_bytes(&s("room"), &gid, &ctx, &s("signer_handle"), &sk, &s("subject_handle"), &subk, na);
+        assert_eq!(hex(&sb), s("signing_bytes_hex"), "{name} signing bytes");
+        let grant = if c["grant"].is_string() { s("grant") } else { c["grant"].to_string() };
+        let leaves = vec![(s("signer_handle"), sk.to_vec())];
+        let g = GenesisAssertion { room: s("room"), creator_handle: "@x".into(), group_id_b64: String::new(), creator_key_b64: B64.encode([0u8; 32]), signature_b64: String::new() };
+        let run = |ctx: &[u8]| verify_admission_authority(&grant, "", &s("room"), &gid, ctx, &s("subject_handle"), &subk, &leaves, &g, na - 1);
+        assert!(run(&ctx).is_ok(), "{name} genuine: {:?}", run(&ctx));
+        for k in ["stale_group_context_hex", "rival_group_context_hex"] {
+            let e = run(&unhex(&s(k))).unwrap_err().to_string();
+            assert!(e.contains("stale or different MLS group state"), "{name} {k}: {e}");
+        }
+        println!("{name}: signing bytes equal; genuine accept; stale + rival reject:context");
+    }
+}

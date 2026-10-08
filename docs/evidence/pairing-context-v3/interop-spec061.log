@@ -1,0 +1,20 @@
+
+-- 1/2 honest: hark creates and signs; the web client admits itself
+emitted: groupinfo.b64 token.txt grant.json (room @interop, creator @agent)
+web client built an external Commit for @interop as @web
+  epoch after joining locally: 1
+  safety                     : 88a53c83 0a2d17fc 161ec8b2 7a76dab7 cc6fc795 5d06c681 1d06e40f 90da02e5
+PASS: hark admitted the web client by external Commit
+      members: ["@agent", "@web"]
+      safety : 88a53c83 0a2d17fc 161ec8b2 7a76dab7 cc6fc795 5d06c681 1d06e40f 90da02e5
+  ok   hark admitted the web client's external Commit
+
+-- 2/2 forged: the joiner signs its own grant — hark must refuse
+emitted: groupinfo.b64 token.txt grant.json (room @interop, creator @agent)
+forging a grant signed by the JOINER instead of the channel creator
+web client built an external Commit for @interop as @web
+  epoch after joining locally: 1
+  safety                     : ab0e5c94 5d4ad24e 748ef340 19d43c80 560343e9 1f391d1d 1a259e5d 8912bbf1
+  ok   hark refused a grant the channel creator never signed
+
+== PASS: both stacks agree, on the admission AND on the refusal ==
