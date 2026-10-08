@@ -100,7 +100,18 @@ pub const DS_MLS_INVITE: &str = "cbcl-mls-invite/v1";
 /// subject's wire key, and every verifier requires the external Commit's path leaf
 /// to be that exact pair, which makes reading it worth nothing to a reader that
 /// does not hold the key.
-pub const DS_MLS_PAIRGRANT: &str = "cbcl-mls-pairgrant/v1";
+///
+/// **v2 — group-bound (SPEC-103 REQ-013 pairing-domain decision).** The v1 context
+/// named room, signer, subject and expiry, but no group. A rival group under the
+/// same room name, built by whoever obtained another public KeyPackage of the
+/// signer, holds the signer's genuine leaf; a joiner checking a v1 grant against
+/// that rival's GroupInfo finds a live signer leaf matching its pin, a
+/// self-signed first-contact genesis, and a signature that verifies — and seats
+/// itself in the rival. v2 puts the raw MLS group identifier of the signer's
+/// admitted group inside the signed bytes and the JSON record (`group_id_b64`),
+/// and every verifier requires it to equal the group being judged. v1 grants are
+/// refused, not translated: there is no legacy path.
+pub const DS_MLS_PAIRGRANT: &str = "cbcl-mls-pairgrant/v2";
 
 /// Leaf capabilities advertising the genesis extension type. REQ-016 obliges
 /// every hark and web-client KeyPackage/leaf to carry this; openmls then

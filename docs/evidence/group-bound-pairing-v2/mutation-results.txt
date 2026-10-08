@@ -1,0 +1,9 @@
+M1 drop group-id equality in PairingGrant::verify (restores v1 authority): KILLED by a_rival_same_room_group_info, a_grant_for_another_group, a_rival_group_info_yields, hark_decides_every_vector_case (green: -)
+M2 drop lp(group_id) from the signed context: KILLED by pairgrant_signing_bytes_cross_stack_vector, a_grant_for_another_group, hark_reproduces_the_v2_context, hark_decides_every_vector_case (green: -)
+M3 route an unsupported pairing kind to the invite path: KILLED by old_unknown_and_malformed_pairing_records, hark_decides_every_vector_case (green: -)
+M4 joiner installs without verify_external_join: KILLED by a_rival_same_room_group_info, a_member_authorises_an_agent, a_grant_for_another_group, joiner_refuses_group_info_conflicting, a_rival_group_info_yields (green: -)
+M5 joiner refusal without provider rollback: KILLED by a_rival_same_room_group_info, a_member_authorises_an_agent, a_rival_group_info_yields (green: -)
+M6 pairing record no longer closed (deny_unknown_fields removed): KILLED by old_unknown_and_malformed_pairing_records, hark_decides_every_vector_case (green: -)
+M7 joiner skips tree leaf-vs-pin (REQ-012d): KILLED by joiner_refuses_group_info_conflicting (green: -)
+M8 member (recipient) side trusts the group id the grant itself names: KILLED by a_grant_for_another_group (green: -)
+ALL MUTANTS KILLED

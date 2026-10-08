@@ -18,12 +18,9 @@ use openmls::prelude::{
 };
 use tls_codec::{DeserializeBytes as _, Serialize as _};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-
 use super::group::{
-    AdmissionGrant, ExternalAdmission, GenesisAssertion, PairingGrant, credential_handle,
-    elect_committer,
-    group_genesis_creator, member_bindings,
+    ExternalAdmission, GenesisAssertion, credential_handle, elect_committer,
+    group_genesis_creator, live_leaf_bindings, member_bindings, verify_admission_authority,
 };
 use super::pins::PinStore;
 use super::provider::DurableProvider;
@@ -366,7 +363,7 @@ pub fn reject_v1_owner_removal(group: &MlsGroup, staged: &StagedCommit) -> Resul
 /// Wall-clock milliseconds, for admission-grant expiry (SPEC-061 REQ-002).
 /// hark is a native binary, so unlike the wasm crate it has a clock of its own
 /// and does not take the time from a caller.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -456,33 +453,22 @@ fn validate_external_commit(
             "external Commit refused: its AAD carries no admission grant (SPEC-061 REQ-002)".into(),
         )
     })?;
-
-    // Which credential is this? The discriminator is REQUIRED on the newer flavour
-    // and absent on the older one, and the two are never tried in turn: a
-    // credential checked under whichever rules happen to parse is a credential with
-    // the weaker of the two rule sets. cbcl-bus dispatches on the same field in the
-    // same place (SPEC-061 OQ-001).
-    let kind = serde_json::from_str::<serde_json::Value>(&presented.grant_json)
-        .map_err(|e| MlsError::Rejected(format!("admission grant json: {e}")))?
-        .get("kind")
-        .and_then(|k| k.as_str())
-        .map(str::to_owned);
-    if kind.as_deref() == Some(super::DS_MLS_PAIRGRANT) {
-        // SPEC-061 REQ-008: authorised by a member, bound to this exact leaf. No
-        // genesis is consulted — the authority is the tree we are holding.
-        let grant: PairingGrant = serde_json::from_str(&presented.grant_json)
-            .map_err(|e| MlsError::Rejected(format!("pairing grant json: {e}")))?;
-        grant.verify(group, room, &handle, leaf_key, now_ms)?;
-    } else {
-        // SPEC-061 REQ-002: authorised by the creator, bearer, bound to a token.
-        let creator_key = genesis.creator_key()?;
-        let token = B64
-            .decode(&presented.token_b64)
-            .map_err(|e| MlsError::Rejected(format!("admission token: {e}")))?;
-        let grant: AdmissionGrant = serde_json::from_str(&presented.grant_json)
-            .map_err(|e| MlsError::Rejected(format!("admission grant json: {e}")))?;
-        grant.verify(room, &genesis.creator_handle, &creator_key, &token, now_ms)?;
-    }
+    // Which credential is this, and does it authorise this leaf into THIS group?
+    // The same predicate the joiner applied before installing (and cbcl-bus
+    // applies on both sides): a pairing grant must name this group's id and a
+    // live signer leaf of the tree we hold; an unsupported pairing kind is refused
+    // and never re-read as an invite (SPEC-061 OQ-001).
+    verify_admission_authority(
+        &presented.grant_json,
+        &presented.token_b64,
+        room,
+        group.group_id().as_slice(),
+        &handle,
+        leaf_key,
+        &live_leaf_bindings(group, None),
+        genesis,
+        now_ms,
+    )?;
 
     // The joiner's own leaf still answers to the pin rules every other leaf does
     // (REQ-012d). A grant says SOMEBODY was authorised; on the invite flavour it

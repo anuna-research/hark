@@ -962,6 +962,47 @@ impl MlsSession {
             .map(|bs| bs.into_iter().map(|(h, _)| h).collect())
     }
 
+    /// SPEC-061 REQ-008 (group-bound pairing v2): sign a pairing admission grant
+    /// authorising `(subject_handle, subject_key)` to seat itself in THIS room's
+    /// group, returned as the grant JSON the `(pairgrant …)` frame carries.
+    ///
+    /// The group identifier inside the signature is read from the group this
+    /// session has INSTALLED — a merged, admitted membership — and from nothing
+    /// else: not a pending self-seat, not a hub-supplied id. With no admitted
+    /// group there is nothing to vouch for, so this refuses (retryably).
+    ///
+    /// `subject_key` MUST be the key verified from the subject's own signed
+    /// `idkey` assertion (SPEC-013 REQ-019); a hub-asserted key would authorise
+    /// whoever the hub chose.
+    pub fn sign_pairing_grant(
+        &self,
+        subject_handle: &str,
+        subject_key: &[u8; 32],
+        not_after_ms: u64,
+    ) -> Result<String, MlsError> {
+        let group = self.group.as_ref().ok_or_else(|| {
+            MlsError::NotReady(format!(
+                "no admitted MLS group for {}; a pairing grant is bound to one",
+                self.room
+            ))
+        })?;
+        let key = <[u8; 32]>::try_from(self.identity.public_key())
+            .map_err(|_| MlsError::Rejected("identity key is not 32 bytes".into()))?;
+        let wire = ChatIdentity::from_seed(self.wire_seed);
+        let grant = super::group::PairingGrant::mint(
+            &wire,
+            &self.handle,
+            &key,
+            group,
+            &self.room,
+            subject_handle,
+            subject_key,
+            not_after_ms,
+        );
+        serde_json::to_string(&grant)
+            .map_err(|e| MlsError::Rejected(format!("serialize pairing grant: {e}")))
+    }
+
     /// SPEC-061 REQ-005: the `(groupinfo …)` frame for this room's CURRENT epoch,
     /// or `None` when we hold no group.
     ///
@@ -1106,9 +1147,10 @@ impl MlsSession {
     ///
     /// Nothing is verified here, and there is nothing here that could be: a grant
     /// is checked against the ratchet tree it authorises entry to, and we do not
-    /// have that tree yet. A grant that is junk, forged, or for somebody else
-    /// builds a commit every member refuses, which is where the check belongs.
-    /// What we DO check is that it names us — not for security, but because acting
+    /// have that tree yet. It is verified when a GroupInfo arrives — by
+    /// `join_by_grant`, against that GroupInfo's group id and tree, before anything
+    /// is installed or sent (group-bound pairing v2) — and again by every member
+    /// before merge. What we DO check is that it names us — not for security, but because acting
     /// on a grant for another agent means burning a GroupInfo claim to build a
     /// commit that is certain to be rejected.
     fn on_pairgrant(&mut self, text: &str) -> SessionEvent {
@@ -1222,6 +1264,7 @@ impl MlsSession {
             &self.room,
             &grant,
             &mut self.pins,
+            super::validation::now_ms(),
         ) {
             Ok(joined) => {
                 let commit = B64.encode(&joined.commit);
@@ -2915,15 +2958,12 @@ mod tests {
         creator.create_group_as_creator().unwrap();
 
         // The member that paired the agent signs its admission (REQ-008).
-        let grant = super::super::group::PairingGrant::mint(
-            &c_wire,
-            "@creator",
-            &c_wire.verifying_key_bytes(),
-            "@room",
-            "@agent",
-            &a_wire.verifying_key_bytes(),
-            u64::MAX,
-        );
+        let grant: super::super::group::PairingGrant = serde_json::from_str(
+            &creator
+                .sign_pairing_grant("@agent", &a_wire.verifying_key_bytes(), u64::MAX)
+                .unwrap(),
+        )
+        .unwrap();
         let grant_json = serde_json::to_string(&grant).unwrap();
         let pairgrant = format!(
             "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
@@ -2985,6 +3025,109 @@ mod tests {
         );
     }
 
+    /// Group-bound pairing v2, on the agent's real frame path: a hub that serves a
+    /// RIVAL same-room GroupInfo — its own creator, a copy of the signer's public
+    /// leaf — gets no Commit, no ciphertext and no installed or pending group out
+    /// of the agent, and the agent keeps its UNCHANGED grant and seats itself on
+    /// the genuine GroupInfo when that arrives.
+    #[test]
+    fn a_rival_group_info_yields_no_commit_and_leaves_the_grant_redeemable() {
+        use openmls::group::GroupId;
+        use openmls::prelude::MlsGroup;
+        use openmls::prelude::tls_codec::Serialize as _;
+        let (c_dir, c_wire) = setup("rivalgi", 110, "@creator");
+        let (a_dir, a_wire) = setup("rivalgi", 111, "@agent");
+        let (m_dir, m_wire) = setup("rivalgi", 112, "@mallory");
+        let mut creator =
+            MlsSession::open(&c_dir, "creator", "@room", "@creator", &c_wire, true).unwrap();
+        let mut agent = MlsSession::open(&a_dir, "agent", "@room", "@agent", &a_wire, true).unwrap();
+        let c_frames = creator.join_frames().unwrap();
+        let a_frames = agent.join_frames().unwrap();
+        creator.handle_frame(&a_frames[1]);
+        agent.handle_frame(&c_frames[1]); // the agent pins the signer's genuine key
+        creator.create_group_as_creator().unwrap();
+
+        let grant = creator
+            .sign_pairing_grant("@agent", &a_wire.verifying_key_bytes(), u64::MAX)
+            .unwrap();
+        let pairgrant = format!(
+            "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
+            B64.encode(&grant)
+        );
+        agent.handle_frame(&pairgrant);
+
+        // Mallory's rival under the same room name, carrying the signer's leaf
+        // from another of its public KeyPackages.
+        let m_provider = DurableProvider::open(&m_dir.join("m.mls")).unwrap();
+        let m_identity = MlsIdentity::from_wire_identity(&m_wire, "@mallory");
+        let mut m_pins = PinStore::open(&m_dir.join("m.pins")).unwrap();
+        m_pins
+            .observe_verified("@creator", &c_wire.verifying_key_bytes())
+            .unwrap();
+        let mut m_ledger =
+            super::super::keypackages::ConsumedLedger::open(&m_dir.join("m.kpledger")).unwrap();
+        let (mut rival, _) = create_group(&m_provider, &m_identity, "@room").unwrap();
+        let kp = build_one_time(&creator.provider, &creator.identity, 1)
+            .unwrap()
+            .remove(0);
+        super::super::group::add_member(
+            &m_provider,
+            &m_identity,
+            &mut rival,
+            &kp.bytes,
+            "@creator",
+            &m_pins,
+            &mut m_ledger,
+            "@room",
+            super::super::claim::CommitPromise::Inactive,
+        )
+        .unwrap();
+        let rival_gi = rival
+            .export_group_info(m_provider.crypto(), &m_identity.signer, true)
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap();
+        let rival_frame = format!(
+            "(groupinfo @room :epoch 0 :gi \"{}\" :from @mallory)",
+            B64.encode(&rival_gi)
+        );
+
+        match agent.handle_frame(&rival_frame) {
+            SessionEvent::Dropped { reason, .. } => {
+                assert!(reason.contains("different MLS group"), "{reason}")
+            }
+            other => panic!("a rival GroupInfo must be refused, got {other:?}"),
+        }
+        assert!(agent.group.is_none(), "nothing installed");
+        assert!(agent.pending_seat.is_none(), "no Commit in flight to the rival");
+        assert!(
+            MlsGroup::load(agent.provider.storage(), &GroupId::from_slice(rival.group_id().as_slice()))
+                .unwrap()
+                .is_none(),
+            "and the rival group is not left in the provider"
+        );
+        assert_eq!(agent.pair_grant.as_deref(), Some(grant.as_str()), "the grant is unspent");
+
+        // The genuine GroupInfo still seats the agent on the same grant.
+        let gi = creator.group_info_frame().unwrap();
+        let SessionEvent::Handled { outbound } = agent.handle_frame(&gi) else {
+            panic!("genuine groupinfo handled")
+        };
+        let commit = outbound
+            .iter()
+            .find(|f| f.starts_with("(deliver @room"))
+            .expect("the genuine group gets the Commit")
+            .clone();
+        assert!(matches!(creator.handle_frame(&commit), SessionEvent::Handled { .. }));
+        assert!(
+            creator.member_handles().unwrap().iter().any(|h| h == "@agent"),
+            "the signer's group admits the agent"
+        );
+        for d in [c_dir, a_dir, m_dir] {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
     #[test]
     fn a_rejected_welcome_preserves_pending_external_admission() {
         welcome_during_pending_admission(false);
@@ -3015,15 +3158,12 @@ mod tests {
         creator.create_group_as_creator().unwrap();
 
         // The member that paired the agent signs its admission (REQ-008).
-        let grant = super::super::group::PairingGrant::mint(
-            &c_wire,
-            "@creator",
-            &c_wire.verifying_key_bytes(),
-            "@room",
-            "@agent",
-            &a_wire.verifying_key_bytes(),
-            u64::MAX,
-        );
+        let grant: super::super::group::PairingGrant = serde_json::from_str(
+            &creator
+                .sign_pairing_grant("@agent", &a_wire.verifying_key_bytes(), u64::MAX)
+                .unwrap(),
+        )
+        .unwrap();
         let grant_json = serde_json::to_string(&grant).unwrap();
         let pairgrant = format!(
             "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
@@ -3160,15 +3300,12 @@ mod tests {
         agent.handle_frame(&c_frames[1]);
         creator.create_group_as_creator().unwrap();
 
-        let grant = super::super::group::PairingGrant::mint(
-            &c_wire,
-            "@creator",
-            &c_wire.verifying_key_bytes(),
-            "@room",
-            "@agent",
-            &a_wire.verifying_key_bytes(),
-            u64::MAX,
-        );
+        let grant: super::super::group::PairingGrant = serde_json::from_str(
+            &creator
+                .sign_pairing_grant("@agent", &a_wire.verifying_key_bytes(), u64::MAX)
+                .unwrap(),
+        )
+        .unwrap();
         let pairgrant = format!(
             "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
             B64.encode(serde_json::to_string(&grant).unwrap())
@@ -3214,15 +3351,12 @@ mod tests {
         agent.handle_frame(&c_frames[1]);
         creator.create_group_as_creator().unwrap();
 
-        let grant = super::super::group::PairingGrant::mint(
-            &c_wire,
-            "@creator",
-            &c_wire.verifying_key_bytes(),
-            "@room",
-            "@agent",
-            &a_wire.verifying_key_bytes(),
-            u64::MAX,
-        );
+        let grant: super::super::group::PairingGrant = serde_json::from_str(
+            &creator
+                .sign_pairing_grant("@agent", &a_wire.verifying_key_bytes(), u64::MAX)
+                .unwrap(),
+        )
+        .unwrap();
         let pairgrant = format!(
             "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
             B64.encode(serde_json::to_string(&grant).unwrap())
@@ -3285,15 +3419,12 @@ mod tests {
         agent.handle_frame(&c_frames[1]);
         creator.create_group_as_creator().unwrap();
 
-        let grant = super::super::group::PairingGrant::mint(
-            &c_wire,
-            "@creator",
-            &c_wire.verifying_key_bytes(),
-            "@room",
-            "@agent",
-            &a_wire.verifying_key_bytes(),
-            u64::MAX,
-        );
+        let grant: super::super::group::PairingGrant = serde_json::from_str(
+            &creator
+                .sign_pairing_grant("@agent", &a_wire.verifying_key_bytes(), u64::MAX)
+                .unwrap(),
+        )
+        .unwrap();
         let pairgrant = format!(
             "(pairgrant @room :for @agent :grant \"{}\" :from @creator)",
             B64.encode(serde_json::to_string(&grant).unwrap())
@@ -3362,15 +3493,15 @@ mod tests {
         // The agent holds a group of its own to fork away from, and a grant it
         // has not spent — the state SPEC-061 REQ-008 leaves it in.
         agent.create_group_as_creator().unwrap();
-        let grant = super::super::group::PairingGrant::mint(
-            &c_wire,
-            "@creator",
-            &c_wire.verifying_key_bytes(),
-            "@room",
-            "@agent",
-            &a_wire.verifying_key_bytes(),
-            u64::MAX,
-        );
+        // A v2 grant is minted only from the signer's admitted group, so the
+        // signer needs one; this grant is held, never redeemed, in this test.
+        creator.create_group_as_creator().unwrap();
+        let grant: super::super::group::PairingGrant = serde_json::from_str(
+            &creator
+                .sign_pairing_grant("@agent", &a_wire.verifying_key_bytes(), u64::MAX)
+                .unwrap(),
+        )
+        .unwrap();
         agent.pair_grant = Some(serde_json::to_string(&grant).unwrap());
         assert!(agent.group.is_some(), "precondition: we hold a group");
 

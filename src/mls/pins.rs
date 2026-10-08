@@ -321,10 +321,12 @@ pub fn invite_signing_bytes(
     out
 }
 
-/// The `cbcl-mls-pairgrant/v1` signed context (SPEC-061 CON-006): `lp(label) ‖
-/// lp(room) ‖ lp(signer_handle) ‖ lp(signer_key) ‖ lp(subject_handle) ‖
-/// lp(subject_key) ‖ u64-be(not_after_ms)`. MUST be byte-identical to cbcl-bus's
-/// `pairgrant_signing_bytes` (crates/cbcl-mls-wasm).
+/// The `cbcl-mls-pairgrant/v2` signed context (SPEC-061 CON-006, as corrected by
+/// the group-bound pairing decision): `lp(label) ‖ lp(room) ‖ lp(group_id) ‖
+/// lp(signer_handle) ‖ lp(signer_key) ‖ lp(subject_handle) ‖ lp(subject_key) ‖
+/// u64-be(not_after_ms)`. MUST be byte-identical to cbcl-bus's
+/// `pairgrant_signing_bytes` (crates/cbcl-mls-wasm); the shared known-answer
+/// vector is `tests/vectors/pairgrant-v2-context-vector.json`.
 ///
 /// The parity requirement bites harder here than it does for
 /// [`invite_signing_bytes`]. An invite may be minted and redeemed on the same
@@ -339,8 +341,15 @@ pub fn invite_signing_bytes(
 /// A handle outside the signature could be re-pointed at another member while the
 /// signature still verified — which would be asking about a different party than
 /// the one the signature covers.
+///
+/// `group_id` is the RAW MLS group identifier (not its base64), taken from the
+/// signer's own admitted group. History: v1 (`cbcl-mls-pairgrant/v1`) had the same
+/// layout without `lp(group_id)`; it bound a grant to a room NAME, and a rival
+/// group under that name carrying a copy of the signer's public leaf satisfied
+/// every v1 check. v2 is the correction; v1 is no longer produced or accepted.
 pub fn pairgrant_signing_bytes(
     room: &str,
+    group_id: &[u8],
     signer_handle: &str,
     signer_key: &[u8; 32],
     subject_handle: &str,
@@ -350,6 +359,7 @@ pub fn pairgrant_signing_bytes(
     let mut out = Vec::new();
     lp(&mut out, DS_MLS_PAIRGRANT.as_bytes());
     lp(&mut out, room.as_bytes());
+    lp(&mut out, group_id);
     lp(&mut out, signer_handle.as_bytes());
     lp(&mut out, signer_key);
     lp(&mut out, subject_handle.as_bytes());
@@ -529,9 +539,12 @@ mod tests {
         assert_ne!(got, idkey_signing_bytes("@research", &key, "@research", 0));
     }
 
-    /// SPEC-061 CON-006 / OQ-001: the PAIRING grant's signed context is
-    /// byte-identical to cbcl-bus's `pairgrant_signing_bytes`, and the same
-    /// literal is constructed by hand there.
+    /// SPEC-061 CON-006 / OQ-001 (v2, group-bound): the PAIRING grant's signed
+    /// context is byte-identical to cbcl-bus's `pairgrant_signing_bytes`, and the
+    /// same literal is constructed by hand there. The machine-readable twin of
+    /// this vector, shared with the browser contract, is
+    /// `tests/vectors/pairgrant-v2-context-vector.json` (checked in
+    /// `tests/pairgrant_v2_vector.rs`).
     ///
     /// This vector carries more weight than the invite one above. An invite can be
     /// minted and redeemed on a single stack, so a same-stack test would catch a
@@ -542,8 +555,10 @@ mod tests {
     fn pairgrant_signing_bytes_cross_stack_vector() {
         let signer = [0xABu8; 32];
         let subject = [0xCDu8; 32];
+        let group_id: Vec<u8> = (0u8..32).collect();
         let got = pairgrant_signing_bytes(
             "@research",
+            &group_id,
             "@user-qp2zs",
             &signer,
             "@agent6",
@@ -552,14 +567,16 @@ mod tests {
         );
 
         // Independent manual construction:
-        // lp(label) ‖ lp(room) ‖ lp(signer_handle) ‖ lp(signer_key)
+        // lp(label) ‖ lp(room) ‖ lp(group_id) ‖ lp(signer_handle) ‖ lp(signer_key)
         //           ‖ lp(subject_handle) ‖ lp(subject_key) ‖ u64-be(exp)
         let mut want = Vec::new();
-        let label = b"cbcl-mls-pairgrant/v1"; // 21 bytes
+        let label = b"cbcl-mls-pairgrant/v2"; // 21 bytes
         want.extend_from_slice(&(label.len() as u32).to_be_bytes());
         want.extend_from_slice(label);
         want.extend_from_slice(&9u32.to_be_bytes());
         want.extend_from_slice(b"@research");
+        want.extend_from_slice(&32u32.to_be_bytes());
+        want.extend_from_slice(&group_id);
         want.extend_from_slice(&11u32.to_be_bytes());
         want.extend_from_slice(b"@user-qp2zs");
         want.extend_from_slice(&32u32.to_be_bytes());
@@ -570,6 +587,23 @@ mod tests {
         want.extend_from_slice(&subject);
         want.extend_from_slice(&1_785_000_000_000u64.to_be_bytes());
         assert_eq!(got, want, "pairing grant signing bytes match the cbcl-bus layout");
+
+        // The group is load-bearing: the same grant for any other group signs
+        // different bytes, so a signature over one never verifies for the other.
+        let mut other_group = group_id.clone();
+        other_group[0] ^= 1;
+        assert_ne!(
+            got,
+            pairgrant_signing_bytes(
+                "@research",
+                &other_group,
+                "@user-qp2zs",
+                &signer,
+                "@agent6",
+                &subject,
+                1_785_000_000_000,
+            )
+        );
 
         // A pairing grant's signature must never verify as an invite grant's: the
         // two are checked under different authority rules, so a context that could
