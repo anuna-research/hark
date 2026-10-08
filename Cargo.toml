@@ -17,9 +17,9 @@ base64 = "0.22"
 # One cbcl-rs revision shared with cbcl-bus/cbcl-rs.sha. Core and parser provide
 # generic CBCL semantics; hark owns MLS-DS protocol domains and signature checks.
 # Keep all three dependencies in lockstep with the browser's object runtime.
-cbcl-core = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "d2cbd968e36dbc0d5876a878e65a89942386890c" }
-cbcl-parser = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "d2cbd968e36dbc0d5876a878e65a89942386890c" }
-cbcl-wasm = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "d2cbd968e36dbc0d5876a878e65a89942386890c", default-features = false, features = ["std"] }
+cbcl-core = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "865292f1890a79b70bf87627d9a8ba198af3e7d6" }
+cbcl-parser = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "865292f1890a79b70bf87627d9a8ba198af3e7d6" }
+cbcl-wasm = { git = "https://git.anuna.io/anuna-research/cbcl-rs.git", rev = "865292f1890a79b70bf87627d9a8ba198af3e7d6", default-features = false, features = ["std"] }
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 config = "0.15"

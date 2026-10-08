@@ -1,5 +1,5 @@
 {
   "source": "cbcl-rs test-vectors/state (SPEC-019 conformance corpus)",
-  "cbcl_rs_sha": "d2cbd968e36dbc0d5876a878e65a89942386890c",
+  "cbcl_rs_sha": "865292f1890a79b70bf87627d9a8ba198af3e7d6",
   "note": "Copied byte-for-byte; re-copy when Cargo.toml's cbcl-wasm rev moves. src/objects/runtime.rs replays every vector."
 }
