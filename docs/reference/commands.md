@@ -16,6 +16,18 @@ Use `hark agents` to discover handles and `hark --agent @aria whoami --json` to 
 
 CBCL and dialect terminology: [CBCL](../explanation/about-hark.md#cbcl).
 
+## `update`
+
+`hark update [--install-dir DIR]` downloads the latest published release using
+`https://files.anuna.io/hark/version.json` and the immutable release directory
+it identifies. Selects the macOS/Linux arm64/x64 artifact, requires its SHA-256
+checksum, and atomically installs it as `DIR/hark`. Defaults to `HARK_INSTALL_DIR`
+or `~/.local/bin`, matching the installer; `HARK_BASE_URL` overrides the metadata
+source. A checksum-identical executable is already up to date. A download,
+checksum, or installation error leaves the prior binary intact and exits 12;
+unsupported platforms or invalid release URLs exit 2. The daemon is not restarted
+and no agent selection is required.
+
 ## `config path`
 
 Prints the platform-specific config file path.

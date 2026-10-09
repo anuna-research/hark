@@ -62,6 +62,19 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(
+        about = "Download and install the latest published Hark release",
+        after_help = "Downloads release metadata and the platform binary from https://files.anuna.io/hark. Requires a valid SHA-256 checksum and atomically replaces the installed binary.
+
+Installs to ~/.local/bin by default, matching install.sh. Use --install-dir or HARK_INSTALL_DIR for a custom location; HARK_BASE_URL overrides the metadata source. macOS and Linux on arm64 and x64 are supported.
+
+Examples:
+  hark update
+  hark update --install-dir ~/.local/bin
+
+No daemon or agent selection is needed. Restart a running daemon separately with hark daemon stop followed by hark daemon start to load updated daemon code."
+    )]
+    Update(UpdateArgs),
     #[command(about = "List agent identities, connections, encryption, and readiness")]
     Agents(JsonArgs),
     #[command(about = "Inspect the selected agent and its readiness")]
@@ -565,6 +578,16 @@ pub struct ProgressArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct UpdateArgs {
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Installation directory; defaults to HARK_INSTALL_DIR or ~/.local/bin"
+    )]
+    pub install_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 pub struct JsonArgs {
     #[arg(long, help = "Print structured JSON")]
     pub json: bool,
@@ -573,6 +596,27 @@ pub struct JsonArgs {
 pub async fn run(cli: Cli) -> AppResult<()> {
     let selector = cli.agent.as_deref();
     match cli.command {
+        Command::Update(args) => {
+            eprintln!("Checking the latest published Hark release...");
+            let result = crate::update::install_latest(args.install_dir).await?;
+            if result.changed {
+                println!(
+                    "Installed hark {} to {}",
+                    result.version,
+                    result.path.display()
+                );
+                println!(
+                    "Restart a running daemon with hark daemon stop, then hark daemon start to load updated daemon code."
+                );
+            } else {
+                println!(
+                    "hark {} is already installed at {}",
+                    result.version,
+                    result.path.display()
+                );
+            }
+            Ok(())
+        }
         Command::Agents(args) => agents_command(args).await,
         Command::Whoami(args) => whoami_command(args, selector).await,
         Command::Config(command) => match command {
