@@ -26,7 +26,28 @@ use crate::local_api::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = COMMAND_NAME, version, about)]
+#[command(
+    name = COMMAND_NAME,
+    version,
+    about = "Connect agents to chat rooms, receive routed work, and operate shared objects",
+    after_help = "Getting started:
+  Have a pairing code?    hark pair <code>
+  Join a chat channel:    hark join @room --as @agent --speak '*'
+  Handle routed work:     hark init --help
+
+After connecting:
+  hark tell \"hello\"              Send text to the joined chat channel
+  hark recv --timeout 30s          Consume one incoming message
+  hark close                      Close the selected agent connection
+
+Agent selection:
+  CBCL_AGENT_HANDLE selects a local agent; when unset, commands use the daemon's
+  active agent (the most recently created connection). join, pair, and init
+  select the new agent for subsequent calls. Closing it clears the active selection.
+  Use hark daemon status to inspect connections.
+
+Run hark <command> --help for prerequisites, examples, and output behavior."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -40,36 +61,122 @@ pub enum Command {
     #[command(about = "Manage the per-user local daemon")]
     #[command(subcommand)]
     Daemon(DaemonCommand),
+    #[command(about = "Join a chat channel, creating config and starting the daemon if needed")]
     #[command(
-        about = "One-shot join: scaffold config if absent, start the daemon if needed, and join a chat channel"
+        after_help = "Starts the daemon if needed and makes the joined agent active. Subsequent commands need no eval or exported handle unless CBCL_AGENT_HANDLE is already set.
+
+Example:
+  hark join @demo --as @aria --speak '*'
+  hark tell \"hello\"
+  hark recv --timeout 30s
+
+Without --speak, advertise no dialects. Use --speak '*' for all channel messages; use --objects for shared objects."
     )]
     Join(JoinArgs),
     #[command(
         about = "Pair an agent into a channel via a memorable code: `hark pair <id>-word-word`"
     )]
+    #[command(
+        after_help = "Use a code issued by a channel member in the web app. The pairing record supplies the channel, name, and advertised dialects. Creates config and starts the daemon if needed; makes the paired agent active without eval. CBCL_AGENT_HANDLE, when set, still overrides the active agent.
+
+Example:
+  hark pair 1-rocket-anchor
+  hark recv --timeout 30s
+
+Replace the example code with your issued code."
+    )]
     Pair(PairArgs),
-    #[command(about = "Create an agent WebSocket and print the local handle")]
+    #[command(about = "Connect an agent to the configured router or chat hub")]
+    #[command(
+        after_help = "For routed work, configure router.ws_url and start the daemon with hark daemon start. For chat onboarding, use hark join or hark pair.
+
+Example (configured router and known elf dialect):
+  hark daemon start
+  hark init --dialect elf
+  hark recv --timeout 30s
+
+Prints export CBCL_AGENT_HANDLE=... by default; --json prints the connection response including agent_handle. The new agent also becomes active in the daemon. Export its handle when you need to select it explicitly across multiple connections."
+    )]
     Init(InitArgs),
     #[command(about = "Receive one CBCL message for the current agent handle")]
-    Recv(RecvArgs),
     #[command(
-        about = "Ask the hub for older room history (SPEC-086); the frames arrive through `hark recv`"
+        after_help = "Each call consumes one queued message for the selected agent. Prints bare CBCL to stdout unless --record is used. Without --timeout, waits until a message arrives. A timeout exits 10 without a message.
+
+Example:
+  hark recv --timeout 30s
+
+For chat, join with --speak '*' to receive all messages or --objects for object traffic."
+    )]
+    Recv(RecvArgs),
+    #[command(about = "Request older chat history; receive the frames through hark recv")]
+    #[command(
+        after_help = "Requires a joined chat agent. Sends a history request; frames arrive asynchronously through recv and update learned object state. There is no end-of-history marker. Only one request per room may be in flight.
+
+Example:
+  hark history --limit 100
+  hark recv --timeout 5s"
     )]
     History(HistoryArgs),
-    #[command(
-        about = "Read, act on, and create hypermedia objects in the joined channel (SPEC-086 Stage B; needs `join --objects`)"
-    )]
+    #[command(about = "Inspect and update shared objects in a chat channel")]
     #[command(subcommand)]
+    #[command(
+        after_help = "list, read, act, and open require a chat agent joined with --objects (pair may enable it automatically). check needs a running daemon but no joined agent and sends nothing.
+
+Inspect existing objects:
+  hark object list
+  hark object read <thread>
+
+read returns state, not the contract. Obtain the definition from the object creator and run hark object check --define definition.json to inspect its verbs and field types before acting.
+
+Create an object:
+  hark object check --help
+  hark object open --help"
+    )]
     Object(ObjectCommand),
     #[command(about = "Validate and send a CBCL reply message")]
+    #[command(
+        after_help = "Answer a received ask using its dialect and exact :thread value. Supply a complete CBCL frame, not plain text. The example assumes an ask in the elf dialect with thread rcp-123; replace both with the received values.
+
+Example:
+  hark reply '(lang elf (reply \"done\" :thread \"rcp-123\"))'
+  hark reply < reply.cbcl
+
+Invalid CBCL exits 8. Use hark error for a terminal failure."
+    )]
     Reply(MessageInputArgs),
     #[command(about = "Validate and send a CBCL error message")]
+    #[command(
+        after_help = "Report a terminal failure for a received ask using its dialect and exact :thread value. Replace the example dialect and thread with the received values.
+
+Example:
+  hark error '(lang elf (error \"failed\" :thread \"rcp-123\"))'
+
+Accepts a complete CBCL frame as an argument or from stdin. Invalid CBCL exits 8."
+    )]
     Error(MessageInputArgs),
     #[command(
         about = "Send plain chat text as (tell @channel \"…\"); the argument is never parsed as CBCL"
     )]
+    #[command(
+        after_help = "Requires a selected agent joined to a chat channel. Sends literal text to that channel.
+
+Examples:
+  hark tell \"hello\"
+  printf 'hello\\n' | hark tell
+
+For structured CBCL or routed work, use hark send, reply, or error."
+    )]
     Tell(TellArgs),
     #[command(about = "Transmit a caller-supplied CBCL frame unchanged, of any performative")]
+    #[command(
+        after_help = "Requires a selected agent and a complete frame valid for its dialect. Preserves the supplied frame bytes; validates before sending. Plain text belongs in hark tell.
+
+Example (routed work in elf; replace rcp-123 with the received thread):
+  hark send '(lang elf (tell @router \"progress\" :thread \"rcp-123\" :text \"running tests\"))'
+  hark send < message.cbcl
+
+Invalid CBCL exits 8."
+    )]
     Send(MessageInputArgs),
     // SIMPLIFY: deprecation shims (SPEC-016 REQ-020). `emit` keeps its
     // leading-`(` sniff and `progress` keeps its frame builder, so scripts
@@ -90,7 +197,7 @@ pub enum Command {
     #[command(about = "Close the current agent handle")]
     Close,
     #[command(
-        about = "Print the MLS identity safety number and epoch state hash for an encrypted channel (SPEC-013 REQ-024)",
+        about = "Print the identity safety number and epoch state hash for an encrypted channel",
         name = "safety-number"
     )]
     SafetyNumber(SafetyNumberArgs),
@@ -200,7 +307,7 @@ pub struct JoinArgs {
     pub hub: Option<String>,
     #[arg(
         long = "objects",
-        help = "Subscribe to hypermedia-object messages (SPEC-086): every object message (a `sha256-<64hex>` dialect) in the channel, including this agent's own and replayed history, reaches `recv` with an attestation record"
+        help = "Subscribe to shared-object messages: every object message (a `sha256-<64hex>` dialect) in the channel, including this agent's own and replayed history, reaches `recv` with an attestation record"
     )]
     pub objects: bool,
 }
@@ -221,7 +328,7 @@ pub struct PairArgs {
     pub hub: Option<String>,
     #[arg(
         long = "objects",
-        help = "Subscribe to hypermedia-object messages (SPEC-086). Implied when the pairing record lists an object dialect (sha256-<64hex>)"
+        help = "Subscribe to shared-object messages. Implied when the pairing record lists an object dialect (sha256-<64hex>)"
     )]
     pub objects: bool,
 }
@@ -253,7 +360,7 @@ pub struct InitArgs {
     pub cap: Option<String>,
     #[arg(
         long = "mls-create",
-        help = "Chat hub only: after joining an encrypted private channel, bootstrap its MLS group as the room creator (SPEC-013 REQ-016 operator intent). The agent then adds present members as the elected owner."
+        help = "Chat hub only: after joining an encrypted private channel, bootstrap its MLS group as the room creator with explicit creator intent. The agent then adds present members as the elected owner."
     )]
     pub mls_create: bool,
     #[arg(long = "json", help = "Print JSON instead of shell exports")]
@@ -262,11 +369,14 @@ pub struct InitArgs {
 
 #[derive(Debug, Args)]
 pub struct RecvArgs {
-    #[arg(long = "timeout", help = "Maximum wait, using ms, s, m, or h")]
+    #[arg(
+        long = "timeout",
+        help = "Maximum wait: positive integer with ms, s, m, or h suffix (up to 2160h); timeout exits 10"
+    )]
     pub timeout: Option<String>,
     #[arg(
         long = "record",
-        help = "Print the JSON recv response (message plus the SPEC-086 attestation record) instead of the bare message bytes"
+        help = "Print JSON with the message and object authorship record instead of bare CBCL"
     )]
     pub record: bool,
 }
@@ -274,19 +384,63 @@ pub struct RecvArgs {
 #[derive(Debug, Subcommand)]
 pub enum ObjectCommand {
     #[command(
-        about = "Validate a definition without sending: prints its dialect (self-address), verbs, state rules, the contract, and the CBCL dialect cbcl-rs verified"
+        about = "Validate an object definition and print its verbs, fields, state rules, and contract"
+    )]
+    #[command(
+        after_help = r#"Requires a running daemon (hark daemon start); no agent or channel is required.
+Prints JSON including dialect, opener, verbs and field types, state rules, and contract.
+No messages are sent.
+
+Accepted definitions: a JSON file or inline JSON containing an authoring definition
+(name, verbs, project), a version-3 contract (kind: "contract", verbs, state), or
+serialized contract text. Versions 1 and 2 are rejected.
+
+Minimal example:
+  hark object check --define '{"name":"note","verbs":{"open":{"causedBy":"begin","fields":{"text":"string"}}},"project":{"text":["last","open","text"]}}'
+
+Save this definition as note.json to create an instance:
+  hark join @demo --as @aria --objects
+  hark object open --define note.json --thread note-1 --field text=hello
+  hark object read note-1"#
     )]
     Check(ObjectCheckArgs),
     #[command(about = "List the object threads this agent has learned from the room")]
+    #[command(
+        after_help = "Requires a chat agent joined with --objects. Prints learned objects as JSON; use their thread ids with hark object read or act. If an older object is missing, request hark history and retry after its frames arrive."
+    )]
     List,
     #[command(about = "Print an object's projected state as JSON")]
+    #[command(
+        after_help = "Requires a chat agent with object access. Find thread ids with hark object list. Prints projected state as JSON. To discover verbs and field types, obtain the definition from its creator and run hark object check --define definition.json.
+
+Example:
+  hark object read list-1
+
+If the thread is absent from learned history, request hark history and retry after its frames arrive."
+    )]
     Read(ObjectReadArgs),
     #[command(
-        about = "Act on an object: cbcl-rs binds provenance, picks the predecessor and verifies the act; the daemon signs and sends"
+        about = "Validate, sign, and send an action using the object contract and learned history"
+    )]
+    #[command(
+        after_help = "Requires a chat agent with object access and a known thread from hark object list. Read current state with hark object read <thread>. Obtain the definition from its creator and inspect verbs and fields with hark object check --define definition.json; read does not return the contract.
+
+Example (a checklist contract with a check verb):
+  hark object act list-1 check --field item=milk --field done=true
+
+Routing and causal fields are filled automatically. Rejected actions send nothing. Use only fields declared by the contract."
     )]
     Act(ObjectActArgs),
     #[command(
         about = "Create an object from a contract definition: verifies it, declares the dialect to the room, sends the opener"
+    )]
+    #[command(
+        after_help = "Requires a chat agent with object access. Validate your definition first with hark object check --define definition.json; its opener determines the required fields.
+
+Example (the note definition in hark object check --help):
+  hark object open --define note.json --thread note-1 --field text=hello
+
+Declares the verified contract to the room and sends its opener. Use a fresh thread id."
     )]
     Open(ObjectOpenArgs),
 }
@@ -296,7 +450,7 @@ pub struct ObjectCheckArgs {
     #[arg(
         long = "define",
         value_name = "FILE|JSON",
-        help = "The definition to validate: a path to a JSON file or inline JSON, in any form `open --define` accepts (see docs/object-definitions.md)"
+        help = "Definition file or inline JSON; see the accepted forms and example below"
     )]
     pub define: String,
     #[arg(
@@ -605,7 +759,7 @@ async fn join_command(args: JoinArgs) -> AppResult<()> {
             cap: args.cap,
             added_by: None,
             // `join` never bootstraps an MLS group; `init --mls-create` is the
-            // room-creator path (SPEC-013 REQ-016 operator intent).
+            // room-creator path with explicit creator intent.
             mls_create: None,
             objects: args.objects.then_some(true),
         })
