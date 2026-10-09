@@ -309,8 +309,8 @@ pub struct AgentsResponse {
     pub daemon: DaemonStatus,
     pub agents: Vec<AgentStatus>,
     /// The session's active handle (REQ-003, SPEC-016): the most recently
-    /// created, still-open agent. CLI commands fall back to it when
-    /// `CBCL_AGENT_HANDLE` is unset.
+    /// created, still-open agent. Informational only: CLI selection requires
+    /// a sole registered agent or an explicit selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_agent_handle: Option<String>,
 }
@@ -325,6 +325,9 @@ pub struct DaemonStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentStatus {
+    /// Absent when talking to a daemon predating session inspection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<AgentConnectionStatus>,
     pub agent_handle: String,
     pub router_agent_id: String,
     pub dialects: Vec<String>,
@@ -359,6 +362,17 @@ pub struct AgentStatus {
     /// agent sent was sealed to an epoch nobody was on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mls_fork_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentConnectionStatus {
+    pub backend: String,
+    pub hub: Option<String>,
+    pub encryption: String,
+    pub socket: String,
+    pub ready: bool,
+    pub reason: Option<String>,
+    pub recovery: Option<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -475,6 +489,29 @@ impl LocalApiClient {
             .map_err(|error| ClientPingError::DecodeFailed(error.to_string()))?;
 
         self.validate_ping(ping)
+    }
+
+    pub async fn effective_config(&self) -> Result<serde_json::Value, ClientPingError> {
+        let response = self
+            .http
+            .get(self.url("/v1/config"))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .send()
+            .await
+            .map_err(|error| ClientPingError::RequestFailed(error.to_string()))?;
+
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(ClientPingError::AuthFailure);
+        }
+
+        if !response.status().is_success() {
+            return Err(ClientPingError::UnexpectedStatus(response.status()));
+        }
+
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| ClientPingError::DecodeFailed(error.to_string()))
     }
 
     pub async fn agents(&self) -> Result<AgentsResponse, ClientPingError> {
@@ -902,6 +939,7 @@ pub async fn serve_local_api_with_agents(
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/ping", get(ping))
+        .route("/v1/config", get(effective_config))
         .route("/v1/agents", get(agents).post(create_agent))
         .route("/v1/agents/{handle}/recv", get(recv))
         .route("/v1/agents/{handle}/send", post(send))
@@ -1321,6 +1359,82 @@ async fn ping(
     Ok(Json(PingResponse::current()))
 }
 
+async fn effective_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    reject_if_stopping(&state)?;
+    Ok(Json(state.config.redacted_effective()))
+}
+
+fn inspect_agent(snapshot: crate::daemon::AgentStatusSnapshot, hub: Option<String>) -> AgentStatus {
+    let reason = if snapshot.state != crate::daemon::AgentState::Connected {
+        Some(
+            snapshot
+                .unhealthy_detail
+                .clone()
+                .or(snapshot.reconnect_detail.clone())
+                .unwrap_or_else(|| snapshot.state.as_str().to_owned()),
+        )
+    } else {
+        snapshot
+            .mls_fork_detail
+            .clone()
+            .or(snapshot.readiness_reason.clone())
+    };
+    let recovery = if reason.is_none() {
+        None
+    } else if snapshot.state == crate::daemon::AgentState::Unhealthy {
+        Some(format!(
+            "hark --agent {} close; reconnect with hark init or hark pair",
+            snapshot.agent_handle
+        ))
+    } else if reason
+        .as_deref()
+        .is_some_and(|r| r.contains("exhausted") || r.contains("downgrade"))
+    {
+        Some(format!(
+            "hark --agent {} close; verify the channel and obtain a new pairing code; hark pair <code>",
+            snapshot.agent_handle
+        ))
+    } else {
+        Some(format!(
+            "wait for automatic recovery; hark --agent {} whoami",
+            snapshot.agent_handle
+        ))
+    };
+    let connection = AgentConnectionStatus {
+        backend: if snapshot.channel.is_some() {
+            "chat"
+        } else {
+            "router"
+        }
+        .to_owned(),
+        hub,
+        encryption: snapshot.encryption,
+        socket: snapshot.state.as_str().to_owned(),
+        ready: reason.is_none(),
+        reason,
+        recovery,
+    };
+    AgentStatus {
+        connection: Some(connection),
+        agent_handle: snapshot.agent_handle,
+        router_agent_id: snapshot.router_agent_id,
+        dialects: snapshot.dialects,
+        state: snapshot.state.as_str().to_owned(),
+        queued_messages: snapshot.queued_messages,
+        queued_bytes: snapshot.queued_bytes,
+        unhealthy_reason: snapshot.unhealthy_reason,
+        unhealthy_detail: snapshot.unhealthy_detail,
+        channel: snapshot.channel,
+        reconnect_attempts: snapshot.reconnect_attempts,
+        reconnect_detail: snapshot.reconnect_detail,
+        mls_fork_detail: snapshot.mls_fork_detail,
+    }
+}
+
 async fn agents(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1332,20 +1446,7 @@ async fn agents(
         .status_snapshots()
         .await
         .into_iter()
-        .map(|snapshot| AgentStatus {
-            agent_handle: snapshot.agent_handle,
-            router_agent_id: snapshot.router_agent_id,
-            dialects: snapshot.dialects,
-            state: snapshot.state.as_str().to_owned(),
-            queued_messages: snapshot.queued_messages,
-            queued_bytes: snapshot.queued_bytes,
-            unhealthy_reason: snapshot.unhealthy_reason,
-            unhealthy_detail: snapshot.unhealthy_detail,
-            channel: snapshot.channel,
-            reconnect_attempts: snapshot.reconnect_attempts,
-            reconnect_detail: snapshot.reconnect_detail,
-            mls_fork_detail: snapshot.mls_fork_detail,
-        })
+        .map(|snapshot| inspect_agent(snapshot, state.config.redacted_hub_url()))
         .collect();
     let active_agent_handle = state
         .agents
@@ -3201,6 +3302,85 @@ mod tests {
         assert_eq!(status.agents[0].state, "connected");
         assert_eq!(status.agents[0].dialects, ["elf"]);
 
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn status_separates_socket_from_encrypted_session_readiness() {
+        let store = agent_store();
+        let agent = handle();
+        store
+            .insert_connected_with_router_channels(
+                agent.clone(),
+                vec![],
+                None,
+                None,
+                Some("@aria".to_owned()),
+                Some("@private".to_owned()),
+            )
+            .await
+            .unwrap();
+        let server = TestServer::start_with_store(None, store.clone()).await;
+        let client = server.client();
+        let status = client.agents().await.unwrap();
+        let connection = status.agents[0].connection.as_ref().unwrap();
+        assert_eq!(connection.socket, "connected");
+        assert!(!connection.ready);
+        assert_eq!(connection.encryption, "unknown");
+
+        store
+            .set_session_readiness(&agent, "mls", Some("awaiting MLS Welcome".to_owned()))
+            .await
+            .unwrap();
+        let status = client.agents().await.unwrap();
+        let connection = status.agents[0].connection.as_ref().unwrap();
+        assert!(!connection.ready);
+        assert_eq!(connection.reason.as_deref(), Some("awaiting MLS Welcome"));
+        assert!(connection.recovery.as_deref().unwrap().contains("whoami"));
+
+        store
+            .set_session_readiness(&agent, "mls", None)
+            .await
+            .unwrap();
+        store
+            .set_mls_fork(&agent, Some("group diverged".to_owned()))
+            .await
+            .unwrap();
+        let status = client.agents().await.unwrap();
+        assert!(!status.agents[0].connection.as_ref().unwrap().ready);
+        assert_eq!(status.agents[0].state, "connected");
+        store.set_mls_fork(&agent, None).await.unwrap();
+        let status = client.agents().await.unwrap();
+        assert!(status.agents[0].connection.as_ref().unwrap().ready);
+        assert_eq!(
+            status.agents[0].connection.as_ref().unwrap().encryption,
+            "mls"
+        );
+
+        store
+            .mark_unhealthy(&agent, "test", Some("socket closed".to_owned()))
+            .await
+            .unwrap();
+        let status = client.agents().await.unwrap();
+        let connection = status.agents[0].connection.as_ref().unwrap();
+        assert!(!connection.ready);
+        assert_eq!(connection.socket, "unhealthy");
+        assert!(connection.recovery.as_deref().unwrap().contains("close"));
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn effective_config_requires_authentication_and_returns_resolved_defaults() {
+        let server = TestServer::start(None).await;
+        let response = reqwest::Client::new()
+            .get(server.url("/v1/config"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let config = server.client().effective_config().await.unwrap();
+        assert_eq!(config["chat"]["claim_window_ms"], 400);
+        assert_eq!(config["chat"]["channel"], "@general");
         server.stop().await;
     }
 

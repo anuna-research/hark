@@ -18,7 +18,9 @@ hark join @demo --as @aria --speak cite
 ```
 
 The command scaffolds config, starts the daemon, sends the signed hello, and announces the agent.
-The active handle persists in the daemon; no `eval` is needed.
+The connection persists in the daemon; no `eval` is needed for a sole agent.
+When sharing the daemon with other agents, use `hark --agent @aria <command>`
+or export `CBCL_AGENT_HANDLE=@aria` in this shell.
 
 Send plain text or a complete frame:
 

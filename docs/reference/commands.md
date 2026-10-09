@@ -8,14 +8,25 @@ mode: reference
 The CLI exposes configuration, daemon lifecycle, routed agents, chat membership, dialects, and object operations.
 Generated command help is available through `hark --help` and `hark <command> --help`.
 The generated man page is `man hark`.
-A selected agent comes from `CBCL_AGENT_HANDLE`, or the daemon's active agent when that variable is unset.
-An exported `@name` selects a chat agent by its wire name.
+Select an existing agent with global `--agent <handle|@name>` (before or after the command).
+It overrides `CBCL_AGENT_HANDLE`. With neither, the sole registered agent is selected;
+multiple registered agents cause a usage error (exit 2), even if one is active.
+A wire `@name` must identify exactly one connection; duplicates require the internal handle.
+Use `hark agents` to discover handles and `hark --agent @aria whoami --json` to inspect one.
 
 CBCL and dialect terminology: [CBCL](../explanation/about-hark.md#cbcl).
 
 ## `config path`
 
 Prints the platform-specific config file path.
+
+## `config show`
+
+Prints the running daemon's effective configuration as JSON, including resolved
+chat defaults. Requires a running daemon. This queries its captured settings,
+so later environment changes in the calling shell do not change the result.
+Authentication tokens are redacted; hub URLs omit credentials, query parameters,
+and fragments. Restart an older daemon if it lacks this endpoint.
 
 ## `config show-example`
 
@@ -38,7 +49,32 @@ singleton lock.
 
 ## `daemon status`
 
-Prints daemon state and active agent handles in a human-readable format.
+Prints daemon state and agent connections in a human-readable format.
+`--json` returns the daemon API's `{daemon, agents, active_agent_handle?}` object.
+The active handle is informational; it does not resolve ambiguous selections.
+
+## `agents` and `whoami`
+
+`hark agents [--json]` lists registered connections. `hark whoami [--json]`
+inspects the selected connection. Their text output includes the local handle,
+wire identity, channel, backend, redacted hub URL, encryption, socket state,
+and readiness. A blocked connection includes a reason and recovery guidance.
+
+`agents --json` uses the same envelope as `daemon status --json`; `whoami --json`
+returns one agent record. Its `connection` object contains `backend`, `hub`,
+`encryption`, `socket`, `ready`, `reason`, and `recovery`. `socket` describes transport
+connectivity; `ready` describes current transport and encryption readiness.
+A connected socket awaiting an MLS Welcome or recovering a fork has `ready: false`.
+Readiness is a snapshot, so callers must still handle send errors and exit 13.
+Older daemons omit `connection`; text output reports readiness as unknown.
+
+Example:
+
+```sh
+hark agents --json
+hark --agent @aria whoami --json
+hark --agent @aria recv --timeout 30s
+```
 
 ## `daemon stop`
 
@@ -54,10 +90,21 @@ Default output exports the local handle as `export CBCL_AGENT_HANDLE='…'`; `--
 ## `recv`
 
 Requires a selected agent. Blocks until one CBCL message is available, then
-prints only that message to stdout.
+prints only that message to stdout. Each invocation consumes one queued message.
 Timeout units are `ms`, `s`, `m`, and `h`; the maximum finite timeout is `2160h`. `--record` prints the JSON response
 instead, with the [SPEC-086 — Object transport for SDK agents](../../specs/SPEC-086-hark-object-transport.md) attestation record when the message is an object
 delivered under `--objects`.
+
+`--follow` keeps the process alive and prints one JSON response per line, with
+`agent_handle`, `message`, and any object attestation `record`. It flushes each
+line and pins the selected handle for the process lifetime. `--timeout` applies
+to each receive; an idle wait ends the stream with exit 10 and no extra output
+record. `--record` has the same per-message JSON shape for a single receive.
+A closed stdout pipe ends successfully.
+
+```sh
+hark --agent @aria recv --follow --timeout 5m
+```
 
 ## `history`
 
@@ -153,7 +200,8 @@ This command scaffolds missing config and starts the daemon if needed.
 It sends the signed hello and emits `announce`, so chat clients render the member as an agent. `--speak` advertises only the listed dialects
 (never the channel's whole menu); when the hub conveys a declared menu, an
 undeclared `--speak` is rejected. The joined handle becomes the session's
-active agent — follow-up commands need no exported env var.
+active agent. Follow-up commands need no selector when it is the sole registered
+connection; with multiple agents use `--agent` or `CBCL_AGENT_HANDLE`.
 
 `--objects` ([SPEC-086 — Object transport for SDK agents](../../specs/SPEC-086-hark-object-transport.md)) subscribes the agent to every channel object message, identified by a `sha256-<64hex>` dialect.
 This includes its own messages and replayed history.
@@ -194,3 +242,13 @@ listed. Either way, the subscription covers all objects in the channel.
 
 Requires a selected agent. Removes the local handle and closes the selected
 router WebSocket. Successful `close` prints nothing.
+
+## Structured output conventions
+
+Existing output shapes are preserved: `init --json` returns a connection response;
+object commands return their operation-specific JSON (including a bare array for
+`object list` and projected state for `object read`); dialect publication/query
+return their operation results. Inspection uses daemon envelopes for lists and
+an agent record for a single selection. Streaming receive uses JSON Lines rather
+than a JSON array. Diagnostics remain on stderr, and nonzero exit codes still
+signal failure. Commands without a JSON mode retain their existing output.

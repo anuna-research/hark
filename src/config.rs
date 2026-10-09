@@ -201,6 +201,39 @@ impl fmt::Debug for ValidatedRouterConfig {
 }
 
 impl AppConfig {
+    /// Status surfaces never expose URL credentials, query tokens, or fragments.
+    pub fn redacted_hub_url(&self) -> Option<String> {
+        self.router
+            .ws_url
+            .as_deref()
+            .map(|raw| match Url::parse(raw) {
+                Ok(mut url) => {
+                    let _ = url.set_username("");
+                    let _ = url.set_password(None);
+                    url.set_query(None);
+                    url.set_fragment(None);
+                    url.to_string()
+                }
+                Err(_) => "<invalid URL>".to_owned(),
+            })
+    }
+
+    /// Report the daemon's captured configuration, including implicit chat defaults.
+    pub fn redacted_effective(&self) -> serde_json::Value {
+        serde_json::json!({
+            "router": {"ws_url": self.redacted_hub_url(),
+                "auth_token": self.router.auth_token.as_ref().map(|_| "<redacted>")},
+            "chat": {
+                "channel": self.chat.channel.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(DEFAULT_CHAT_CHANNEL),
+                "identity_dir": self.chat.identity_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).or_else(default_chat_identity_dir),
+                "claim_window_ms": self.chat.claim_window_ms.unwrap_or(DEFAULT_CLAIM_WINDOW_MS),
+                "liveness_timeout_ms": self.chat.liveness_timeout_ms.unwrap_or(DEFAULT_LIVENESS_TIMEOUT_MS)
+            },
+            "agent": {"agent_id_prefix": self.agent.agent_id_prefix, "auto_install_advertised": self.agent.auto_install_advertised},
+            "daemon": {"bind": self.daemon.bind, "max_messages_per_handle": self.daemon.max_messages_per_handle,
+                "max_bytes_per_handle": self.daemon.max_bytes_per_handle, "overflow_policy": self.daemon.overflow_policy}
+        })
+    }
     pub fn load() -> Result<Self, ConfigError> {
         Self::load_from(default_config_file())
     }

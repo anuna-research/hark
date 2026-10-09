@@ -62,7 +62,9 @@ Setup: [How to configure hark](../how-to/how-to-configure-hark.md).
 ## Agent selection and advertised dialects
 
 `CBCL_AGENT_HANDLE` selects a local handle or a chat agent's wire `@name`.
-When it is unset, session commands use the daemon's active agent.
+Global `--agent <handle|@name>` overrides it. With neither, session commands
+select the sole registered agent and reject multiple agents with exit 2.
+`hark config show` prints the running daemon's effective settings as redacted JSON.
 
 `CBCL_AGENT_AUTO_INSTALL_ADVERTISED` defaults to enabled.
 The value `false` disables initialization's best-effort queries for advertised dialects.
