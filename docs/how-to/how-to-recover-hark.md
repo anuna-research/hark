@@ -48,7 +48,8 @@ hark init --dialect elf
 
 Unhealthy handles:
 
-Run `hark daemon status` to see active handles. Then create a
+Run `hark agents` to see handles, then `hark --agent <handle> whoami` for
+socket and encryption readiness, the reason, and recovery guidance. Then create a
 fresh handle with `init`, or remove the unhealthy one:
 
 ```bash

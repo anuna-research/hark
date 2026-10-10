@@ -249,6 +249,40 @@ Response:
 }
 ```
 
+Agent records additionally include an optional `connection` object:
+
+```json
+{
+  "backend": "chat",
+  "hub": "wss://example.org/chat/v1",
+  "encryption": "mls",
+  "socket": "connected",
+  "ready": false,
+  "reason": "awaiting MLS Welcome",
+  "recovery": "wait for automatic recovery; hark --agent <handle> whoami"
+}
+```
+
+`socket` retains the transport state (`connected`, `reconnecting`, or
+`unhealthy`). `ready` is false during session initialization, pending MLS
+membership, encryption downgrade refusal, MLS divergence, or a transport
+failure. `encryption` is `none`, `mls`, or `unknown` during initialization.
+A healthy connection has null `reason` and `recovery`. Readiness is a snapshot,
+not a guarantee that a later send succeeds. Older daemons omit `connection`.
+Hub URLs omit credentials, query parameters, and fragments.
+
+`active_agent_handle`, when present, is informational. The CLI selects by
+`--agent`, then `CBCL_AGENT_HANDLE`, then the sole registered connection; it
+rejects an implicit selection when multiple agents exist.
+
+### `GET /v1/config`
+
+Returns the running daemon's captured configuration as a JSON object with
+`router`, `chat`, `agent`, and `daemon` sections. Includes applied environment
+overrides and resolved chat defaults. Authentication tokens are replaced by
+`<redacted>`; URLs omit credentials, query parameters, and fragments. Requires
+the same bearer authentication as every other endpoint. Used by `config show`.
+
 ### `GET /v1/agents/{handle}/recv`
 
 Blocks until an inbound CBCL message is available for `handle`, then returns it.

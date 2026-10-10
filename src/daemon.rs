@@ -93,6 +93,8 @@ pub struct AgentStatusSnapshot {
     /// let an agent sit forked and silent while `hark daemon status` said
     /// `connected` and its safety number printed as though it were a member.
     pub mls_fork_detail: Option<String>,
+    pub encryption: String,
+    pub readiness_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -259,8 +261,8 @@ struct AgentRegistry {
     config: AgentStoreConfig,
     agents: HashMap<AgentHandle, AgentEntry>,
     /// The session's active handle (REQ-003, SPEC-016 ADR-002): the most
-    /// recently created agent. CLI commands fall back to it when
-    /// `CBCL_AGENT_HANDLE` is unset, dropping the `eval` ritual.
+    /// recently created agent. Exposed for inspection; CLI selection requires
+    /// a sole registered agent or an explicit selector.
     active: Option<AgentHandle>,
     /// SPEC-086 Stage B: the object runtime, when the daemon runs one. Every
     /// object delivery to a subscribed agent is also fed to it.
@@ -283,6 +285,8 @@ struct AgentEntry {
     /// SPEC-013 REQ-006: a non-terminal MLS divergence, or `None` when the group
     /// is tracking the room.
     mls_fork_detail: Option<String>,
+    encryption: String,
+    readiness_reason: Option<String>,
     /// SPEC-086 CON-002: while set and in the future, a `(history …)` request
     /// for this agent's room is unanswered and a second one is refused.
     history_in_flight_until: Option<std::time::Instant>,
@@ -679,6 +683,10 @@ impl AgentStore {
             reconnect_attempts: 0,
             reconnect_detail: None,
             mls_fork_detail: None,
+            encryption: if channel.is_some() { "unknown" } else { "none" }.to_owned(),
+            readiness_reason: channel
+                .as_ref()
+                .map(|_| "awaiting session initialization".to_owned()),
             history_in_flight_until: None,
             objects: false,
             queue: VecDeque::new(),
@@ -1181,6 +1189,23 @@ impl AgentStore {
         Ok(())
     }
 
+    /// Record encryption and session readiness independently of socket health.
+    pub async fn set_session_readiness(
+        &self,
+        handle: &AgentHandle,
+        encryption: &str,
+        reason: Option<String>,
+    ) -> Result<(), AgentError> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .agents
+            .get_mut(handle)
+            .ok_or(AgentError::UnknownHandle)?;
+        entry.encryption = encryption.to_owned();
+        entry.readiness_reason = reason;
+        Ok(())
+    }
+
     /// SPEC-013 REQ-006/REQ-021: record — or clear — an MLS divergence.
     ///
     /// Deliberately *unlike* [`Self::mark_unhealthy`]: it changes no state, closes
@@ -1236,6 +1261,10 @@ impl AgentStore {
             reconnect_attempts: 0,
             reconnect_detail: detail,
             mls_fork_detail: None,
+            encryption: if channel.is_some() { "unknown" } else { "none" }.to_owned(),
+            readiness_reason: channel
+                .as_ref()
+                .map(|_| "awaiting session initialization".to_owned()),
             history_in_flight_until: None,
             objects: false,
             queue: VecDeque::new(),
@@ -1546,6 +1575,8 @@ impl AgentEntry {
             reconnect_detail: self.reconnect_detail.clone(),
             objects: self.objects,
             mls_fork_detail: self.mls_fork_detail.clone(),
+            encryption: self.encryption.clone(),
+            readiness_reason: self.readiness_reason.clone(),
         }
     }
 }

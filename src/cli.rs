@@ -26,50 +26,181 @@ use crate::local_api::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = COMMAND_NAME, version, about)]
+#[command(
+    name = COMMAND_NAME,
+    version,
+    about = "Connect agents to chat rooms, receive routed work, and operate shared objects",
+    after_help = "Getting started:
+  Have a pairing code?    hark pair <code>
+  Join a chat channel:    hark join @room --as @agent --speak '*'
+  Handle routed work:     hark init --help
+
+After connecting:
+  hark tell \"hello\"              Send text to the joined chat channel
+  hark recv --timeout 30s          Consume one incoming message
+  hark close                      Close the selected agent connection
+
+Agent selection:
+  --agent <handle|@name> overrides CBCL_AGENT_HANDLE. Without either, commands
+  select the sole registered agent; multiple agents require explicit selection.
+  Use hark agents or hark --agent @name whoami --json to inspect readiness.
+  Use hark daemon status --json to inspect the daemon and connections.
+
+Run hark <command> --help for prerequisites, examples, and output behavior."
+)]
 pub struct Cli {
+    #[arg(
+        long,
+        global = true,
+        value_name = "HANDLE|@NAME",
+        help = "Select an agent explicitly; overrides CBCL_AGENT_HANDLE. Required with multiple agents"
+    )]
+    pub agent: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(
+        about = "Download and install the latest published Hark release",
+        after_help = "Downloads release metadata and the platform binary from https://files.anuna.io/hark. Requires a valid SHA-256 checksum and atomically replaces the installed binary.
+
+Installs to ~/.local/bin by default, matching install.sh. Use --install-dir or HARK_INSTALL_DIR for a custom location; HARK_BASE_URL overrides the metadata source. macOS and Linux on arm64 and x64 are supported.
+
+Examples:
+  hark update
+  hark update --install-dir ~/.local/bin
+
+No daemon or agent selection is needed. Restart a running daemon separately with hark daemon stop followed by hark daemon start to load updated daemon code."
+    )]
+    Update(UpdateArgs),
+    #[command(about = "List agent identities, connections, encryption, and readiness")]
+    Agents(JsonArgs),
+    #[command(about = "Inspect the selected agent and its readiness")]
+    Whoami(JsonArgs),
     #[command(about = "Show or create the user configuration file")]
     #[command(subcommand)]
     Config(ConfigCommand),
     #[command(about = "Manage the per-user local daemon")]
     #[command(subcommand)]
     Daemon(DaemonCommand),
+    #[command(about = "Join a chat channel, creating config and starting the daemon if needed")]
     #[command(
-        about = "One-shot join: scaffold config if absent, start the daemon if needed, and join a chat channel"
+        after_help = "Starts the daemon if needed and makes the joined agent active. Subsequent commands select the sole registered agent; with multiple agents, use --agent or CBCL_AGENT_HANDLE.
+
+Example:
+  hark join @demo --as @aria --speak '*'
+  hark tell \"hello\"
+  hark recv --timeout 30s
+
+Without --speak, advertise no dialects. Use --speak '*' for all channel messages; use --objects for shared objects."
     )]
     Join(JoinArgs),
     #[command(
         about = "Pair an agent into a channel via a memorable code: `hark pair <id>-word-word`"
     )]
+    #[command(
+        after_help = "Use a code issued by a channel member in the web app. The pairing record supplies the channel, name, and advertised dialects. Creates config and starts the daemon if needed; makes the paired agent active. With multiple agents, select one with --agent or CBCL_AGENT_HANDLE.
+
+Example:
+  hark pair 1-rocket-anchor
+  hark recv --timeout 30s
+
+Replace the example code with your issued code."
+    )]
     Pair(PairArgs),
-    #[command(about = "Create an agent WebSocket and print the local handle")]
+    #[command(about = "Connect an agent to the configured router or chat hub")]
+    #[command(
+        after_help = "For routed work, configure router.ws_url and start the daemon with hark daemon start. For chat onboarding, use hark join or hark pair.
+
+Example (configured router and known elf dialect):
+  hark daemon start
+  hark init --dialect elf
+  hark recv --timeout 30s
+
+Prints export CBCL_AGENT_HANDLE=... by default; --json prints the connection response including agent_handle. With one registered agent, subsequent commands select it automatically. With multiple agents, use --agent or export its handle as CBCL_AGENT_HANDLE."
+    )]
     Init(InitArgs),
     #[command(about = "Receive one CBCL message for the current agent handle")]
-    Recv(RecvArgs),
     #[command(
-        about = "Ask the hub for older room history (SPEC-086); the frames arrive through `hark recv`"
+        after_help = "Each call consumes one queued message for the selected agent. Prints bare CBCL to stdout unless --record is used. Without --timeout, waits until a message arrives. --follow emits one JSON response per line, flushes each message, and pins the selected agent until exit. A timeout exits 10 without a message.
+
+Example:
+  hark recv --timeout 30s
+
+For chat, join with --speak '*' to receive all messages or --objects for object traffic."
+    )]
+    Recv(RecvArgs),
+    #[command(about = "Request older chat history; receive the frames through hark recv")]
+    #[command(
+        after_help = "Requires a joined chat agent. Sends a history request; frames arrive asynchronously through recv and update learned object state. There is no end-of-history marker. Only one request per room may be in flight.
+
+Example:
+  hark history --limit 100
+  hark recv --timeout 5s"
     )]
     History(HistoryArgs),
-    #[command(
-        about = "Read, act on, and create hypermedia objects in the joined channel (SPEC-086 Stage B; needs `join --objects`)"
-    )]
+    #[command(about = "Inspect and update shared objects in a chat channel")]
     #[command(subcommand)]
+    #[command(
+        after_help = "list, read, act, and open require a chat agent joined with --objects (pair may enable it automatically). check needs a running daemon but no joined agent and sends nothing.
+
+Inspect existing objects:
+  hark object list
+  hark object read <thread>
+
+read returns state, not the contract. Obtain the definition from the object creator and run hark object check --define definition.json to inspect its verbs and field types before acting.
+
+Create an object:
+  hark object check --help
+  hark object open --help"
+    )]
     Object(ObjectCommand),
     #[command(about = "Validate and send a CBCL reply message")]
+    #[command(
+        after_help = "Answer a received ask using its dialect and exact :thread value. Supply a complete CBCL frame, not plain text. The example assumes an ask in the elf dialect with thread rcp-123; replace both with the received values.
+
+Example:
+  hark reply '(lang elf (reply \"done\" :thread \"rcp-123\"))'
+  hark reply < reply.cbcl
+
+Invalid CBCL exits 8. Use hark error for a terminal failure."
+    )]
     Reply(MessageInputArgs),
     #[command(about = "Validate and send a CBCL error message")]
+    #[command(
+        after_help = "Report a terminal failure for a received ask using its dialect and exact :thread value. Replace the example dialect and thread with the received values.
+
+Example:
+  hark error '(lang elf (error \"failed\" :thread \"rcp-123\"))'
+
+Accepts a complete CBCL frame as an argument or from stdin. Invalid CBCL exits 8."
+    )]
     Error(MessageInputArgs),
     #[command(
         about = "Send plain chat text as (tell @channel \"…\"); the argument is never parsed as CBCL"
     )]
+    #[command(
+        after_help = "Requires a selected agent joined to a chat channel. Sends literal text to that channel.
+
+Examples:
+  hark tell \"hello\"
+  printf 'hello\\n' | hark tell
+
+For structured CBCL or routed work, use hark send, reply, or error."
+    )]
     Tell(TellArgs),
     #[command(about = "Transmit a caller-supplied CBCL frame unchanged, of any performative")]
+    #[command(
+        after_help = "Requires a selected agent and a complete frame valid for its dialect. Preserves the supplied frame bytes; validates before sending. Plain text belongs in hark tell.
+
+Example (routed work in elf; replace rcp-123 with the received thread):
+  hark send '(lang elf (tell @router \"progress\" :thread \"rcp-123\" :text \"running tests\"))'
+  hark send < message.cbcl
+
+Invalid CBCL exits 8."
+    )]
     Send(MessageInputArgs),
     // SIMPLIFY: deprecation shims (SPEC-016 REQ-020). `emit` keeps its
     // leading-`(` sniff and `progress` keeps its frame builder, so scripts
@@ -90,7 +221,7 @@ pub enum Command {
     #[command(about = "Close the current agent handle")]
     Close,
     #[command(
-        about = "Print the MLS identity safety number and epoch state hash for an encrypted channel (SPEC-013 REQ-024)",
+        about = "Print the identity safety number and epoch state hash for an encrypted channel",
         name = "safety-number"
     )]
     SafetyNumber(SafetyNumberArgs),
@@ -102,10 +233,10 @@ pub struct SafetyNumberArgs {
         long = "handle",
         help = "Wire handle (@name) whose session state to read"
     )]
-    pub handle: String,
+    pub handle: Option<String>,
     #[arg(
         long = "channel",
-        help = "Channel; defaults to chat.channel from config"
+        help = "Channel; defaults to selected agent channel or chat.channel"
     )]
     pub channel: Option<String>,
 }
@@ -156,6 +287,8 @@ pub struct DialectSubscribeArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
+    #[command(about = "Print the running daemon's effective configuration as redacted JSON")]
+    Show,
     #[command(about = "Print the platform config file path")]
     Path,
     #[command(about = "Print an example config.toml")]
@@ -171,7 +304,7 @@ pub enum DaemonCommand {
     #[command(about = "Run the daemon in the foreground")]
     Run,
     #[command(about = "Show daemon and active agent status")]
-    Status,
+    Status(JsonArgs),
     #[command(about = "Stop the daemon")]
     Stop,
 }
@@ -200,7 +333,7 @@ pub struct JoinArgs {
     pub hub: Option<String>,
     #[arg(
         long = "objects",
-        help = "Subscribe to hypermedia-object messages (SPEC-086): every object message (a `sha256-<64hex>` dialect) in the channel, including this agent's own and replayed history, reaches `recv` with an attestation record"
+        help = "Subscribe to shared-object messages: every object message (a `sha256-<64hex>` dialect) in the channel, including this agent's own and replayed history, reaches `recv` with an attestation record"
     )]
     pub objects: bool,
 }
@@ -221,7 +354,7 @@ pub struct PairArgs {
     pub hub: Option<String>,
     #[arg(
         long = "objects",
-        help = "Subscribe to hypermedia-object messages (SPEC-086). Implied when the pairing record lists an object dialect (sha256-<64hex>)"
+        help = "Subscribe to shared-object messages. Implied when the pairing record lists an object dialect (sha256-<64hex>)"
     )]
     pub objects: bool,
 }
@@ -253,7 +386,7 @@ pub struct InitArgs {
     pub cap: Option<String>,
     #[arg(
         long = "mls-create",
-        help = "Chat hub only: after joining an encrypted private channel, bootstrap its MLS group as the room creator (SPEC-013 REQ-016 operator intent). The agent then adds present members as the elected owner."
+        help = "Chat hub only: after joining an encrypted private channel, bootstrap its MLS group as the room creator with explicit creator intent. The agent then adds present members as the elected owner."
     )]
     pub mls_create: bool,
     #[arg(long = "json", help = "Print JSON instead of shell exports")]
@@ -262,11 +395,19 @@ pub struct InitArgs {
 
 #[derive(Debug, Args)]
 pub struct RecvArgs {
-    #[arg(long = "timeout", help = "Maximum wait, using ms, s, m, or h")]
+    #[arg(
+        long,
+        help = "Continuously receive JSON Lines; flush after each message. --timeout applies to each wait and exits 10 on inactivity"
+    )]
+    pub follow: bool,
+    #[arg(
+        long = "timeout",
+        help = "Maximum wait: positive integer with ms, s, m, or h suffix (up to 2160h); timeout exits 10"
+    )]
     pub timeout: Option<String>,
     #[arg(
         long = "record",
-        help = "Print the JSON recv response (message plus the SPEC-086 attestation record) instead of the bare message bytes"
+        help = "Print JSON with the message and object authorship record instead of bare CBCL"
     )]
     pub record: bool,
 }
@@ -274,19 +415,63 @@ pub struct RecvArgs {
 #[derive(Debug, Subcommand)]
 pub enum ObjectCommand {
     #[command(
-        about = "Validate a definition without sending: prints its dialect (self-address), verbs, state rules, the contract, and the CBCL dialect cbcl-rs verified"
+        about = "Validate an object definition and print its verbs, fields, state rules, and contract"
+    )]
+    #[command(
+        after_help = r#"Requires a running daemon (hark daemon start); no agent or channel is required.
+Prints JSON including dialect, opener, verbs and field types, state rules, and contract.
+No messages are sent.
+
+Accepted definitions: a JSON file or inline JSON containing an authoring definition
+(name, verbs, project), a version-3 contract (kind: "contract", verbs, state), or
+serialized contract text. Versions 1 and 2 are rejected.
+
+Minimal example:
+  hark object check --define '{"name":"note","verbs":{"open":{"causedBy":"begin","fields":{"text":"string"}}},"project":{"text":["last","open","text"]}}'
+
+Save this definition as note.json to create an instance:
+  hark join @demo --as @aria --objects
+  hark object open --define note.json --thread note-1 --field text=hello
+  hark object read note-1"#
     )]
     Check(ObjectCheckArgs),
     #[command(about = "List the object threads this agent has learned from the room")]
+    #[command(
+        after_help = "Requires a chat agent joined with --objects. Prints learned objects as JSON; use their thread ids with hark object read or act. If an older object is missing, request hark history and retry after its frames arrive."
+    )]
     List,
     #[command(about = "Print an object's projected state as JSON")]
+    #[command(
+        after_help = "Requires a chat agent with object access. Find thread ids with hark object list. Prints projected state as JSON. To discover verbs and field types, obtain the definition from its creator and run hark object check --define definition.json.
+
+Example:
+  hark object read list-1
+
+If the thread is absent from learned history, request hark history and retry after its frames arrive."
+    )]
     Read(ObjectReadArgs),
     #[command(
-        about = "Act on an object: cbcl-rs binds provenance, picks the predecessor and verifies the act; the daemon signs and sends"
+        about = "Validate, sign, and send an action using the object contract and learned history"
+    )]
+    #[command(
+        after_help = "Requires a chat agent with object access and a known thread from hark object list. Read current state with hark object read <thread>. Obtain the definition from its creator and inspect verbs and fields with hark object check --define definition.json; read does not return the contract.
+
+Example (a checklist contract with a check verb):
+  hark object act list-1 check --field item=milk --field done=true
+
+Routing and causal fields are filled automatically. Rejected actions send nothing. Use only fields declared by the contract."
     )]
     Act(ObjectActArgs),
     #[command(
         about = "Create an object from a contract definition: verifies it, declares the dialect to the room, sends the opener"
+    )]
+    #[command(
+        after_help = "Requires a chat agent with object access. Validate your definition first with hark object check --define definition.json; its opener determines the required fields.
+
+Example (the note definition in hark object check --help):
+  hark object open --define note.json --thread note-1 --field text=hello
+
+Declares the verified contract to the room and sends its opener. Use a fresh thread id."
     )]
     Open(ObjectOpenArgs),
 }
@@ -296,7 +481,7 @@ pub struct ObjectCheckArgs {
     #[arg(
         long = "define",
         value_name = "FILE|JSON",
-        help = "The definition to validate: a path to a JSON file or inline JSON, in any form `open --define` accepts (see docs/object-definitions.md)"
+        help = "Definition file or inline JSON; see the accepted forms and example below"
     )]
     pub define: String,
     #[arg(
@@ -392,9 +577,50 @@ pub struct ProgressArgs {
     pub dialect: String,
 }
 
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Installation directory; defaults to HARK_INSTALL_DIR or ~/.local/bin"
+    )]
+    pub install_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct JsonArgs {
+    #[arg(long, help = "Print structured JSON")]
+    pub json: bool,
+}
+
 pub async fn run(cli: Cli) -> AppResult<()> {
+    let selector = cli.agent.as_deref();
     match cli.command {
+        Command::Update(args) => {
+            eprintln!("Checking the latest published Hark release...");
+            let result = crate::update::install_latest(args.install_dir).await?;
+            if result.changed {
+                println!(
+                    "Installed hark {} to {}",
+                    result.version,
+                    result.path.display()
+                );
+                println!(
+                    "Restart a running daemon with hark daemon stop, then hark daemon start to load updated daemon code."
+                );
+            } else {
+                println!(
+                    "hark {} is already installed at {}",
+                    result.version,
+                    result.path.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Agents(args) => agents_command(args).await,
+        Command::Whoami(args) => whoami_command(args, selector).await,
         Command::Config(command) => match command {
+            ConfigCommand::Show => config_show().await,
             ConfigCommand::Path => config_path(),
             ConfigCommand::ShowExample => config_show_example(),
             ConfigCommand::Init => config_init(),
@@ -402,47 +628,74 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Daemon(command) => match command {
             DaemonCommand::Start => daemon_start().await,
             DaemonCommand::Run => daemon_run().await,
-            DaemonCommand::Status => daemon_status().await,
+            DaemonCommand::Status(args) => daemon_status(args.json).await,
             DaemonCommand::Stop => daemon_stop().await,
         },
         Command::Join(args) => join_command(args).await,
         Command::Pair(args) => pair_command(args).await,
         Command::Init(args) => init_command(args).await,
-        Command::Recv(args) => recv_command(args).await,
-        Command::History(args) => history_command(args).await,
-        Command::Object(command) => object_command(command).await,
-        Command::Reply(args) => send_message_command(SendMessageKind::Reply, args).await,
-        Command::Error(args) => send_message_command(SendMessageKind::Error, args).await,
-        Command::Tell(args) => tell_command(args).await,
-        Command::Send(args) => send_frame_command(args).await,
+        Command::Recv(args) => recv_command(args, selector).await,
+        Command::History(args) => history_command(args, selector).await,
+        Command::Object(command) => object_command(command, selector).await,
+        Command::Reply(args) => send_message_command(SendMessageKind::Reply, args, selector).await,
+        Command::Error(args) => send_message_command(SendMessageKind::Error, args, selector).await,
+        Command::Tell(args) => tell_command(args, selector).await,
+        Command::Send(args) => send_frame_command(args, selector).await,
         Command::Emit(args) => {
             deprecation_notice("emit", "hark tell <text>` for chat or `hark send <frame>");
-            emit_command(args).await
+            emit_command(args, selector).await
         }
         Command::Progress(args) => {
             deprecation_notice(
                 "progress",
                 "hark send '(lang <d> (tell @router \"progress\" …))'",
             );
-            progress_command(args).await
+            progress_command(args, selector).await
         }
         Command::Dialect(command) => match command {
-            DialectCommand::Publish(args) => dialect_publish_command(args).await,
-            DialectCommand::Query(args) => dialect_query_command(args).await,
-            DialectCommand::List => dialect_list_command().await,
-            DialectCommand::Subscribe(args) => dialect_subscribe_command(args).await,
-            DialectCommand::Unsubscribe => dialect_unsubscribe_command().await,
+            DialectCommand::Publish(args) => dialect_publish_command(args, selector).await,
+            DialectCommand::Query(args) => dialect_query_command(args, selector).await,
+            DialectCommand::List => dialect_list_command(selector).await,
+            DialectCommand::Subscribe(args) => dialect_subscribe_command(args, selector).await,
+            DialectCommand::Unsubscribe => dialect_unsubscribe_command(selector).await,
         },
-        Command::Close => close_command().await,
-        Command::SafetyNumber(args) => safety_number_command(args),
+        Command::Close => close_command(selector).await,
+        Command::SafetyNumber(args) => safety_number_command(args, selector).await,
     }
 }
 
 /// SPEC-013 REQ-024: a headless operator compares the identity safety number
 /// out-of-band — once at pairing time, again on a membership change or
-/// rotation. Reads the persisted session state directly (no daemon
-/// round-trip); the state is current as of the last group mutation.
-fn safety_number_command(args: SafetyNumberArgs) -> AppResult<()> {
+/// rotation. --handle reads persisted session state directly; otherwise the
+/// daemon resolves the selected identity and channel. The persisted state is
+/// current as of the last group mutation.
+async fn safety_number_command(args: SafetyNumberArgs, selector: Option<&str>) -> AppResult<()> {
+    if selector.is_some() && args.handle.is_some() {
+        return Err(AppError::Usage(
+            "use --agent or --handle, not both".to_owned(),
+        ));
+    }
+    let (wire_handle, selected_channel) = if let Some(handle) = args.handle {
+        (handle, None)
+    } else {
+        let client = discover_live_client().await?;
+        let handle = resolve_session_handle(&client, selector).await?;
+        let agents = client
+            .agents()
+            .await
+            .map_err(|error| map_client_error(error, "agent inspection failed"))?;
+        let agent = agents
+            .agents
+            .into_iter()
+            .find(|agent| agent.agent_handle == handle.as_str())
+            .ok_or(AppError::AgentHandleUnavailable)?;
+        if agent.channel.is_none() {
+            return Err(AppError::Usage(
+                "safety numbers require an encrypted chat agent".to_owned(),
+            ));
+        }
+        (agent.router_agent_id, agent.channel)
+    };
     let config =
         crate::config::AppConfig::load().map_err(|error| AppError::Usage(error.to_string()))?;
     let chat = config
@@ -450,9 +703,9 @@ fn safety_number_command(args: SafetyNumberArgs) -> AppResult<()> {
         .map_err(|error| AppError::Usage(error.to_string()))?;
     let channel = match args.channel {
         Some(channel) => channel,
-        None => chat.channel.clone(),
+        None => selected_channel.unwrap_or_else(|| chat.channel.clone()),
     };
-    let file_stem = crate::local_api::chat_key_filename(&args.handle);
+    let file_stem = crate::local_api::chat_key_filename(&wire_handle);
     let (numbers, _trust) =
         crate::mls::session::offline_safety_numbers(&chat.identity_dir, &file_stem, &channel)
             .map_err(|error| AppError::Usage(error.to_string()))?;
@@ -465,6 +718,92 @@ fn safety_number_command(args: SafetyNumberArgs) -> AppResult<()> {
     );
     println!("  {}", numbers.epoch_state);
     Ok(())
+}
+
+fn print_json(value: &impl serde::Serialize) -> AppResult<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value)
+            .map_err(|error| AppError::Internal(error.to_string()))?
+    );
+    Ok(())
+}
+
+async fn config_show() -> AppResult<()> {
+    let client = discover_live_client().await?;
+    let config = client.effective_config().await.map_err(|error| {
+        map_client_error(
+            error,
+            "effective config query failed (restart an older daemon)",
+        )
+    })?;
+    print_json(&config)
+}
+
+fn print_agent(agent: &AgentStatus) {
+    println!(
+        "{} wire={} channel={}",
+        agent.agent_handle,
+        agent.router_agent_id,
+        agent.channel.as_deref().unwrap_or("-")
+    );
+    if let Some(connection) = &agent.connection {
+        println!(
+            "  backend={} hub={} encryption={} socket={} ready={}",
+            connection.backend,
+            connection.hub.as_deref().unwrap_or("-"),
+            connection.encryption,
+            connection.socket,
+            connection.ready
+        );
+        if let Some(reason) = &connection.reason {
+            println!("  reason={reason}");
+        }
+        if let Some(recovery) = &connection.recovery {
+            println!("  recovery={recovery}");
+        }
+    } else {
+        println!(
+            "  socket={} ready=unknown (restart the daemon for readiness inspection)",
+            agent.state
+        );
+    }
+}
+
+async fn agents_command(args: JsonArgs) -> AppResult<()> {
+    let client = discover_live_client().await?;
+    let response = client
+        .agents()
+        .await
+        .map_err(|error| map_client_error(error, "agent list failed"))?;
+    if args.json {
+        print_json(&response)
+    } else {
+        for agent in &response.agents {
+            print_agent(agent);
+        }
+        Ok(())
+    }
+}
+
+async fn whoami_command(args: JsonArgs, selector: Option<&str>) -> AppResult<()> {
+    let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client, selector).await?;
+    let response = client
+        .agents()
+        .await
+        .map_err(|error| map_client_error(error, "agent inspection failed"))?;
+    let agent = response
+        .agents
+        .iter()
+        .find(|agent| agent.agent_handle == handle.as_str())
+        .ok_or(AppError::AgentHandleUnavailable)?;
+    if args.json {
+        print_json(agent)
+    } else {
+        print_agent(agent);
+        Ok(())
+    }
 }
 
 fn config_path() -> AppResult<()> {
@@ -605,7 +944,7 @@ async fn join_command(args: JoinArgs) -> AppResult<()> {
             cap: args.cap,
             added_by: None,
             // `join` never bootstraps an MLS group; `init --mls-create` is the
-            // room-creator path (SPEC-013 REQ-016 operator intent).
+            // room-creator path with explicit creator intent.
             mls_create: None,
             objects: args.objects.then_some(true),
         })
@@ -827,35 +1166,43 @@ async fn init_command(args: InitArgs) -> AppResult<()> {
     Ok(())
 }
 
-async fn recv_command(args: RecvArgs) -> AppResult<()> {
+async fn recv_command(args: RecvArgs, selector: Option<&str>) -> AppResult<()> {
     let timeout_ms = match args.timeout {
         Some(timeout) => Some(parse_recv_timeout_ms(&timeout)?),
         None => None,
     };
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
-    let response = client
-        .recv(&handle, timeout_ms)
-        .await
-        .map_err(map_local_api_request_error)?;
-    if args.record {
-        // SPEC-086 ADR-002: the JSON response, record included (absent for a
-        // message the object subscription did not deliver).
-        println!(
-            "{}",
+    let handle = resolve_session_handle(&client, selector).await?;
+    let mut stdout = std::io::stdout();
+    loop {
+        let response = client
+            .recv(&handle, timeout_ms)
+            .await
+            .map_err(map_local_api_request_error)?;
+        let line = if args.record || args.follow {
             serde_json::to_string(&response)
                 .map_err(|error| AppError::Internal(error.to_string()))?
-        );
-    } else {
-        println!("{}", response.message);
+        } else {
+            response.message
+        };
+        if let Err(error) = writeln!(stdout, "{line}").and_then(|_| stdout.flush()) {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(AppError::Internal(format!(
+                "failed to write receive output: {error}"
+            )));
+        }
+        if !args.follow {
+            return Ok(());
+        }
     }
-    Ok(())
 }
 
 /// SPEC-086 Stage B: `hark object list|read|act|open`. Every subcommand talks
 /// to the daemon's object runtime for the current agent, which must have
 /// joined with `--objects`.
-async fn object_command(command: ObjectCommand) -> AppResult<()> {
+async fn object_command(command: ObjectCommand, selector: Option<&str>) -> AppResult<()> {
     let client = discover_live_client().await?;
     if let ObjectCommand::Check(args) = command {
         // Needs the runtime, not an agent: a definition can be checked before
@@ -876,7 +1223,7 @@ async fn object_command(command: ObjectCommand) -> AppResult<()> {
         }
         return Ok(());
     }
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     match command {
         ObjectCommand::Check(_) => unreachable!("handled above"),
         ObjectCommand::List => {
@@ -1002,7 +1349,7 @@ fn object_fields_from_cli(json: Option<&str>, pairs: &[String]) -> AppResult<ser
 /// SPEC-086 CON-002: `hark history [--limit N] [--room @name]`. The request
 /// goes out on the current agent's own hub connection; the replayed frames
 /// arrive through `hark recv` (with `replayed: true` in their records).
-async fn history_command(args: HistoryArgs) -> AppResult<()> {
+async fn history_command(args: HistoryArgs, selector: Option<&str>) -> AppResult<()> {
     if !(1..=crate::object_transport::HISTORY_LIMIT_MAX).contains(&args.limit) {
         return Err(AppError::Usage(format!(
             "--limit must be between 1 and {}",
@@ -1010,7 +1357,7 @@ async fn history_command(args: HistoryArgs) -> AppResult<()> {
         )));
     }
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     let room = match args.room {
         Some(room) => {
             crate::config::validate_chat_handle("room", &room)
@@ -1038,9 +1385,9 @@ async fn history_command(args: HistoryArgs) -> AppResult<()> {
     Ok(())
 }
 
-async fn close_command() -> AppResult<()> {
+async fn close_command(selector: Option<&str>) -> AppResult<()> {
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     client
         .close(&handle)
         .await
@@ -1071,7 +1418,11 @@ fn validate_init_advertisement(dialects: &[String]) -> AppResult<()> {
     Ok(())
 }
 
-async fn send_message_command(kind: SendMessageKind, args: MessageInputArgs) -> AppResult<()> {
+async fn send_message_command(
+    kind: SendMessageKind,
+    args: MessageInputArgs,
+    selector: Option<&str>,
+) -> AppResult<()> {
     let message = read_message_input(args.message)?;
     // The CLI's fixed-performative verbs are reply and error; `send` carries
     // everything else and is validated by `validate_for_emit`.
@@ -1082,7 +1433,7 @@ async fn send_message_command(kind: SendMessageKind, args: MessageInputArgs) -> 
         eprintln!("{}: {error}", error.code());
         AppError::CbclValidation
     })?;
-    send_validated_message(kind, message).await
+    send_validated_message(kind, message, selector).await
 }
 
 /// SPEC-016 REQ-020: one-line deprecation notice on stderr, naming the
@@ -1096,7 +1447,7 @@ fn deprecation_notice(verb: &str, replacement: &str) {
 /// **always literal text**, whatever character it starts with, and is wrapped
 /// into `(tell @<channel> "<text>" :from @<handle>)`. A leading `(` buys the
 /// caller nothing here: that is what `hark send` is for.
-async fn tell_command(args: TellArgs) -> AppResult<()> {
+async fn tell_command(args: TellArgs, selector: Option<&str>) -> AppResult<()> {
     let text = read_message_input(args.text)?;
     let text = text.trim();
     if text.is_empty() {
@@ -1104,7 +1455,7 @@ async fn tell_command(args: TellArgs) -> AppResult<()> {
     }
 
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     let (channel, wire_handle) = agent_chat_channel(&client, &handle).await?;
     let channel = channel.ok_or_else(|| {
         AppError::Usage(
@@ -1124,7 +1475,7 @@ async fn tell_command(args: TellArgs) -> AppResult<()> {
 /// envelope. It never wraps, rewrites, reorders, or injects a parameter; the
 /// only transformation is trimming the surrounding whitespace a shell or stdin
 /// adds. A `(meta …)` form is refused by `validate_for_emit`.
-async fn send_frame_command(args: MessageInputArgs) -> AppResult<()> {
+async fn send_frame_command(args: MessageInputArgs, selector: Option<&str>) -> AppResult<()> {
     let frame = read_message_input(args.message)?;
     let frame = frame.trim();
     if frame.is_empty() {
@@ -1134,7 +1485,7 @@ async fn send_frame_command(args: MessageInputArgs) -> AppResult<()> {
     }
 
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     transmit_frame(&client, &handle, frame.to_owned()).await
 }
 
@@ -1218,7 +1569,7 @@ fn emit_input_is_cbcl_form(input: &str) -> bool {
 }
 
 /// Deprecated alias: routes to `tell` or `send` by the leading-`(` sniff.
-async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
+async fn emit_command(args: MessageInputArgs, selector: Option<&str>) -> AppResult<()> {
     let input = read_message_input(args.message)?;
     let input = input.trim();
     if input.is_empty() {
@@ -1227,14 +1578,20 @@ async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
         ));
     }
     if emit_input_is_cbcl_form(input) {
-        send_frame_command(MessageInputArgs {
-            message: Some(input.to_owned()),
-        })
+        send_frame_command(
+            MessageInputArgs {
+                message: Some(input.to_owned()),
+            },
+            selector,
+        )
         .await
     } else {
-        tell_command(TellArgs {
-            text: Some(input.to_owned()),
-        })
+        tell_command(
+            TellArgs {
+                text: Some(input.to_owned()),
+            },
+            selector,
+        )
         .await
     }
 }
@@ -1244,17 +1601,21 @@ async fn emit_command(args: MessageInputArgs) -> AppResult<()> {
 /// script keeps working; the progress-specific *validation* is gone with
 /// `MessageKind::Progress`, which is safe here because the CLI builds the frame
 /// and cannot build it wrong.
-async fn progress_command(args: ProgressArgs) -> AppResult<()> {
+async fn progress_command(args: ProgressArgs, selector: Option<&str>) -> AppResult<()> {
     validate_dialect_id(&args.dialect).map_err(|error| AppError::Usage(error.to_string()))?;
     let message = build_progress_message(&args.thread, args.text.as_deref(), &args.dialect);
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     transmit_frame(&client, &handle, message).await
 }
 
-async fn send_validated_message(kind: SendMessageKind, message: String) -> AppResult<()> {
+async fn send_validated_message(
+    kind: SendMessageKind,
+    message: String,
+    selector: Option<&str>,
+) -> AppResult<()> {
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     client
         .send(&handle, &SendRequest { kind, message })
         .await
@@ -1262,11 +1623,14 @@ async fn send_validated_message(kind: SendMessageKind, message: String) -> AppRe
     Ok(())
 }
 
-async fn dialect_publish_command(args: DialectPublishArgs) -> AppResult<()> {
+async fn dialect_publish_command(
+    args: DialectPublishArgs,
+    selector: Option<&str>,
+) -> AppResult<()> {
     let define = read_message_input(args.define)?;
     let define = define.trim().to_owned();
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     let response = client
         .meta_publish(&handle, &MetaPublishRequest { define })
         .await
@@ -1283,9 +1647,9 @@ async fn dialect_publish_command(args: DialectPublishArgs) -> AppResult<()> {
     Ok(())
 }
 
-async fn dialect_query_command(args: DialectQueryArgs) -> AppResult<()> {
+async fn dialect_query_command(args: DialectQueryArgs, selector: Option<&str>) -> AppResult<()> {
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     let response = client
         .meta_query(&handle, &MetaQueryRequest { name: args.name })
         .await
@@ -1303,9 +1667,9 @@ async fn dialect_query_command(args: DialectQueryArgs) -> AppResult<()> {
     Ok(())
 }
 
-async fn dialect_list_command() -> AppResult<()> {
+async fn dialect_list_command(selector: Option<&str>) -> AppResult<()> {
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     let response = client
         .meta_list(&handle)
         .await
@@ -1316,9 +1680,12 @@ async fn dialect_list_command() -> AppResult<()> {
     Ok(())
 }
 
-async fn dialect_subscribe_command(args: DialectSubscribeArgs) -> AppResult<()> {
+async fn dialect_subscribe_command(
+    args: DialectSubscribeArgs,
+    selector: Option<&str>,
+) -> AppResult<()> {
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     client
         .meta_subscribe(
             &handle,
@@ -1331,9 +1698,9 @@ async fn dialect_subscribe_command(args: DialectSubscribeArgs) -> AppResult<()> 
     Ok(())
 }
 
-async fn dialect_unsubscribe_command() -> AppResult<()> {
+async fn dialect_unsubscribe_command(selector: Option<&str>) -> AppResult<()> {
     let client = discover_live_client().await?;
-    let handle = resolve_session_handle(&client).await?;
+    let handle = resolve_session_handle(&client, selector).await?;
     client
         .meta_unsubscribe(&handle)
         .await
@@ -1363,32 +1730,27 @@ fn read_message_input(message: Option<String>) -> AppResult<String> {
 /// Resolve the agent handle for a session command (REQ-003, SPEC-016):
 /// an explicit `CBCL_AGENT_HANDLE` always wins (multi-agent scripting);
 /// otherwise fall back to the daemon-tracked active handle — no `eval`.
-async fn resolve_session_handle(client: &LocalApiClient) -> AppResult<AgentHandle> {
-    let env = std::env::var("CBCL_AGENT_HANDLE")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-
-    // A wire `@name` (the invite-provided name `hark pair` prints) pins the
-    // shell to its OWN agent by the human-meaningful name cbcl-bus assigned —
-    // resolved to the daemon's opaque internal handle via the live agent list.
-    // This is what lets two agents share one machine-wide daemon and still be
-    // driven independently from separate shells, without juggling 26-char
-    // handles or racing the daemon's single active-handle slot.
-    if let Some(name) = env.as_deref().filter(|value| value.starts_with('@')) {
-        return resolve_wire_name(client, name).await;
+async fn resolve_session_handle(
+    client: &LocalApiClient,
+    selector: Option<&str>,
+) -> AppResult<AgentHandle> {
+    let selection = selector.map(str::to_owned).or_else(|| {
+        std::env::var("CBCL_AGENT_HANDLE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    if let Some(value) = selection {
+        let value = value.trim();
+        if value.starts_with('@') {
+            return resolve_wire_name(client, value).await;
+        }
+        return AgentHandle::new(value).map_err(|error| AppError::Usage(error.to_string()));
     }
-
-    let active = if env.is_some() {
-        None // don't bother the daemon; the env var decides
-    } else {
-        client
-            .agents()
-            .await
-            .map_err(|error| map_client_error(error, "daemon agents query failed"))?
-            .active_agent_handle
-    };
-    choose_agent_handle(env, active)
+    let agents = client
+        .agents()
+        .await
+        .map_err(|error| map_client_error(error, "daemon agents query failed"))?;
+    select_default_agent(&agents.agents)
 }
 
 /// Resolve a wire `@name` to the daemon's opaque internal handle by looking it
@@ -1400,32 +1762,20 @@ async fn resolve_wire_name(client: &LocalApiClient, name: &str) -> AppResult<Age
         .agents()
         .await
         .map_err(|error| map_client_error(error, "daemon agents query failed"))?;
-    let selection =
-        select_by_wire_name(&agents.agents, agents.active_agent_handle.as_deref(), name)?;
-    if let Some(warning) = selection.warning {
-        eprintln!("warning: {warning}");
-    }
+    let selection = select_by_wire_name(&agents.agents, name)?;
     AgentHandle::new(selection.handle).map_err(|error| AppError::Usage(error.to_string()))
 }
 
-/// The internal handle chosen for a wire `@name`, plus an optional ambiguity
-/// warning to surface. Split from the network fetch so the selection rules are
-/// unit-testable.
+/// The internal handle chosen for an unambiguous wire name.
 #[derive(Debug)]
 struct WireNameSelection {
     handle: String,
-    warning: Option<String>,
 }
 
 /// Pure selection over a live agent list: pick the internal handle whose wire
-/// name (`router_agent_id`) equals `name`. No match is a usage error; a single
-/// match wins cleanly; multiple matches (a re-pair sharing one identity) prefer
-/// the active handle and carry a warning so the ambiguity is never silent.
-fn select_by_wire_name(
-    agents: &[AgentStatus],
-    active: Option<&str>,
-    name: &str,
-) -> AppResult<WireNameSelection> {
+/// name (`router_agent_id`) equals `name`. No match is an unavailable handle; a single
+/// match wins cleanly; multiple matches require an explicit internal handle.
+fn select_by_wire_name(agents: &[AgentStatus], name: &str) -> AppResult<WireNameSelection> {
     let matches: Vec<&AgentStatus> = agents
         .iter()
         .filter(|agent| agent.router_agent_id == name)
@@ -1437,35 +1787,28 @@ fn select_by_wire_name(
         // so classifying the client-side miss as a usage error made the code a
         // script saw depend on which layer noticed first.
         [] => Err(AppError::AgentHandleUnknown(format!(
-            "no live agent named {name} on this daemon; run `hark daemon status` to list them \
+            "no live agent named {name} on this daemon; run `hark agents` to list them \
              (CBCL_AGENT_HANDLE accepts a wire @name or an internal handle)"
         ))),
         [only] => Ok(WireNameSelection {
             handle: only.agent_handle.clone(),
-            warning: None,
         }),
-        many => {
-            let pick = many
-                .iter()
-                .find(|agent| Some(agent.agent_handle.as_str()) == active)
-                .copied()
-                .unwrap_or(many[0]);
-            Ok(WireNameSelection {
-                handle: pick.agent_handle.clone(),
-                warning: Some(format!(
-                    "{} agents share the wire name {name}; using {} \
-                     (re-pairing the same invite reuses one identity)",
-                    many.len(),
-                    pick.agent_handle
-                )),
-            })
-        }
+        many => Err(AppError::Usage(format!(
+            "{} agents share the wire name {name}; use --agent with an internal handle from hark agents",
+            many.len()
+        ))),
     }
 }
 
-fn choose_agent_handle(env: Option<String>, active: Option<String>) -> AppResult<AgentHandle> {
-    let value = env.or(active).ok_or(AppError::MissingAgentHandle)?;
-    AgentHandle::new(value).map_err(|error| AppError::Usage(error.to_string()))
+fn select_default_agent(agents: &[AgentStatus]) -> AppResult<AgentHandle> {
+    match agents {
+        [] => Err(AppError::MissingAgentHandle),
+        [only] => AgentHandle::new(&only.agent_handle)
+            .map_err(|error| AppError::Usage(error.to_string())),
+        _ => Err(AppError::Usage(
+            "multiple agents are registered; use --agent <handle|@name> or CBCL_AGENT_HANDLE (hark agents lists them)".to_owned(),
+        )),
+    }
 }
 
 async fn discover_live_client() -> AppResult<LocalApiClient> {
@@ -1715,13 +2058,15 @@ async fn daemon_start() -> AppResult<()> {
     wait_for_daemon_ready(&paths, Duration::from_secs(10)).await
 }
 
-async fn daemon_status() -> AppResult<()> {
+async fn daemon_status(json: bool) -> AppResult<()> {
     let paths = resolve_runtime_paths()
         .map_err(|error| AppError::Internal(format!("failed to resolve runtime dir: {error}")))?;
     let Some(record) = load_discovery_record(&paths)
         .map_err(|error| AppError::Internal(format!("failed to read daemon discovery: {error}")))?
     else {
-        println!("daemon: not running");
+        if !json {
+            println!("daemon: not running");
+        }
         return Err(AppError::DaemonNotRunning);
     };
 
@@ -1731,6 +2076,9 @@ async fn daemon_status() -> AppResult<()> {
                 .agents()
                 .await
                 .map_err(|error| map_client_error(error, "daemon status failed"))?;
+            if json {
+                return print_json(&agents);
+            }
             println!("daemon: running");
             println!("addr: {}", agents.daemon.addr);
             println!("version: {}", agents.daemon.version);
@@ -1740,6 +2088,7 @@ async fn daemon_status() -> AppResult<()> {
                 println!("active: {active}");
             }
             for agent in agents.agents {
+                print_agent(&agent);
                 let dialects = agent.dialects.join(",");
                 println!(
                     "{} {} router_agent_id={} dialects=[{}] queued_messages={} queued_bytes={}",
@@ -1943,7 +2292,7 @@ mod tests {
 
     use super::{
         AgentStatus, Cli, Command, ConfigCommand, DaemonCommand, build_chat_config_toml,
-        build_progress_message, build_tell_message, choose_agent_handle, emit_input_is_cbcl_form,
+        build_progress_message, build_tell_message, select_default_agent, emit_input_is_cbcl_form,
         escape_cbcl_string, parse_recv_timeout_ms, select_by_wire_name,
         validate_init_advertisement,
     };
@@ -1958,6 +2307,7 @@ mod tests {
     /// given internal handle. Other fields are irrelevant to name resolution.
     fn chat_agent(internal: &str, wire: &str) -> AgentStatus {
         AgentStatus {
+            connection: None,
             agent_handle: internal.to_owned(),
             router_agent_id: wire.to_owned(),
             dialects: vec![],
@@ -1979,9 +2329,8 @@ mod tests {
             chat_agent("HANDLEA", "@hark-a"),
             chat_agent("HANDLEB", "@hark-b"),
         ];
-        let selection = select_by_wire_name(&agents, None, "@hark-b").expect("resolves");
+        let selection = select_by_wire_name(&agents, "@hark-b").expect("resolves");
         assert_eq!(selection.handle, "HANDLEB");
-        assert!(selection.warning.is_none());
     }
 
     /// An unknown wire name exits 7, not 2.
@@ -2003,7 +2352,7 @@ mod tests {
     #[test]
     fn unknown_wire_name_exits_as_an_unusable_handle() {
         let agents = [chat_agent("HANDLEA", "@hark-a")];
-        let error = select_by_wire_name(&agents, None, "@ghost").expect_err("no such name");
+        let error = select_by_wire_name(&agents, "@ghost").expect_err("no such name");
         assert_eq!(
             error.exit_code(),
             ExitCode::AgentHandleUnavailable,
@@ -2018,23 +2367,16 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_wire_name_prefers_active_and_warns() {
-        // Two connections share one wire identity (a re-pair with the same
-        // invite): the active handle wins and the ambiguity is surfaced.
+    fn duplicate_wire_name_requires_internal_handle() {
         let agents = [
             chat_agent("OLDCONN", "@hark-a"),
             chat_agent("NEWCONN", "@hark-a"),
         ];
-        let selection = select_by_wire_name(&agents, Some("NEWCONN"), "@hark-a").expect("resolves");
-        assert_eq!(selection.handle, "NEWCONN");
+        let error = select_by_wire_name(&agents, "@hark-a").expect_err("ambiguous");
         assert!(
-            selection
-                .warning
-                .as_deref()
-                .unwrap_or_default()
-                .contains("share the wire name"),
-            "ambiguity must warn: {:?}",
-            selection.warning
+            error
+                .to_string()
+                .contains("use --agent with an internal handle")
         );
     }
 
@@ -2250,25 +2592,27 @@ mod tests {
     }
 
     #[test]
-    fn chooses_env_handle_over_daemon_active_handle() {
-        let env_handle = crate::daemon::AgentHandle::generate();
-        let active_handle = crate::daemon::AgentHandle::generate();
-
-        // An explicit env var always wins (multi-agent scripting).
-        let chosen = choose_agent_handle(
-            Some(env_handle.as_str().to_owned()),
-            Some(active_handle.as_str().to_owned()),
-        )
-        .expect("env handle should resolve");
-        assert_eq!(chosen.as_str(), env_handle.as_str());
-
-        // Without the env var the daemon-tracked active handle is used.
-        let chosen = choose_agent_handle(None, Some(active_handle.as_str().to_owned()))
-            .expect("active handle should resolve");
-        assert_eq!(chosen.as_str(), active_handle.as_str());
-
-        // Neither → the missing-handle error.
-        assert!(choose_agent_handle(None, None).is_err());
+    fn default_selection_requires_exactly_one_registered_agent() {
+        assert!(matches!(
+            select_default_agent(&[]),
+            Err(crate::errors::AppError::MissingAgentHandle)
+        ));
+        let first = crate::daemon::AgentHandle::generate();
+        let second = crate::daemon::AgentHandle::generate();
+        let agents = [
+            chat_agent(first.as_str(), "@first"),
+            chat_agent(second.as_str(), "@second"),
+        ];
+        assert_eq!(
+            select_default_agent(&agents[..1]).unwrap().as_str(),
+            first.as_str()
+        );
+        assert!(
+            select_default_agent(&agents)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple agents")
+        );
     }
 
     /// SPEC-016 TEST-013: the message-minting surface is exactly

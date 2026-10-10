@@ -16,7 +16,7 @@ These codes describe command outcomes and loopback API failures.
 | 3 | daemon not running |
 | 4 | daemon already running for foreground `daemon run` |
 | 5 | stale daemon discovery state |
-| 6 | no exported handle and no active agent |
+| 6 | no selector and no registered agent |
 | 7 | agent handle is unknown, unhealthy, or busy |
 | 8 | CBCL validation or command-kind validation failed |
 | 9 | router configuration, connection, or authentication failure |

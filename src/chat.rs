@@ -1173,6 +1173,35 @@ fn error_slug(text: &str) -> Option<String> {
     })
 }
 
+async fn update_session_readiness(
+    store: &AgentStore,
+    handle: &AgentHandle,
+    mls: Option<&crate::mls::session::MlsSession>,
+) {
+    let (encryption, reason) = match mls {
+        Some(session) if session.downgrade_refused() => (
+            "mls",
+            Some("encryption downgrade refused; verify the room configuration".to_owned()),
+        ),
+        Some(session) if session.recovery_exhausted() => (
+            "mls",
+            Some("MLS recovery exhausted; re-pair this agent into the channel".to_owned()),
+        ),
+        Some(session) if session.fork_active() => (
+            "mls",
+            Some("MLS group diverged; automatic re-admission in progress".to_owned()),
+        ),
+        Some(session) if session.encrypted() && !session.joined() => {
+            ("mls", Some("awaiting MLS Welcome".to_owned()))
+        }
+        Some(session) if session.encrypted() => ("mls", None),
+        _ => ("none", None),
+    };
+    let _ = store
+        .set_session_readiness(handle, encryption, reason)
+        .await;
+}
+
 fn spawn_receive_loop(args: ReceiveLoopArgs) {
     let ReceiveLoopArgs {
         store,
@@ -1304,6 +1333,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     }
                 }
             }
+            update_session_readiness(&store, &handle, mls.as_ref()).await;
             tokio::select! {
                 _ = &mut close_rx => {
                     let _ = websocket.close(None).await;
