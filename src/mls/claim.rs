@@ -352,11 +352,10 @@ impl ArmedClaim {
 pub enum CommitPromise<'a> {
     /// The room has not activated the epoch protocol — the capability is not
     /// unanimous across present members, so the hub refuses claims with
-    /// `epoch-claim-inactive` and every client commits as it did before.
+    /// `epoch-claim-inactive`; membership mutations then fail closed.
     ///
-    /// RFC 9420 §14 is unsatisfied for such a room. That is the status quo
-    /// rather than a regression, and it is why activation is unanimous: a
-    /// promise some members keep is worse than one nobody makes.
+    /// RFC 9420 §14 is unsatisfied for such a room, so callers must not create
+    /// or merge membership commits until the capability is active.
     Inactive,
     /// An armed claim is held for this room and epoch.
     Armed(&'a ArmedClaim),
@@ -369,7 +368,7 @@ pub struct RefusalBudget {
 }
 
 /// Pure state machine for one room's claim exchange. The transport owns timers
-/// and I/O; this value makes the merge gate and fallback decision explicit.
+/// and I/O; this value makes the merge gate decision explicit.
 #[derive(Debug, Clone)]
 pub struct ClaimMachine {
     room: String,
@@ -384,7 +383,7 @@ pub enum ClaimAction {
     None,
     Send(String),
     Armed(ArmedClaim),
-    CommitUnclaimed,
+    Unsupported,
     Starved(u32),
 }
 
@@ -394,7 +393,7 @@ impl ClaimMachine {
     }
 
     pub fn begin(&self, from: &str) -> ClaimAction {
-        if !self.active { return ClaimAction::CommitUnclaimed; }
+        if !self.active { return ClaimAction::Unsupported; }
         ClaimAction::Send(epochclaim_frame(&self.room, self.epoch, from, self.token.as_deref()))
     }
 
@@ -410,7 +409,7 @@ impl ClaimMachine {
 
     pub fn refused(&mut self, refusal: Refusal, from: &str) -> ClaimAction {
         match refusal {
-            Refusal::Inactive => { self.active = false; ClaimAction::CommitUnclaimed }
+            Refusal::Inactive => { self.active = false; ClaimAction::Unsupported }
             Refusal::NoClaim => { self.token = None; ClaimAction::Send(epochclaim_frame(&self.room, self.epoch, from, None)) }
             Refusal::Contended if self.budget.refused() => ClaimAction::Send(epochclaim_frame(&self.room, self.epoch, from, self.token.as_deref())),
             Refusal::Contended => ClaimAction::Starved(self.budget.consecutive()),
@@ -478,10 +477,10 @@ mod tests {
     }
 
     #[test]
-    fn inactive_rooms_take_the_negotiated_legacy_path() {
+    fn inactive_rooms_fail_closed() {
         let mut machine = ClaimMachine::new("@room", 7, true, None);
-        assert_eq!(machine.refused(Refusal::Inactive, "@hark"), ClaimAction::CommitUnclaimed);
-        assert_eq!(machine.begin("@hark"), ClaimAction::CommitUnclaimed);
+        assert_eq!(machine.refused(Refusal::Inactive, "@hark"), ClaimAction::Unsupported);
+        assert_eq!(machine.begin("@hark"), ClaimAction::Unsupported);
     }
 
     #[test]
@@ -692,9 +691,9 @@ mod tests {
     ///
     /// They differ in the only dimension a retry loop cares about: what makes
     /// them clear. Contention clears when the holder finishes, in seconds.
-    /// `epoch-claim-inactive` clears on a MEMBERSHIP change — a legacy client
-    /// leaving or upgrading — so retrying it on a backoff turns an ordinary
-    /// rollout into a hot loop against a hub that will refuse every attempt.
+    /// `epoch-claim-inactive` clears when room capability negotiation changes,
+    /// so retrying it on a backoff would create a hot loop against a hub that
+    /// will refuse every attempt.
     #[test]
     fn refusals_are_classified_by_what_makes_them_clear() {
         assert_eq!(
