@@ -152,6 +152,10 @@ pub struct MlsSession {
     v1_log: Option<crate::mls_ds::ClientLog>,
     /// Durable, unmerged local mutation awaiting its signed DS log record.
     pending_ds: Option<PendingDsCommit>,
+    epoch_claim_active: bool,
+    epoch_claim: Option<crate::mls::claim::ClaimMachine>,
+    pending_epoch_add: Option<PendingEpochAdd>,
+    pending_epoch: Option<PendingEpochCommit>,
     /// The wire identity (signs idkey/bye assertions — same key as the MLS
     /// leaf, different DS labels).
     wire_seed: [u8; 32],
@@ -313,6 +317,19 @@ struct PendingDsCommit {
     accepted_in_memory: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingEpochAdd { target: String, kp: Vec<u8> }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingEpochCommit {
+    epoch: u64,
+    token: String,
+    commit: String,
+    welcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consumed_ref: Option<String>,
+}
+
 /// The on-disk stem for one agent's MLS state **in one room**.
 ///
 /// Keyed on `(wire handle, room)`, not the handle alone. The signing key is
@@ -469,6 +486,10 @@ impl MlsSession {
             is_v1: false,
             v1_log: None,
             pending_ds: None,
+            epoch_claim_active: false,
+            epoch_claim: None,
+            pending_epoch_add: None,
+            pending_epoch: None,
             wire_seed: wire.signing_seed(),
             pair_grant: None,
             present: std::collections::HashSet::new(),
@@ -528,6 +549,7 @@ impl MlsSession {
             }
         }
         session.pending_ds = session.load_pending_ds()?;
+        session.pending_epoch = session.load_pending_epoch()?;
         if let (Some(pending), Some(group)) = (session.pending_ds.as_mut(), session.group.as_ref()) {
             pending.accepted_in_memory = group.epoch().as_u64() == pending.base as u64 + 1;
         }
@@ -609,6 +631,28 @@ impl MlsSession {
 
     fn pending_ds_path(&self) -> PathBuf {
         self.meta_path.with_extension("dspending")
+    }
+
+    fn pending_epoch_path(&self) -> PathBuf { self.meta_path.with_extension("epochpending") }
+
+    fn load_pending_epoch(&self) -> Result<Option<PendingEpochCommit>, MlsError> {
+        match fs::read(self.pending_epoch_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| MlsError::Storage(std::io::Error::other(e))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(MlsError::Storage(e)),
+        }
+    }
+
+    fn persist_pending_epoch(&self, pending: &PendingEpochCommit) -> Result<(), MlsError> {
+        let path = self.pending_epoch_path();
+        let tmp = path.with_extension("epochpending.tmp");
+        let bytes = serde_json::to_vec_pretty(pending).map_err(std::io::Error::other)?;
+        let mut file = fs::File::create(&tmp)?; file.write_all(&bytes)?; file.sync_all()?; fs::rename(tmp, path)?; Ok(())
+    }
+
+    fn clear_pending_epoch(&mut self) -> Result<(), MlsError> {
+        self.pending_epoch = None;
+        match fs::remove_file(self.pending_epoch_path()) { Ok(()) => Ok(()), Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(()), Err(e) => Err(MlsError::Storage(e)) }
     }
 
     fn load_pending_ds(&self) -> Result<Option<PendingDsCommit>, MlsError> {
@@ -1049,6 +1093,8 @@ impl MlsSession {
                     probable_fork: false,
                 },
             },
+            "roomcaps" => self.on_roomcaps(text),
+            "epochgranted" => self.on_epochgranted(text),
             "idkey" => self.on_idkey(text),
             "welcome" => self.on_welcome(text),
             // SPEC-061 REQ-008 — the two halves of seating ourselves.
@@ -1760,6 +1806,12 @@ impl MlsSession {
     ///
     /// Returns `NotMls` for anything else so the ordinary error path is unchanged.
     fn on_error(&mut self, text: &str) -> SessionEvent {
+        if let Some(refusal) = crate::mls::claim::refusal(text, &self.room) {
+            if let Some(machine) = self.epoch_claim.as_mut() {
+                let action = machine.refused(refusal, &self.handle);
+                return self.claim_action(action).unwrap_or_else(|e| SessionEvent::Dropped { reason: e.to_string(), probable_fork: false });
+            }
+        }
         let Some(items) = parse_list(text) else {
             return SessionEvent::NotMls;
         };
@@ -1988,6 +2040,16 @@ impl MlsSession {
         // yet — the old order reported this as "deliver before MLS join" and
         // discarded the only acknowledgement the self-seating path ever gets.
         if kw_symbol(text, ":from").as_deref() == Some(self.handle.as_str()) {
+            if self.pending_epoch.as_ref().is_some_and(|pending| pending.commit == text) {
+                let pending = self.pending_epoch.as_ref().expect("matched").clone();
+                let release = self.epoch_claim.as_ref().and_then(|machine| machine.release(&self.handle));
+                let mut outbound = vec![pending.welcome];
+                if let Some(release) = release { outbound.push(release); }
+                outbound.extend(self.group_info_frame());
+                if let Err(error) = self.clear_pending_epoch() { return SessionEvent::Dropped { reason: error.to_string(), probable_fork: false }; }
+                self.epoch_claim = None;
+                return SessionEvent::Handled { outbound };
+            }
             match self.accept_pending_ds(text) {
                 Ok(Some(outbound)) => return SessionEvent::Handled { outbound },
                 Err(error) => {
@@ -2131,6 +2193,72 @@ impl MlsSession {
 
     /// REQ-003/REQ-008: the hub answered our `keyget` — add the member if we
     /// are the elected owner.
+    fn on_roomcaps(&mut self, text: &str) -> SessionEvent {
+        let capability = crate::mls::claim::capability_name();
+        let active = crate::mls::claim::capability_active(text, &self.room, &capability);
+        self.epoch_claim_active = active;
+        if !active || self.pending_epoch.is_none() { return SessionEvent::Handled { outbound: vec![] }; }
+        let pending = self.pending_epoch.as_ref().expect("checked");
+        let machine = crate::mls::claim::ClaimMachine::new(&self.room, pending.epoch, true, Some(pending.token.clone()));
+        let action = machine.begin(&self.handle);
+        self.epoch_claim = Some(machine);
+        self.claim_action(action).unwrap_or_else(|e| SessionEvent::Dropped { reason: e.to_string(), probable_fork: false })
+    }
+
+    fn on_epochgranted(&mut self, text: &str) -> SessionEvent {
+        let Some(grant) = crate::mls::claim::granted(text, &self.room) else { return SessionEvent::NotMls; };
+        let Some(machine) = self.epoch_claim.as_mut() else { return SessionEvent::Handled { outbound: vec![] }; };
+        let action = machine.grant(grant, &self.handle);
+        self.claim_action(action).unwrap_or_else(|e| SessionEvent::Dropped { reason: e.to_string(), probable_fork: false })
+    }
+
+    fn claim_action(&mut self, action: crate::mls::claim::ClaimAction) -> Result<SessionEvent, MlsError> {
+        use crate::mls::claim::ClaimAction;
+        match action {
+            ClaimAction::None => Ok(SessionEvent::Handled { outbound: vec![] }),
+            ClaimAction::Send(frame) => Ok(SessionEvent::Handled { outbound: vec![frame] }),
+            ClaimAction::CommitUnclaimed => {
+                self.epoch_claim_active = false;
+                let pending = self.pending_epoch_add.take().ok_or_else(|| MlsError::Rejected("inactive claim without pending Add".into()))?;
+                self.commit_epoch_add(pending, None)
+            }
+            ClaimAction::Armed(claim) => {
+                if let Some(pending) = self.pending_epoch.clone() {
+                    let group = self.group.as_mut().ok_or_else(|| MlsError::Rejected("recovering epoch Commit without a group".into()))?;
+                    if group.epoch().as_u64() == pending.epoch && group.pending_commit().is_some() {
+                        group.merge_pending_commit(&self.provider).map_err(MlsError::stack("recover armed epoch Add"))?;
+                        if let Some(reference)=pending.consumed_ref.as_deref(){ self.ledger.mark_consumed(reference)?; }
+                        self.provider.persist()?; self.persist_meta()?;
+                    }
+                    return Ok(SessionEvent::Handled { outbound: vec![pending.commit] });
+                }
+                let pending = self.pending_epoch_add.take().ok_or_else(|| MlsError::Rejected("armed claim without pending Add".into()))?;
+                self.commit_epoch_add(pending, Some(&claim))
+            }
+            ClaimAction::Starved(n) => Err(MlsError::Rejected(format!("epoch claim starved after {n} refusals"))),
+        }
+    }
+
+    fn commit_epoch_add(&mut self, pending: PendingEpochAdd, claim: Option<&crate::mls::claim::ArmedClaim>) -> Result<SessionEvent, MlsError> {
+        let group = self.group.as_mut().ok_or_else(|| MlsError::Rejected("epoch Add before MLS join".into()))?;
+        if claim.is_none() {
+            let outcome = add_member(&self.provider, &self.identity, group, &pending.kp, &pending.target, &self.pins, &mut self.ledger, &self.room, crate::mls::claim::CommitPromise::Inactive)?;
+            self.persist_meta()?;
+            return Ok(SessionEvent::Handled { outbound: vec![format!("(deliver {} :enc mls :ct \"{}\" :from {})", self.room, B64.encode(outcome.commit_bytes), self.handle), format!("(welcome {} :for {} :ct \"{}\" :from {})", self.room, pending.target, B64.encode(outcome.welcome_bytes), self.handle)] });
+        }
+        let claim = claim.expect("checked");
+        crate::mls::group::check_promise(&crate::mls::claim::CommitPromise::Armed(claim), &self.room, group.epoch().as_u64())?;
+        let outcome = stage_add_member(&self.provider, &self.identity, group, &pending.kp, &pending.target, &self.pins, &mut self.ledger, &self.room)?;
+        let record = PendingEpochCommit { epoch: claim.epoch(), token: claim.token().into(), commit: format!("(deliver {} :enc mls :ct \"{}\" :from {})", self.room, B64.encode(&outcome.commit_bytes), self.handle), welcome: format!("(welcome {} :for {} :ct \"{}\" :from {})", self.room, pending.target, B64.encode(&outcome.welcome_bytes), self.handle), consumed_ref: outcome.consumed_ref };
+        self.provider.persist()?;
+        self.persist_pending_epoch(&record)?;
+        self.group.as_mut().expect("group staged above").merge_pending_commit(&self.provider).map_err(MlsError::stack("merge armed epoch Add"))?;
+        if let Some(reference)=record.consumed_ref.as_deref(){ self.ledger.mark_consumed(reference)?; }
+        self.provider.persist()?; self.persist_meta()?;
+        let commit=record.commit.clone(); self.pending_epoch=Some(record);
+        Ok(SessionEvent::Handled { outbound: vec![commit] })
+    }
+
     fn on_keypkg(&mut self, text: &str) -> SessionEvent {
         let result = (|| -> Result<SessionEvent, MlsError> {
             let target = kw_symbol(text, ":for")
@@ -2217,6 +2345,15 @@ impl MlsSession {
                     base,
                     adds_member: true,
                 }));
+            }
+
+            if self.epoch_claim_active {
+                let epoch = group.epoch().as_u64();
+                self.pending_epoch_add = Some(PendingEpochAdd { target, kp });
+                let machine = crate::mls::claim::ClaimMachine::new(&self.room, epoch, true, self.pending_epoch.as_ref().map(|p| p.token.clone()));
+                let action = machine.begin(&self.handle);
+                self.epoch_claim = Some(machine);
+                return self.claim_action(action);
             }
 
             let outcome = add_member(
@@ -4574,17 +4711,25 @@ mod tests {
             },
             _ => panic!("onetime list"),
         };
-        let SessionEvent::Handled { outbound: add_out } =
+        let cap = crate::mls::claim::capability_name();
+        alice.handle_frame(&format!("(roomcaps @research :active (\"{cap}\"))"));
+        let SessionEvent::Handled { outbound: claim } =
             alice.handle_frame(&format!("(keypkg @hub :for @bob :kp \"{bob_kp_b64}\")"))
         else {
             panic!("keypkg handled")
         };
-        assert_eq!(add_out.len(), 2, "commit + welcome — the Add succeeded");
+        assert!(claim[0].starts_with("(epochclaim @research :epoch 0"));
+        let SessionEvent::Handled { outbound: arm } = alice.handle_frame("(epochgranted @research :epoch 0 :token \"claim-1\" :state claimed)") else { panic!("grant") };
+        assert!(arm[0].starts_with("(epocharm @research :epoch 0"));
+        let SessionEvent::Handled { outbound: commit } = alice.handle_frame("(epochgranted @research :epoch 0 :token \"claim-1\" :state armed)") else { panic!("armed") };
+        assert_eq!(commit.len(), 1, "Welcome is withheld until Commit acceptance");
+        let SessionEvent::Handled { outbound: followup } = alice.handle_frame(&commit[0]) else { panic!("echo") };
+        assert!(followup[0].starts_with("(welcome @research"));
+        assert!(followup.iter().any(|frame| frame.starts_with("(epochrelease @research")));
 
         // Bob joins via the welcome; both now agree on a 2-member group.
-        let _ = bob.handle_frame(&add_out[0]);
         assert!(matches!(
-            bob.handle_frame(&add_out[1]),
+            bob.handle_frame(&followup[0]),
             SessionEvent::Handled { .. }
         ));
         assert!(bob.joined());

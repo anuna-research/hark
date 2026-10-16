@@ -151,6 +151,22 @@ pub fn capability_name() -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Whether a hub-originated `roomcaps` frame for `room` lists `capability` in
+/// its `:active` list. Parse the frame structurally so a digest appearing in an
+/// unrelated field or another room cannot activate the merge protocol.
+pub fn capability_active(text: &str, room: &str, capability: &str) -> bool {
+    let Ok(SExpr::List(items)) = cbcl_parser::parse(text) else { return false };
+    if !matches!(items.first(), Some(SExpr::Atom(Atom::Symbol(head))) if head == "roomcaps")
+        || !matches!(items.get(1), Some(SExpr::Atom(Atom::Symbol(named))) if named == room)
+    {
+        return false;
+    }
+    items.windows(2).any(|pair| {
+        matches!(&pair[0], SExpr::Atom(Atom::Keyword(key)) if key == "active")
+            && matches!(&pair[1], SExpr::List(caps) if caps.iter().any(|item| matches!(item, SExpr::Atom(Atom::Str(cap)) if cap == capability)))
+    })
+}
+
 /// The grammar whose digest is the capability. Byte-identical to the hub's
 /// canonical copy, enforced by a drift guard in `tests/join_cli.rs`.
 pub const EPOCH_GRAMMAR: &[u8] = include_bytes!("../dialects/mls-epoch.cbcl");
@@ -352,6 +368,60 @@ pub struct RefusalBudget {
     consecutive: u32,
 }
 
+/// Pure state machine for one room's claim exchange. The transport owns timers
+/// and I/O; this value makes the merge gate and fallback decision explicit.
+#[derive(Debug, Clone)]
+pub struct ClaimMachine {
+    room: String,
+    epoch: u64,
+    token: Option<String>,
+    active: bool,
+    budget: RefusalBudget,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ClaimAction {
+    None,
+    Send(String),
+    Armed(ArmedClaim),
+    CommitUnclaimed,
+    Starved(u32),
+}
+
+impl ClaimMachine {
+    pub fn new(room: &str, epoch: u64, active: bool, token: Option<String>) -> Self {
+        Self { room: room.into(), epoch, token, active, budget: RefusalBudget::default() }
+    }
+
+    pub fn begin(&self, from: &str) -> ClaimAction {
+        if !self.active { return ClaimAction::CommitUnclaimed; }
+        ClaimAction::Send(epochclaim_frame(&self.room, self.epoch, from, self.token.as_deref()))
+    }
+
+    pub fn grant(&mut self, grant: Grant, from: &str) -> ClaimAction {
+        if grant.epoch != self.epoch { return ClaimAction::None; }
+        self.budget.granted();
+        self.token = Some(grant.token.clone());
+        match grant.state {
+            ClaimState::Claimed => ClaimAction::Send(epocharm_frame(&self.room, self.epoch, from, &grant.token)),
+            ClaimState::Armed => ArmedClaim::from_grant(&grant, &self.room).map(ClaimAction::Armed).unwrap_or(ClaimAction::None),
+        }
+    }
+
+    pub fn refused(&mut self, refusal: Refusal, from: &str) -> ClaimAction {
+        match refusal {
+            Refusal::Inactive => { self.active = false; ClaimAction::CommitUnclaimed }
+            Refusal::NoClaim => { self.token = None; ClaimAction::Send(epochclaim_frame(&self.room, self.epoch, from, None)) }
+            Refusal::Contended if self.budget.refused() => ClaimAction::Send(epochclaim_frame(&self.room, self.epoch, from, self.token.as_deref())),
+            Refusal::Contended => ClaimAction::Starved(self.budget.consecutive()),
+        }
+    }
+
+    pub fn release(&self, from: &str) -> Option<String> {
+        self.token.as_deref().map(|token| epochrelease_frame(&self.room, self.epoch, from, token))
+    }
+}
+
 impl RefusalBudget {
     /// A refusal arrived. Returns `true` while the budget still permits a retry,
     /// `false` once it is exhausted and the caller must surface the condition.
@@ -377,6 +447,52 @@ impl RefusalBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_claim_arm_and_release_flow() {
+        let mut machine = ClaimMachine::new("@room", 7, true, None);
+        assert_eq!(machine.begin("@hark"), ClaimAction::Send("(epochclaim @room :epoch 7 :from @hark)".into()));
+        assert_eq!(machine.grant(Grant { epoch: 7, token: "t".into(), state: ClaimState::Claimed }, "@hark"), ClaimAction::Send("(epocharm @room :epoch 7 :token \"t\" :from @hark)".into()));
+        let armed = machine.grant(Grant { epoch: 7, token: "t".into(), state: ClaimState::Armed }, "@hark");
+        assert!(matches!(armed, ClaimAction::Armed(ref claim) if claim.covers("@room", 7)));
+        assert_eq!(machine.release("@hark").as_deref(), Some("(epochrelease @room :epoch 7 :token \"t\" :from @hark)"));
+    }
+
+    #[test]
+    fn room_capability_requires_the_addressed_active_list() {
+        assert!(capability_active(
+            "(roomcaps @room :active (\"digest\"))",
+            "@room",
+            "digest"
+        ));
+        assert!(!capability_active(
+            "(roomcaps @other :active (\"digest\"))",
+            "@room",
+            "digest"
+        ));
+        assert!(!capability_active(
+            "(roomcaps @room :inactive \"digest\" :active ())",
+            "@room",
+            "digest"
+        ));
+    }
+
+    #[test]
+    fn inactive_rooms_take_the_negotiated_legacy_path() {
+        let mut machine = ClaimMachine::new("@room", 7, true, None);
+        assert_eq!(machine.refused(Refusal::Inactive, "@hark"), ClaimAction::CommitUnclaimed);
+        assert_eq!(machine.begin("@hark"), ClaimAction::CommitUnclaimed);
+    }
+
+    #[test]
+    fn contention_is_bounded_and_no_claim_restarts_immediately() {
+        let mut machine = ClaimMachine::new("@room", 7, true, Some("old".into()));
+        assert_eq!(machine.refused(Refusal::NoClaim, "@hark"), ClaimAction::Send("(epochclaim @room :epoch 7 :from @hark)".into()));
+        for _ in 1..REFUSAL_BUDGET {
+            assert!(matches!(machine.refused(Refusal::Contended, "@hark"), ClaimAction::Send(_)));
+        }
+        assert_eq!(machine.refused(Refusal::Contended, "@hark"), ClaimAction::Starved(REFUSAL_BUDGET));
+    }
 
     /// TEST-001/CON-001 (positive) — the request is well-formed CBCL and carries
     /// the epoch it is claiming, which is the whole content of the promise.

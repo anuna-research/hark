@@ -45,6 +45,15 @@
   ;; :agents carries the channel's pairing provenance as (agent adder) pairs, so
   ;; a member who joined AFTER an agent announced itself still knows which of the
   ;; roster are agents (SPEC-016 REQ-002/010).
+  ;; SPEC-108 controls use a dedicated ephemeral session handler.
+  (extend huddle (request op)
+    (tell @room (huddle-request :request request :op op)))
+  (extend huddleresult (request data)
+    (tell @room (huddle-response :request request :data data)))
+  (extend huddlestate (data)
+    (tell @room (huddle-state :data data)))
+  (extend huddlesignal (data)
+    (tell @room (huddle-signal :data data)))
   (extend webhook (request data)
     (tell @room (webhook-request :request request :data data)))
   (extend webhookresult (request data)
@@ -55,8 +64,21 @@
     (tell @room (display-name :name name :revision revision)))
   (extend presence (members agents)
     (tell @room (roster :members members :agents agents)))
-  (extend roomcfg (enc dialects)
-    (tell @room (room-config :enc enc :dialects dialects)))
+  (extend roomcfg (enc dialects settings settings-owner views created)
+    (tell @room (room-config :enc enc :dialects dialects :settings settings :settings-owner settings-owner :views views :created created)))
+  (extend fetchview (digest)
+    (tell @room (view-fetch :digest digest)))
+  (extend viewdef (digest def)
+    (tell @room (view-definition :digest digest :def def)))
+  ;; SPEC-106: settings pointers; settingscfg is unrelated to MLS Welcome.
+  (extend setroomsettings (settings)
+    (tell @room (settings-pointer-write :settings settings)))
+  (extend getusersettings ()
+    (tell @hub (settings-pointer-read)))
+  (extend setusersettings (settings-room settings)
+    (tell @hub (settings-pointer-write :settings-room settings-room :settings settings)))
+  (extend settingscfg (enabled org-room org-settings user-room user-settings user-state)
+    (tell @hub (settings-pointers :enabled enabled :org-room org-room :org-settings org-settings :user-room user-room :user-settings user-settings :user-state user-state)))
 
   ;; --- SPEC-015 channel dialects: declare / undeclare / acquire ---------
   (extend adddialect (name digest def)
