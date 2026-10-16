@@ -51,6 +51,10 @@ fn two_agents_full_encrypted_channel_lifecycle() {
     // Alice creates; presence re-broadcasts her idkey (bob newly seen) AND,
     // since alice already pinned bob, prompts the keyget the hub answers.
     alice.create_group_as_creator().unwrap();
+    let cap = hark::mls::claim::capability_name();
+    alice.handle_frame(&format!(
+        "(roomcaps @research :active (\"{cap}\"))"
+    ));
     let SessionEvent::Handled { outbound } =
         alice.handle_frame("(presence @research :members (@alice @bob))")
     else {
@@ -71,17 +75,32 @@ fn two_agents_full_encrypted_channel_lifecycle() {
         let end = start + rest[start..].find('"').unwrap();
         &rest[start..end]
     };
-    let SessionEvent::Handled { outbound } =
+    let SessionEvent::Handled { outbound: claim } =
         alice.handle_frame(&format!("(keypkg @hub :for @bob :kp \"{kp_b64}\")"))
     else {
         panic!("keypkg");
     };
-    assert_eq!(outbound.len(), 2, "commit + welcome");
+    assert!(claim[0].starts_with("(epochclaim @research :epoch 0"));
+    let _ = alice.handle_frame(
+        "(epochgranted @research :epoch 0 :token \"add-claim\" :state claimed)",
+    );
+    let SessionEvent::Handled { outbound: commit } = alice.handle_frame(
+        "(epochgranted @research :epoch 0 :token \"add-claim\" :state armed)",
+    ) else {
+        panic!("armed add");
+    };
+    let SessionEvent::Handled { outbound: followup } = alice.handle_frame(&commit[0]) else {
+        panic!("accepted add");
+    };
+    let welcome = followup
+        .iter()
+        .find(|frame| frame.starts_with("(welcome @research"))
+        .expect("welcome");
 
     // Bob joins via the fanned welcome.
-    let _ = bob.handle_frame(&outbound[0]); // pre-membership commit: inert
+    let _ = bob.handle_frame(&commit[0]); // pre-membership commit: inert
     assert!(matches!(
-        bob.handle_frame(&outbound[1]),
+        bob.handle_frame(welcome),
         SessionEvent::Handled { .. }
     ));
     assert!(bob.joined());
@@ -126,11 +145,22 @@ fn two_agents_full_encrypted_channel_lifecycle() {
         .unwrap();
     let evidence: hark::mls::removal::RemovalEvidence =
         serde_json::from_slice(&evidence_bytes).unwrap();
-    let remove_frame = alice.remove_with_evidence(&evidence).unwrap();
+    let remove_claim = alice.remove_with_evidence(&evidence).unwrap();
+    assert!(remove_claim.starts_with("(epochclaim @research :epoch 1"));
+    let _ = alice.handle_frame(
+        "(epochgranted @research :epoch 1 :token \"remove-claim\" :state claimed)",
+    );
+    let SessionEvent::Handled { outbound: remove } = alice.handle_frame(
+        "(epochgranted @research :epoch 1 :token \"remove-claim\" :state armed)",
+    ) else {
+        panic!("armed removal");
+    };
+    let remove_frame = &remove[0];
     assert!(matches!(
-        bob.handle_frame(&remove_frame),
+        bob.handle_frame(remove_frame),
         SessionEvent::Handled { .. }
     ));
+    let _ = alice.handle_frame(remove_frame);
     let post_removal = alice
         .encrypt_outbound("(say @research :from @alice :text \"bob must not read this\")")
         .unwrap();

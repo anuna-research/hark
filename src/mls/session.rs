@@ -27,7 +27,7 @@ use openmls::prelude::MlsGroup;
 use rand::Rng as _;
 
 use super::group::{
-    GenesisAssertion, GenesisTrust, add_member, stage_add_member, create_group, group_genesis_creator, is_owner,
+    GenesisAssertion, GenesisTrust, stage_add_member, create_group, group_genesis_creator, is_owner,
     join_by_grant, join_from_welcome, member_bindings, verify_add_target,
 };
 use super::keypackages::{
@@ -36,7 +36,7 @@ use super::keypackages::{
 };
 use super::pins::{PinStore, idkey_signing_bytes};
 use super::provider::DurableProvider;
-use super::removal::{RemovalEvidence, remove_member};
+use super::removal::RemovalEvidence;
 use super::safety::{SafetyNumbers, group_safety_numbers};
 use super::validation::{ForkSignal, Inbound, encrypt_message, enforce_sender, process_inbound};
 use super::{MlsError, MlsIdentity};
@@ -152,6 +152,11 @@ pub struct MlsSession {
     v1_log: Option<crate::mls_ds::ClientLog>,
     /// Durable, unmerged local mutation awaiting its signed DS log record.
     pending_ds: Option<PendingDsCommit>,
+    epoch_claim_active: bool,
+    epoch_claim: Option<crate::mls::claim::ClaimMachine>,
+    pending_epoch_add: Option<PendingEpochAdd>,
+    pending_epoch_remove: Option<PendingEpochRemove>,
+    pending_epoch: Option<PendingEpochCommit>,
     /// The wire identity (signs idkey/bye assertions — same key as the MLS
     /// leaf, different DS labels).
     wire_seed: [u8; 32],
@@ -313,6 +318,27 @@ struct PendingDsCommit {
     accepted_in_memory: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingEpochAdd { target: String, kp: Vec<u8> }
+
+#[derive(Debug, Clone)]
+struct PendingEpochRemove {
+    evidence: RemovalEvidence,
+    next_add: Option<PendingEpochAdd>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingEpochCommit {
+    epoch: u64,
+    token: String,
+    commit: String,
+    welcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_add: Option<PendingEpochAdd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consumed_ref: Option<String>,
+}
+
 /// The on-disk stem for one agent's MLS state **in one room**.
 ///
 /// Keyed on `(wire handle, room)`, not the handle alone. The signing key is
@@ -469,6 +495,11 @@ impl MlsSession {
             is_v1: false,
             v1_log: None,
             pending_ds: None,
+            epoch_claim_active: false,
+            epoch_claim: None,
+            pending_epoch_add: None,
+            pending_epoch_remove: None,
+            pending_epoch: None,
             wire_seed: wire.signing_seed(),
             pair_grant: None,
             present: std::collections::HashSet::new(),
@@ -528,6 +559,7 @@ impl MlsSession {
             }
         }
         session.pending_ds = session.load_pending_ds()?;
+        session.pending_epoch = session.load_pending_epoch()?;
         if let (Some(pending), Some(group)) = (session.pending_ds.as_mut(), session.group.as_ref()) {
             pending.accepted_in_memory = group.epoch().as_u64() == pending.base as u64 + 1;
         }
@@ -609,6 +641,28 @@ impl MlsSession {
 
     fn pending_ds_path(&self) -> PathBuf {
         self.meta_path.with_extension("dspending")
+    }
+
+    fn pending_epoch_path(&self) -> PathBuf { self.meta_path.with_extension("epochpending") }
+
+    fn load_pending_epoch(&self) -> Result<Option<PendingEpochCommit>, MlsError> {
+        match fs::read(self.pending_epoch_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| MlsError::Storage(std::io::Error::other(e))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(MlsError::Storage(e)),
+        }
+    }
+
+    fn persist_pending_epoch(&self, pending: &PendingEpochCommit) -> Result<(), MlsError> {
+        let path = self.pending_epoch_path();
+        let tmp = path.with_extension("epochpending.tmp");
+        let bytes = serde_json::to_vec_pretty(pending).map_err(std::io::Error::other)?;
+        let mut file = fs::File::create(&tmp)?; file.write_all(&bytes)?; file.sync_all()?; fs::rename(tmp, path)?; Ok(())
+    }
+
+    fn clear_pending_epoch(&mut self) -> Result<(), MlsError> {
+        self.pending_epoch = None;
+        match fs::remove_file(self.pending_epoch_path()) { Ok(()) => Ok(()), Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(()), Err(e) => Err(MlsError::Storage(e)) }
     }
 
     fn load_pending_ds(&self) -> Result<Option<PendingDsCommit>, MlsError> {
@@ -1049,6 +1103,8 @@ impl MlsSession {
                     probable_fork: false,
                 },
             },
+            "roomcaps" => self.on_roomcaps(text),
+            "epochgranted" => self.on_epochgranted(text),
             "idkey" => self.on_idkey(text),
             "welcome" => self.on_welcome(text),
             // SPEC-061 REQ-008 — the two halves of seating ourselves.
@@ -1497,68 +1553,27 @@ impl MlsSession {
             leaf_index,
             &leaf_key,
         );
-        let creator = group_genesis_creator(group)
-            .map(|(handle, _)| handle)
-            .unwrap_or_default();
-        let remove_ct = crate::mls::removal::remove_member(
-            &self.provider,
-            &self.identity,
-            group,
-            &self.room,
-            &evidence,
-            &self.pins,
-            &creator,
-            crate::mls::claim::CommitPromise::Inactive,
-        )?;
-        let evidence_json = serde_json::to_vec(&evidence)
-            .map_err(|e| MlsError::Rejected(format!("evidence serialize: {e}")))?;
-
-        // Re-add at the epoch the Remove just produced.
-        let group = self
-            .group
-            .as_mut()
-            .ok_or_else(|| MlsError::Rejected("heal lost its group".into()))?;
-        let outcome = add_member(
-            &self.provider,
-            &self.identity,
-            group,
-            kp_bytes,
-            target,
-            &self.pins,
-            &mut self.ledger,
-            &self.room,
-            crate::mls::claim::CommitPromise::Inactive,
-        )?;
-        self.persist_meta()?;
-        tracing::info!(
-            room = %self.room, target,
-            "re-provisioned a resyncing member: stale leaf removed, fresh leaf added (REQ-026)"
-        );
-        Ok(vec![
-            format!(
-                "(deliver {} :enc mls :ct \"{}\" :evidence \"{}\" :from {})",
-                self.room,
-                B64.encode(&remove_ct),
-                B64.encode(&evidence_json),
-                self.handle
-            ),
-            format!(
-                "(deliver {} :enc mls :ct \"{}\" :from {})",
-                self.room,
-                B64.encode(&outcome.commit_bytes),
-                self.handle
-            ),
-            format!(
-                "(welcome {} :for {} :ct \"{}\" :from {})",
-                self.room,
-                target,
-                B64.encode(&outcome.welcome_bytes),
-                self.handle
-            ),
-        ])
+        if !self.epoch_claim_active {
+            return Err(MlsError::Rejected("room has not activated mandatory MLS epoch claims".into()));
+        }
+        let epoch = group.epoch().as_u64();
+        self.pending_epoch_remove = Some(PendingEpochRemove {
+            evidence,
+            next_add: Some(PendingEpochAdd {
+                target: target.to_owned(),
+                kp: kp_bytes.to_vec(),
+            }),
+        });
+        let machine = crate::mls::claim::ClaimMachine::new(&self.room, epoch, true, None);
+        let action = machine.begin(&self.handle);
+        self.epoch_claim = Some(machine);
+        match self.claim_action(action)? {
+            SessionEvent::Handled { outbound } => Ok(outbound),
+            _ => Err(MlsError::Rejected("epoch claim did not yield outbound work".into())),
+        }
     }
 
-    /// SPEC-013 REQ-026 — honour another member's request to be re-provisioned.    /// SPEC-013 REQ-026 — honour another member's request to be re-provisioned.
+    /// SPEC-013 REQ-026 — honour another member's request to be re-provisioned.
     ///
     /// A member whose group forked discards it and asks to be put back
     /// ([[#REQ-025]]). Somebody has to answer, and before this hark never did:
@@ -1760,6 +1775,12 @@ impl MlsSession {
     ///
     /// Returns `NotMls` for anything else so the ordinary error path is unchanged.
     fn on_error(&mut self, text: &str) -> SessionEvent {
+        if let Some(refusal) = crate::mls::claim::refusal(text, &self.room) {
+            if let Some(machine) = self.epoch_claim.as_mut() {
+                let action = machine.refused(refusal, &self.handle);
+                return self.claim_action(action).unwrap_or_else(|e| SessionEvent::Dropped { reason: e.to_string(), probable_fork: false });
+            }
+        }
         let Some(items) = parse_list(text) else {
             return SessionEvent::NotMls;
         };
@@ -1988,6 +2009,29 @@ impl MlsSession {
         // yet — the old order reported this as "deliver before MLS join" and
         // discarded the only acknowledgement the self-seating path ever gets.
         if kw_symbol(text, ":from").as_deref() == Some(self.handle.as_str()) {
+            if self.pending_epoch.as_ref().is_some_and(|pending| pending.commit == text) {
+                let pending = self.pending_epoch.as_ref().expect("matched").clone();
+                let release = self.epoch_claim.as_ref().and_then(|machine| machine.release(&self.handle));
+                let mut outbound = pending.welcome.into_iter().collect::<Vec<_>>();
+                if let Some(release) = release { outbound.push(release); }
+                outbound.extend(self.group_info_frame());
+                let next_add = pending.next_add;
+                if let Err(error) = self.clear_pending_epoch() { return SessionEvent::Dropped { reason: error.to_string(), probable_fork: false }; }
+                self.epoch_claim = None;
+                if let Some(add) = next_add {
+                    let epoch = self.group.as_ref().map(|group| group.epoch().as_u64()).unwrap_or_default();
+                    self.pending_epoch_add = Some(add);
+                    let machine = crate::mls::claim::ClaimMachine::new(&self.room, epoch, true, None);
+                    let action = machine.begin(&self.handle);
+                    self.epoch_claim = Some(machine);
+                    match self.claim_action(action) {
+                        Ok(SessionEvent::Handled { outbound: next }) => outbound.extend(next),
+                        Ok(_) => {}
+                        Err(error) => return SessionEvent::Dropped { reason: error.to_string(), probable_fork: false },
+                    }
+                }
+                return SessionEvent::Handled { outbound };
+            }
             match self.accept_pending_ds(text) {
                 Ok(Some(outbound)) => return SessionEvent::Handled { outbound },
                 Err(error) => {
@@ -2131,6 +2175,88 @@ impl MlsSession {
 
     /// REQ-003/REQ-008: the hub answered our `keyget` — add the member if we
     /// are the elected owner.
+    fn on_roomcaps(&mut self, text: &str) -> SessionEvent {
+        let capability = crate::mls::claim::capability_name();
+        let active = crate::mls::claim::capability_active(text, &self.room, &capability);
+        self.epoch_claim_active = active;
+        if !active || self.pending_epoch.is_none() { return SessionEvent::Handled { outbound: vec![] }; }
+        let pending = self.pending_epoch.as_ref().expect("checked");
+        let machine = crate::mls::claim::ClaimMachine::new(&self.room, pending.epoch, true, Some(pending.token.clone()));
+        let action = machine.begin(&self.handle);
+        self.epoch_claim = Some(machine);
+        self.claim_action(action).unwrap_or_else(|e| SessionEvent::Dropped { reason: e.to_string(), probable_fork: false })
+    }
+
+    fn on_epochgranted(&mut self, text: &str) -> SessionEvent {
+        let Some(grant) = crate::mls::claim::granted(text, &self.room) else { return SessionEvent::NotMls; };
+        let Some(machine) = self.epoch_claim.as_mut() else { return SessionEvent::Handled { outbound: vec![] }; };
+        let action = machine.grant(grant, &self.handle);
+        self.claim_action(action).unwrap_or_else(|e| SessionEvent::Dropped { reason: e.to_string(), probable_fork: false })
+    }
+
+    fn claim_action(&mut self, action: crate::mls::claim::ClaimAction) -> Result<SessionEvent, MlsError> {
+        use crate::mls::claim::ClaimAction;
+        match action {
+            ClaimAction::None => Ok(SessionEvent::Handled { outbound: vec![] }),
+            ClaimAction::Send(frame) => Ok(SessionEvent::Handled { outbound: vec![frame] }),
+            ClaimAction::Unsupported => Err(MlsError::Rejected(
+                "room has not activated mandatory MLS epoch claims".into(),
+            )),
+            ClaimAction::Armed(claim) => {
+                if let Some(pending) = self.pending_epoch.clone() {
+                    let group = self.group.as_mut().ok_or_else(|| MlsError::Rejected("recovering epoch Commit without a group".into()))?;
+                    if group.epoch().as_u64() == pending.epoch && group.pending_commit().is_some() {
+                        group.merge_pending_commit(&self.provider).map_err(MlsError::stack("recover armed epoch Add"))?;
+                        if let Some(reference)=pending.consumed_ref.as_deref(){ self.ledger.mark_consumed(reference)?; }
+                        self.provider.persist()?; self.persist_meta()?;
+                    }
+                    return Ok(SessionEvent::Handled { outbound: vec![pending.commit] });
+                }
+                if let Some(pending) = self.pending_epoch_remove.take() {
+                    return self.commit_epoch_remove(pending, &claim);
+                }
+                let pending = self.pending_epoch_add.take().ok_or_else(|| MlsError::Rejected("armed claim without pending Add".into()))?;
+                self.commit_epoch_add(pending, &claim)
+            }
+            ClaimAction::Starved(n) => Err(MlsError::Rejected(format!("epoch claim starved after {n} refusals"))),
+        }
+    }
+
+    fn commit_epoch_add(&mut self, pending: PendingEpochAdd, claim: &crate::mls::claim::ArmedClaim) -> Result<SessionEvent, MlsError> {
+        let group = self.group.as_mut().ok_or_else(|| MlsError::Rejected("epoch Add before MLS join".into()))?;
+        crate::mls::group::check_promise(&crate::mls::claim::CommitPromise::Armed(claim), &self.room, group.epoch().as_u64())?;
+        let outcome = stage_add_member(&self.provider, &self.identity, group, &pending.kp, &pending.target, &self.pins, &mut self.ledger, &self.room)?;
+        let record = PendingEpochCommit { epoch: claim.epoch(), token: claim.token().into(), commit: format!("(deliver {} :enc mls :ct \"{}\" :from {})", self.room, B64.encode(&outcome.commit_bytes), self.handle), welcome: Some(format!("(welcome {} :for {} :ct \"{}\" :from {})", self.room, pending.target, B64.encode(&outcome.welcome_bytes), self.handle)), next_add: None, consumed_ref: outcome.consumed_ref };
+        self.provider.persist()?;
+        self.persist_pending_epoch(&record)?;
+        self.group.as_mut().expect("group staged above").merge_pending_commit(&self.provider).map_err(MlsError::stack("merge armed epoch Add"))?;
+        if let Some(reference)=record.consumed_ref.as_deref(){ self.ledger.mark_consumed(reference)?; }
+        self.provider.persist()?; self.persist_meta()?;
+        let commit=record.commit.clone(); self.pending_epoch=Some(record);
+        Ok(SessionEvent::Handled { outbound: vec![commit] })
+    }
+
+    fn commit_epoch_remove(&mut self, pending: PendingEpochRemove, claim: &crate::mls::claim::ArmedClaim) -> Result<SessionEvent, MlsError> {
+        let creator = self.genesis.as_ref().map(|g| g.creator_handle.clone()).ok_or_else(|| MlsError::Rejected("no genesis".into()))?;
+        let group = self.group.as_mut().ok_or_else(|| MlsError::Rejected("epoch Remove before MLS join".into()))?;
+        crate::mls::group::check_promise(&crate::mls::claim::CommitPromise::Armed(claim), &self.room, group.epoch().as_u64())?;
+        let commit = crate::mls::removal::stage_remove_member(&self.provider, &self.identity, group, &self.room, &pending.evidence, &self.pins, &creator)?;
+        let evidence = serde_json::to_vec(&pending.evidence).map_err(std::io::Error::other)?;
+        let record = PendingEpochCommit {
+            epoch: claim.epoch(), token: claim.token().into(),
+            commit: format!("(deliver {} :enc mls :ct \"{}\" :evidence \"{}\" :from {})", self.room, B64.encode(commit), B64.encode(evidence), self.handle),
+            welcome: None, next_add: pending.next_add, consumed_ref: None,
+        };
+        self.provider.persist()?;
+        self.persist_pending_epoch(&record)?;
+        self.group.as_mut().expect("group staged above").merge_pending_commit(&self.provider).map_err(MlsError::stack("merge armed epoch Remove"))?;
+        self.provider.persist()?;
+        self.persist_meta()?;
+        let commit = record.commit.clone();
+        self.pending_epoch = Some(record);
+        Ok(SessionEvent::Handled { outbound: vec![commit] })
+    }
+
     fn on_keypkg(&mut self, text: &str) -> SessionEvent {
         let result = (|| -> Result<SessionEvent, MlsError> {
             let target = kw_symbol(text, ":for")
@@ -2219,39 +2345,15 @@ impl MlsSession {
                 }));
             }
 
-            let outcome = add_member(
-                &self.provider,
-                &self.identity,
-                group,
-                &kp,
-                &target,
-                &self.pins,
-                &mut self.ledger,
-                &self.room,
-                // SPEC-027 REQ-001: no room declares the epoch capability yet,
-                // so no room has activated the protocol and every commit takes
-                // the pre-SPEC-063 path. This becomes `Armed(&claim)` when the
-                // claim exchange lands; the gate is here now so that wiring is
-                // a change to one argument rather than a change to the
-                // invariant.
-                crate::mls::claim::CommitPromise::Inactive,
-            )?;
-            self.persist_meta()?;
-            Ok(SessionEvent::Handled { outbound: vec![
-                format!(
-                    "(deliver {} :enc mls :ct \"{}\" :from {})",
-                    self.room,
-                    B64.encode(&outcome.commit_bytes),
-                    self.handle
-                ),
-                format!(
-                    "(welcome {} :for {} :ct \"{}\" :from {})",
-                    self.room,
-                    target,
-                    B64.encode(&outcome.welcome_bytes),
-                    self.handle
-                ),
-            ] })
+            if !self.epoch_claim_active {
+                return Err(MlsError::Rejected("room has not activated mandatory MLS epoch claims".into()));
+            }
+            let epoch = group.epoch().as_u64();
+            self.pending_epoch_add = Some(PendingEpochAdd { target, kp });
+            let machine = crate::mls::claim::ClaimMachine::new(&self.room, epoch, true, self.pending_epoch.as_ref().map(|p| p.token.clone()));
+            let action = machine.begin(&self.handle);
+            self.epoch_claim = Some(machine);
+            self.claim_action(action)
         })();
         match result {
             Ok(event) => event,
@@ -2346,35 +2448,18 @@ impl MlsSession {
     /// Remove a member as the elected owner, given verified evidence
     /// (REQ-014). Returns the deliver frame carrying commit + evidence.
     pub fn remove_with_evidence(&mut self, evidence: &RemovalEvidence) -> Result<String, MlsError> {
-        let creator = self
-            .genesis
-            .as_ref()
-            .map(|g| g.creator_handle.clone())
-            .ok_or_else(|| MlsError::Rejected("no genesis".into()))?;
-        let group = self
-            .group
-            .as_mut()
-            .ok_or_else(|| MlsError::Rejected("not in a group".into()))?;
-        let commit = remove_member(
-            &self.provider,
-            &self.identity,
-            group,
-            &self.room,
-            evidence,
-            &self.pins,
-            &creator,
-            // As above: inactive until a room activates the protocol.
-            crate::mls::claim::CommitPromise::Inactive,
-        )?;
-        let json = serde_json::to_vec(evidence).map_err(std::io::Error::other)?;
-        self.persist_meta()?;
-        Ok(format!(
-            "(deliver {} :enc mls :ct \"{}\" :evidence \"{}\" :from {})",
-            self.room,
-            B64.encode(&commit),
-            B64.encode(json),
-            self.handle
-        ))
+        if !self.epoch_claim_active {
+            return Err(MlsError::Rejected("room has not activated mandatory MLS epoch claims".into()));
+        }
+        let epoch = self.group.as_ref().ok_or_else(|| MlsError::Rejected("not in a group".into()))?.epoch().as_u64();
+        self.pending_epoch_remove = Some(PendingEpochRemove { evidence: evidence.clone(), next_add: None });
+        let machine = crate::mls::claim::ClaimMachine::new(&self.room, epoch, true, None);
+        let action = machine.begin(&self.handle);
+        self.epoch_claim = Some(machine);
+        match self.claim_action(action)? {
+            SessionEvent::Handled { mut outbound } if outbound.len() == 1 => Ok(outbound.remove(0)),
+            _ => Err(MlsError::Rejected("epoch claim did not yield one request".into())),
+        }
     }
 
     /// REQ-024: both safety numbers for the live group.
@@ -2563,6 +2648,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         (dir, ChatIdentity::from_seed([seed; 32]))
+    }
+
+    fn activate_epoch_claims(session: &mut MlsSession) {
+        let cap = crate::mls::claim::capability_name();
+        session.handle_frame(&format!("(roomcaps {} :active (\"{cap}\"))", session.room));
+    }
+
+    fn claimed_add(session: &mut MlsSession, keypkg: &str) -> SessionEvent {
+        activate_epoch_claims(session);
+        let epoch = session.group.as_ref().expect("group").epoch().as_u64();
+        let SessionEvent::Handled { outbound: claim } = session.handle_frame(keypkg) else { panic!("claim") };
+        assert!(claim[0].starts_with("(epochclaim "));
+        let claimed = format!("(epochgranted {} :epoch {epoch} :token \"test-claim-{epoch}\" :state claimed)", session.room);
+        let SessionEvent::Handled { outbound: arm } = session.handle_frame(&claimed) else { panic!("arm") };
+        assert!(arm[0].starts_with("(epocharm "));
+        let armed = format!("(epochgranted {} :epoch {epoch} :token \"test-claim-{epoch}\" :state armed)", session.room);
+        let SessionEvent::Handled { outbound: commit } = session.handle_frame(&armed) else { panic!("commit") };
+        let SessionEvent::Handled { outbound: followup } = session.handle_frame(&commit[0]) else { panic!("echo") };
+        SessionEvent::Handled { outbound: commit.into_iter().chain(followup).collect() }
     }
 
     /// **S1 regression (SPEC-026 review).** Two agents under ONE wire handle in
@@ -3076,7 +3180,7 @@ mod tests {
             _ => panic!("packages"),
         };
         let SessionEvent::Handled { outbound } =
-            creator.handle_frame(&format!("(keypkg @hub :for @agent :kp \"{agent_kp}\")"))
+            claimed_add(&mut creator, &format!("(keypkg @hub :for @agent :kp \"{agent_kp}\")"))
         else {
             panic!("add handled")
         };
@@ -3485,7 +3589,7 @@ mod tests {
 
         // The creator honours the request by adding it at the live epoch.
         let keypkg = format!("(keypkg @hub :for @agent :kp \"{agent_kp}\")");
-        let SessionEvent::Handled { outbound } = creator.handle_frame(&keypkg) else {
+        let SessionEvent::Handled { outbound } = claimed_add(&mut creator, &keypkg) else {
             panic!("keypkg handled")
         };
         let welcome = outbound
@@ -3555,7 +3659,7 @@ mod tests {
 
         // Re-admitted.
         let keypkg = format!("(keypkg @hub :for @agent :kp \"{agent_kp}\")");
-        let SessionEvent::Handled { outbound } = creator.handle_frame(&keypkg) else {
+        let SessionEvent::Handled { outbound } = claimed_add(&mut creator, &keypkg) else {
             panic!("keypkg handled")
         };
         let welcome = outbound
@@ -3729,7 +3833,7 @@ mod tests {
             _ => panic!("a onetime list"),
         };
         let SessionEvent::Handled { outbound } =
-            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{peer_kp}\")"))
+            claimed_add(&mut creator, &format!("(keypkg @hub :for @peer :kp \"{peer_kp}\")"))
         else {
             panic!("seat the peer")
         };
@@ -3930,7 +4034,7 @@ mod tests {
             _ => panic!("list"),
         };
         let SessionEvent::Handled { outbound } =
-            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{peer_kp}\")"))
+            claimed_add(&mut creator, &format!("(keypkg @hub :for @peer :kp \"{peer_kp}\")"))
         else {
             panic!("seat")
         };
@@ -4000,7 +4104,7 @@ mod tests {
         };
         // Seat the peer in @rooma using one of ITS @rooma packages.
         let SessionEvent::Handled { outbound } =
-            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{}\")", pkg(&a_frames[0], 0)))
+            claimed_add(&mut creator, &format!("(keypkg @hub :for @peer :kp \"{}\")", pkg(&a_frames[0], 0)))
         else {
             panic!("seat")
         };
@@ -4094,7 +4198,7 @@ mod tests {
             _ => panic!("list"),
         };
         let SessionEvent::Handled { outbound } =
-            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{peer_kp}\")"))
+            claimed_add(&mut creator, &format!("(keypkg @hub :for @peer :kp \"{peer_kp}\")"))
         else {
             panic!("seat")
         };
@@ -4154,11 +4258,12 @@ mod tests {
 
         // Add with the LAST-RESORT package.
         let SessionEvent::Handled { outbound } =
-            creator.handle_frame(&format!("(keypkg @hub :for @peer :kp \"{last}\")"))
+            claimed_add(&mut creator, &format!("(keypkg @hub :for @peer :kp \"{last}\")"))
         else {
             panic!("add with last-resort")
         };
-        assert_eq!(outbound.len(), 2, "commit + welcome");
+        assert!(outbound.iter().any(|frame| frame.starts_with("(deliver @room")));
+        assert!(outbound.iter().any(|frame| frame.starts_with("(welcome @room")));
         assert!(
             !creator.ledger.is_consumed(&last_ref),
             "the last-resort package is NOT burned — the pool drains to it, and burning it \
@@ -4196,10 +4301,10 @@ mod tests {
             _ => panic!("list"),
         };
         let frame = format!("(keypkg @hub :for @peer :kp \"{kp}\")");
-        let SessionEvent::Handled { outbound } = creator.handle_frame(&frame) else {
+        let SessionEvent::Handled { outbound } = claimed_add(&mut creator, &frame) else {
             panic!("first add")
         };
-        assert_eq!(outbound.len(), 2, "commit + welcome");
+        assert!(outbound.iter().any(|frame| frame.starts_with("(welcome @room")));
 
         // Remove the member, then let the hub serve the SAME package again.
         // Without the ledger recording the first spend, this would re-add a leaf
@@ -4207,6 +4312,16 @@ mod tests {
         let evidence = creator.leave_frame().ok();
         let _ = evidence;
         let event = creator.handle_frame(&frame);
+        let SessionEvent::Handled { outbound: claim } = event else {
+            panic!("replayed package starts a claim")
+        };
+        assert!(claim[0].starts_with("(epochclaim @room :epoch 1"));
+        let _ = creator.handle_frame(
+            "(epochgranted @room :epoch 1 :token \"replay-claim\" :state claimed)",
+        );
+        let event = creator.handle_frame(
+            "(epochgranted @room :epoch 1 :token \"replay-claim\" :state armed)",
+        );
         assert!(
             matches!(event, SessionEvent::Dropped { .. }),
             "a package already spent is refused: {event:?}"
@@ -4340,16 +4455,23 @@ mod tests {
             }
         };
         let keypkg = format!("(keypkg @hub :for @bob :kp \"{bob_kp_b64}\")");
-        let SessionEvent::Handled { outbound } = alice.handle_frame(&keypkg) else {
+        let SessionEvent::Handled { outbound } = claimed_add(&mut alice, &keypkg) else {
             panic!("keypkg handled")
         };
-        assert_eq!(outbound.len(), 2, "commit fan + welcome");
+        let commit = outbound
+            .iter()
+            .find(|frame| frame.starts_with("(deliver @research"))
+            .expect("commit fan");
+        let welcome = outbound
+            .iter()
+            .find(|frame| frame.starts_with("(welcome @research"))
+            .expect("welcome");
 
         // Bob consumes the fanned welcome (the commit deliver predates his
         // membership and is dropped harmlessly).
-        let _ = bob.handle_frame(&outbound[0]);
+        let _ = bob.handle_frame(commit);
         assert!(matches!(
-            bob.handle_frame(&outbound[1]),
+            bob.handle_frame(welcome),
             SessionEvent::Handled { .. }
         ));
         assert!(bob.joined());
@@ -4376,8 +4498,22 @@ mod tests {
         let bye = bob.leave_frame().unwrap();
         let evidence_b64 = kw_b64(&bye, ":evidence").unwrap();
         let evidence: RemovalEvidence = serde_json::from_slice(&evidence_b64).unwrap();
-        let remove_deliver = alice.remove_with_evidence(&evidence).unwrap();
+        let claim = alice.remove_with_evidence(&evidence).unwrap();
+        assert!(claim.starts_with("(epochclaim @research :epoch 1"));
+        let _ = alice.handle_frame(
+            "(epochgranted @research :epoch 1 :token \"remove-claim\" :state claimed)",
+        );
+        let SessionEvent::Handled { outbound: remove_frames } = alice.handle_frame(
+            "(epochgranted @research :epoch 1 :token \"remove-claim\" :state armed)",
+        ) else {
+            panic!("armed removal creates a commit")
+        };
+        let remove_deliver = remove_frames
+            .into_iter()
+            .find(|frame| frame.starts_with("(deliver @research"))
+            .expect("removal commit");
         assert!(remove_deliver.contains(":evidence"));
+        let _ = alice.handle_frame(&remove_deliver);
         // An existing grant must not turn a confirmed removal into an automatic
         // external rejoin. It remains reusable only on the separate fork path.
         bob.pair_grant = Some("earlier-admission".into());
@@ -4451,7 +4587,7 @@ mod tests {
         // no resync request and cannot grant permission to rejoin.
         let fresh_package = kw_str(&b_frames[0], ":last").unwrap();
         let fresh_keypkg = format!("(keypkg @hub :for @bob :kp \"{fresh_package}\")");
-        let SessionEvent::Handled { outbound } = alice.handle_frame(&fresh_keypkg) else {
+        let SessionEvent::Handled { outbound } = claimed_add(&mut alice, &fresh_keypkg) else {
             panic!("fresh admission handled")
         };
         let welcome = outbound
@@ -4574,17 +4710,25 @@ mod tests {
             },
             _ => panic!("onetime list"),
         };
-        let SessionEvent::Handled { outbound: add_out } =
+        let cap = crate::mls::claim::capability_name();
+        alice.handle_frame(&format!("(roomcaps @research :active (\"{cap}\"))"));
+        let SessionEvent::Handled { outbound: claim } =
             alice.handle_frame(&format!("(keypkg @hub :for @bob :kp \"{bob_kp_b64}\")"))
         else {
             panic!("keypkg handled")
         };
-        assert_eq!(add_out.len(), 2, "commit + welcome — the Add succeeded");
+        assert!(claim[0].starts_with("(epochclaim @research :epoch 0"));
+        let SessionEvent::Handled { outbound: arm } = alice.handle_frame("(epochgranted @research :epoch 0 :token \"claim-1\" :state claimed)") else { panic!("grant") };
+        assert!(arm[0].starts_with("(epocharm @research :epoch 0"));
+        let SessionEvent::Handled { outbound: commit } = alice.handle_frame("(epochgranted @research :epoch 0 :token \"claim-1\" :state armed)") else { panic!("armed") };
+        assert_eq!(commit.len(), 1, "Welcome is withheld until Commit acceptance");
+        let SessionEvent::Handled { outbound: followup } = alice.handle_frame(&commit[0]) else { panic!("echo") };
+        assert!(followup[0].starts_with("(welcome @research"));
+        assert!(followup.iter().any(|frame| frame.starts_with("(epochrelease @research")));
 
         // Bob joins via the welcome; both now agree on a 2-member group.
-        let _ = bob.handle_frame(&add_out[0]);
         assert!(matches!(
-            bob.handle_frame(&add_out[1]),
+            bob.handle_frame(&followup[0]),
             SessionEvent::Handled { .. }
         ));
         assert!(bob.joined());
@@ -4593,6 +4737,21 @@ mod tests {
             bob.safety_numbers().unwrap().identity,
             "both stacks agree on the membership safety number"
         );
+
+        let bye = bob.leave_frame().expect("bob can prove his departure");
+        let evidence = kw_str(&bye, ":evidence")
+            .and_then(|encoded| B64.decode(encoded).ok())
+            .and_then(|bytes| serde_json::from_slice::<RemovalEvidence>(&bytes).ok())
+            .expect("valid removal evidence");
+        let remove_claim = alice.remove_with_evidence(&evidence).expect("claim request");
+        assert!(remove_claim.starts_with("(epochclaim @research :epoch 1"));
+        let SessionEvent::Handled { outbound: remove_arm } = alice.handle_frame("(epochgranted @research :epoch 1 :token \"claim-2\" :state claimed)") else { panic!("remove grant") };
+        assert!(remove_arm[0].starts_with("(epocharm @research :epoch 1"));
+        let SessionEvent::Handled { outbound: remove_commit } = alice.handle_frame("(epochgranted @research :epoch 1 :token \"claim-2\" :state armed)") else { panic!("remove armed") };
+        assert_eq!(remove_commit.len(), 1);
+        assert!(matches!(bob.handle_frame(&remove_commit[0]), SessionEvent::Handled { .. }));
+        let SessionEvent::Handled { outbound: remove_followup } = alice.handle_frame(&remove_commit[0]) else { panic!("remove echo") };
+        assert!(remove_followup.iter().any(|frame| frame.starts_with("(epochrelease @research :epoch 1")));
 
         let _ = fs::remove_dir_all(&a_dir);
         let _ = fs::remove_dir_all(&b_dir);
