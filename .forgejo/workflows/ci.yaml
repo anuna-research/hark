@@ -92,5 +92,14 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: Media test tools
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            $SUDO apt-get update && $SUDO apt-get install -y ffmpeg
+          fi
+          node --version
+          ffprobe -version
+
       - name: Test
         run: cargo test --locked

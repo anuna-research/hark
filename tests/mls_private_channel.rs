@@ -129,6 +129,25 @@ fn two_agents_full_encrypted_channel_lifecycle() {
         other => panic!("expected plaintext, got {other:?}"),
     }
 
+    // SPEC-101 attachments use the same MLS object-content path. The hub
+    // sees neither the canonical descriptor nor its key; the peer receives
+    // exactly the descriptor needed to authenticate/decrypt the stored bytes.
+    let (attachment, stored) = hark::media::seal(b"private attachment", "audio/ogg").unwrap();
+    let reference = attachment.render().unwrap();
+    let file: serde_json::Value = serde_json::from_str(include_str!("vectors/media/file-contract.json")).unwrap();
+    let content = format!("(lang {} (open @research :title \"sound\" :ref {} :caption \"private\" :thread \"media-private\" :caused-by begin :from @alice))", file["dialect"].as_str().unwrap(), serde_json::to_string(&reference).unwrap());
+    let wire = alice.encrypt_outbound(&content).unwrap();
+    assert!(!wire.contains(&reference));
+    assert!(!wire.contains(&attachment.encryption.key));
+    match bob.handle_frame(&wire) {
+        SessionEvent::Plaintext {text, sender} => {
+            assert_eq!(sender, "@alice");
+            assert_eq!(text, content);
+            assert_eq!(hark::media::Descriptor::parse(&reference).unwrap().open(&stored).unwrap(), b"private attachment");
+        }
+        other => panic!("expected private file object, got {other:?}"),
+    }
+
     // Safety numbers agree (REQ-021/REQ-024) — the out-of-band comparison.
     assert_eq!(
         alice.safety_numbers().unwrap().identity,

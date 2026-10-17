@@ -1,3 +1,8 @@
+mod media_api;
+pub use media_api::{
+    MediaAttachment, MediaDownloadRequest, MediaDownloadResponse, MediaListResponse,
+    MediaUploadRequest, MediaUploadResponse,
+};
 use std::{
     fmt,
     net::SocketAddr,
@@ -439,6 +444,7 @@ pub enum LocalApiError {
 
 #[derive(Clone)]
 struct AppState {
+    media_http: reqwest::Client,
     record: Arc<DiscoveryRecord>,
     stop: Arc<StopState>,
     agents: AgentStore,
@@ -722,6 +728,54 @@ impl LocalApiClient {
         decode_api_response(response).await
     }
 
+    pub async fn media_upload(
+        &self,
+        handle: &AgentHandle,
+        request: &MediaUploadRequest,
+    ) -> Result<MediaUploadResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/v1/agents/{}/media/upload", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|_| {
+                LocalApiRequestError::RequestFailed("media upload request failed".into())
+            })?;
+        decode_api_response(response).await
+    }
+    pub async fn media_list(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<MediaListResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/v1/agents/{}/media", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .send()
+            .await
+            .map_err(|_| LocalApiRequestError::RequestFailed("media list request failed".into()))?;
+        decode_api_response(response).await
+    }
+    pub async fn media_download(
+        &self,
+        handle: &AgentHandle,
+        request: &MediaDownloadRequest,
+    ) -> Result<MediaDownloadResponse, LocalApiRequestError> {
+        let response = self
+            .http
+            .post(self.url(&format!("/v1/agents/{}/media/download", handle.as_str())))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(|_| {
+                LocalApiRequestError::RequestFailed("media download request failed".into())
+            })?;
+        decode_api_response(response).await
+    }
+
     pub async fn meta_subscribe(
         &self,
         handle: &AgentHandle,
@@ -916,6 +970,7 @@ pub async fn serve_local_api_with_agents(
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let state = AppState {
+        media_http: crate::media::http().map_err(|e| std::io::Error::other(e.to_string()))?,
         record: Arc::new(record),
         agents,
         config: Arc::new(config),
@@ -944,6 +999,15 @@ fn router(state: AppState) -> Router {
         .route("/v1/agents/{handle}/recv", get(recv))
         .route("/v1/agents/{handle}/send", post(send))
         .route("/v1/agents/{handle}/history", post(history))
+        .route("/v1/agents/{handle}/media", get(media_api::list))
+        .route(
+            "/v1/agents/{handle}/media/upload",
+            post(media_api::upload).layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/agents/{handle}/media/download",
+            post(media_api::download),
+        )
         .route(
             "/v1/agents/{handle}/objects",
             get(objects_list).post(object_open),

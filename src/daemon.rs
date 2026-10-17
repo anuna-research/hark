@@ -354,6 +354,8 @@ struct PendingMetaReply {
 /// don't steal another command's slot.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum MetaReplyExpectation {
+    /// A socket-only media response with this random correlation id.
+    Media(String),
     /// Only a bare `(reply ...)` frame satisfies the waiter. Used by
     /// `publish` (meta teach reply) and `list` (meta query list reply).
     Reply,
@@ -847,22 +849,36 @@ impl AgentStore {
                 .get_mut(handle)
                 .ok_or(AgentError::UnknownHandle)?;
             entry.ensure_healthy()?;
+            if entry.pending_meta_reply.as_ref()
+                .is_some_and(|pending| pending.sender.is_closed())
+            {
+                entry.pending_meta_reply = None;
+            }
             if entry.pending_meta_reply.is_some() {
                 return Err(AgentError::MetaSendBusy);
             }
             entry.pending_meta_reply = Some(PendingMetaReply {
-                expectation,
+                expectation: expectation.clone(),
                 sender: reply_tx,
             });
         }
 
-        if let Err(error) = self.send_outbound(handle, message).await {
+        let sent = if matches!(expectation, MetaReplyExpectation::Media(_)) {
+            self.send_control_outbound(handle, message).await
+        } else {
+            self.send_outbound(handle, message).await
+        };
+        if let Err(error) = sent {
             // Clear the slot so subsequent attempts aren't stuck on the
             // bookkeeping. Best-effort: if the handle vanished mid-flight
             // the next get_mut will simply miss.
             let mut inner = self.inner.lock().await;
             if let Some(entry) = inner.agents.get_mut(handle) {
-                entry.pending_meta_reply = None;
+                if entry.pending_meta_reply.as_ref()
+                    .is_some_and(|pending| pending.expectation == expectation)
+                {
+                    entry.pending_meta_reply = None;
+                }
             }
             return Err(error);
         }
@@ -884,7 +900,11 @@ impl AgentStore {
                 // Timed out — clear the slot so the next attempt can proceed.
                 let mut inner = self.inner.lock().await;
                 if let Some(entry) = inner.agents.get_mut(handle) {
-                    entry.pending_meta_reply = None;
+                    if entry.pending_meta_reply.as_ref()
+                        .is_some_and(|pending| pending.expectation == expectation)
+                    {
+                        entry.pending_meta_reply = None;
+                    }
                 }
                 Err(AgentError::MetaReplyTimeout)
             }
@@ -1183,6 +1203,12 @@ impl AgentStore {
             .agents
             .get_mut(handle)
             .ok_or(AgentError::UnknownHandle)?;
+        // Socket-only media controls cannot survive a session boundary.
+        if entry.pending_meta_reply.as_ref()
+            .is_some_and(|p| matches!(p.expectation, MetaReplyExpectation::Media(_)))
+        {
+            entry.pending_meta_reply = None;
+        }
         entry.state = AgentState::Reconnecting;
         entry.reconnect_attempts = attempts;
         entry.reconnect_detail = detail;
@@ -1490,7 +1516,11 @@ impl MetaReplyDelivery {
 
 fn expectation_matches(expectation: &MetaReplyExpectation, delivery: &MetaReplyDelivery) -> bool {
     match (expectation, delivery) {
-        (_, MetaReplyDelivery::Reply(_)) => true,
+        (MetaReplyExpectation::Media(req), MetaReplyDelivery::Reply(frame)) => {
+            crate::media::ControlReply::parse(frame).is_some_and(|reply| reply.req == *req)
+        }
+        (MetaReplyExpectation::Media(_), _) => false,
+        (_, MetaReplyDelivery::Reply(frame)) => !crate::media::is_control(frame),
         (MetaReplyExpectation::Reply, _) => false,
         (
             MetaReplyExpectation::ReplyOrPushNamed(expected),
@@ -3126,5 +3156,61 @@ mod tests {
 
     fn handle() -> super::AgentHandle {
         super::AgentHandle::new("0123456789ABCDEFGHJKMNPQRS").expect("handle should be valid")
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    #[tokio::test]
+    async fn media_waiter_is_cancelled_when_its_socket_reconnects() {
+        let store = AgentStore::new(AgentStoreConfig {
+            agent_id_prefix: "media".into(),
+            max_messages_per_handle: 8,
+            max_bytes_per_handle: 4096,
+        });
+        let handle = AgentHandle::new("0123456789ABCDEFGHJKMNPQRS").unwrap();
+        store
+            .insert_connected(handle.clone(), vec![])
+            .await
+            .unwrap();
+        let (sender, receiver) = oneshot::channel();
+        store
+            .inner
+            .lock()
+            .await
+            .agents
+            .get_mut(&handle)
+            .unwrap()
+            .pending_meta_reply = Some(PendingMetaReply {
+            expectation: MetaReplyExpectation::Media("0123456789abcdef".into()),
+            sender,
+        });
+        store.mark_reconnecting(&handle, 0, None).await.unwrap();
+        assert!(receiver.await.is_err());
+        assert_eq!(
+            store.status_snapshots().await[0].state,
+            AgentState::Reconnecting
+        );
+    }
+    #[test]
+    fn media_reply_waiter_requires_its_own_correlation_id() {
+        let expectation = MetaReplyExpectation::Media("0123456789abcdef".into());
+        assert!(!expectation_matches(
+            &expectation,
+            &MetaReplyDelivery::Reply("(reply @aria :ok true)".into())
+        ));
+        assert!(!expectation_matches(
+            &expectation,
+            &MetaReplyDelivery::Reply("(mediaok :req \"fedcba9876543210\")".into())
+        ));
+        assert!(expectation_matches(
+            &expectation,
+            &MetaReplyDelivery::Reply("(mediaok :req \"0123456789abcdef\")".into())
+        ));
+        assert!(!expectation_matches(
+            &MetaReplyExpectation::Reply,
+            &MetaReplyDelivery::Reply("(mediaok :req \"0123456789abcdef\")".into())
+        ));
     }
 }

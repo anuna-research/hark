@@ -157,6 +157,12 @@ Create an object:
   hark object open --help"
     )]
     Object(ObjectCommand),
+    #[command(
+        about = "Upload, list, and download encrypted room attachments",
+        subcommand,
+        after_help = "Requires a ready chat agent joined with --objects and media enabled on the hub. Images and audio only; encrypted files may not exceed 8 MiB. The daemon needs ffprobe on PATH for metadata validation. Upload posts a file object into the selected room. Downloads verify and decrypt before saving; existing files are never overwritten."
+    )]
+    Media(MediaCommand),
     #[command(about = "Validate and send a CBCL reply message")]
     #[command(
         after_help = "Answer a received ask using its dialect and exact :thread value. Supply a complete CBCL frame, not plain text. The example assumes an ask in the elf dialect with thread rcp-123; replace both with the received values.
@@ -476,6 +482,39 @@ Declares the verified contract to the room and sends its opener. Use a fresh thr
     Open(ObjectOpenArgs),
 }
 
+#[derive(Debug, Subcommand)]
+pub enum MediaCommand {
+    #[command(about = "Encrypt, upload, and post an image or audio file into the selected room")]
+    Upload(MediaUploadArgs),
+    #[command(
+        about = "List attachments learned from room history as JSON; use hark history for older files"
+    )]
+    List,
+    #[command(
+        about = "Download, verify, decrypt, and save a learned attachment without overwriting"
+    )]
+    Download(MediaDownloadArgs),
+}
+#[derive(Debug, Args)]
+pub struct MediaUploadArgs {
+    pub file: PathBuf,
+    #[arg(long, help = "Display name; defaults to the filename")]
+    pub title: Option<String>,
+    #[arg(long, default_value = "", help = "Caption or image description")]
+    pub caption: String,
+    #[arg(
+        long,
+        help = "Acknowledge that the hub and room members can read this file; required outside MLS"
+    )]
+    pub allow_public: bool,
+}
+#[derive(Debug, Args)]
+pub struct MediaDownloadArgs {
+    pub thread: String,
+    #[arg(long, short = 'o', help = "Destination file; must not already exist")]
+    pub output: PathBuf,
+}
+
 #[derive(Debug, Args)]
 pub struct ObjectCheckArgs {
     #[arg(
@@ -637,6 +676,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Recv(args) => recv_command(args, selector).await,
         Command::History(args) => history_command(args, selector).await,
         Command::Object(command) => object_command(command, selector).await,
+        Command::Media(command) => media_command(command, selector).await,
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args, selector).await,
         Command::Error(args) => send_message_command(SendMessageKind::Error, args, selector).await,
         Command::Tell(args) => tell_command(args, selector).await,
@@ -1202,6 +1242,127 @@ async fn recv_command(args: RecvArgs, selector: Option<&str>) -> AppResult<()> {
 /// SPEC-086 Stage B: `hark object list|read|act|open`. Every subcommand talks
 /// to the daemon's object runtime for the current agent, which must have
 /// joined with `--objects`.
+async fn media_command(command: MediaCommand, selector: Option<&str>) -> AppResult<()> {
+    use crate::local_api::{MediaDownloadRequest, MediaUploadRequest};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let client = discover_live_client().await?;
+    let handle = resolve_session_handle(&client, selector).await?;
+    let output = match command {
+        MediaCommand::Upload(args) => {
+            let file = fs::File::open(&args.file)
+                .map_err(|e| AppError::Usage(format!("cannot open media file: {e}")))?;
+            if !file
+                .metadata()
+                .map_err(|e| AppError::Usage(e.to_string()))?
+                .is_file()
+            {
+                return Err(AppError::Usage(
+                    "media upload requires a regular file".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.take((crate::media::MAX_PLAINTEXT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|e| AppError::Usage(format!("cannot read media file: {e}")))?;
+            if bytes.len() > crate::media::MAX_PLAINTEXT_BYTES {
+                return Err(AppError::Usage(
+                    "encrypted files may not exceed 8 MiB".into(),
+                ));
+            }
+            let title = args
+                .title
+                .or_else(|| {
+                    args.file
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_owned)
+                })
+                .ok_or_else(|| AppError::Usage("filename is not UTF-8; provide --title".into()))?;
+            let response = client
+                .media_upload(
+                    &handle,
+                    &MediaUploadRequest {
+                        data: STANDARD.encode(bytes),
+                        title,
+                        caption: args.caption,
+                        allow_public: args.allow_public,
+                    },
+                )
+                .await
+                .map_err(map_local_api_request_error)?;
+            serde_json::to_value(response)
+        }
+        MediaCommand::List => serde_json::to_value(
+            client
+                .media_list(&handle)
+                .await
+                .map_err(map_local_api_request_error)?,
+        ),
+        MediaCommand::Download(args) => {
+            // Check before downloading, then atomically persist without clobbering
+            // to close the race with another writer. Never trust the peer's title
+            // as a destination path. Temporary/output files are private (0600).
+            if args
+                .output
+                .try_exists()
+                .map_err(|e| AppError::Usage(e.to_string()))?
+            {
+                return Err(AppError::Usage("output file already exists".into()));
+            }
+            let response = client
+                .media_download(
+                    &handle,
+                    &MediaDownloadRequest {
+                        thread: args.thread,
+                    },
+                )
+                .await
+                .map_err(map_local_api_request_error)?;
+            if response.data.len() > crate::media::MAX_PLAINTEXT_BYTES.div_ceil(3) * 4 {
+                return Err(AppError::Internal("daemon returned oversized media".into()));
+            }
+            let bytes = STANDARD
+                .decode(response.data)
+                .map_err(|_| AppError::Internal("daemon returned invalid media encoding".into()))?;
+            if bytes.len() != response.attachment.size
+                || bytes.len() > crate::media::MAX_PLAINTEXT_BYTES
+            {
+                return Err(AppError::Internal(
+                    "daemon returned invalid media size".into(),
+                ));
+            }
+            save_media(&args.output, &bytes)?;
+            Ok(serde_json::json!({"ok":true,"output":args.output,"attachment":response.attachment}))
+        }
+    }
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).map_err(|e| AppError::Internal(e.to_string()))?
+    );
+    Ok(())
+}
+
+fn save_media(path: &Path, bytes: &[u8]) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| AppError::Usage(format!("cannot create output: {e}")))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|e| AppError::Usage(format!("cannot save media: {e}")))?;
+    temporary.persist_noclobber(path).map_err(|e| {
+        AppError::Usage(format!(
+            "cannot save media without overwriting: {}",
+            e.error
+        ))
+    })?;
+    Ok(())
+}
+
 async fn object_command(command: ObjectCommand, selector: Option<&str>) -> AppResult<()> {
     let client = discover_live_client().await?;
     if let ObjectCommand::Check(args) = command {
@@ -2292,8 +2453,8 @@ mod tests {
 
     use super::{
         AgentStatus, Cli, Command, ConfigCommand, DaemonCommand, build_chat_config_toml,
-        build_progress_message, build_tell_message, select_default_agent, emit_input_is_cbcl_form,
-        escape_cbcl_string, parse_recv_timeout_ms, select_by_wire_name,
+        build_progress_message, build_tell_message, emit_input_is_cbcl_form, escape_cbcl_string,
+        parse_recv_timeout_ms, select_by_wire_name, select_default_agent,
         validate_init_advertisement,
     };
     use crate::errors::ExitCode;
@@ -2749,5 +2910,57 @@ mod tests {
         assert!(validate_init_advertisement(&[]).is_err());
         // duplicate dialect → reject
         assert!(validate_init_advertisement(&["elf".to_owned(), "elf".to_owned()]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    #[test]
+    fn media_cli_requires_output_and_accepts_agreed_upload_flags() {
+        let cli = Cli::try_parse_from([
+            "hark",
+            "--agent",
+            "@aria",
+            "media",
+            "upload",
+            "photo.png",
+            "--caption",
+            "A photo",
+            "--title",
+            "Photo",
+            "--allow-public",
+        ])
+        .unwrap();
+        let Command::Media(MediaCommand::Upload(args)) = cli.command else {
+            panic!("upload")
+        };
+        assert!(args.allow_public);
+        assert_eq!(args.title.as_deref(), Some("Photo"));
+        assert!(Cli::try_parse_from(["hark", "media", "download", "file-1"]).is_err());
+        assert!(
+            Cli::try_parse_from(["hark", "media", "download", "file-1", "-o", "out.png"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["hark", "media", "list"]).is_ok());
+    }
+    #[test]
+    fn media_download_does_not_clobber_or_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        save_media(&path, b"verified").unwrap();
+        assert!(save_media(&path, b"replace").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"verified");
+        #[cfg(unix)]
+        {
+            use std::os::unix::{fs::PermissionsExt, fs::symlink};
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let link = dir.path().join("link");
+            symlink(&path, &link).unwrap();
+            assert!(save_media(&link, b"replace").is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"verified");
+        }
     }
 }

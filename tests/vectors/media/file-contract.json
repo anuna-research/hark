@@ -1,0 +1,5 @@
+{
+  "dialect": "sha256-af932a54f3159a545decef1709b7ac6bde140cefc6117b28832d97431d88aaec",
+  "contract": "{\"version\":3,\"kind\":\"contract\",\"name\":\"file\",\"verbs\":{\"open\":{\"fields\":{\"title\":\"string\",\"ref\":\"string\",\"caption\":\"string\"},\"after\":[\"begin\"]}},\"state\":{\"title\":[\"last\",\"open\",\"title\"],\"ref\":[\"last\",\"open\",\"ref\"],\"caption\":[\"last\",\"open\",\"caption\"]}}",
+  "definition": "(define sha256-af932a54f3159a545decef1709b7ac6bde140cefc6117b28832d97431d88aaec (cbcl) @object\n  (:resource-requirements ((max-depth 16) (max-expansion-size 4096) (verification-time 1000)))\n  (extend open (to title ref caption) (tell to :title title :ref ref :caption caption))\n  (shape open (require :title string) (require :ref string) (require :caption string))\n  (protocol (then begin open))\n  (state (title (last open :title)) (ref (last open :ref)) (caption (last open :caption))))"
+}

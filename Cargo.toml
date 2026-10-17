@@ -11,6 +11,7 @@ name = "hark"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = "0.10.3"
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
@@ -44,9 +45,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 subtle = "2.6"
+tempfile = "3.16"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
-tokio = { version = "1.44", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.44", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -57,5 +59,4 @@ assert_cmd = "2.0"
 clap_mangen = "0.2"
 predicates = "3.1"
 proptest = "1"
-tempfile = "3.16"
 tokio = { version = "1.44", features = ["test-util"] }
