@@ -274,7 +274,8 @@ hark media download THREAD --output PATH
 ```
 
 All commands select the agent using global `--agent`, `CBCL_AGENT_HANDLE`, or
-the sole registered agent. Require a chat agent with `--objects`. Transfers
+the sole registered agent. Require a chat agent with object access, enabled by the pairing dialog when
+an object dialect is selected, or explicitly with `--objects`. Transfers
 also require a ready session, media enabled on the hub, and `ffprobe` on the
 daemon's PATH. Lists include only the browser's `file` contract and valid
 attachment descriptors from learned history.
