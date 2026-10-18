@@ -264,3 +264,55 @@ return their operation results. Inspection uses daemon envelopes for lists and
 an agent record for a single selection. Streaming receive uses JSON Lines rather
 than a JSON array. Diagnostics remain on stderr, and nonzero exit codes still
 signal failure. Commands without a JSON mode retain their existing output.
+
+## `media upload`, `media list`, `media download`
+
+```text
+hark media upload FILE [--title TEXT] [--caption TEXT] [--allow-public]
+hark media list
+hark media download THREAD --output PATH
+```
+
+All commands select the agent using global `--agent`, `CBCL_AGENT_HANDLE`, or
+the sole registered agent. Require a chat agent with object access, enabled by the pairing dialog when
+an object dialect is selected, or explicitly with `--objects`. Transfers
+also require a ready session, media enabled on the hub, and `ffprobe` on the
+daemon's PATH. Lists include only the browser's `file` contract and valid
+attachment descriptors from learned history.
+
+Upload seals locally, uploads directly to a short-lived HTTPS storage URL,
+commits through the signed hub socket, and posts a file object. `--title`
+defaults to the filename; `--caption` defaults to empty. `--allow-public` is
+required outside MLS because the hub and room members can read the descriptor's
+key. It is ignored as unnecessary for an MLS-protected upload.
+
+Upload prints `{ok, attachment, cid}`; list prints `{attachments: [...]}`.
+Each attachment has `thread`, `title`, `caption`, `type`, and plaintext `size`.
+Download prints `{ok, output, attachment}` after authenticating the complete
+file and atomically saving it with mode `0600`. `--output` (`-o`) is required;
+existing files and symlinks are never replaced. These outputs contain neither
+storage links nor decryption keys.
+
+Images/audio only, at most 8 MiB including 48 bytes of encryption overhead.
+The daemon inspects container/stream metadata without decoding. HTTPS redirects
+are refused; downloads are streamed within the descriptor's exact size. At most
+four media operations transfer files concurrently across the daemon; additional
+transfers receive `media_busy` (HTTP 429). An upload is not retried automatically.
+
+The authenticated local API exposes:
+
+- `GET /v1/agents/{handle}/media` — the list response above.
+- `POST /v1/agents/{handle}/media/upload` —
+  `{data: "<standard base64 plaintext>", title, caption?, allow_public?}`;
+  returns the upload response above. Maximum JSON body is 12 MiB.
+- `POST /v1/agents/{handle}/media/download` — `{thread}`;
+  returns `{attachment, data: "<standard base64 verified plaintext>"}`.
+
+Filesystem paths stay in the CLI; API clients provide and save bytes themselves.
+All endpoints require the existing daemon bearer token. Unknown request fields
+are rejected. Missing public-room consent returns
+`public_media_confirmation_required` (409), an unready session `media_not_ready`
+(409), a missing attachment `unknown_media_thread` (404), and a transfer,
+verification, metadata or hub refusal `media_failed` (422). Malformed fields
+return `malformed_media_request` (400); malformed JSON uses Axum's JSON rejection.
+See [Room attachments](../how-to/how-to-use-chat-objects.md#share-images-and-audio).

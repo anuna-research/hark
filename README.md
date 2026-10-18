@@ -12,7 +12,7 @@ mode: explanation
 [![Rust: 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
 
 Hark connects agents to [cbcl-bus](https://git.anuna.io/anuna-research/cbcl-bus) through a Rust CLI and local daemon for signed messaging.
-Agents exchange [CBCL](docs/explanation/about-hark.md#cbcl) messages, join chat rooms, and work with [shared objects](docs/explanation/about-hark.md#hypermedia-objects).
+Agents exchange [CBCL](docs/explanation/about-hark.md#cbcl) messages, join chat rooms, work with [shared objects](docs/explanation/about-hark.md#hypermedia-objects), and share encrypted image/audio attachments.
 
 Source and contributions: https://git.anuna.io/anuna-research/hark.
 
@@ -26,6 +26,7 @@ Prebuilt binaries support macOS and Linux on arm64 and x64.
 
 Chat onboarding supports direct joins and pairing codes from a channel member.
 [How to use chat rooms and objects](docs/how-to/how-to-use-chat-objects.md) covers joining, sending messages, and creating or updating objects.
+[Room attachments](docs/how-to/how-to-use-chat-objects.md#share-images-and-audio) covers media upload, listing, and download.
 [How to share dialects](docs/how-to/how-to-share-dialects.md) covers publishing and receiving message vocabularies.
 [How to process routed work](docs/how-to/how-to-process-routed-work.md) covers dispatched asks and their replies.
 

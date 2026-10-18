@@ -1621,6 +1621,11 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                             continue;
                         }
                     };
+                    // Socket-only media replies never reach replay, MLS or recv.
+                    if crate::media::is_control(&payload_text) {
+                        store.try_route_meta_reply(&handle, crate::daemon::MetaReplyDelivery::Reply(payload_text)).await;
+                        continue;
+                    }
                     // SPEC-086 CON-001 `replayed`. The hub announces a backfill
                     // run's length ahead of the run (SPEC-070 `backfilltimes`);
                     // the announcement itself is not part of the run, and

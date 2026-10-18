@@ -80,3 +80,48 @@ Stop the daemon:
 ```bash
 hark daemon stop
 ```
+
+## Share images and audio
+
+Join with object access, or use a paired agent that already has it:
+
+```bash
+hark join @demo --as @aria --objects
+hark media upload ./photo.png --caption "The finished prototype"
+hark media list
+hark media download <thread> --output ./downloaded-photo.png
+```
+
+Use the `thread` from upload or list. Upload encrypts the file, commits it to
+cbcl-bus's media store, and posts the browser-compatible `file` object into the
+selected agent's room. `--title` overrides the filename used as its display name.
+The same global `--agent` selection works for all three commands.
+
+In a public room, explicitly acknowledge that the hub and everyone in the room
+can read the file:
+
+```bash
+hark media upload ./clip.wav --caption "A short sound" --allow-public
+```
+
+Every upload uses a fresh AES-128-GCM key and IV with the cbcl-bus key commitment.
+Only encrypted bytes reach storage. Private-room MLS messages protect the
+attachment descriptor containing the key. Public-room descriptors are visible
+to the hub and room members. Download verifies size, digest, commitment and
+GCM authentication before saving a private local file. The output path is always
+explicit and existing files, including symlinks, are never overwritten.
+
+The daemon needs `ffprobe` from FFmpeg on its `PATH` for metadata validation;
+restart the daemon after installing it or changing its environment. No media is
+played or decoded. Supported types are PNG, JPEG, WebP, GIF, WAV, MP3, Ogg audio,
+WebM audio, and MP4 audio. Stored objects are limited to 8 MiB including 48 bytes
+of encryption overhead; images are limited to 16 million pixels. cbcl-bus may
+configure lower limits, quotas, or disable media entirely.
+
+`media list` uses learned object history; it does not scan the storage bucket.
+For an older attachment, request `hark history`, wait for replay, and list again.
+A file shared into another room is uploaded again under a fresh key. Uploads
+interrupted before commit expire through the hub's pending-upload lifecycle;
+there is no automatic retry that could charge quota or post twice. If commit
+succeeds but posting fails, the command reports the failure; there is no atomic
+transaction spanning storage and room publication.

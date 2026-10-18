@@ -12,6 +12,7 @@ pub mod errors;
 pub mod hub_dialect;
 pub mod identity;
 pub mod local_api;
+pub mod media;
 pub mod mls;
 pub mod mls_ds;
 pub mod object_transport;

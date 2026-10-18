@@ -975,6 +975,7 @@ dependencies = [
 name = "hark"
 version = "0.5.1"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "assert_cmd",
  "axum",

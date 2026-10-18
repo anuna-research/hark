@@ -1,0 +1,15 @@
+{
+  "oracle": "Node node:crypto createCipheriv/createHmac/createHash, independent of browser module",
+  "plaintext": "4342434c206d6564696120766563746f720a00ff",
+  "type": "image/png",
+  "key": "000102030405060708090a0b0c0d0e0f",
+  "iv": "101112131415161718191a1b",
+  "aad": "cbcl-media/1;t=image/png;n=68",
+  "commitment": "7c0f120d47e1d5ef3fcb57cb84457335c49ef916a6f267684822369ad363d9a5",
+  "sealed": "876c40e32f22d38b7ebc7d83a2449f5148b67478a6655564c3452208c294d8673f4ce3b6",
+  "stored": "7c0f120d47e1d5ef3fcb57cb84457335c49ef916a6f267684822369ad363d9a5876c40e32f22d38b7ebc7d83a2449f5148b67478a6655564c3452208c294d8673f4ce3b6",
+  "digest": "649ab6cd02802c83e4ebeafdedab018f475e97e65a3240063bccf187e852f535",
+  "reference": "{\"version\":2,\"uri\":\"ni:///sha-256;ZJq2zQKALIPk6-r97asBj0del-ZaMkAGO8zxh-hS9TU\",\"size\":68,\"type\":\"image/png\",\"encryption\":{\"algorithm\":\"AES-128-GCM\",\"key\":\"AAECAwQFBgcICQoLDA0ODw\",\"iv\":\"EBESExQVFhcYGRob\"}}",
+  "legacyReference": "cbcl-media/1;h=649ab6cd02802c83e4ebeafdedab018f475e97e65a3240063bccf187e852f535;n=68;t=image/png;k=AAECAwQFBgcICQoLDA0ODw;iv=EBESExQVFhcYGRob",
+  "uri": "ni:///sha-256;ZJq2zQKALIPk6-r97asBj0del-ZaMkAGO8zxh-hS9TU"
+}

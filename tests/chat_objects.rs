@@ -385,3 +385,32 @@ async fn a_hark_agent_creates_reads_and_acts_on_an_object_through_the_hub() {
     let listed = objects.list(who).await.unwrap();
     assert_eq!(listed.len(), 1, "echoes deduplicated by cid: {listed:?}");
 }
+
+/// Attachment controls are consumed before ordinary chat delivery, including
+/// unsolicited/late replies for requests that no longer have a waiter.
+#[tokio::test]
+async fn media_socket_controls_never_leak_to_receive_all() {
+    let hub=FakeHub::start(vec![Act::AcceptAndServe {
+        enc:false,
+        send:vec![
+            "(mediastate :enabled true)".into(),
+            "(mediaurl :req \"0123456789abcdef\" :url \"https://storage.example/secret\" :expires 2000000000)".into(),
+            "(mediaok :req \"0123456789abcdef\")".into(),
+            "(mediano :req \"0123456789abcdef\" :why media-off)".into(),
+            "(tell @general \"after controls\" :from @bo)".into(),
+        ],
+        history:vec![],
+    }]).await;
+    let store = store();
+    let handle = join(store.clone(), &hub, false, true).await;
+    // roomcfg may also be delivered to receive-all; no media control may be.
+    loop {
+        let incoming = next(&store, &handle).await;
+        assert!(!hark::media::is_control(&incoming.message));
+        if incoming.message.contains("after controls") {
+            break;
+        }
+    }
+    nothing_more(&store, &handle).await;
+    store.close(&handle).await.unwrap();
+}
