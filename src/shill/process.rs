@@ -76,6 +76,7 @@ pub(super) async fn invoke(program: &Program, arguments: &[Argument]) -> Result<
         .prefix("hark-shill-child-")
         .tempdir()?;
     let scratch_path = scratch.path().canonicalize()?;
+    verify_pinned_executable(program)?;
     let mut words = Vec::new();
     for (index, argument) in arguments.iter().enumerate() {
         match argument {
@@ -142,6 +143,9 @@ pub(super) async fn invoke(program: &Program, arguments: &[Argument]) -> Result<
             limit(libc::RLIMIT_NOFILE as _, 64)?;
             limit(libc::RLIMIT_NPROC as _, 32)?;
             limit(libc::RLIMIT_CORE as _, 0)?;
+            // This timer survives exec and provides a backstop if the Hark parent is killed.
+            // The parent watchdog remains the precise wall-clock/process-group enforcer.
+            libc::alarm(cpu.saturating_add(1) as libc::c_uint);
             Ok(())
         });
     }
@@ -193,6 +197,35 @@ pub(super) async fn invoke(program: &Program, arguments: &[Argument]) -> Result<
         stderr: String::from_utf8(stderr)?,
         code: status.code().unwrap_or(128),
     })
+}
+
+#[cfg(unix)]
+fn verify_pinned_executable(program: &Program) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let pinned = program
+        .executable_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("program executable was not pinned at policy load"))?
+        .metadata()?;
+    let current = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&program.executable)?
+        .metadata()?;
+    if pinned.dev() != current.dev()
+        || pinned.ino() != current.ino()
+        || pinned.len() != current.len()
+        || pinned.mtime() != current.mtime()
+        || pinned.mtime_nsec() != current.mtime_nsec()
+    {
+        return fail("program executable changed after policy load");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_pinned_executable(_program: &Program) -> Result<()> {
+    fail("experimental shill requires Unix")
 }
 
 #[cfg(target_os = "macos")]
