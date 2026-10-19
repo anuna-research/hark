@@ -10,9 +10,9 @@ use crate::{
     object_transport::{AttestedBy, ObjectRecord},
 };
 use serde_json::{Value, json};
+use std::{fs, time::Duration};
 #[cfg(target_os = "macos")]
-use std::time::Instant;
-use std::{fs, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Instant};
 
 fn manifest() -> Manifest {
     serde_json::from_value(json!({"version":1,"controller":"@controller","worker":"@worker",
