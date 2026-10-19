@@ -158,6 +158,11 @@ Create an object:
     )]
     Object(ObjectCommand),
     #[command(
+        about = "Experimental CBCL capability executor (Shill-inspired)",
+        subcommand
+    )]
+    Shill(crate::shill::ShillCommand),
+    #[command(
         about = "Upload, list, and download encrypted room attachments",
         subcommand,
         after_help = "Requires a ready chat agent with object access (enabled by pairing or --objects) and media enabled on the hub. Images and audio only; encrypted files may not exceed 8 MiB. The daemon needs ffprobe on PATH for metadata validation. Upload posts a file object into the selected room. Downloads verify and decrypt before saving; existing files are never overwritten."
@@ -684,6 +689,18 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Recv(args) => recv_command(args, selector).await,
         Command::History(args) => history_command(args, selector).await,
         Command::Object(command) => object_command(command, selector).await,
+        Command::Shill(command) => {
+            let connection = if command.needs_agent() {
+                let client = discover_live_client().await?;
+                let handle = resolve_session_handle(&client, selector).await?;
+                Some((client, handle))
+            } else {
+                None
+            };
+            crate::shill::command(command, connection)
+                .await
+                .map_err(|error| AppError::Usage(format!("shill: {error:#}")))
+        }
         Command::Media(command) => media_command(command, selector).await,
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args, selector).await,
         Command::Error(args) => send_message_command(SendMessageKind::Error, args, selector).await,
@@ -1380,10 +1397,8 @@ fn recognize_object_record(
     if dialect.len() > 65536 || history.len() > 262144 || record.len() > 65536 {
         return Err("recognition input exceeds bounds".into());
     }
-    fn native(
-        f: fn(&[u8]) -> Result<Vec<u8>, Vec<u8>>,
-        input: &str,
-    ) -> Result<serde_json::Value, String> {
+    type NativeExport = fn(&[u8]) -> Result<Vec<u8>, Vec<u8>>;
+    fn native(f: NativeExport, input: &str) -> Result<serde_json::Value, String> {
         let bytes = f(input.as_bytes()).map_err(|e| String::from_utf8_lossy(&e).to_string())?;
         serde_json::from_slice(&bytes).map_err(|e| e.to_string())
     }

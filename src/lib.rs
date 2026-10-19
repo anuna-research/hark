@@ -21,6 +21,7 @@ pub mod pairing;
 pub mod reconnect;
 pub mod router;
 pub mod selector;
+pub mod shill;
 pub mod signed_frame;
 pub mod signed_transport;
 pub mod update;

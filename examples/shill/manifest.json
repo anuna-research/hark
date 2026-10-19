@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "controller": "@shill-controller",
+  "worker": "@shill-worker",
+  "room": "@shill-demo",
+  "hub": "wss://chat.anuna.io/chat/v1",
+  "provenance": "mls",
+  "lifetime_seconds": 900,
+  "max_commands": 100,
+  "min_interval_ms": 100,
+  "resources": { "readme": "README.txt" },
+  "programs": {}
+}
