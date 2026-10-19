@@ -166,7 +166,8 @@ command quota across restarts; stop and explicitly rotate the journal to reset i
 External programs currently work only on macOS with `/usr/bin/sandbox-exec`; all
 other platforms reject manifests containing programs. Snapshot reads work on Unix.
 There is no unsandboxed fallback. A locally configured program has a canonical
-absolute executable and fixed argv prefix. `invoke` appends only fragments selected
+absolute executable, a pinned open descriptor and a fixed argv prefix. Its device,
+inode, size and modification time are rechecked immediately before launch. `invoke` appends only fragments selected
 from the declared parameter schema and materialized directory grants. The executor
 clears the environment, uses an empty temporary home/cwd and null stdin, captures
 UTF-8 stdout/stderr with a combined byte bound, and applies CPU, file-size,
@@ -190,16 +191,18 @@ The wall-clock deadline covers process exit and pipe EOF, and kills the whole ch
 process group with SIGKILL on timeout/output overflow/cancellation. Surviving children
 are killed even after a normally exiting parent. Ctrl-C cancels the worker and its
 active child group; SIGTERM does the same. The durable claim remains spent/uncertain.
-An uncatchable parent SIGKILL or host crash cannot run that cleanup; any surviving
-child remains sandboxed, but its parent-side wall-clock and memory watchers are lost.
+An inherited alarm provides a coarse backstop if an uncatchable parent SIGKILL skips
+that cleanup; any surviving child remains sandboxed, but its precise process-group
+and memory watchers are lost. A deliberately hostile configured executable can catch
+the alarm.
 Use external process supervision or a disposable VM for stronger crash containment.
 
 `sandbox-exec`/Seatbelt is a platform-specific experimental backend. The parent Hark
 CLI retains its user's authority, and the local daemon/token, admission code,
 manifest, executor, journal and OS remain trusted. This does not isolate bugs in the
 parent native parser. Local processes able to modify executables or private state
-are outside this threat model. The program binary can change on disk between
-configuration and exec; use immutable, trusted binaries. For stronger separation,
+are outside this threat model. Executable replacement is detected before launch;
+immutable, trusted binaries still minimize the final pathname-to-exec race. For stronger separation,
 run the worker under a dedicated user or disposable VM.
 
 Public rooms require `--allow-public`, trust the hub for identity and expose all

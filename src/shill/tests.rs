@@ -12,7 +12,7 @@ use crate::{
 use serde_json::{Value, json};
 #[cfg(target_os = "macos")]
 use std::time::Instant;
-use std::{fs, time::Duration};
+use std::{fs, sync::Arc, time::Duration};
 
 fn manifest() -> Manifest {
     serde_json::from_value(json!({"version":1,"controller":"@controller","worker":"@worker",
@@ -347,6 +347,7 @@ fn manifest_rejects_unknown_authority_and_oversized_resources() {
 fn program(file: &str, args: &[&str]) -> Program {
     Program {
         executable: PathBuf::from(file),
+        executable_file: Some(Arc::new(fs::File::open(file).unwrap())),
         arguments: args.iter().map(|s| s.to_string()).collect(),
         parameters: Vec::new(),
         timeout_ms: 1000,
@@ -372,6 +373,37 @@ async fn sandbox_runs_a_fixed_program_without_inheriting_environment() {
         "{}",
         result.stdout
     );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn executable_replacement_after_policy_load_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("tool");
+    fs::copy("/usr/bin/true", &executable).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = manifest();
+    config.programs.insert(
+        "tool".into(),
+        Program {
+            executable: executable.clone(),
+            executable_file: None,
+            arguments: Vec::new(),
+            parameters: Vec::new(),
+            timeout_ms: 1000,
+            max_output_bytes: 4096,
+            memory_mb: 32,
+        },
+    );
+    let policy = Policy::prepare(config, dir.path()).unwrap();
+    fs::remove_file(&executable).unwrap();
+    fs::copy("/usr/bin/false", &executable).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let error = process::run(&policy.manifest.programs["tool"])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("changed after policy load"));
 }
 
 #[cfg(target_os = "macos")]
@@ -680,5 +712,12 @@ fn directory_snapshot_rejects_symlinks_and_oversized_files() {
     fs::write(dir.path().join("docs/big"), vec![0u8; 32769]).unwrap();
     let mut config = manifest();
     config.directories.insert("docs".into(), "docs".into());
+    assert!(Policy::prepare(config, dir.path()).is_err());
+
+    fs::remove_file(dir.path().join("docs/big")).unwrap();
+    let root_link = dir.path().join("docs-link");
+    std::os::unix::fs::symlink(dir.path().join("docs"), &root_link).unwrap();
+    let mut config = manifest();
+    config.directories.insert("docs".into(), "docs-link".into());
     assert!(Policy::prepare(config, dir.path()).is_err());
 }

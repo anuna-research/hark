@@ -35,6 +35,8 @@ pub(super) struct Manifest {
 #[serde(deny_unknown_fields)]
 pub(super) struct Program {
     pub executable: PathBuf,
+    #[serde(skip)]
+    pub executable_file: Option<Arc<File>>,
     pub arguments: Vec<String>,
     #[serde(default)]
     pub parameters: Vec<Parameter>,
@@ -88,7 +90,7 @@ fn words_valid(words: &[String]) -> bool {
 impl DirectorySnapshot {
     fn load(root: &Path, count: &mut usize, bytes: &mut usize) -> Result<Self> {
         fn visit(
-            root: &Path,
+            directory: &File,
             relative: &Path,
             depth: usize,
             count: &mut usize,
@@ -98,28 +100,24 @@ impl DirectorySnapshot {
             if depth > 4 {
                 return fail("directory snapshot depth exceeds 4");
             }
-            for item in std::fs::read_dir(root.join(relative))? {
+            for item in std::fs::read_dir(fd_path(directory)?)? {
                 let item = item?;
                 *count += 1;
                 if *count > 256 {
                     return fail("directory snapshots exceed 256 total entries");
                 }
                 let path = relative.join(item.file_name());
-                let metadata = std::fs::symlink_metadata(root.join(&path))?;
-                if metadata.file_type().is_symlink() {
-                    return fail("directory snapshots must not contain symlinks");
-                }
+                let child = openat(directory, &item.file_name())?;
+                let metadata = child.metadata()?;
                 if metadata.is_dir() {
                     entries.push(SnapshotEntry {
                         path: path.clone(),
                         bytes: None,
                     });
-                    visit(root, &path, depth + 1, count, bytes, entries)?;
+                    visit(&child, &path, depth + 1, count, bytes, entries)?;
                 } else if metadata.is_file() {
                     let mut contents = Vec::new();
-                    File::open(root.join(&path))?
-                        .take(32769)
-                        .read_to_end(&mut contents)?;
+                    child.take(32769).read_to_end(&mut contents)?;
                     *bytes += contents.len();
                     if contents.len() > 32768 || *bytes > 1024 * 1024 {
                         return fail(
@@ -136,11 +134,12 @@ impl DirectorySnapshot {
             }
             Ok(())
         }
-        if !root.is_dir() {
+        let root = open_path_no_follow(root)?;
+        if !root.metadata()?.is_dir() {
             return fail("directory grant must name a directory");
         }
         let mut entries = Vec::new();
-        visit(root, Path::new(""), 0, count, bytes, &mut entries)?;
+        visit(&root, Path::new(""), 0, count, bytes, &mut entries)?;
         Ok(Self { entries })
     }
 }
@@ -261,12 +260,14 @@ impl Policy {
                 }
             }
             program.executable = program.executable.canonicalize()?;
+            let executable = open_path_no_follow(&program.executable)?;
             let mut header = [0; 2];
-            File::open(&program.executable)?.read_exact(&mut header)?;
+            (&executable).read_exact(&mut header)?;
             if header == *b"#!" {
                 return fail("program bindings require native executables, not scripts");
             }
             super::process::require_sandbox()?;
+            program.executable_file = Some(Arc::new(executable));
         }
         Ok(Self {
             manifest,
@@ -316,4 +317,55 @@ impl Policy {
             })
             .collect()
     }
+}
+
+#[cfg(unix)]
+fn fd(file: &File) -> std::os::fd::RawFd {
+    use std::os::fd::AsRawFd;
+    file.as_raw_fd()
+}
+
+#[cfg(target_os = "macos")]
+fn fd_path(file: &File) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut path = vec![0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(fd(file), libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let length = path
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(path.len());
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&path[..length])))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fd_path(file: &File) -> Result<PathBuf> {
+    Ok(PathBuf::from(format!("/proc/self/fd/{}", fd(file))))
+}
+
+#[cfg(unix)]
+fn open_path_no_follow(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?)
+}
+
+#[cfg(unix)]
+fn openat(directory: &File, name: &std::ffi::OsStr) -> Result<File> {
+    use std::{ffi::CString, os::fd::FromRawFd, os::unix::ffi::OsStrExt};
+    let name = CString::new(name.as_bytes())?;
+    let descriptor = unsafe {
+        libc::openat(
+            fd(directory),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
 }
