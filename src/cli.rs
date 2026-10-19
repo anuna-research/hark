@@ -158,6 +158,11 @@ Create an object:
     )]
     Object(ObjectCommand),
     #[command(
+        about = "Experimental CBCL capability executor (Shill-inspired)",
+        subcommand
+    )]
+    Shill(crate::shill::ShillCommand),
+    #[command(
         about = "Upload, list, and download encrypted room attachments",
         subcommand,
         after_help = "Requires a ready chat agent with object access (enabled by pairing or --objects) and media enabled on the hub. Images and audio only; encrypted files may not exceed 8 MiB. The daemon needs ffprobe on PATH for metadata validation. Upload posts a file object into the selected room. Downloads verify and decrypt before saving; existing files are never overwritten."
@@ -420,6 +425,14 @@ pub struct RecvArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ObjectCommand {
+    /// Parse and admit an attested receive record locally with native cbcl-rs.
+    Recognize {
+        #[arg(long)]
+        dialect: PathBuf,
+        #[arg(long)]
+        history: Option<PathBuf>,
+        record: String,
+    },
     #[command(
         about = "Validate an object definition and print its verbs, fields, state rules, and contract"
     )]
@@ -676,6 +689,18 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Command::Recv(args) => recv_command(args, selector).await,
         Command::History(args) => history_command(args, selector).await,
         Command::Object(command) => object_command(command, selector).await,
+        Command::Shill(command) => {
+            let connection = if command.needs_agent() {
+                let client = discover_live_client().await?;
+                let handle = resolve_session_handle(&client, selector).await?;
+                Some((client, handle))
+            } else {
+                None
+            };
+            crate::shill::command(command, connection)
+                .await
+                .map_err(|error| AppError::Usage(format!("shill: {error:#}")))
+        }
         Command::Media(command) => media_command(command, selector).await,
         Command::Reply(args) => send_message_command(SendMessageKind::Reply, args, selector).await,
         Command::Error(args) => send_message_command(SendMessageKind::Error, args, selector).await,
@@ -1363,7 +1388,94 @@ fn save_media(path: &Path, bytes: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
+// Local recognition keeps shell agents out of the CBCL parsing/admission business.
+fn recognize_object_record(
+    dialect: &str,
+    history: &str,
+    record: &str,
+) -> Result<serde_json::Value, String> {
+    if dialect.len() > 65536 || history.len() > 262144 || record.len() > 65536 {
+        return Err("recognition input exceeds bounds".into());
+    }
+    type NativeExport = fn(&[u8]) -> Result<Vec<u8>, Vec<u8>>;
+    fn native(f: NativeExport, input: &str) -> Result<serde_json::Value, String> {
+        let bytes = f(input.as_bytes()).map_err(|e| String::from_utf8_lossy(&e).to_string())?;
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    }
+    let envelope: serde_json::Value = serde_json::from_str(record).map_err(|e| e.to_string())?;
+    let text = envelope["message"].as_str().ok_or("missing message")?;
+    let signer = envelope["record"]["signer"]
+        .as_str()
+        .ok_or("missing attested signer")?;
+    let act = native(cbcl_wasm::read_act_bytes, text)?;
+    if act["from"].as_str() != Some(signer) {
+        return Err("sender differs from attested signer".into());
+    }
+    let expected = cbcl_wasm::dialect_hash_bytes(dialect.as_bytes())
+        .map_err(|e| String::from_utf8_lossy(&e).to_string())?;
+    let expected = String::from_utf8(expected)
+        .map_err(|e| e.to_string())?
+        .replace("sha256:", "sha256-");
+    if act["dialect"].as_str() != Some(expected.trim_matches('"')) {
+        return Err("unexpected dialect".into());
+    }
+    let thread = act["thread"].as_str().ok_or("missing thread")?;
+    let history: Vec<serde_json::Value> =
+        serde_json::from_str(history).map_err(|e| e.to_string())?;
+    if history.len() > 128 {
+        return Err("history exceeds bounds".into());
+    }
+    let entries = history
+        .iter()
+        .map(|e| {
+            let signer = e["record"]["signer"]
+                .as_str()
+                .ok_or("missing historical signer")?;
+            let message = e["message"].as_str().ok_or("missing historical message")?;
+            let previous = native(cbcl_wasm::read_act_bytes, message)?;
+            if previous["from"].as_str() != Some(signer)
+                || previous["thread"].as_str() != Some(thread)
+                || previous["dialect"] != act["dialect"]
+            {
+                return Err("historical identity or thread mismatch".into());
+            }
+            Ok(format!(
+                "({} {})",
+                serde_json::to_string(signer).unwrap(),
+                message
+            ))
+        })
+        .collect::<Result<Vec<String>, String>>()?;
+    let frame = format!(
+        "(admit {} {} (acts {}) ({} {}))",
+        dialect,
+        serde_json::to_string(thread).unwrap(),
+        entries.join(" "),
+        serde_json::to_string(signer).unwrap(),
+        text
+    );
+    let verdict = native(cbcl_wasm::admit_bytes, &frame)?;
+    Ok(serde_json::json!({"act":act,"admission":verdict}))
+}
+
 async fn object_command(command: ObjectCommand, selector: Option<&str>) -> AppResult<()> {
+    if let ObjectCommand::Recognize {
+        dialect,
+        history,
+        record,
+    } = command
+    {
+        let definition = fs::read_to_string(dialect).map_err(|e| AppError::Usage(e.to_string()))?;
+        let history = history
+            .map(fs::read_to_string)
+            .transpose()
+            .map_err(|e| AppError::Usage(e.to_string()))?
+            .unwrap_or_else(|| "[]".to_owned());
+        let result =
+            recognize_object_record(&definition, &history, &record).map_err(AppError::Usage)?;
+        println!("{}", result);
+        return Ok(());
+    }
     let client = discover_live_client().await?;
     if let ObjectCommand::Check(args) = command {
         // Needs the runtime, not an agent: a definition can be checked before
@@ -1386,7 +1498,7 @@ async fn object_command(command: ObjectCommand, selector: Option<&str>) -> AppRe
     }
     let handle = resolve_session_handle(&client, selector).await?;
     match command {
-        ObjectCommand::Check(_) => unreachable!("handled above"),
+        ObjectCommand::Check(_) | ObjectCommand::Recognize { .. } => unreachable!("handled above"),
         ObjectCommand::List => {
             let response = client
                 .objects_list(&handle)
@@ -2647,6 +2759,34 @@ mod tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    #[test]
+    fn native_object_recognition_checks_ancestry_sender_and_dialect() {
+        let definition = "(define bounded (cbcl) @a (extend open (to) (tell to)) (extend count (to) (tell to)) (protocol (then begin open) (then open count)) (state (requested (exists open)) (counting (exists count))))";
+        let name = String::from_utf8(cbcl_wasm::dialect_hash_bytes(definition.as_bytes()).unwrap())
+            .unwrap();
+        let root = serde_json::json!({"message":format!("(lang {} (open @demo :thread \"t\" :caused-by begin :from @a))",name),"record":{"signer":"@a"}});
+        let accepted = super::recognize_object_record(definition, "[]", &root.to_string()).unwrap();
+        assert_eq!(accepted["admission"]["verdict"], "accepted");
+        let parent = accepted["act"]["address"].as_str().unwrap();
+        let command = serde_json::json!({"message":format!("(lang {} (count @demo :thread \"t\" :caused-by {} :from @a))",name,parent),"record":{"signer":"@a"}});
+        let history = serde_json::json!([root]).to_string();
+        assert_eq!(
+            super::recognize_object_record(definition, &history, &command.to_string()).unwrap()["admission"]
+                ["verdict"],
+            "accepted"
+        );
+        assert_eq!(
+            super::recognize_object_record(definition, "[]", &command.to_string()).unwrap()["admission"]
+                ["verdict"],
+            "pending"
+        );
+        let mut wrong = command.clone();
+        wrong["record"]["signer"] = serde_json::json!("@other");
+        assert!(super::recognize_object_record(definition, &history, &wrong.to_string()).is_err());
+        let wrong = command.to_string().replace(&name, "different-dialect");
+        assert!(super::recognize_object_record(definition, &history, &wrong).is_err());
     }
 
     #[test]

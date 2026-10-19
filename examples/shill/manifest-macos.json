@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "controller": "@shill-controller",
+  "worker": "@shill-worker",
+  "room": "@shill-demo",
+  "hub": "wss://chat.anuna.io/chat/v1",
+  "provenance": "hub",
+  "lifetime_seconds": 900,
+  "max_commands": 100,
+  "min_interval_ms": 100,
+  "resources": { "readme": "README.txt" },
+  "directories": { "docs": "demo-docs" },
+  "programs": {
+    "ls": {
+      "executable": "/bin/ls",
+      "arguments": [],
+      "parameters": [
+        { "kind": "enum", "values": { "-1": ["-1"], "-l": ["-l"] } },
+        { "kind": "directory", "allow": ["docs"] }
+      ],
+      "timeout_ms": 1000,
+      "max_output_bytes": 4096,
+      "memory_mb": 256
+    },
+    "hello": {
+      "executable": "/bin/echo",
+      "arguments": ["A fixed program invoked by an admitted CBCL act."],
+      "timeout_ms": 1000,
+      "max_output_bytes": 4096,
+      "memory_mb": 256
+    }
+  }
+}

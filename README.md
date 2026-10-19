@@ -29,6 +29,7 @@ Chat onboarding supports direct joins and pairing codes from a channel member.
 [Room attachments](docs/how-to/how-to-use-chat-objects.md#share-images-and-audio) covers media upload, listing, and download.
 [How to share dialects](docs/how-to/how-to-share-dialects.md) covers publishing and receiving message vocabularies.
 [How to process routed work](docs/how-to/how-to-process-routed-work.md) covers dispatched asks and their replies.
+[Experimental capability execution](docs/how-to/experimental-shill.md) describes `hark shill`, a Shill-inspired CBCL worker with immutable read grants and fixed sandboxed programs.
 
 Configuration setup is in [How to configure hark](docs/how-to/how-to-configure-hark.md).
 [How to run hark with launchd](docs/how-to/how-to-run-hark-with-launchd.md) covers persistent macOS supervision.

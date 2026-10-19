@@ -31,6 +31,7 @@ fs2 = "0.4"
 futures-util = "0.3"
 hkdf = "0.12"
 hmac = "0.12"
+libc = "0.2"
 # SPEC-013 ADR-003 / BK-3: version-pinned to the crate the web client builds
 # against, exact — an unlocked `cargo update` on either side would otherwise let
 # the MLS wire behaviour silently diverge across the hark/web boundary (NFR-001).

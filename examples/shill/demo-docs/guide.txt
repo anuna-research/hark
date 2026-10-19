@@ -1,0 +1,2 @@
+This directory is a bounded snapshot granted to the remote ls capability.
+The host materializes only the selected grant inside a read-only sandbox area.
