@@ -16,7 +16,7 @@ key is deliberately public test material; the CA signing key was discarded.
 Certificates are valid October 2026 through October 2036 and trusted only by
 the test client. No production TLS trust bypass is present.
 
-Media tests require Node (WebCrypto/HTTPS fixtures) and ffprobe (metadata).
+Media tests require Node (WebCrypto/HTTPS fixtures) only. Metadata inspection runs in process.
 
 sample.* are original cbcl-bus test assets decoded from FIXTURES in
 apps/cbcl_chat/test/web/media-metadata.test.mjs at the same source pin.

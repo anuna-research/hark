@@ -790,21 +790,16 @@ must revalidate messages before forwarding them to the router.
 Router validation remains authoritative.
 
 
-## General attachment and media diagnostics extension (API 5)
+## General attachments (API 5)
 
-API 5 adds `download_only` (optional boolean, default false) to the authenticated
-media upload request. True selects exactly `application/octet-stream` under
-[[SPEC-101-channel-media-store#REQ-020]]; false retains image/audio validation.
+Media upload classifies content automatically. Supported image/audio formats
+receive in-process metadata inspection. Other files use exactly
+`application/octet-stream` under [[SPEC-101-channel-media-store#REQ-020]].
 Opaque descriptors use the existing encrypted file object and integrity checks.
-No opaque bytes are decoded or opened automatically.
+No opaque bytes are decoded or opened automatically. Upload takes no format or
+preview-selection flag, and requires no separately installed media executable.
 
-`GET /v1/media/doctor` requires the daemon token but no agent. It returns JSON
-with `ready` (boolean), `environment` ("running daemon"), `ffprobe` (configured
-absolute executable or "ffprobe" for daemon PATH lookup), and `detail` (null on
-success, actionable config/restart instructions on failure). The operation uses
-the same bounded image inspection and transfer semaphore as media operations.
-
-The API version changes from 4 to 5 because API 4 daemons reject the new upload
-field and lack the diagnostic endpoint. CLI discovery rejects those daemons
-before issuing operations and supplies the existing restart guidance. Old CLI
-versions likewise reject API 5. No descriptor version changes.
+API 5 identifies the native daemon's support for opaque descriptors and general
+uploads. CLI discovery rejects API 4 daemons before issuing operations and
+supplies the existing restart guidance. Old CLI versions likewise reject API 5.
+No descriptor version changes.

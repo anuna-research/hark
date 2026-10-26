@@ -20,6 +20,6 @@ Opaque attachments have no automatic rendering, execution, navigation, playback,
 or open action. Names and MIME hints cannot grant preview authority. Browser
 custom views receive no opaque bytes or generic download capability.
 
-Hark's `--download-only` selects this path explicitly. Default image/audio upload
-retains the checked preview path. Existing descriptor encryption, size limits,
+Hark automatically selects this path for formats outside its image/audio
+allowlist. Recognized image/audio retains in-process metadata inspection. Existing descriptor encryption, size limits,
 room authorization and media runtime controls apply to both paths.

@@ -265,20 +265,19 @@ an agent record for a single selection. Streaming receive uses JSON Lines rather
 than a JSON array. Diagnostics remain on stderr, and nonzero exit codes still
 signal failure. Commands without a JSON mode retain their existing output.
 
-## `media upload`, `media list`, `media download`, `media doctor`
+## `media upload`, `media list`, `media download`
 
 ```text
-hark media upload FILE [--title TEXT] [--caption TEXT] [--allow-public] [--download-only]
+hark media upload FILE [--title TEXT] [--caption TEXT] [--allow-public]
 hark media list
-hark media doctor
 hark media download THREAD --output PATH
 ```
 
 Transfer/list commands select the agent using global `--agent`, `CBCL_AGENT_HANDLE`, or
 the sole registered agent. Require a chat agent with object access, enabled by the pairing dialog when
 an object dialect is selected, or explicitly with `--objects`. Transfers
-also require a ready session and media enabled on the hub. Image/audio validation
-uses `daemon.ffprobe_path` when configured, otherwise the daemon PATH. Lists include only the browser's `file` contract and valid
+also require a ready session and media enabled on the hub. Metadata inspection
+runs in process and needs no external tools. Lists include only the browser's `file` contract and valid
 attachment descriptors from learned history.
 
 Upload seals locally, uploads directly to a short-lived HTTPS storage URL,
@@ -287,13 +286,11 @@ defaults to the filename; `--caption` defaults to empty. `--allow-public` is
 required outside MLS because the hub and room members can read the descriptor's
 key. It is ignored as unnecessary for an MLS-protected upload.
 
-`--download-only` accepts any file within the size limit as
-`application/octet-stream`, with no metadata decoding or automatic rendering.
-The default image/audio path still rejects unsupported or invalid media.
-`media doctor` checks validation inside the running daemon without selecting an
-agent. It prints `ready`, `environment`, `ffprobe`, and `detail` as JSON, and exits
-unsuccessfully when validation is unavailable. Repair instructions identify the
-daemon config and required restart.
+Upload classifies file contents automatically. Supported image/audio types use
+in-process metadata inspection. Other files use `application/octet-stream`,
+with no automatic rendering. No format-selection flag is needed. Failed preview
+metadata checks select
+opaque transfer rather than granting preview authority.
 
 Upload prints `{ok, attachment, cid}`; list prints `{attachments: [...]}`.
 Each attachment has `thread`, `title`, `caption`, `type`, and plaintext `size`.
@@ -302,7 +299,7 @@ file and atomically saving it with mode `0600`. `--output` (`-o`) is required;
 existing files and symlinks are never replaced. These outputs contain neither
 storage links nor decryption keys.
 
-Images/audio only, at most 8 MiB including 48 bytes of encryption overhead.
+All attachments are limited to 8 MiB including 48 bytes of encryption overhead.
 The daemon inspects container/stream metadata without decoding. HTTPS redirects
 are refused; downloads are streamed within the descriptor's exact size. At most
 four media operations transfer files concurrently across the daemon; additional

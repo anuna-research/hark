@@ -111,40 +111,21 @@ to the hub and room members. Download verifies size, digest, commitment and
 GCM authentication before saving a private local file. The output path is always
 explicit and existing files, including symlinks, are never overwritten.
 
-For a PDF, archive, or other general file, explicitly select download-only transfer:
+PDFs, archives and other general files use the same command:
 
 ```bash
-hark media upload ./architecture-sketch.pdf --download-only --title 'Architecture sketch.pdf'
+hark media upload ./architecture-sketch.pdf
 ```
 
-This uses the hub/client's `application/octet-stream` descriptor. Room members
-can explicitly download and verify the original bytes. Files are never rendered,
-executed or opened automatically. No MIME claim or filename enables a preview.
-Without `--download-only`, unsupported files and invalid image/audio still fail
-closed. Opaque transfer does not require `ffprobe`.
+Hark identifies supported image/audio formats from the bytes and inspects their
+metadata in process. Other files use the hub/client's `application/octet-stream`
+descriptor automatically. Room members explicitly download and verify these
+opaque attachments; contents are never rendered, executed or opened automatically.
+File extensions and sender MIME hints do not enable a preview. Files that fail
+preview metadata checks are also shared as opaque bytes,
+so failed validation never grants preview authority.
 
-For image/audio validation, check the running daemon before sharing:
-
-```bash
-hark media doctor
-```
-
-If FFmpeg's `ffprobe` is missing from the daemon PATH, set an absolute executable
-in your Hark config file (use `hark config path` to locate it):
-
-```toml
-[daemon]
-ffprobe_path = "/opt/homebrew/bin/ffprobe"
-```
-
-Then run `hark daemon stop`, `hark daemon start`, and `hark media doctor`.
-The daemon loads this setting at startup. The calling shell's PATH does not
-change an already-running daemon. On Intel Homebrew, the path is usually
-`/usr/local/bin/ffprobe`; use the actual executable on your machine.
-The diagnostic validates a known image using the same probe and limits as
-transfers. It requires no selected agent, reports the daemon's probe selection,
-and exits unsuccessfully when validation is unavailable. A configured missing
-or unusable probe never falls back silently to another executable.
+No external media tools, daemon PATH setup, or extra upload flags are required.
 
 No media is played. Supported preview types are PNG, JPEG, WebP, GIF, WAV, MP3, Ogg audio,
 WebM audio, and MP4 audio. Stored objects are limited to 8 MiB including 48 bytes

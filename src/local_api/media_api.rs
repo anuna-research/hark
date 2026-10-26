@@ -17,8 +17,6 @@ pub struct MediaUploadRequest {
     pub caption: String,
     #[serde(default)]
     pub allow_public: bool,
-    #[serde(default)]
-    pub download_only: bool,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MediaAttachment {
@@ -153,13 +151,7 @@ pub(super) async fn upload(
     let bytes = STANDARD
         .decode(&request.data)
         .map_err(|_| bad("data must be standard base64"))?;
-    let mime = media::inspect_with_probe(
-        &bytes,
-        request.download_only.then_some(media::OPAQUE_TYPE),
-        state.config.daemon.ffprobe_path.as_deref(),
-    )
-    .await
-    .map_err(failure)?;
+    let mime = media::inspect(&bytes, None).await.map_err(failure)?;
     objects
         .check(media::file_definition())
         .await
@@ -314,13 +306,9 @@ pub(super) async fn download(
     .await
     .map_err(failure)?;
     let plaintext = descriptor.open(&stored).map_err(failure)?;
-    media::inspect_with_probe(
-        &plaintext,
-        Some(&descriptor.mime),
-        state.config.daemon.ffprobe_path.as_deref(),
-    )
-    .await
-    .map_err(failure)?;
+    media::inspect(&plaintext, Some(&descriptor.mime))
+        .await
+        .map_err(failure)?;
     ready(&state.agents, &handle, None).await?;
     Ok(Json(MediaDownloadResponse {
         attachment,
@@ -401,7 +389,6 @@ mod tests {
             title: "sample.wav".into(),
             caption: "A short sound".into(),
             allow_public,
-            download_only: false,
         }
     }
     fn wav() -> Vec<u8> {
@@ -460,41 +447,20 @@ mod tests {
         state.agents.close(&handle).await.unwrap();
     }
     #[tokio::test]
-    async fn media_doctor_checks_daemon_config_and_requires_authentication() {
-        let (mut state, handle, headers, mut rx) = fixture().await;
-        Arc::make_mut(&mut state.config).daemon.ffprobe_path = Some("/missing/hark-ffprobe".into());
-        assert_eq!(
-            doctor(State(state.clone()), HeaderMap::new())
-                .await
-                .unwrap_err()
-                .status,
-            StatusCode::UNAUTHORIZED
-        );
-        let result = doctor(State(state.clone()), headers.clone())
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(result["ready"], false);
-        assert_eq!(result["environment"], "running daemon");
-        assert!(
-            result["detail"]
-                .as_str()
-                .unwrap()
-                .contains("daemon.ffprobe_path")
-        );
-        let failed = upload(
+    async fn media_oversize_never_reserves_storage_or_posts() {
+        let (state, handle, headers, mut rx) = fixture().await;
+        let mut invalid = request(true);
+        invalid.data = STANDARD.encode(vec![0; media::MAX_PLAINTEXT_BYTES + 1]);
+        let result = upload(
             State(state.clone()),
             headers,
             Path(handle.as_str().into()),
-            Json(request(true)),
+            Json(invalid),
         )
         .await
         .unwrap_err();
-        assert_eq!(failed.code, "media_failed");
-        assert!(
-            rx.try_recv().is_err(),
-            "failed validation must not reserve storage or post a file"
-        );
+        assert!(["media_failed", "malformed_media_request"].contains(&result.code));
+        assert!(rx.try_recv().is_err());
         state.agents.close(&handle).await.unwrap();
     }
 
@@ -663,7 +629,6 @@ mod tests {
         let mut opaque = request(true);
         opaque.data = STANDARD.encode(pdf);
         opaque.title = "architecture.pdf".into();
-        opaque.download_only = true;
         let uploaded = client.media_upload(&handle, &opaque).await.unwrap();
         assert_eq!(uploaded.attachment.mime, media::OPAQUE_TYPE);
         let listed = client.media_list(&handle).await.unwrap();
@@ -712,26 +677,4 @@ mod contract_test {
         assert_eq!(compiled.dialect, browser["dialect"]);
         assert_eq!(compiled.cbcl, browser["definition"]);
     }
-}
-
-/// Authenticated daemon-side dependency check; no agent or room is required.
-pub(super) async fn doctor(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
-    reject_if_stopping(&state)?;
-    let _permit = TRANSFERS.try_acquire().map_err(|_| busy())?;
-    let result = media::inspect_with_probe(
-        include_bytes!("../../tests/vectors/media/sample.png"),
-        Some("image/png"),
-        state.config.daemon.ffprobe_path.as_deref(),
-    )
-    .await;
-    Ok(Json(json!({
-        "ready": result.is_ok(),
-        "environment": "running daemon",
-        "ffprobe": state.config.daemon.ffprobe_path.as_deref().unwrap_or_else(|| std::path::Path::new("ffprobe")),
-        "detail": result.err().map(|e| format!("{}; configure daemon.ffprobe_path in the config file with an absolute ffprobe executable, restart hark daemon, and rerun hark media doctor", e.0)),
-    })))
 }

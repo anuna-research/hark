@@ -1,5 +1,5 @@
 pub const COMMAND_NAME: &str = "hark";
-// API 4: SPEC-016 kind/verb changes. API 5: opaque upload flag and media doctor.
+// API 4: SPEC-016 kind/verb changes. API 5: native general attachments and opaque descriptors.
 // Reject stale daemons before issuing requests they cannot interpret.
 pub const LOCAL_API_VERSION: u16 = 5;
 

@@ -155,13 +155,8 @@ async fn media_cli_rejects_api4_daemon_before_issuing_operations() {
         });
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     for args in [
-        vec!["media", "doctor"],
-        vec![
-            "media",
-            "upload",
-            "tests/vectors/media/sample.png",
-            "--download-only",
-        ],
+        vec!["media", "list"],
+        vec!["media", "upload", "tests/vectors/media/sample.png"],
     ] {
         let result = tokio::process::Command::from(env.command(args))
             .output()
