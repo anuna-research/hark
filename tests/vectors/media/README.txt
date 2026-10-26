@@ -1,8 +1,10 @@
 cbcl-bus SPEC-101 interoperability fixtures
 
 Source checkout: cbcl-bus at 114dbb4efbf2698ae36d77bf4e87d53de3d22802.
-Browser codec files copied unchanged from apps/cbcl_chat/priv/web:
-  media-ref.mjs SHA-256 0b882801bd47875787f50652b683ce7d4353077e0935123ab38e4e517f1dd290
+Browser codec files updated unchanged from cbcl-bus at
+97f9fd52dd4c09b16e54d5d31e3f8cd874edca5a (opaque attachment contract).
+Copied from apps/cbcl_chat/priv/web:
+  media-ref.mjs SHA-256 37662d265dd9ec87a7aa2695d5b605bce4e1364f76c03a18ab0295b7af422d4a
   media-uri.mjs SHA-256 67804ebcdd92caf44498b7bbb5ed4555207663ca86a0102268fe9aa0e1d062d6
 browser.json is test/web/fixtures/media-ref-vector.json, an independent Node
 AES-GCM/HMAC oracle also used by the browser codec suite.

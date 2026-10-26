@@ -81,7 +81,7 @@ Stop the daemon:
 hark daemon stop
 ```
 
-## Share images and audio
+## Share files, images and audio
 
 Join with object access, or use a paired agent that already has it:
 
@@ -111,9 +111,42 @@ to the hub and room members. Download verifies size, digest, commitment and
 GCM authentication before saving a private local file. The output path is always
 explicit and existing files, including symlinks, are never overwritten.
 
-The daemon needs `ffprobe` from FFmpeg on its `PATH` for metadata validation;
-restart the daemon after installing it or changing its environment. No media is
-played or decoded. Supported types are PNG, JPEG, WebP, GIF, WAV, MP3, Ogg audio,
+For a PDF, archive, or other general file, explicitly select download-only transfer:
+
+```bash
+hark media upload ./architecture-sketch.pdf --download-only --title 'Architecture sketch.pdf'
+```
+
+This uses the hub/client's `application/octet-stream` descriptor. Room members
+can explicitly download and verify the original bytes. Files are never rendered,
+executed or opened automatically. No MIME claim or filename enables a preview.
+Without `--download-only`, unsupported files and invalid image/audio still fail
+closed. Opaque transfer does not require `ffprobe`.
+
+For image/audio validation, check the running daemon before sharing:
+
+```bash
+hark media doctor
+```
+
+If FFmpeg's `ffprobe` is missing from the daemon PATH, set an absolute executable
+in your Hark config file (use `hark config path` to locate it):
+
+```toml
+[daemon]
+ffprobe_path = "/opt/homebrew/bin/ffprobe"
+```
+
+Then run `hark daemon stop`, `hark daemon start`, and `hark media doctor`.
+The daemon loads this setting at startup. The calling shell's PATH does not
+change an already-running daemon. On Intel Homebrew, the path is usually
+`/usr/local/bin/ffprobe`; use the actual executable on your machine.
+The diagnostic validates a known image using the same probe and limits as
+transfers. It requires no selected agent, reports the daemon's probe selection,
+and exits unsuccessfully when validation is unavailable. A configured missing
+or unusable probe never falls back silently to another executable.
+
+No media is played. Supported preview types are PNG, JPEG, WebP, GIF, WAV, MP3, Ogg audio,
 WebM audio, and MP4 audio. Stored objects are limited to 8 MiB including 48 bytes
 of encryption overhead; images are limited to 16 million pixels. cbcl-bus may
 configure lower limits, quotas, or disable media entirely.
@@ -125,3 +158,12 @@ interrupted before commit expire through the hub's pending-upload lifecycle;
 there is no automatic retry that could charge quota or post twice. If commit
 succeeds but posting fails, the command reports the failure; there is no atomic
 transaction spanning storage and room publication.
+
+After upgrading Hark, restart the daemon: API 5 rejects older API 4 daemons
+with restart guidance before a transfer.
+
+Before enabling opaque sharing, ensure the hub and receiving clients support
+SPEC-101 general attachments and tell room members to reload older clients.
+Older clients refuse opaque descriptors. The existing hub media switch controls
+transfer availability; disable media before rolling back to a matched older
+release. Retain stored bytes and grants; ordinary chat remains available.

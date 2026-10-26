@@ -728,6 +728,17 @@ impl LocalApiClient {
         decode_api_response(response).await
     }
 
+    pub async fn media_doctor(&self) -> Result<serde_json::Value, LocalApiRequestError> {
+        let response = self
+            .http
+            .get(self.url("/v1/media/doctor"))
+            .header(AUTHORIZATION, self.auth_header.clone())
+            .send()
+            .await
+            .map_err(|error| LocalApiRequestError::RequestFailed(error.to_string()))?;
+        decode_api_response(response).await
+    }
+
     pub async fn media_upload(
         &self,
         handle: &AgentHandle,
@@ -994,6 +1005,7 @@ pub async fn serve_local_api_with_agents(
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/ping", get(ping))
+        .route("/v1/media/doctor", get(media_api::doctor))
         .route("/v1/config", get(effective_config))
         .route("/v1/agents", get(agents).post(create_agent))
         .route("/v1/agents/{handle}/recv", get(recv))
@@ -3227,15 +3239,15 @@ mod tests {
             .validate_ping(PingResponse {
                 ok: true,
                 version: "9.9.9".to_owned(),
-                api_version: LOCAL_API_VERSION + 1,
+                api_version: 4,
             })
-            .expect_err("incompatible ping should fail");
+            .expect_err("pre-attachment API v4 daemon must require restart");
 
         assert_eq!(
             error,
             ClientPingError::ApiIncompatible {
                 daemon_version: Some("9.9.9".to_owned()),
-                daemon_api_version: Some(LOCAL_API_VERSION + 1),
+                daemon_api_version: Some(4),
                 cli_api_version: LOCAL_API_VERSION,
             }
         );

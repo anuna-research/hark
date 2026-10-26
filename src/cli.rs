@@ -165,7 +165,7 @@ Create an object:
     #[command(
         about = "Upload, list, and download encrypted room attachments",
         subcommand,
-        after_help = "Requires a ready chat agent with object access (enabled by pairing or --objects) and media enabled on the hub. Images and audio only; encrypted files may not exceed 8 MiB. The daemon needs ffprobe on PATH for metadata validation. Upload posts a file object into the selected room. Downloads verify and decrypt before saving; existing files are never overwritten."
+        after_help = "Requires a ready chat agent with object access (enabled by pairing or --objects) and media enabled on the hub. Images/audio are validated; --download-only shares any file without preview. Encrypted files may not exceed 8 MiB. For image/audio validation, configure daemon.ffprobe_path or the daemon PATH; check hark media doctor. Upload posts a file object into the selected room. Downloads verify and decrypt before saving; existing files are never overwritten."
     )]
     Media(MediaCommand),
     #[command(about = "Validate and send a CBCL reply message")]
@@ -497,7 +497,9 @@ Declares the verified contract to the room and sends its opener. Use a fresh thr
 
 #[derive(Debug, Subcommand)]
 pub enum MediaCommand {
-    #[command(about = "Encrypt, upload, and post an image or audio file into the selected room")]
+    #[command(about = "Check image/audio validation in the running daemon environment")]
+    Doctor,
+    #[command(about = "Encrypt, upload, and post a file into the selected room")]
     Upload(MediaUploadArgs),
     #[command(
         about = "List attachments learned from room history as JSON; use hark history for older files"
@@ -520,6 +522,11 @@ pub struct MediaUploadArgs {
         help = "Acknowledge that the hub and room members can read this file; required outside MLS"
     )]
     pub allow_public: bool,
+    #[arg(
+        long,
+        help = "Share any file as opaque bytes for explicit download, without preview"
+    )]
+    pub download_only: bool,
 }
 #[derive(Debug, Args)]
 pub struct MediaDownloadArgs {
@@ -1271,8 +1278,26 @@ async fn media_command(command: MediaCommand, selector: Option<&str>) -> AppResu
     use crate::local_api::{MediaDownloadRequest, MediaUploadRequest};
     use base64::{Engine, engine::general_purpose::STANDARD};
     let client = discover_live_client().await?;
+    if matches!(command, MediaCommand::Doctor) {
+        let result = client
+            .media_doctor()
+            .await
+            .map_err(map_local_api_request_error)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(|e| AppError::Internal(e.to_string()))?
+        );
+        if result["ready"] != true {
+            return Err(AppError::Usage(
+                "media validation is unavailable in the running daemon; see diagnostic above"
+                    .into(),
+            ));
+        }
+        return Ok(());
+    }
     let handle = resolve_session_handle(&client, selector).await?;
     let output = match command {
+        MediaCommand::Doctor => unreachable!(),
         MediaCommand::Upload(args) => {
             let file = fs::File::open(&args.file)
                 .map_err(|e| AppError::Usage(format!("cannot open media file: {e}")))?;
@@ -1311,6 +1336,7 @@ async fn media_command(command: MediaCommand, selector: Option<&str>) -> AppResu
                         title,
                         caption: args.caption,
                         allow_public: args.allow_public,
+                        download_only: args.download_only,
                     },
                 )
                 .await

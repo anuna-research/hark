@@ -20,7 +20,9 @@ use tokio::io::AsyncReadExt;
 
 pub const MAX_STORED_BYTES: usize = 8_388_608;
 pub const MAX_PLAINTEXT_BYTES: usize = MAX_STORED_BYTES - 48;
+pub const OPAQUE_TYPE: &str = "application/octet-stream";
 const TYPES: &[&str] = &[
+    OPAQUE_TYPE,
     "image/png",
     "image/jpeg",
     "image/webp",
@@ -485,8 +487,19 @@ pub fn file_definition() -> serde_json::Value {
 /// local private temporary file is readable by the probe; network protocols and
 /// playlists are excluded by magic recognition and the protocol whitelist.
 pub async fn inspect(bytes: &[u8], expected: Option<&str>) -> Result<String> {
+    inspect_with_probe(bytes, expected, None).await
+}
+
+pub async fn inspect_with_probe(
+    bytes: &[u8],
+    expected: Option<&str>,
+    probe: Option<&std::path::Path>,
+) -> Result<String> {
     if bytes.len() > MAX_PLAINTEXT_BYTES {
         return Err(error("media-too-large"));
+    }
+    if expected == Some(OPAQUE_TYPE) {
+        return Ok(OPAQUE_TYPE.into());
     }
     let mime = sniff(bytes).ok_or_else(|| error("unsupported-media-type"))?;
     if expected.is_some_and(|t| t != mime) {
@@ -496,7 +509,12 @@ pub async fn inspect(bytes: &[u8], expected: Option<&str>) -> Result<String> {
         .map_err(|_| error("cannot create private media inspection file"))?;
     file.write_all(bytes)
         .map_err(|_| error("cannot inspect media file"))?;
-    let mut child = tokio::process::Command::new("ffprobe")
+    if probe.is_some_and(|p| !p.is_absolute()) {
+        return Err(error(
+            "daemon.ffprobe_path must be an absolute executable path",
+        ));
+    }
+    let mut child = tokio::process::Command::new(probe.unwrap_or_else(|| std::path::Path::new("ffprobe")))
         .args([
             "-v",
             "error",
@@ -521,7 +539,7 @@ pub async fn inspect(bytes: &[u8], expected: Option<&str>) -> Result<String> {
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|_| error("ffprobe is required on the daemon PATH to validate media files"))?;
+        .map_err(|_| error("cannot execute ffprobe in the daemon environment; set daemon.ffprobe_path in the config file to an absolute executable (for example /opt/homebrew/bin/ffprobe), restart hark daemon, then run hark media doctor"))?;
     let mut stdout = child.stdout.take().expect("piped stdout").take(65_537);
     let work = async {
         let mut output = Vec::new();
@@ -616,6 +634,55 @@ mod tests {
     fn vector() -> serde_json::Value {
         serde_json::from_str(include_str!("../tests/vectors/media/browser.json")).unwrap()
     }
+    #[tokio::test]
+    async fn media_opaque_is_explicit_and_integrity_checked() {
+        for bytes in [
+            b"%PDF-1.7\narchitecture sketch".as_slice(),
+            b"<script>active</script>",
+            b"",
+            b"\x89PNG\r\n\x1a\ninvalid",
+        ] {
+            assert_eq!(
+                inspect(bytes, Some(OPAQUE_TYPE)).await.unwrap(),
+                OPAQUE_TYPE
+            );
+            assert!(inspect(bytes, None).await.is_err());
+            let (d, mut stored) = seal(bytes, OPAQUE_TYPE).unwrap();
+            let parsed = Descriptor::parse(&d.render().unwrap()).unwrap();
+            assert_eq!(parsed.open(&stored).unwrap(), bytes);
+            stored[32] ^= 1;
+            assert!(parsed.open(&stored).is_err());
+        }
+        assert!(
+            inspect(&vec![0; MAX_PLAINTEXT_BYTES + 1], Some(OPAQUE_TYPE))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn media_probe_configuration_fails_closed() {
+        let missing = std::path::Path::new("/nonexistent/hark-test-ffprobe");
+        let failure = inspect_with_probe(&wav(), None, Some(missing))
+            .await
+            .unwrap_err();
+        assert!(failure.0.contains("daemon environment"));
+        assert!(failure.0.contains("daemon.ffprobe_path"));
+        assert!(failure.0.contains("hark media doctor"));
+        assert!(
+            inspect_with_probe(&wav(), None, Some(std::path::Path::new("ffprobe")))
+                .await
+                .is_err()
+        );
+        // Opaque downloads are verified cryptographically and never invoke a decoder.
+        assert_eq!(
+            inspect_with_probe(b"%PDF-1.7", Some(OPAQUE_TYPE), Some(missing))
+                .await
+                .unwrap(),
+            OPAQUE_TYPE
+        );
+    }
+
     #[test]
     fn media_browser_vector_matches_both_directions() {
         let v = vector();
@@ -797,11 +864,11 @@ mod tests {
     #[test]
     fn media_browser_webcrypto_opens_native_and_native_opens_browser() {
         // Pinned, unmodified cbcl-bus browser codec; no sibling checkout needed.
-        let (d, stored) = seal(b"bidirectional media", "audio/ogg").unwrap();
+        let (d, stored) = seal(b"bidirectional media", OPAQUE_TYPE).unwrap();
         let script = r#"import {openMedia,sealMedia} from './tests/vectors/media/media-ref.mjs';
             const d=process.argv[1],s=Buffer.from(process.argv[2],'hex');
             const p=await openMedia(d,s);
-            const sealed=await sealMedia(p,'audio/ogg');
+            const sealed=await sealMedia(p,'application/octet-stream');
             process.stdout.write(JSON.stringify({plaintext:Buffer.from(p).toString('hex'),reference:sealed.reference,stored:Buffer.from(sealed.stored).toString('hex')}));"#;
         let result = std::process::Command::new("node")
             .args([

@@ -12,9 +12,10 @@ export const MIME_TYPES = Object.freeze([
   'audio/ogg',
   'audio/webm',
   'audio/mp4',
+  'application/octet-stream',
 ]);
 const grammar =
-  /^cbcl-media\/1;h=([0-9a-f]{64});n=([1-9][0-9]{1,6});t=(image\/(?:png|jpeg|webp|gif)|audio\/(?:wav|mpeg|ogg|webm|mp4));k=([A-Za-z0-9_-]{21}[AQgw]);iv=([A-Za-z0-9_-]{16})$/;
+  /^cbcl-media\/1;h=([0-9a-f]{64});n=([1-9][0-9]{1,6});t=(image\/(?:png|jpeg|webp|gif)|audio\/(?:wav|mpeg|ogg|webm|mp4)|application\/octet-stream);k=([A-Za-z0-9_-]{21}[AQgw]);iv=([A-Za-z0-9_-]{16})$/;
 const encoder = new TextEncoder();
 const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 function invalid() {

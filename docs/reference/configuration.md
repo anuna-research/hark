@@ -29,6 +29,8 @@ ws_url = "wss://cbcl-lfe.anuna.io/agent/v1"
 agent_id_prefix = "local-agent"
 
 [daemon]
+# Optional absolute executable; absent uses the running daemon PATH.
+# ffprobe_path = "/opt/homebrew/bin/ffprobe"
 bind = "127.0.0.1:0"
 max_messages_per_handle = 1000
 max_bytes_per_handle = 67108864
@@ -56,6 +58,9 @@ router auth, and it does not open a router WebSocket. Router configuration is
 validated lazily when `init` creates an agent instance.
 
 Configuration changes take effect after a daemon restart.
+`daemon.ffprobe_path` must be absolute. A missing or unusable executable is
+reported by `hark media doctor` and fails image/audio transfers closed.
+Opaque `--download-only` transfers do not need this dependency.
 
 Setup: [How to configure hark](../how-to/how-to-configure-hark.md).
 

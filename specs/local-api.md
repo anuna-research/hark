@@ -132,7 +132,7 @@ Response:
 {
   "ok": true,
   "version": "0.1.0",
-  "api_version": 4
+  "api_version": 5
 }
 ```
 
@@ -232,7 +232,7 @@ Response:
     "pid": 12345,
     "addr": "127.0.0.1:49152",
     "version": "0.1.0",
-    "api_version": 4
+    "api_version": 5
   },
   "agents": [
     {
@@ -788,3 +788,23 @@ Local CLI commands should perform CBCL parse/validation before calling
 must revalidate messages before forwarding them to the router.
 
 Router validation remains authoritative.
+
+
+## General attachment and media diagnostics extension (API 5)
+
+API 5 adds `download_only` (optional boolean, default false) to the authenticated
+media upload request. True selects exactly `application/octet-stream` under
+[[SPEC-101-channel-media-store#REQ-020]]; false retains image/audio validation.
+Opaque descriptors use the existing encrypted file object and integrity checks.
+No opaque bytes are decoded or opened automatically.
+
+`GET /v1/media/doctor` requires the daemon token but no agent. It returns JSON
+with `ready` (boolean), `environment` ("running daemon"), `ffprobe` (configured
+absolute executable or "ffprobe" for daemon PATH lookup), and `detail` (null on
+success, actionable config/restart instructions on failure). The operation uses
+the same bounded image inspection and transfer semaphore as media operations.
+
+The API version changes from 4 to 5 because API 4 daemons reject the new upload
+field and lack the diagnostic endpoint. CLI discovery rejects those daemons
+before issuing operations and supplies the existing restart guidance. Old CLI
+versions likewise reject API 5. No descriptor version changes.

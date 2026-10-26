@@ -26,6 +26,7 @@ channel = "@general"
 agent_id_prefix = "local-agent"
 
 [daemon]
+# ffprobe_path = "/opt/homebrew/bin/ffprobe" # absolute path in the daemon environment
 bind = "127.0.0.1:0"
 max_messages_per_handle = 1000
 max_bytes_per_handle = 67108864
@@ -94,6 +95,8 @@ pub struct AgentConfig {
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct DaemonConfig {
+    /// Absolute ffprobe executable; absent uses the daemon PATH.
+    pub ffprobe_path: Option<PathBuf>,
     pub bind: String,
     pub max_messages_per_handle: usize,
     pub max_bytes_per_handle: usize,
@@ -147,6 +150,7 @@ impl Default for AppConfig {
                 auto_install_advertised: DEFAULT_AUTO_INSTALL_ADVERTISED,
             },
             daemon: DaemonConfig {
+                ffprobe_path: None,
                 bind: DEFAULT_DAEMON_BIND.to_owned(),
                 max_messages_per_handle: DEFAULT_MAX_MESSAGES_PER_HANDLE,
                 max_bytes_per_handle: DEFAULT_MAX_BYTES_PER_HANDLE,
@@ -170,6 +174,7 @@ impl Default for AgentConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            ffprobe_path: None,
             bind: DEFAULT_DAEMON_BIND.to_owned(),
             max_messages_per_handle: DEFAULT_MAX_MESSAGES_PER_HANDLE,
             max_bytes_per_handle: DEFAULT_MAX_BYTES_PER_HANDLE,
@@ -230,7 +235,7 @@ impl AppConfig {
                 "liveness_timeout_ms": self.chat.liveness_timeout_ms.unwrap_or(DEFAULT_LIVENESS_TIMEOUT_MS)
             },
             "agent": {"agent_id_prefix": self.agent.agent_id_prefix, "auto_install_advertised": self.agent.auto_install_advertised},
-            "daemon": {"bind": self.daemon.bind, "max_messages_per_handle": self.daemon.max_messages_per_handle,
+            "daemon": {"ffprobe_path": self.daemon.ffprobe_path, "bind": self.daemon.bind, "max_messages_per_handle": self.daemon.max_messages_per_handle,
                 "max_bytes_per_handle": self.daemon.max_bytes_per_handle, "overflow_policy": self.daemon.overflow_policy}
         })
     }
@@ -245,6 +250,17 @@ impl AppConfig {
     }
 
     pub fn validate_daemon_runtime(&self) -> Result<(), ConfigError> {
+        if self
+            .daemon
+            .ffprobe_path
+            .as_ref()
+            .is_some_and(|p| !p.is_absolute())
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "daemon.ffprobe_path",
+                reason: "must be an absolute executable path".into(),
+            });
+        }
         validate_agent_id_prefix(&self.agent.agent_id_prefix)?;
         validate_daemon_bind(&self.daemon.bind)?;
         validate_positive(
