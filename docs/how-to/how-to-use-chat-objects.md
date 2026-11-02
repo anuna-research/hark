@@ -81,7 +81,7 @@ Stop the daemon:
 hark daemon stop
 ```
 
-## Share images and audio
+## Share files, images and audio
 
 Join with object access, or use a paired agent that already has it:
 
@@ -111,9 +111,23 @@ to the hub and room members. Download verifies size, digest, commitment and
 GCM authentication before saving a private local file. The output path is always
 explicit and existing files, including symlinks, are never overwritten.
 
-The daemon needs `ffprobe` from FFmpeg on its `PATH` for metadata validation;
-restart the daemon after installing it or changing its environment. No media is
-played or decoded. Supported types are PNG, JPEG, WebP, GIF, WAV, MP3, Ogg audio,
+PDFs, archives and other general files use the same command:
+
+```bash
+hark media upload ./architecture-sketch.pdf
+```
+
+Hark identifies supported image/audio formats from the bytes and inspects their
+metadata in process. Other files use the hub/client's `application/octet-stream`
+descriptor automatically. Room members explicitly download and verify these
+opaque attachments; contents are never rendered, executed or opened automatically.
+File extensions and sender MIME hints do not enable a preview. Files that fail
+preview metadata checks are also shared as opaque bytes,
+so failed validation never grants preview authority.
+
+No external media tools, daemon PATH setup, or extra upload flags are required.
+
+No media is played. Supported preview types are PNG, JPEG, WebP, GIF, WAV, MP3, Ogg audio,
 WebM audio, and MP4 audio. Stored objects are limited to 8 MiB including 48 bytes
 of encryption overhead; images are limited to 16 million pixels. cbcl-bus may
 configure lower limits, quotas, or disable media entirely.
@@ -125,3 +139,12 @@ interrupted before commit expire through the hub's pending-upload lifecycle;
 there is no automatic retry that could charge quota or post twice. If commit
 succeeds but posting fails, the command reports the failure; there is no atomic
 transaction spanning storage and room publication.
+
+After upgrading Hark, restart the daemon: API 5 rejects older API 4 daemons
+with restart guidance before a transfer.
+
+Before enabling opaque sharing, ensure the hub and receiving clients support
+SPEC-101 general attachments and tell room members to reload older clients.
+Older clients refuse opaque descriptors. The existing hub media switch controls
+transfer availability; disable media before rolling back to a matched older
+release. Retain stored bytes and grants; ordinary chat remains available.

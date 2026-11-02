@@ -165,7 +165,7 @@ Create an object:
     #[command(
         about = "Upload, list, and download encrypted room attachments",
         subcommand,
-        after_help = "Requires a ready chat agent with object access (enabled by pairing or --objects) and media enabled on the hub. Images and audio only; encrypted files may not exceed 8 MiB. The daemon needs ffprobe on PATH for metadata validation. Upload posts a file object into the selected room. Downloads verify and decrypt before saving; existing files are never overwritten."
+        after_help = "Requires a ready chat agent with object access (enabled by pairing or --objects) and media enabled on the hub. Images/audio are inspected in process; other files are shared as opaque attachments without preview. Encrypted files may not exceed 8 MiB. No external media tools are required. Upload posts a file object into the selected room. Downloads verify and decrypt before saving; existing files are never overwritten."
     )]
     Media(MediaCommand),
     #[command(about = "Validate and send a CBCL reply message")]
@@ -497,7 +497,7 @@ Declares the verified contract to the room and sends its opener. Use a fresh thr
 
 #[derive(Debug, Subcommand)]
 pub enum MediaCommand {
-    #[command(about = "Encrypt, upload, and post an image or audio file into the selected room")]
+    #[command(about = "Encrypt, upload, and post a file into the selected room")]
     Upload(MediaUploadArgs),
     #[command(
         about = "List attachments learned from room history as JSON; use hark history for older files"

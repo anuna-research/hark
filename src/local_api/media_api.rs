@@ -447,6 +447,24 @@ mod tests {
         state.agents.close(&handle).await.unwrap();
     }
     #[tokio::test]
+    async fn media_oversize_never_reserves_storage_or_posts() {
+        let (state, handle, headers, mut rx) = fixture().await;
+        let mut invalid = request(true);
+        invalid.data = STANDARD.encode(vec![0; media::MAX_PLAINTEXT_BYTES + 1]);
+        let result = upload(
+            State(state.clone()),
+            headers,
+            Path(handle.as_str().into()),
+            Json(invalid),
+        )
+        .await
+        .unwrap_err();
+        assert!(["media_failed", "malformed_media_request"].contains(&result.code));
+        assert!(rx.try_recv().is_err());
+        state.agents.close(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn media_api_upload_list_download_with_real_https_storage() {
         let (mut state, handle, _headers, mut rx) = fixture().await;
         let mut storage = tokio::process::Command::new("node")
@@ -606,6 +624,31 @@ mod tests {
                 .await,
             Err(AgentError::RecvTimeout)
         ));
+        // Same authorized room path, real HTTPS store, and file object for opaque PDFs.
+        let pdf = b"%PDF-1.7\nopaque architecture sketch\n%%EOF";
+        let mut opaque = request(true);
+        opaque.data = STANDARD.encode(pdf);
+        opaque.title = "architecture.pdf".into();
+        let uploaded = client.media_upload(&handle, &opaque).await.unwrap();
+        assert_eq!(uploaded.attachment.mime, media::OPAQUE_TYPE);
+        let listed = client.media_list(&handle).await.unwrap();
+        let opaque_entry = listed
+            .attachments
+            .iter()
+            .find(|a| a.thread == uploaded.attachment.thread)
+            .unwrap();
+        assert_eq!(opaque_entry.mime, media::OPAQUE_TYPE);
+        assert_eq!(opaque_entry.size, pdf.len());
+        let downloaded = client
+            .media_download(
+                &handle,
+                &MediaDownloadRequest {
+                    thread: uploaded.attachment.thread,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(STANDARD.decode(downloaded.data).unwrap(), pdf);
         state.agents.close(&handle).await.unwrap();
         relay.abort();
         server.abort();

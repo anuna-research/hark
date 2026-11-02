@@ -273,11 +273,11 @@ hark media list
 hark media download THREAD --output PATH
 ```
 
-All commands select the agent using global `--agent`, `CBCL_AGENT_HANDLE`, or
+Transfer/list commands select the agent using global `--agent`, `CBCL_AGENT_HANDLE`, or
 the sole registered agent. Require a chat agent with object access, enabled by the pairing dialog when
 an object dialect is selected, or explicitly with `--objects`. Transfers
-also require a ready session, media enabled on the hub, and `ffprobe` on the
-daemon's PATH. Lists include only the browser's `file` contract and valid
+also require a ready session and media enabled on the hub. Metadata inspection
+runs in process and needs no external tools. Lists include only the browser's `file` contract and valid
 attachment descriptors from learned history.
 
 Upload seals locally, uploads directly to a short-lived HTTPS storage URL,
@@ -286,6 +286,12 @@ defaults to the filename; `--caption` defaults to empty. `--allow-public` is
 required outside MLS because the hub and room members can read the descriptor's
 key. It is ignored as unnecessary for an MLS-protected upload.
 
+Upload classifies file contents automatically. Supported image/audio types use
+in-process metadata inspection. Other files use `application/octet-stream`,
+with no automatic rendering. No format-selection flag is needed. Failed preview
+metadata checks select
+opaque transfer rather than granting preview authority.
+
 Upload prints `{ok, attachment, cid}`; list prints `{attachments: [...]}`.
 Each attachment has `thread`, `title`, `caption`, `type`, and plaintext `size`.
 Download prints `{ok, output, attachment}` after authenticating the complete
@@ -293,7 +299,7 @@ file and atomically saving it with mode `0600`. `--output` (`-o`) is required;
 existing files and symlinks are never replaced. These outputs contain neither
 storage links nor decryption keys.
 
-Images/audio only, at most 8 MiB including 48 bytes of encryption overhead.
+All attachments are limited to 8 MiB including 48 bytes of encryption overhead.
 The daemon inspects container/stream metadata without decoding. HTTPS redirects
 are refused; downloads are streamed within the descriptor's exact size. At most
 four media operations transfer files concurrently across the daemon; additional

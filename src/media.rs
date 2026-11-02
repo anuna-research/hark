@@ -14,13 +14,14 @@ use cbcl_core::sexpr::{Atom, SExpr};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, io::Write, process::Stdio, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 use subtle::ConstantTimeEq;
-use tokio::io::AsyncReadExt;
 
 pub const MAX_STORED_BYTES: usize = 8_388_608;
 pub const MAX_PLAINTEXT_BYTES: usize = MAX_STORED_BYTES - 48;
+pub const OPAQUE_TYPE: &str = "application/octet-stream";
 const TYPES: &[&str] = &[
+    OPAQUE_TYPE,
     "image/png",
     "image/jpeg",
     "image/webp",
@@ -481,110 +482,103 @@ pub fn file_definition() -> serde_json::Value {
     serde_json::json!({"name":"file","verbs":{"open":{"causedBy":"begin","fields":{"title":"string","ref":"string","caption":"string"}}},"project":{"title":["last","open","title"],"ref":["last","open","ref"],"caption":["last","open","caption"]}})
 }
 
-/// Inspect headers/stream metadata, without decoding or playing media. Only a
-/// local private temporary file is readable by the probe; network protocols and
-/// playlists are excluded by magic recognition and the protocol whitelist.
+/// Classify attachments and inspect preview metadata entirely in process.
+/// Unknown or unpreviewable formats remain opaque. No pixels/samples are decoded,
+/// and no subprocess or temporary file is used.
 pub async fn inspect(bytes: &[u8], expected: Option<&str>) -> Result<String> {
     if bytes.len() > MAX_PLAINTEXT_BYTES {
         return Err(error("media-too-large"));
     }
-    let mime = sniff(bytes).ok_or_else(|| error("unsupported-media-type"))?;
+    if expected == Some(OPAQUE_TYPE) {
+        return Ok(OPAQUE_TYPE.into());
+    }
+    let mime = sniff(bytes).unwrap_or(OPAQUE_TYPE);
     if expected.is_some_and(|t| t != mime) {
         return Err(error("media type does not match file bytes"));
     }
-    let mut file = tempfile::NamedTempFile::new()
-        .map_err(|_| error("cannot create private media inspection file"))?;
-    file.write_all(bytes)
-        .map_err(|_| error("cannot inspect media file"))?;
-    let mut child = tokio::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-protocol_whitelist",
-            "file",
-            "-skip_frame",
-            "all",
-            "-max_alloc",
-            "16777216",
-            "-probesize",
-            "8388608",
-            "-analyzeduration",
-            "5000000",
-            "-show_entries",
-            "format=format_name:stream=codec_type,codec_name,width,height:stream_disposition=attached_pic",
-            "-of",
-            "json",
-        ])
-        .arg(file.path())
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| error("ffprobe is required on the daemon PATH to validate media files"))?;
-    let mut stdout = child.stdout.take().expect("piped stdout").take(65_537);
-    let work = async {
-        let mut output = Vec::new();
-        stdout
-            .read_to_end(&mut output)
-            .await
-            .map_err(|_| error("media inspection failed"))?;
-        if output.len() > 65_536 {
-            return Err(error("media metadata too large"));
-        }
-        if !child
-            .wait()
-            .await
-            .map_err(|_| error("media inspection failed"))?
-            .success()
-        {
-            return Err(error("unrecognized media bytes"));
-        }
-        let value: serde_json::Value =
-            serde_json::from_slice(&output).map_err(|_| error("invalid media metadata"))?;
-        let format = value["format"]["format_name"].as_str().unwrap_or_default();
-        let allowed = match mime {
-            "image/png" => format == "png_pipe",
-            "image/jpeg" => format == "jpeg_pipe",
-            "image/webp" => format == "webp_pipe",
-            "image/gif" => format == "gif",
-            "audio/wav" => format == "wav",
-            "audio/mpeg" => format == "mp3",
-            "audio/ogg" => format == "ogg",
-            "audio/webm" => format.split(',').any(|name| name == "webm"),
-            "audio/mp4" => format.split(',').any(|name| name == "mp4"),
-            _ => false,
-        };
-        if !allowed {
-            return Err(error("media container does not match file type"));
-        }
-        let streams = value["streams"]
-            .as_array()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| error("no media streams"))?;
+    if mime == OPAQUE_TYPE {
+        return Ok(mime.into());
+    }
+    let owned = bytes.to_vec();
+    let inspected = tokio::task::spawn_blocking(move || {
         if mime.starts_with("image/") {
-            if streams.len() != 1 || streams[0]["codec_type"] != "video" {
-                return Err(error("invalid image"));
-            }
-            let w = streams[0]["width"].as_u64().unwrap_or(0);
-            let h = streams[0]["height"].as_u64().unwrap_or(0);
-            if w == 0 || h == 0 || w.checked_mul(h).is_none_or(|pixels| pixels > 16_000_000) {
+            let format = match mime {
+                "image/png" => image::ImageFormat::Png,
+                "image/jpeg" => image::ImageFormat::Jpeg,
+                "image/gif" => image::ImageFormat::Gif,
+                "image/webp" => image::ImageFormat::WebP,
+                _ => unreachable!(),
+            };
+            let mut reader = image::ImageReader::with_format(std::io::Cursor::new(owned), format);
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(64 * 1024 * 1024);
+            reader.limits(limits);
+            let (width, height) = reader
+                .into_dimensions()
+                .map_err(|_| error("invalid image metadata"))?;
+            if width == 0
+                || height == 0
+                || width
+                    .checked_mul(height)
+                    .is_none_or(|pixels| pixels > 16_000_000)
+            {
                 return Err(error(
                     "image exceeds 16 million pixels or has invalid dimensions",
                 ));
             }
-        } else if !streams.iter().any(|s| s["codec_type"] == "audio")
-            || streams
+        } else {
+            use symphonia::core::{
+                common::Limit,
+                formats::{FormatOptions, TrackType, probe::Hint},
+                io::MediaSourceStream,
+                meta::MetadataOptions,
+            };
+            let source =
+                MediaSourceStream::new(Box::new(std::io::Cursor::new(owned)), Default::default());
+            let format = symphonia::default::get_probe()
+                .probe(
+                    &Hint::new(),
+                    source,
+                    FormatOptions::default(),
+                    MetadataOptions::default()
+                        .limit_tag_bytes(Limit::Maximum(65_536))
+                        .limit_visual_bytes(Limit::Maximum(0)),
+                )
+                .map_err(|_| error("invalid audio metadata"))?;
+            let expected_container = match mime {
+                "audio/wav" => "wave",
+                "audio/mpeg" => "mp3",
+                "audio/ogg" => "ogg",
+                "audio/webm" => "matroska",
+                "audio/mp4" => "isomp4",
+                _ => unreachable!(),
+            };
+            if format.format_info().short_name != expected_container {
+                return Err(error("media container does not match file type"));
+            }
+            if !format
+                .tracks()
                 .iter()
-                .any(|s| s["codec_type"] != "audio" && s["disposition"]["attached_pic"] != 1)
-        {
-            return Err(error("audio file contains unsupported streams"));
+                .any(|t| t.track_type() == Some(TrackType::Audio))
+                || format
+                    .tracks()
+                    .iter()
+                    .any(|t| t.track_type() != Some(TrackType::Audio))
+            {
+                return Err(error("audio file contains unsupported streams"));
+            }
         }
         Ok(mime.to_owned())
-    };
-    tokio::time::timeout(Duration::from_secs(15), work)
-        .await
-        .map_err(|_| error("media inspection timed out"))?
+    })
+    .await
+    .map_err(|_| error("media inspection failed"))?;
+    match inspected {
+        Ok(mime) => Ok(mime),
+        // Failed preview recognition never grants preview authority. General
+        // uploads remain shareable under the upstream opaque-file contract.
+        Err(_) if expected.is_none() => Ok(OPAQUE_TYPE.into()),
+        Err(error) => Err(error),
+    }
 }
 fn sniff(b: &[u8]) -> Option<&'static str> {
     if b.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -616,6 +610,108 @@ mod tests {
     fn vector() -> serde_json::Value {
         serde_json::from_str(include_str!("../tests/vectors/media/browser.json")).unwrap()
     }
+    #[tokio::test]
+    async fn media_general_files_are_automatic_and_integrity_checked() {
+        for bytes in [
+            b"%PDF-1.7\narchitecture sketch".as_slice(),
+            b"<script>active</script>",
+            b"",
+            b"\x89PNG\r\n\x1a\ninvalid",
+        ] {
+            assert_eq!(
+                inspect(bytes, Some(OPAQUE_TYPE)).await.unwrap(),
+                OPAQUE_TYPE
+            );
+            assert_eq!(inspect(bytes, None).await.unwrap(), OPAQUE_TYPE);
+            let (d, mut stored) = seal(bytes, OPAQUE_TYPE).unwrap();
+            let parsed = Descriptor::parse(&d.render().unwrap()).unwrap();
+            assert_eq!(parsed.open(&stored).unwrap(), bytes);
+            stored[32] ^= 1;
+            assert!(parsed.open(&stored).is_err());
+        }
+        assert!(
+            inspect(&vec![0; MAX_PLAINTEXT_BYTES + 1], Some(OPAQUE_TYPE))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn media_metadata_has_no_runtime_tool_dependency() {
+        let no_tools = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "media::tests::media_metadata_validates_bytes_without_decoding",
+            ])
+            .env("PATH", no_tools.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn media_native_metadata_rejects_invalid_dimensions_and_audio() {
+        let png = include_bytes!("../tests/vectors/media/sample.png");
+        for (width, height) in [(0u32, 1u32), (1, 0), (4001, 4000), (u32::MAX, u32::MAX)] {
+            let mut bytes = png.to_vec();
+            bytes[16..20].copy_from_slice(&width.to_be_bytes());
+            bytes[20..24].copy_from_slice(&height.to_be_bytes());
+            assert!(inspect(&bytes, Some("image/png")).await.is_err());
+            assert_eq!(inspect(&bytes, None).await.unwrap(), OPAQUE_TYPE);
+        }
+        for bytes in [
+            png[..16].to_vec(),
+            png[..24].to_vec(),
+            include_bytes!("../tests/vectors/media/sample.gif")[..10].to_vec(),
+            b"RIFF1234WAVEbad".to_vec(),
+            b"ID3not audio".to_vec(),
+            b"OggSnot audio".to_vec(),
+            b"\x1a\x45\xdf\xa3webmnot audio".to_vec(),
+            b"1234ftypnot audio".to_vec(),
+        ] {
+            assert!(inspect(&bytes, sniff(&bytes)).await.is_err());
+            assert_eq!(inspect(&bytes, None).await.unwrap(), OPAQUE_TYPE);
+        }
+        assert!(inspect(png, Some("audio/wav")).await.is_err());
+        let mut disguised_wav = b"ID3\x04\0\0\0\0\0\0".to_vec();
+        disguised_wav.extend(wav());
+        assert_eq!(inspect(&disguised_wav, None).await.unwrap(), OPAQUE_TYPE);
+        assert!(inspect(&disguised_wav, Some("audio/mpeg")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn media_native_pixel_budget_and_unsupported_containers_stay_opaque() {
+        use image::ImageEncoder;
+        // Encode a valid, highly compressible image beyond the preview budget.
+        // This reaches the pixel guard instead of failing on a corrupt header.
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &vec![0; 4001 * 4000],
+                4001,
+                4000,
+                image::ExtendedColorType::L8,
+            )
+            .unwrap();
+        let failure = inspect(&png, Some("image/png")).await.unwrap_err();
+        assert!(failure.0.contains("16 million pixels"));
+        assert_eq!(inspect(&png, None).await.unwrap(), OPAQUE_TYPE);
+        for brand in [b"avif", b"heic", b"mp42"] {
+            // Unsupported ISO BMFF brand/header, not an audio preview claim.
+            let mut bytes = b"\0\0\0\x18ftyp".to_vec();
+            bytes.extend(brand);
+            bytes.extend([0; 12]);
+            assert_eq!(inspect(&bytes, None).await.unwrap(), OPAQUE_TYPE);
+            assert!(inspect(&bytes, Some("audio/mp4")).await.is_err());
+        }
+    }
+
     #[test]
     fn media_browser_vector_matches_both_directions() {
         let v = vector();
@@ -791,17 +887,21 @@ mod tests {
         }
 
         assert!(inspect(&wav(), Some("image/png")).await.is_err());
-        assert!(inspect(b"<svg></svg>", None).await.is_err());
-        assert!(inspect(b"RIFF1234WAVEbad", None).await.is_err());
+        assert_eq!(inspect(b"<svg></svg>", None).await.unwrap(), OPAQUE_TYPE);
+        assert!(
+            inspect(b"RIFF1234WAVEbad", Some("audio/wav"))
+                .await
+                .is_err()
+        );
     }
     #[test]
     fn media_browser_webcrypto_opens_native_and_native_opens_browser() {
         // Pinned, unmodified cbcl-bus browser codec; no sibling checkout needed.
-        let (d, stored) = seal(b"bidirectional media", "audio/ogg").unwrap();
+        let (d, stored) = seal(b"bidirectional media", OPAQUE_TYPE).unwrap();
         let script = r#"import {openMedia,sealMedia} from './tests/vectors/media/media-ref.mjs';
             const d=process.argv[1],s=Buffer.from(process.argv[2],'hex');
             const p=await openMedia(d,s);
-            const sealed=await sealMedia(p,'audio/ogg');
+            const sealed=await sealMedia(p,'application/octet-stream');
             process.stdout.write(JSON.stringify({plaintext:Buffer.from(p).toString('hex'),reference:sealed.reference,stored:Buffer.from(sealed.stored).toString('hex')}));"#;
         let result = std::process::Command::new("node")
             .args([

@@ -1,7 +1,7 @@
 pub const COMMAND_NAME: &str = "hark";
-// SPEC-016 ADR-009: `kind` enum `emit` → `send`, `progress` dropped. The bump
-// is what makes a stale daemon fail loudly (exit 12) rather than silently.
-pub const LOCAL_API_VERSION: u16 = 4;
+// API 4: SPEC-016 kind/verb changes. API 5: native general attachments and opaque descriptors.
+// Reject stale daemons before issuing requests they cannot interpret.
+pub const LOCAL_API_VERSION: u16 = 5;
 
 pub const DEFAULT_AGENT_ID_PREFIX: &str = "local-agent";
 pub const DEFAULT_DAEMON_BIND: &str = "127.0.0.1:0";

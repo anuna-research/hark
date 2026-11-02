@@ -3227,15 +3227,15 @@ mod tests {
             .validate_ping(PingResponse {
                 ok: true,
                 version: "9.9.9".to_owned(),
-                api_version: LOCAL_API_VERSION + 1,
+                api_version: 4,
             })
-            .expect_err("incompatible ping should fail");
+            .expect_err("pre-attachment API v4 daemon must require restart");
 
         assert_eq!(
             error,
             ClientPingError::ApiIncompatible {
                 daemon_version: Some("9.9.9".to_owned()),
-                daemon_api_version: Some(LOCAL_API_VERSION + 1),
+                daemon_api_version: Some(4),
                 cli_api_version: LOCAL_API_VERSION,
             }
         );

@@ -118,3 +118,62 @@ fn sample_record(addr: SocketAddr) -> DiscoveryRecord {
         api_version: LOCAL_API_VERSION,
     }
 }
+
+mod support;
+
+#[tokio::test]
+async fn media_cli_rejects_api4_daemon_before_issuing_operations() {
+    use axum::{Json, Router, routing::get};
+    use hark::daemon::{RuntimePaths, create_runtime_dir, write_discovery_record};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let env = support::TestEnv::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut record = sample_record(listener.local_addr().unwrap());
+    record.api_version = 4;
+    let paths = RuntimePaths::new(env.runtime_dir());
+    create_runtime_dir(&paths.runtime_dir).unwrap();
+    write_discovery_record(&paths, &record).unwrap();
+    let unexpected = Arc::new(AtomicUsize::new(0));
+    let calls = unexpected.clone();
+    let app = Router::new()
+        .route(
+            "/v1/ping",
+            get(|| async {
+                Json(PingResponse {
+                    ok: true,
+                    version: "0.7.0".into(),
+                    api_version: 4,
+                })
+            }),
+        )
+        .fallback(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { axum::http::StatusCode::UNPROCESSABLE_ENTITY }
+        });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for args in [
+        vec!["media", "list"],
+        vec!["media", "upload", "tests/vectors/media/sample.png"],
+    ] {
+        let result = tokio::process::Command::from(env.command(args))
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(12),
+            "{}",
+            support::output_debug(&result)
+        );
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(error.contains("daemon_api_incompatible"), "{error}");
+        assert!(error.contains("restart the daemon"), "{error}");
+    }
+    assert_eq!(unexpected.load(Ordering::SeqCst), 0);
+    // TestEnv cleanup is synchronous; remove the mock discovery before Drop.
+    std::fs::remove_file(&paths.discovery_file).unwrap();
+    server.abort();
+}
