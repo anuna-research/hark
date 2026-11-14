@@ -1,0 +1,2 @@
+    Checking hark v0.7.0 (/private/tmp/v020/hark)
+    Finished `dev` profile [unoptimized] target(s) in 7.27s

@@ -289,7 +289,7 @@ pub struct CreateAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mls_create: Option<bool>,
     /// Chat transport only: the SPEC-086 object subscription (CON-003). Off
-    /// by default. When on, every object content message (a `sha256-<64hex>` dialect) in the channel —
+    /// by default. When on, every object content message (a `f1220<64hex>` dialect) in the channel —
     /// the agent's own and replayed history included — is delivered to `recv`
     /// with an attestation record. Persisted in the pairing record, so a
     /// daemon restart resumes it. Ignored by the router.
@@ -1075,7 +1075,7 @@ async fn create_agent(
     }
 }
 
-/// Strip every object dialect (`sha256-<64hex>`) from an advertised dialect
+/// Strip every object dialect (`f1220<64hex>`) from an advertised dialect
 /// set, returning whether any was present (SPEC-086 CON-003).
 fn take_objects(dialects: &mut Vec<String>) -> bool {
     use crate::object_transport::is_object_dialect_name;
@@ -3075,14 +3075,10 @@ mod tests {
     #[test]
     fn take_objects_strips_object_dialects_and_reports_presence() {
         let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut dialects = vec![
-            "cite".to_owned(),
-            format!("sha256-{hex}"),
-            "vote".to_owned(),
-        ];
+        let mut dialects = vec!["cite".to_owned(), format!("f1220{hex}"), "vote".to_owned()];
         assert!(super::take_objects(&mut dialects));
         assert_eq!(dialects, ["cite", "vote"]);
-        let mut none = vec!["cite".to_owned(), "sha256-short".to_owned()];
+        let mut none = vec!["cite".to_owned(), "f1220short".to_owned()];
         assert!(!super::take_objects(&mut none));
         assert_eq!(none.len(), 2);
     }
@@ -3629,7 +3625,7 @@ mod tests {
         store
             .enqueue_object(
                 &handle,
-                "(lang sha256-x (check @room))".to_owned(),
+                "(lang f1220x (check @room))".to_owned(),
                 record.clone(),
             )
             .await
@@ -3646,7 +3642,7 @@ mod tests {
             .json::<serde_json::Value>()
             .await
             .expect("response should decode");
-        assert_eq!(body["message"], "(lang sha256-x (check @room))");
+        assert_eq!(body["message"], "(lang f1220x (check @room))");
         assert_eq!(
             body["record"],
             serde_json::json!({
@@ -3860,9 +3856,9 @@ mod tests {
             "name": "checklist",
             "verbs": {
                 "open": { "causedBy": "begin", "fields": { "title": "string" } },
-                "check": { "causedBy": ["open"], "fields": { "item": "string", "done": "bool" } }
+                "check": { "causedBy": ["open"], "fields": { "item": "string", "done": "bool", "clock": "hlc" } }
             },
-            "project": { "title": ["last", "open", "title"], "items": ["latestPerKey", "check", "item", "done"] }
+            "project": { "title": ["initial", "open", "title"], "items": ["lwwMap", "check", "item", "done", "clock"] }
         });
         let opened = authed_post_json(
             &server,
@@ -3872,7 +3868,7 @@ mod tests {
         .await;
         assert_eq!(opened.status(), StatusCode::OK);
         let opened: super::ObjectOpenResponse = opened.json().await.unwrap();
-        assert!(opened.dialect.starts_with("sha256-"), "{}", opened.dialect);
+        assert!(opened.dialect.starts_with("f1220"), "{}", opened.dialect);
         {
             // SPEC-087 REQ-005: the dialect is declared to the room before
             // the opener goes out; the opener carries no definition.
@@ -3916,7 +3912,7 @@ mod tests {
         {
             let frames = sent.lock().unwrap();
             assert_eq!(frames.len(), 3);
-            assert!(frames[2].contains(":caused-by sha256-"), "{}", frames[2]);
+            assert!(frames[2].contains(":caused-by f1220"), "{}", frames[2]);
         }
 
         let read: super::ObjectReadResponse = authed_get(&server, &format!("{base}/list%201"))
@@ -3967,8 +3963,8 @@ mod tests {
         let definition = serde_json::json!({
             "name": "tally",
             "verbs": { "open": { "causedBy": "begin", "fields": { "title": "string" } },
-                       "add": { "causedBy": ["open"], "fields": { "amount": "number", "op": "string" } } },
-            "project": { "title": ["last", "open", "title"], "amounts": ["events", "add", "amount"], "total": ["sum", "amounts"] }
+                       "add": { "causedBy": ["open"], "fields": { "amount": "integer", "op": "string" } } },
+            "project": { "title": ["initial", "open", "title"], "amounts": ["events", "add", "amount"], "total": ["sum", "amounts"] }
         });
 
         let no_runtime = authed_post_json(
@@ -3994,18 +3990,14 @@ mod tests {
         .await;
         assert_eq!(checked.status(), StatusCode::OK);
         let checked: super::ObjectCheckResponse = checked.json().await.unwrap();
-        assert!(
-            checked.dialect.starts_with("sha256-"),
-            "{}",
-            checked.dialect
-        );
+        assert!(checked.dialect.starts_with("f1220"), "{}", checked.dialect);
         assert_eq!(checked.label, "tally");
         assert!(checked.cbcl.contains("(protocol"), "{}", checked.cbcl);
 
         let invalid = authed_post_json(
             &server,
             "/v1/objects/check",
-            serde_json::json!({ "definition": { "name": "x", "verbs": { "open": { "causedBy": "begin", "fields": {} } }, "project": { "n": ["sum", ["last", "open", "title"]] } } }),
+            serde_json::json!({ "definition": { "name": "x", "verbs": { "open": { "causedBy": "begin", "fields": {} } }, "project": { "n": ["sum", ["initial", "open", "title"]] } } }),
         )
         .await;
         assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);

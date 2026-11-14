@@ -578,7 +578,7 @@ mod tests {
         assert!(
             transcript
                 .iter()
-                .any(|(f, c)| f.starts_with("(lang sha256-") && !*c)
+                .any(|(f, c)| f.starts_with("(lang f1220") && !*c)
         );
         // Object storage holds only sealed bytes, and the production streaming
         // reader refuses redirects, oversized bodies, and corrupt ciphertext.

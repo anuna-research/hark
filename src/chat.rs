@@ -257,7 +257,10 @@ async fn join_hub(
     // the domain-separated envelope. The chat audience is the recipient handle
     // (@-kept), derived per frame by sign_chat_frame.
     let mut conn = recv_bootstrap(&mut websocket).await?;
-    let epoch_caps = mls.as_ref().map(|_| format!(" :caps (\"{}\")", crate::mls::claim::capability_name())).unwrap_or_default();
+    let epoch_caps = mls
+        .as_ref()
+        .map(|_| format!(" :caps (\"{}\")", crate::mls::claim::capability_name()))
+        .unwrap_or_default();
     let hello = format!(
         "(hello {channel} :from {agent_handle} :key \"{}\"{}{})",
         identity.public_key_b64(),
@@ -1841,7 +1844,7 @@ fn spawn_receive_loop(args: ReceiveLoopArgs) {
                     }
                     let Some(responder_text) = responder_text else { continue };
                     // SPEC-086 REQ-001/REQ-002/REQ-006: under the object
-                    // subscription an object content message (a `sha256-<64hex>` dialect) is delivered
+                    // subscription an object content message (a `f1220<64hex>` dialect) is delivered
                     // with its attestation record — own messages and replays
                     // included — independent of `--speak`, the capability set,
                     // and the room's dialect menu. Hark never parses the

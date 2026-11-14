@@ -1,0 +1,10 @@
+   Compiling hark v0.7.0 (/private/tmp/v020/hark)
+    Finished `test` profile [unoptimized] target(s) in 8.20s
+     Running unittests src/lib.rs (target/debug/deps/hark-97cbed0f05eddc33)
+
+running 2 tests
+test objects::runtime::tests::v020_bus_settings_fixture_is_recognized_and_installs ... ok
+test objects::runtime::tests::v020_host_clock_overwrites_callers_merges_declared_fields_and_survives_restart ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 431 filtered out; finished in 0.10s
+

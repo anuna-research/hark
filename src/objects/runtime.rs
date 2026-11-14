@@ -16,6 +16,7 @@
 //! Every command is dispatched on the actor thread; ingestion is
 //! fire-and-forget from the receive loop, reads and writes are request/reply.
 
+use cbcl_core::hlc::Hlc;
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -78,22 +79,25 @@ fn native_json(function: Native, input: &str) -> Result<Value, String> {
 }
 
 /// A CBCL string literal for a state-bearing value: strings quoted with the
-/// escapes cbcl-rs reads, integers as digits, booleans as `#t`/`#f`, lists in
+/// escapes cbcl-rs reads, finite numbers, exact `{decimal: "digits"}` values, booleans as `#t`/`#f`, lists in
 /// parentheses. The same rule as the `cbcl` package's `literal`.
 fn literal(value: &Value) -> Result<String, String> {
     match value {
         Value::String(s) => Ok(quote(s)),
         Value::Number(n) => {
-            if n.is_i64() || n.is_u64() {
-                Ok(n.to_string())
-            } else {
-                Err("state-bearing numbers are integers".to_owned())
-            }
+            Ok(n.to_string())
         }
         Value::Bool(b) => Ok(if *b { "#t" } else { "#f" }.to_owned()),
         Value::Array(items) => {
             let parts = items.iter().map(literal).collect::<Result<Vec<_>, _>>()?;
             Ok(format!("({})", parts.join(" ")))
+        }
+        Value::Object(object) if object.len() == 1 && object.get("decimal").and_then(Value::as_str).is_some() => {
+            let text = format!("{}m", object["decimal"].as_str().unwrap());
+            match cbcl_parser::parse(&text) {
+                Ok(expr @ cbcl_core::sexpr::SExpr::Atom(cbcl_core::sexpr::Atom::Decimal(_))) => Ok(expr.to_string()),
+                _ => Err("invalid exact decimal field".to_owned()),
+            }
         }
         Value::Null | Value::Object(_) => Err("unsupported field value".to_owned()),
     }
@@ -137,21 +141,31 @@ fn keyword_text(fields: &Map<String, Value>) -> Result<String, String> {
     Ok(parts.join(" "))
 }
 
-/// The wire address of a canonical message: `sha256-<hex>` (SPEC-019 R.6).
+fn hlc_fields(dialect: &Dialect, verb: &str) -> Vec<String> {
+    dialect.info["verbs"][verb]["fields"]
+        .as_object()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|(_, kind)| kind.as_str() == Some("hlc"))
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The wire address of a canonical message: `f1220<hex>` (SPEC-019 R.6).
 fn wire_address(canonical: &str) -> Result<String, String> {
     let hash = native(cbcl_wasm::message_hash_bytes, canonical)?;
     Ok(match hash.strip_prefix("sha256:") {
-        Some(hex) => format!("sha256-{hex}"),
+        Some(hex) => format!("f1220{hex}"),
         None => hash,
     })
 }
 
-/// The 64-hex digest an address carries (`sha256-<hex>` → `<hex>`).
+/// The 64-hex digest an address carries (`f1220<hex>` → `<hex>`).
 fn hex_of(address: &str) -> String {
-    address
-        .strip_prefix("sha256-")
-        .unwrap_or(address)
-        .to_owned()
+    address.strip_prefix("f1220").unwrap_or(address).to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +600,12 @@ fn opener_text(
     for (key, value) in fields {
         kw.push_str(&format!(" :{key} {}", literal(value)?));
     }
+    // The intent binder excludes openers; register openers carry an empty
+    // causal replacement set supplied by the host after editor validation.
+    if dialect.info["state"].as_object().is_some_and(|rules| rules.values().any(|rule| {
+        matches!(rule[0].as_str(), Some("lwwPerSigner" | "lwwMap" | "multiValueRegister" | "multiValueMap"))
+            && rule[1].as_str() == Some(opener)
+    })) { kw.push_str(" :replaces ()"); }
     let text = format!(
         "(lang {} ({opener} {}{kw} :caused-by begin :thread {} :from {}))",
         dialect.name,
@@ -629,7 +649,10 @@ fn declaration_frame(room: &str, name: &str, define: &str, from: &str) -> String
 
 /// The acquisition of a declared dialect by digest (SPEC-015 REQ-005).
 fn fetch_frame(room: &str, digest: &str, from: &str) -> String {
-    format!("(fetchdialect {room} :digest {} :from {from})", quote(digest))
+    format!(
+        "(fetchdialect {room} :digest {} :from {from})",
+        quote(digest)
+    )
 }
 
 /// The teach frame an own declaration is journalled as, so a restarted daemon
@@ -677,6 +700,8 @@ struct Controller {
     menu: HashMap<String, String>,
     /// SPEC-086 CON-002: one history request per controller lifetime.
     history_requested: bool,
+    clock: Option<Hlc>,
+    clock_path: Option<PathBuf>,
 }
 
 /// What a controller asks its host to do; the host owns identity, signing
@@ -701,7 +726,83 @@ impl Controller {
             requested: HashSet::new(),
             menu: HashMap::new(),
             history_requested: false,
+            clock: None,
+            clock_path: None,
         }
+    }
+
+    // Clock evidence belongs to the host; callers cannot choose register winners.
+    // Only declared HLC fields participate in receipt merging, never ordinary prose.
+    fn stamp_fields(
+        &mut self,
+        dialect: &Dialect,
+        verb: &str,
+        mut fields: Map<String, Value>,
+        records: &[Record],
+    ) -> Result<Map<String, Value>, String> {
+        let names = hlc_fields(dialect, verb);
+        if names.is_empty() {
+            return Ok(fields);
+        }
+        let mut remote = None;
+        for record in records {
+            let act = native_json(cbcl_wasm::read_act_bytes, &record.canonical)?;
+            for name in hlc_fields(dialect, &record.verb) {
+                if let Some(stamp) = act["fields"][&name].as_str().and_then(Hlc::parse) {
+                    remote = Some(remote.map_or(stamp, |old: Hlc| old.max(stamp)));
+                }
+            }
+        }
+        if self.clock.is_none() {
+            if let Some(path) = &self.clock_path {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => {
+                        self.clock =
+                            Some(Hlc::parse(text.trim()).ok_or("invalid retained host clock")?)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("host clock unavailable: {error}")),
+                }
+            }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "host clock wall time unavailable")?
+            .as_millis();
+        let now = u64::try_from(now).map_err(|_| "host clock wall time overflow")?;
+        let next = self
+            .clock
+            .unwrap_or(Hlc::new(0, 0))
+            .advance(now, remote)
+            .ok_or("host clock exhausted")?;
+        let text = next.render();
+        if let Some(path) = &self.clock_path {
+            let save = || -> std::io::Result<()> {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("clock parent missing"))?;
+                std::fs::create_dir_all(parent)?;
+                let temporary = path.with_extension("hlc.new");
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&temporary)?;
+                file.write_all(text.as_bytes())?;
+                file.sync_all()?;
+                std::fs::rename(&temporary, path)?;
+                std::fs::File::open(parent)?.sync_all()
+            };
+            save().map_err(|error| format!("host clock retention failed: {error}"))?;
+        }
+        self.clock = Some(next);
+        for name in names {
+            fields.insert(name, Value::String(text.clone()));
+        }
+        Ok(fields)
     }
 
     /// Learn a dialect from its `(define …)` text and release the acts that
@@ -943,6 +1044,10 @@ impl Controller {
             kw.insert(key, value);
         }
         let accepted = entry.accepted(thread, &dialect);
+        let kw = match self.stamp_fields(&dialect, verb, kw, &accepted) {
+            Ok(fields) => fields,
+            Err(reason) => return reject(reason),
+        };
         let bound = match intend(&dialect, thread, &accepted, &self.me, verb, &kw) {
             Ok(Bound::Act(canonical)) => canonical,
             Ok(Bound::Rejected {
@@ -993,6 +1098,12 @@ impl Controller {
         let Value::Object(fields) = fields else {
             return Err("opener fields must be a record".to_owned());
         };
+        let verb = compiled
+            .dialect
+            .opener()
+            .ok_or("contract has no opener")?
+            .to_owned();
+        let fields = self.stamp_fields(&compiled.dialect, &verb, fields, &[])?;
         let text = opener_text(&compiled.dialect, &self.room, thread, &self.me, &fields)?;
         let canonical = native(cbcl_wasm::parse_message_bytes, &text)?;
         let name = compiled.dialect.name.clone();
@@ -1311,6 +1422,10 @@ impl Runtime {
             return;
         }
         let mut controller = Controller::new(who.me.clone(), who.room.clone());
+        controller.clock_path = self
+            .journal
+            .as_ref()
+            .map(|journal| journal.path(&who.me, &who.room).with_extension("hlc"));
         let lines = self
             .journal
             .as_mut()
@@ -1352,8 +1467,12 @@ impl Runtime {
 fn deliver(controller: &mut Controller, text: &str, signer: &str, host: &Host<'_>) {
     if let Some(name) = taught_dialect(text) {
         match controller.teach(text, host) {
-            Ok(learned) => tracing::debug!(target: "hark::objects", dialect = name, learned, "teach frame"),
-            Err(reason) => tracing::debug!(target: "hark::objects", dialect = name, %reason, "dialect not learned"),
+            Ok(learned) => {
+                tracing::debug!(target: "hark::objects", dialect = name, learned, "teach frame")
+            }
+            Err(reason) => {
+                tracing::debug!(target: "hark::objects", dialect = name, %reason, "dialect not learned")
+            }
         }
     } else {
         controller.receive(text, signer, host);
@@ -1468,11 +1587,11 @@ mod tests {
             "name": "checklist",
             "verbs": {
                 "open": { "causedBy": "begin", "fields": { "title": "string" } },
-                "check": { "causedBy": ["open"], "fields": { "item": "string", "done": "bool" } }
+                "check": { "causedBy": ["open"], "fields": { "item": "string", "done": "bool", "clock": "hlc" } }
             },
             "project": {
-                "title": ["last", "open", "title"],
-                "items": ["latestPerKey", "check", "item", "done"]
+                "title": ["initial", "open", "title"],
+                "items": ["lwwMap", "check", "item", "done", "clock"]
             }
         })
     }
@@ -1582,7 +1701,7 @@ mod tests {
         assert_eq!(acted.cid.as_deref().map(str::len), Some(64));
         let action = sent.lock().unwrap()[1].clone();
         assert!(
-            action.contains(":caused-by sha256-"),
+            action.contains(":caused-by f1220"),
             "the binder picked the opener as predecessor: {action}"
         );
         assert!(action.contains(":done #t"), "{action}");
@@ -1728,7 +1847,7 @@ mod tests {
         // A teach frame whose body does not hash to its name is refused.
         let forged = define.replacen(
             "(define ",
-            "(define sha256-0000000000000000000000000000000000000000000000000000000000000000 ",
+            "(define f12200000000000000000000000000000000000000000000000000000000000000000 ",
             1,
         );
         let forged = forged.replacen(&format!("{dialect} "), "", 1);
@@ -1911,7 +2030,7 @@ mod tests {
         assert_eq!(checked.verbs["check"]["after"], serde_json::json!(["open"]));
         assert_eq!(
             checked.state["items"],
-            serde_json::json!(["latestPerKey", "check", "item", "done"])
+            serde_json::json!(["lwwMap", "check", "item", "done", "clock"])
         );
         assert!(
             checked
@@ -2114,7 +2233,7 @@ mod tests {
 
     #[test]
     fn teach_frames_are_classified_textually() {
-        let name = format!("sha256-{}", "ab".repeat(32));
+        let name = format!("f1220{}", "ab".repeat(32));
         assert_eq!(
             taught_dialect(&format!("(meta (define {name} (cbcl) @a))")),
             Some(name.as_str())
@@ -2129,7 +2248,53 @@ mod tests {
             literal(&serde_json::json!(["a", 2, true])).unwrap(),
             "(\"a\" 2 #t)"
         );
-        assert!(literal(&serde_json::json!(1.5)).is_err());
+        assert_eq!(literal(&serde_json::json!(1.5)).unwrap(), "1.5");
         assert_eq!(token("@a b"), "\"@a b\"");
     }
+    #[test]
+    fn v020_host_clock_overwrites_callers_merges_declared_fields_and_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let dialect = compile(&checklist()).unwrap().dialect;
+        let mut controller = Controller::new("@a".into(), "@room".into());
+        controller.clock_path = Some(temp.path().join("clock.hlc"));
+        let spoof = serde_json::json!({"item":"milk","done":true,"clock":"hlc-ffffffffffffffff-ffffffff"}).as_object().unwrap().clone();
+        let first = controller.stamp_fields(&dialect,"check",spoof.clone(),&[]).unwrap();
+        let a = Hlc::parse(first["clock"].as_str().unwrap()).unwrap();
+        assert_ne!(first["clock"],spoof["clock"]);
+        let mut restarted = Controller::new("@a".into(), "@room".into());
+        restarted.clock_path = controller.clock_path.clone();
+        let second = restarted.stamp_fields(&dialect,"check",spoof,&[]).unwrap();
+        assert!(Hlc::parse(second["clock"].as_str().unwrap()).unwrap() > a);
+        let future = Hlc::new(a.physical_ms + 100000, 7);
+        let records = [Record {address:"unused".into(),verb:"check".into(),signer:"@b".into(),canonical:format!("(lang {} (check @room () :clock {} :item \"milk\" :done #t :from @b :thread \"t\" :caused-by begin :replaces ()))",dialect.name,quote(&future.render()))},
+            Record {address:"prose".into(),verb:"open".into(),signer:"@b".into(),canonical:format!("(lang {} (open @room () :title \"hlc-ffffffffffffffff-ffffffff\" :from @b :thread \"t\" :caused-by begin))",dialect.name)}];
+        let third = restarted.stamp_fields(&dialect,"check",Map::new(),&records).unwrap();
+        assert!(Hlc::parse(third["clock"].as_str().unwrap()).unwrap() > future);
+    }
+
+    #[test]
+    fn v020_bus_settings_fixture_is_recognized_and_installs() {
+        let bytes = include_str!("../../tests/vectors/cbcl-v020-settings.cbcl");
+        let dialect = Dialect::learn(None, bytes).unwrap();
+        assert_eq!(dialect.name,"f12206c01de420d0205674c385556d81c5344d00ecbcdc1ef16e65ed12c4168219693");
+        assert!(crate::object_transport::is_object_message(&format!("(lang {} (open @room :scope \"room\" :from @a))",dialect.name)));
+        assert_eq!(literal(&serde_json::json!({"decimal":"1.2500"})).unwrap(),"1.25m");
+        assert_eq!(literal(&serde_json::json!(1.5)).unwrap(),"1.5");
+    }
+
+    #[tokio::test]
+    async fn v020_open_supplies_host_clocks_and_register_replacements() {
+        for rule in ["lwwRegister", "lwwPerSigner"] {
+            let (client, _, _, _) = recording();
+            let agent = AgentHandle::generate();
+            let definition = serde_json::json!({"name":"clocked-opener","verbs":{"open":{"after":["begin"],"fields":{"title":"string","clock":"hlc"}}},"state":{"title":[rule,"open","title","clock"]}});
+            let opened = client.open(who(&agent), definition, "clocked".into(), serde_json::json!({"title":"First"})).await.unwrap();
+            assert!(opened.ok,"{opened:?}");
+            let text = opened.message.unwrap();
+            let act = native_json(cbcl_wasm::read_act_bytes,&text).unwrap();
+            assert!(Hlc::parse(act["fields"]["clock"].as_str().unwrap()).is_some());
+            assert_eq!(text.contains(":replaces ()"),rule=="lwwPerSigner");
+        }
+    }
+
 }

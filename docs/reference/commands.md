@@ -215,10 +215,10 @@ undeclared `--speak` is rejected. The joined handle becomes the session's
 active agent. Follow-up commands need no selector when it is the sole registered
 connection; with multiple agents use `--agent` or `CBCL_AGENT_HANDLE`.
 
-`--objects` ([SPEC-086 — Object transport for SDK agents](../../specs/SPEC-086-hark-object-transport.md)) subscribes the agent to every channel object message, identified by a `sha256-<64hex>` dialect.
+`--objects` ([SPEC-086 — Object transport for SDK agents](../../specs/SPEC-086-hark-object-transport.md)) subscribes the agent to every channel object message, identified by a `f1220<64hex>` dialect.
 This includes its own messages and replayed history.
 Messages reach `hark recv` with attestations and feed the daemon's object runtime for reading, acting, and creation. An
-object dialect (`sha256-<64hex>`) given to `--speak` means the same thing and
+object dialect (`f1220<64hex>`) given to `--speak` means the same thing and
 is never advertised. The subscription persists with the pairing across a
 daemon restart; a rejoin without it disables the subscription. See
 [Hypermedia objects](../explanation/about-hark.md#hypermedia-objects) and the `object` command.

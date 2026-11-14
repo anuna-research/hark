@@ -344,7 +344,7 @@ pub struct JoinArgs {
     pub hub: Option<String>,
     #[arg(
         long = "objects",
-        help = "Subscribe to shared-object messages: every object message (a `sha256-<64hex>` dialect) in the channel, including this agent's own and replayed history, reaches `recv` with an attestation record"
+        help = "Subscribe to shared-object messages: every object message (a `f1220<64hex>` dialect) in the channel, including this agent's own and replayed history, reaches `recv` with an attestation record"
     )]
     pub objects: bool,
 }
@@ -365,7 +365,7 @@ pub struct PairArgs {
     pub hub: Option<String>,
     #[arg(
         long = "objects",
-        help = "Subscribe to shared-object messages. Implied when the pairing record lists an object dialect (sha256-<64hex>)"
+        help = "Subscribe to shared-object messages. Implied when the pairing record lists an object dialect (f1220<64hex>)"
     )]
     pub objects: bool,
 }
@@ -446,7 +446,7 @@ Accepted definitions: a JSON file or inline JSON containing an authoring definit
 serialized contract text. Versions 1 and 2 are rejected.
 
 Minimal example:
-  hark object check --define '{"name":"note","verbs":{"open":{"causedBy":"begin","fields":{"text":"string"}}},"project":{"text":["last","open","text"]}}'
+  hark object check --define '{"name":"note","verbs":{"open":{"causedBy":"begin","fields":{"text":"string"}}},"project":{"text":["initial","open","text"]}}'
 
 Save this definition as note.json to create an instance:
   hark join @demo --as @aria --objects
