@@ -78,7 +78,7 @@ Unknown outer `(lang <name>)` wrappers fall back to R1–R4 until the dialect is
 
 Objects are shared, content-addressed state machines: checklists, votes, and drawing boards.
 Each instance is an independent thread of signed acts.
-Its dialect uses the self-address `sha256-<64hex>`, and its `(state …)` clause defines the fold.
+Its dialect uses the self-address `f1220<64hex>`, and its `(state …)` clause defines the fold.
 cbcl-rs admits acts, folds state, and binds intents.
 
 Hark links the `cbcl-wasm` crate natively with its `std` feature.

@@ -256,6 +256,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -292,17 +301,22 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cbcl-core"
-version = "0.1.0"
-source = "git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=d2cbd968e36dbc0d5876a878e65a89942386890c#d2cbd968e36dbc0d5876a878e65a89942386890c"
+version = "0.2.0"
+source = "git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=6b19878abf048725095fd39ffb3f73a1a9014536#6b19878abf048725095fd39ffb3f73a1a9014536"
 dependencies = [
+ "bs58",
  "hashbrown 0.15.5",
+ "num-bigint",
+ "regex-automata",
+ "regex-syntax",
  "sha2",
+ "unsigned-varint",
 ]
 
 [[package]]
 name = "cbcl-parser"
-version = "0.1.0"
-source = "git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=d2cbd968e36dbc0d5876a878e65a89942386890c#d2cbd968e36dbc0d5876a878e65a89942386890c"
+version = "0.2.0"
+source = "git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=6b19878abf048725095fd39ffb3f73a1a9014536#6b19878abf048725095fd39ffb3f73a1a9014536"
 dependencies = [
  "cbcl-core",
  "serde_json",
@@ -310,8 +324,8 @@ dependencies = [
 
 [[package]]
 name = "cbcl-wasm"
-version = "0.1.0"
-source = "git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=d2cbd968e36dbc0d5876a878e65a89942386890c#d2cbd968e36dbc0d5876a878e65a89942386890c"
+version = "0.2.0"
+source = "git+https://git.anuna.io/anuna-research/cbcl-rs.git?rev=6b19878abf048725095fd39ffb3f73a1a9014536#6b19878abf048725095fd39ffb3f73a1a9014536"
 dependencies = [
  "cbcl-core",
  "cbcl-parser",
@@ -2594,9 +2608,9 @@ checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"
-version = "0.8.10"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
@@ -2915,6 +2929,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -3555,6 +3579,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "unsigned-varint"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb066959b24b5196ae73cb057f45598450d2c5f71460e98c49b738086eff9c06"
 
 [[package]]
 name = "untrusted"

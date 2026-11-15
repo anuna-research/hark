@@ -20,10 +20,10 @@ pub(super) fn definition() -> Value {
             "run":{"after":["open"],"fields":{"program":"string"}},
             "invoke":{"after":["open"],"fields":{"program":"string","arguments":"list"}},
             "output":{"after":["read","run","invoke"],"fields":{"seq":"number","data":"string"}},
-            "done":{"after":["read","run","invoke"],"fields":{"number":"number","exit-code":"number","elapsed-micros":"number"}}
+            "done":{"after":["read","run","invoke"],"fields":{"number":"number","exit-code":"number","elapsed-micros":"number","clock":"hlc"}}
         },
-        "state":{"opened":["exists","open"],"session":["last","open","session"],"reading":["exists","read"],"running":["exists","run"],"invoking":["exists","invoke"],
-            "stdout":["events","output","data"],"completed":["exists","done"],"exit-code":["last","done","exit-code"]},
+        "state":{"opened":["exists","open"],"session":["initial","open","session"],"reading":["exists","read"],"running":["exists","run"],"invoking":["exists","invoke"],
+            "stdout":["events","output","data"],"completed":["exists","done"],"exit-code":["lwwRegister","done","exit-code","clock"]},
         "bounds":{"maxString":2048,"maxNumber":1000000000,"maxFields":16,"maxList":32}
     })
 }
@@ -43,6 +43,7 @@ fn native_json(function: NativeExport, input: &str) -> Result<Value> {
 pub(super) struct Dialect {
     pub name: String,
     pub cbcl: String,
+    clock: std::sync::Mutex<cbcl_core::hlc::Hlc>,
 }
 impl Dialect {
     pub fn new() -> Result<Self> {
@@ -58,7 +59,7 @@ impl Dialect {
         if native(cbcl_wasm::verify_dialect_bytes, &cbcl)? != "ok" {
             return fail("dialect verification failed");
         }
-        Ok(Self { name, cbcl })
+        Ok(Self { name, cbcl, clock: std::sync::Mutex::new(cbcl_core::hlc::Hlc::new(0, 0)) })
     }
 
     fn admit(
@@ -103,10 +104,16 @@ impl Dialect {
                 _ => fail("unsupported CBCL field value"),
             }
         }
-        let fields = fields
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("fields must be an object"))?
-            .iter()
+        let mut host_fields = fields.as_object().cloned().ok_or_else(|| anyhow::anyhow!("fields must be an object"))?;
+        if verb == "done" {
+            // Shill threads belong to one transient session and are never resumed
+            // across daemon restarts. The session host owns terminal clocks.
+            let mut clock = self.clock.lock().map_err(|_| anyhow::anyhow!("host clock unavailable"))?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+            *clock = clock.advance(u64::try_from(now)?, None).ok_or_else(|| anyhow::anyhow!("host clock exhausted"))?;
+            host_fields.insert("clock".into(), json!(clock.render()));
+        }
+        let fields = host_fields.iter()
             .map(|(key, value)| Ok(format!(":{key} {}", literal(value)?)))
             .collect::<Result<Vec<_>>>()?
             .join(" ");

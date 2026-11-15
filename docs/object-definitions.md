@@ -37,12 +37,12 @@ person writes:
   "name": "checklist",
   "verbs": {
     "open":  { "causedBy": "begin",   "fields": { "title": "string" } },
-    "check": { "causedBy": ["open"],  "fields": { "item": "string", "done": "bool" } },
+    "check": { "causedBy": ["open"],  "fields": { "item": "string", "done": "bool", "clock": "hlc" } },
     "drop":  { "causedBy": ["open"],  "fields": { "item": "string" } }
   },
   "project": {
-    "title": ["last", "open", "title"],
-    "items": ["registerPerKey", "check", "item", "done", "drop"]
+    "title": ["initial", "open", "title"],
+    "items": ["lwwMap", "check", "item", "done", "clock", "drop"]
   }
 }
 ```
@@ -57,7 +57,7 @@ record's serialised text, is accepted wherever a definition is.
 ### `name`
 
 A short label (`[a-z][a-z0-9-]{0,47}`). It is no part of identity: the
-object's **dialect** is the self-address `sha256-<64hex>` over the body of
+object's **dialect** is the self-address `f1220<64hex>` over the body of
 the CBCL dialect the contract compiles to (SPEC-019 R.6). Two contracts that
 compile to the same body are the same dialect whatever they are called, and a
 contract that compiles to the same body as a hand-written `.cbcl` file has
@@ -70,7 +70,7 @@ One entry per action. Exactly one verb has `"causedBy": "begin"`: the
 the verbs it may follow. The protocol must be acyclic; cbcl-rs's R5 refuses a
 cycle. Repeatable acts each follow the opener.
 
-Field types: `"string"`, `"number"` (integers), `"bool"`, `"list"`, and
+Field types include `"string"`, `"number"`, `"integer"`, `"float"`, `"decimal"`, `"hlc"`, `"bool"`, `"list"`, and
 `{"enumOf": "<state field>"}`, whose values must be among those the named
 state field holds (a vote whose choice must be one of the proposed options).
 Field sets are closed: an action carrying an undeclared field is rejected.
@@ -84,21 +84,21 @@ the defaults; `requirements` (`maxDepth`, `maxExpansionSize`,
 
 ### `project` (the `state`)
 
-The state, as one rule per field over the accepted acts, from the fourteen
+The state, as one rule per field over the accepted acts, from the v0.2 state-rule
 heads of SPEC-019 R.1. Each is a JSON array whose first element is the rule:
 
 | Rule | Meaning |
 | --- | --- |
-| `["last", verb, field]` | one value, chosen by greatest address across everyone |
-| `["latestPerSigner", verb, field]` | one value per signer |
-| `["latestPerKey", verb, keyField, valueField]` | one value per key |
+| `["initial", openerVerb, field]` | immutable value drawn from the unique opener |
+| `["lwwRegister", verb, field, clockField]` | one value across everyone, chosen by HLC then deterministic tie-break |
+| `["lwwPerSigner", verb, field, clockField]` | one value per signer, chosen by HLC |
+| `["lwwMap", verb, keyField, valueField, clockField, deleteVerb?]` | one value per key, chosen by HLC |
 | `["exists", verb]` | whether any such act exists |
 | `["count", verb]` | number of distinct acts |
 | `["events", verb, field]` | every act's value, keyed by address |
 | `["setUnion", verb, field]` | sorted unique scalars; additions only |
 | `["values", verb, field]` | multi-value register: values no later write replaced |
 | `["valuesPerKey", verb, keyField, valueField, deleteVerb?]` | a register map keeping every current value per key |
-| `["registerPerKey", verb, keyField, valueField, deleteVerb?]` | a register map with one current value per key |
 | `["observedSet", addVerb, removeVerb, field]` | values with an unremoved addition |
 | `["counter", incVerb, decVerb, field]` | increments minus decrements |
 | `["histogram", stateField]` | counts of another state field's values |
@@ -106,13 +106,15 @@ heads of SPEC-019 R.1. Each is a JSON array whose first element is the rule:
 
 Two rules matter when writing from a spec:
 
-- **Nothing is ordered by time.** Concurrent writes tie-break by address. If
-  "the latest edit wins" is what the spec means, use a register (`values`,
-  `valuesPerKey`, `registerPerKey`). Replacement is carried as data in a
-  reserved `:replaces` field that cbcl-rs's compiler inserts and its binder
-  fills from the accepted set; an author never declares it and a caller never
-  sets it. To let people remove keys, add a delete verb carrying the key field
-  and name it last.
+- **HLC fields belong to Hark.** Register writes declare a `"hlc"` field,
+  which Hark fills before binding or opening. A caller-supplied timestamp is
+  overwritten. The controller merges only schema-declared clocks from admitted
+  history, and retains its clock atomically beside the object journal before
+  issuing it. `initial` draws only from the opener; later editable values use
+  `lwwRegister`, `lwwPerSigner` or `lwwMap`. Multi-value registers (`values`,
+  `valuesPerKey`) retain concurrent values. The compiler and binder own
+  `:replaces`; callers never declare or set it. A map delete verb carries the
+  key and names no clock field.
 - **Removal from a set is an `observedSet`.** The removing verb carries the
   field; cbcl-rs binds the additions being cancelled. Additions that repeat a
   value need a distinguishing field such as `"op"`, or identical acts
@@ -180,3 +182,9 @@ every browser computes.
   `roomcfg` menu is what maps a dialect's self-address to the digest
   `fetchdialect` takes. `open` declares before it sends, so an object created
   through hark is always fetchable.
+
+For exact decimal values, pass `{"decimal":"1.2500"}`; Hark renders a native
+CBCL decimal without conversion through binary floating point. JSON numbers
+remain integers or finite floats. Counter inputs must be declared `integer`.
+The v0.1 `last`, `latestPerSigner`, `latestPerKey` and `registerPerKey` rules
+are retired; update definitions explicitly rather than relabeling old messages.

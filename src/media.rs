@@ -479,7 +479,7 @@ pub async fn get(client: &reqwest::Client, url: &str, size: usize) -> Result<Vec
 
 /// Browser-equivalent file contract. Presentation stays a browser concern.
 pub fn file_definition() -> serde_json::Value {
-    serde_json::json!({"name":"file","verbs":{"open":{"causedBy":"begin","fields":{"title":"string","ref":"string","caption":"string"}}},"project":{"title":["last","open","title"],"ref":["last","open","ref"],"caption":["last","open","caption"]}})
+    serde_json::json!({"name":"file","verbs":{"open":{"causedBy":"begin","fields":{"title":"string","ref":"string","caption":"string"}}},"project":{"title":["initial","open","title"],"ref":["initial","open","ref"],"caption":["initial","open","caption"]}})
 }
 
 /// Classify attachments and inspect preview metadata entirely in process.
